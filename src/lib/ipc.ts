@@ -2,15 +2,61 @@ import { invoke } from "@tauri-apps/api/core";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
+export type SortKey =
+  | "capture_desc"
+  | "capture_asc"
+  | "filename"
+  | "filename_desc"
+  | "rating_desc"
+  | "rating_asc"
+  | "imported_desc"
+  | "imported_asc";
+
+/** Sentinel `colorLabel` value that matches images with no color label. */
+export const LABEL_NONE = "__none__";
+
 export type QueryParams = {
   folderId?: number | null;
   minStars?: number | null;
   flag?: string | null;
+  colorLabel?: string | null;
+  keywordId?: number | null;
+  collectionId?: number | null;
+  importSessionId?: number | null;
   search?: string | null;
-  sort?: "capture_desc" | "capture_asc" | "filename";
+  sort?: SortKey;
   limit?: number;
   offset?: number;
 };
+
+/** The filter dimensions (excludes sort/search/paging) — the keys "All photos" clears. */
+export const FILTER_DIMENSIONS: (keyof QueryParams)[] = [
+  "folderId",
+  "minStars",
+  "flag",
+  "colorLabel",
+  "keywordId",
+  "collectionId",
+  "importSessionId",
+];
+
+/** True when any filter dimension is active. Single source of truth for nav/footer state. */
+export function hasActiveFilters(p: QueryParams): boolean {
+  return FILTER_DIMENSIONS.some((k) => p[k] != null);
+}
+
+/** A params patch that clears every filter dimension (keeps sort & search). */
+export function clearedFilters(): Partial<QueryParams> {
+  return {
+    folderId: null,
+    minStars: null,
+    flag: null,
+    colorLabel: null,
+    keywordId: null,
+    collectionId: null,
+    importSessionId: null,
+  };
+}
 
 export type ImageRow = {
   id: number;
@@ -148,6 +194,147 @@ export function cullSetLabel(
   label: string | null,
 ): Promise<void> {
   return invoke<void>("cull_set_label", { imageId, label });
+}
+
+// Batch culling (apply one value to a whole selection).
+
+export function cullSetRatingMany(
+  imageIds: number[],
+  stars: number,
+): Promise<void> {
+  return invoke<void>("cull_set_rating_many", { imageIds, stars });
+}
+
+export function cullSetFlagMany(
+  imageIds: number[],
+  flag: "none" | "pick" | "reject",
+): Promise<void> {
+  return invoke<void>("cull_set_flag_many", { imageIds, flag });
+}
+
+export function cullSetLabelMany(
+  imageIds: number[],
+  label: string | null,
+): Promise<void> {
+  return invoke<void>("cull_set_label_many", { imageIds, label });
+}
+
+// ── Keywords / tags ──────────────────────────────────────────────────────────
+
+export type KeywordRow = {
+  id: number;
+  name: string;
+  count: number;
+};
+
+export function keywordsList(): Promise<KeywordRow[]> {
+  return invoke<KeywordRow[]>("keywords_list", {});
+}
+
+export function keywordsForImage(imageId: number): Promise<KeywordRow[]> {
+  return invoke<KeywordRow[]>("keywords_for_image", { imageId });
+}
+
+export function keywordAddToImage(
+  imageId: number,
+  name: string,
+): Promise<KeywordRow> {
+  return invoke<KeywordRow>("keyword_add_to_image", { imageId, name });
+}
+
+export function keywordAddToImages(
+  imageIds: number[],
+  name: string,
+): Promise<KeywordRow> {
+  return invoke<KeywordRow>("keyword_add_to_images", { imageIds, name });
+}
+
+export function keywordRemoveFromImage(
+  imageId: number,
+  keywordId: number,
+): Promise<void> {
+  return invoke<void>("keyword_remove_from_image", { imageId, keywordId });
+}
+
+export function keywordDelete(keywordId: number): Promise<void> {
+  return invoke<void>("keyword_delete", { keywordId });
+}
+
+// ── Collections ──────────────────────────────────────────────────────────────
+
+export type CollectionRow = {
+  id: number;
+  name: string;
+  isSmart: boolean;
+  /** Predicate JSON (serialized QueryParams) for smart collections; null for static. */
+  query: string | null;
+  count: number;
+};
+
+export function collectionsList(): Promise<CollectionRow[]> {
+  return invoke<CollectionRow[]>("collections_list", {});
+}
+
+export function collectionsForImage(imageId: number): Promise<CollectionRow[]> {
+  return invoke<CollectionRow[]>("collections_for_image", { imageId });
+}
+
+export function collectionCreate(
+  name: string,
+  isSmart: boolean,
+  query: string | null,
+): Promise<number> {
+  return invoke<number>("collection_create", { name, isSmart, query });
+}
+
+export function collectionRename(id: number, name: string): Promise<void> {
+  return invoke<void>("collection_rename", { id, name });
+}
+
+export function collectionDelete(id: number): Promise<void> {
+  return invoke<void>("collection_delete", { id });
+}
+
+export function collectionAddImages(
+  collectionId: number,
+  imageIds: number[],
+): Promise<number> {
+  return invoke<number>("collection_add_images", { collectionId, imageIds });
+}
+
+export function collectionRemoveImages(
+  collectionId: number,
+  imageIds: number[],
+): Promise<number> {
+  return invoke<number>("collection_remove_images", { collectionId, imageIds });
+}
+
+/**
+ * Extract the smart-collection predicate from params. Captures the persistent filter dimensions
+ * only — NOT free-text `search` (transient, and not reset by clearedFilters, so it would leak when
+ * toggling a smart collection off) nor `collectionId` (a smart collection defined by membership in
+ * another collection would be circular). Every captured key is in FILTER_DIMENSIONS, so applying /
+ * clearing a smart collection round-trips cleanly. Key order is fixed for stable === comparison.
+ */
+export function smartQueryFromParams(p: QueryParams): string {
+  const pred: QueryParams = {};
+  if (p.folderId != null) pred.folderId = p.folderId;
+  if (p.minStars != null) pred.minStars = p.minStars;
+  if (p.flag != null) pred.flag = p.flag;
+  if (p.colorLabel != null) pred.colorLabel = p.colorLabel;
+  if (p.keywordId != null) pred.keywordId = p.keywordId;
+  if (p.importSessionId != null) pred.importSessionId = p.importSessionId;
+  return JSON.stringify(pred);
+}
+
+/** Parse a smart collection's stored predicate JSON back into QueryParams (safe). */
+export function parseSmartQuery(query: string | null): Partial<QueryParams> {
+  if (!query) return {};
+  try {
+    return JSON.parse(query) as Partial<QueryParams>;
+  } catch {
+    return {};
+  }
 }
 
 // ── Develop IPC ────────────────────────────────────────────────────────────

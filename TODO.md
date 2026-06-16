@@ -51,9 +51,20 @@ Quality: `cargo test --workspace` (7 integration + unit, all green) · `cargo cl
 
 ### Library / catalog
 
+- [x] **Filtering & sorting** — color-label filter (+ unlabeled sentinel), arbitrary star
+      threshold, pick/reject, 8 sort orders (capture/filename/rating/imported); LeftNav
+      All-photos/Picks/Recent wired. (`core-library/query.rs`, `BottomBar`, `LeftNav`)
+- [x] **Keywords / tags** — full CRUD (`core-library/keywords.rs` + 5 commands), per-image editor
+      (`RightInfo`) with autocomplete, batch tagging, LeftNav keyword filter, keyword-name search.
+- [x] **Collections + smart collections** — static membership + smart predicate collections
+      (`core-library/collections.rs` + 7 commands); LeftNav create/filter/delete; RightInfo
+      membership editor; "save current filters as smart".
+- [x] **Multi-select + batch ops** — cmd/shift-click selection, `SelectionBar` (batch
+      rating/flag/label/keyword/collection/export), batch culling via keyboard, batch export.
+- [x] **Import modes** — copy/move/reference picker (`ImportModal`).
 - [ ] FS **watcher** (`notify`) + move reconciliation by content hash (spec §9).
-- [ ] **Smart collections** (saved query predicates) + keywords/tags UI.
-- [ ] Filter bar: finish wiring rating/flag/label/search filters end-to-end.
+- [ ] Keyword **hierarchy** (parent_id) UI; keyword rename/merge.
+- [ ] "Recent import" as a true import-session filter (currently `imported_desc` sort).
 
 ### Packaging / security
 

@@ -6,9 +6,14 @@ import {
   libraryFolders,
   libraryIndexRoot,
   appDefaultLibrary,
+  keywordsList,
+  collectionsList,
+  clearedFilters,
   type QueryParams,
   type ImageRow,
   type FolderRow,
+  type KeywordRow,
+  type CollectionRow,
 } from "./ipc";
 
 export type IndexingState = { done: number; total: number };
@@ -16,7 +21,12 @@ export type IndexingState = { done: number; total: number };
 export interface LibraryState {
   images: ImageRow[];
   folders: FolderRow[];
+  keywords: KeywordRow[];
+  collections: CollectionRow[];
+  /** Count of the current (filtered) query. */
   total: number;
+  /** Count of all present images, ignoring filters (for the "All photos" nav). */
+  grandTotal: number;
   loading: boolean;
   indexing: IndexingState | null;
   error: string | null;
@@ -25,13 +35,18 @@ export interface LibraryState {
 
 export interface LibraryActions {
   refresh: (overrides?: Partial<QueryParams>) => Promise<void>;
+  /** Merge a partial set of params in one update (single refresh). */
+  patchParams: (patch: Partial<QueryParams>) => void;
+  /** Clear every filter dimension (keeps sort & search). */
+  clearFilters: () => void;
   setSort: (sort: QueryParams["sort"]) => void;
   setSearch: (search: string | null) => void;
-  setMinStars: (minStars: number | null) => void;
-  setFlag: (flag: string | null) => void;
-  setFolderId: (folderId: number | null) => void;
   reindex: () => Promise<void>;
   patchImage: (id: number, patch: Partial<ImageRow>) => void;
+  /** Refetch only the keyword list + counts (after tagging changes). */
+  reloadKeywords: () => Promise<void>;
+  /** Refetch only the collection list + counts (after membership/CRUD changes). */
+  reloadCollections: () => Promise<void>;
 }
 
 const DEFAULT_PARAMS: QueryParams = {
@@ -43,7 +58,10 @@ const DEFAULT_PARAMS: QueryParams = {
 export function useLibrary(): LibraryState & LibraryActions {
   const [images, setImages] = useState<ImageRow[]>([]);
   const [folders, setFolders] = useState<FolderRow[]>([]);
+  const [keywords, setKeywords] = useState<KeywordRow[]>([]);
+  const [collections, setCollections] = useState<CollectionRow[]>([]);
   const [total, setTotal] = useState(0);
+  const [grandTotal, setGrandTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [indexing, setIndexing] = useState<IndexingState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -64,14 +82,20 @@ export function useLibrary(): LibraryState & LibraryActions {
       const merged = overrides
         ? { ...paramsRef.current, ...overrides }
         : paramsRef.current;
-      const [imgs, cnt, flds] = await Promise.all([
+      const [imgs, cnt, flds, grand, kws, cols] = await Promise.all([
         libraryQuery(merged),
         libraryCount(merged),
         libraryFolders(),
+        libraryCount({}),
+        keywordsList(),
+        collectionsList(),
       ]);
       setImages(imgs);
       setTotal(cnt);
+      setGrandTotal(grand);
       setFolders(flds);
+      setKeywords(kws);
+      setCollections(cols);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -130,10 +154,14 @@ export function useLibrary(): LibraryState & LibraryActions {
     async function bootstrap() {
       setLoading(true);
       try {
-        const [flds, cnt] = await Promise.all([
+        const [flds, cnt, kws, cols] = await Promise.all([
           libraryFolders(),
           libraryCount(DEFAULT_PARAMS),
+          keywordsList(),
+          collectionsList(),
         ]);
+        setKeywords(kws);
+        setCollections(cols);
 
         if (flds.length === 0 || cnt === 0) {
           const defaultPath = await appDefaultLibrary();
@@ -148,7 +176,9 @@ export function useLibrary(): LibraryState & LibraryActions {
           const imgs = await libraryQuery(DEFAULT_PARAMS);
           setFolders(flds);
           setImages(imgs);
+          // DEFAULT_PARAMS carries no filter dimensions, so cnt is the unfiltered total.
           setTotal(cnt);
+          setGrandTotal(cnt);
         }
       } catch (e) {
         setError(String(e));
@@ -174,6 +204,14 @@ export function useLibrary(): LibraryState & LibraryActions {
     void refresh();
   }, [params, refresh]);
 
+  const patchParams = useCallback((patch: Partial<QueryParams>) => {
+    setParams((p) => ({ ...p, ...patch }));
+  }, []);
+
+  const clearFilters = useCallback(() => {
+    setParams((p) => ({ ...p, ...clearedFilters() }));
+  }, []);
+
   const setSort = useCallback((sort: QueryParams["sort"]) => {
     setParams((p) => ({ ...p, sort }));
   }, []);
@@ -182,39 +220,47 @@ export function useLibrary(): LibraryState & LibraryActions {
     setParams((p) => ({ ...p, search }));
   }, []);
 
-  const setMinStars = useCallback((minStars: number | null) => {
-    setParams((p) => ({ ...p, minStars }));
-  }, []);
-
-  const setFlag = useCallback((flag: string | null) => {
-    setParams((p) => ({ ...p, flag }));
-  }, []);
-
-  const setFolderId = useCallback((folderId: number | null) => {
-    setParams((p) => ({ ...p, folderId }));
-  }, []);
-
   const patchImage = useCallback((id: number, patch: Partial<ImageRow>) => {
     setImages((prev) =>
       prev.map((img) => (img.id === id ? { ...img, ...patch } : img)),
     );
   }, []);
 
+  const reloadKeywords = useCallback(async () => {
+    try {
+      setKeywords(await keywordsList());
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const reloadCollections = useCallback(async () => {
+    try {
+      setCollections(await collectionsList());
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
   return {
     images,
     folders,
+    keywords,
+    collections,
     total,
+    grandTotal,
     loading,
     indexing,
     error,
     params,
     refresh,
+    patchParams,
+    clearFilters,
     setSort,
     setSearch,
-    setMinStars,
-    setFlag,
-    setFolderId,
     reindex,
     patchImage,
+    reloadKeywords,
+    reloadCollections,
   };
 }

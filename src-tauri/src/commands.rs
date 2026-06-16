@@ -2,7 +2,7 @@
 //! `AppHandle` inside the blocking closure (never held across `.await`).
 
 use crate::state::{AppState, DevelopCache};
-use core_library::{FolderRow, ImageRow, IndexStats, QueryParams};
+use core_library::{CollectionRow, FolderRow, ImageRow, IndexStats, KeywordRow, QueryParams};
 use core_pipeline::DevelopParams;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -312,6 +312,211 @@ pub async fn cull_set_label(
     label: Option<String>,
 ) -> Result<(), String> {
     db_write(app, move |c| core_library::set_label(c, image_id, label.as_deref())).await
+}
+
+// Batch culling — applies one value to a whole selection in a single transaction.
+
+#[tauri::command]
+pub async fn cull_set_rating_many(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    stars: i64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_rating_many(&mut db.conn, &image_ids, stars).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cull_set_flag_many(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    flag: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_flag_many(&mut db.conn, &image_ids, &flag).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cull_set_label_many(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    label: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_label_many(&mut db.conn, &image_ids, label.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------- Keywords / tags ----------
+
+#[tauri::command]
+pub async fn keywords_list(app: AppHandle) -> Result<Vec<KeywordRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::list_keywords(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keywords_for_image(app: AppHandle, image_id: i64) -> Result<Vec<KeywordRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::keywords_for_image(&db.conn, image_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keyword_add_to_image(
+    app: AppHandle,
+    image_id: i64,
+    name: String,
+) -> Result<KeywordRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::add_keyword_to_image(&db.conn, image_id, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keyword_add_to_images(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    name: String,
+) -> Result<KeywordRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::add_keyword_to_images(&db.conn, &image_ids, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keyword_remove_from_image(
+    app: AppHandle,
+    image_id: i64,
+    keyword_id: i64,
+) -> Result<(), String> {
+    db_write(app, move |c| {
+        core_library::remove_keyword_from_image(c, image_id, keyword_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), String> {
+    db_write(app, move |c| core_library::delete_keyword(c, keyword_id)).await
+}
+
+// ---------- Collections ----------
+
+#[tauri::command]
+pub async fn collections_list(app: AppHandle) -> Result<Vec<CollectionRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::list_collections(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn collections_for_image(
+    app: AppHandle,
+    image_id: i64,
+) -> Result<Vec<CollectionRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::collections_for_image(&db.conn, image_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn collection_create(
+    app: AppHandle,
+    name: String,
+    is_smart: bool,
+    query: Option<String>,
+) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::create_collection(&db.conn, &name, is_smart, query.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn collection_rename(app: AppHandle, id: i64, name: String) -> Result<(), String> {
+    db_write(app, move |c| core_library::rename_collection(c, id, &name)).await
+}
+
+#[tauri::command]
+pub async fn collection_delete(app: AppHandle, id: i64) -> Result<(), String> {
+    db_write(app, move |c| core_library::delete_collection(c, id)).await
+}
+
+#[tauri::command]
+pub async fn collection_add_images(
+    app: AppHandle,
+    collection_id: i64,
+    image_ids: Vec<i64>,
+) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::add_images_to_collection(&db.conn, collection_id, &image_ids)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn collection_remove_images(
+    app: AppHandle,
+    collection_id: i64,
+    image_ids: Vec<i64>,
+) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::remove_images_from_collection(&db.conn, collection_id, &image_ids)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// A sensible default import destination: the parent of the first watched folder (the library root

@@ -1,4 +1,10 @@
-import { thumbUrl, type ImageRow } from "../../lib/ipc";
+import { Fragment, useState } from "react";
+import {
+  thumbUrl,
+  type ImageRow,
+  type KeywordRow,
+  type CollectionRow,
+} from "../../lib/ipc";
 
 const LABEL_COLORS: { key: string; bg: string }[] = [
   { key: "red", bg: "var(--color-lab-red)" },
@@ -65,15 +71,40 @@ export interface RightInfoHandlers {
   onSetRating: (stars: number) => void;
   onSetFlag: (flag: "none" | "pick" | "reject") => void;
   onSetLabel: (label: string | null) => void;
+  onAddKeyword: (name: string) => void;
+  onRemoveKeyword: (keywordId: number) => void;
+  onAddToCollection: (collectionId: number) => void;
+  onRemoveFromCollection: (collectionId: number) => void;
 }
 
 interface RightInfoProps {
   selectedImage: ImageRow | null;
+  /** Keywords applied to the selected image. */
+  keywords: KeywordRow[];
+  /** All known keywords (for add-field autocomplete). */
+  keywordSuggestions: KeywordRow[];
+  /** Static collections containing the selected image. */
+  imageCollections: CollectionRow[];
+  /** All collections (static + smart) — used to populate the add-to dropdown. */
+  allCollections: CollectionRow[];
   handlers: RightInfoHandlers;
 }
 
-export default function RightInfo({ selectedImage, handlers }: RightInfoProps) {
+export default function RightInfo({
+  selectedImage,
+  keywords,
+  keywordSuggestions,
+  imageCollections,
+  allCollections,
+  handlers,
+}: RightInfoProps) {
   const meta = selectedImage;
+  const [kwInput, setKwInput] = useState("");
+
+  const memberIds = new Set(imageCollections.map((c) => c.id));
+  const addableCollections = allCollections.filter(
+    (c) => !c.isSmart && !memberIds.has(c.id),
+  );
   const stars = meta?.stars ?? 0;
   const flag = meta?.flag ?? "none";
   const activeLabel = meta?.colorLabel ?? "";
@@ -108,6 +139,18 @@ export default function RightInfo({ selectedImage, handlers }: RightInfoProps) {
     : [];
 
   const previewSrc = meta ? thumbUrl(meta.contentHash, 512) : null;
+
+  const appliedNames = new Set(keywords.map((k) => k.name.toLowerCase()));
+  const suggestions = keywordSuggestions.filter(
+    (k) => !appliedNames.has(k.name.toLowerCase()),
+  );
+
+  function commitKeyword() {
+    const name = kwInput.trim();
+    if (!name || !meta) return;
+    if (!appliedNames.has(name.toLowerCase())) handlers.onAddKeyword(name);
+    setKwInput("");
+  }
 
   return (
     <aside
@@ -350,12 +393,9 @@ export default function RightInfo({ selectedImage, handlers }: RightInfoProps) {
             }}
           >
             {metaRows.map(({ label, value }) => (
-              <>
-                <dt key={`dt-${label}`} style={{ color: "var(--color-t3)" }}>
-                  {label}
-                </dt>
+              <Fragment key={label}>
+                <dt style={{ color: "var(--color-t3)" }}>{label}</dt>
                 <dd
-                  key={`dd-${label}`}
                   style={{
                     color: "var(--color-t1)",
                     fontFamily: "var(--font-mono)",
@@ -365,7 +405,7 @@ export default function RightInfo({ selectedImage, handlers }: RightInfoProps) {
                 >
                   {value}
                 </dd>
-              </>
+              </Fragment>
             ))}
           </dl>
         )}
@@ -390,36 +430,191 @@ export default function RightInfo({ selectedImage, handlers }: RightInfoProps) {
         >
           Keywords
         </div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-          {["coast", "golden hour", "travel"].map((kw) => (
-            <span
-              key={kw}
-              style={{
-                fontSize: 11.5,
-                color: "var(--color-t2)",
-                background: "var(--color-elev)",
-                border: "1px solid var(--color-line)",
-                borderRadius: 20,
-                padding: "3px 9px",
+        {meta === null ? (
+          <div style={{ fontSize: 12, color: "var(--color-t3)" }}>
+            No image selected
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {keywords.length === 0 && (
+                <span style={{ fontSize: 11.5, color: "var(--color-t3)" }}>
+                  No keywords
+                </span>
+              )}
+              {keywords.map((kw) => (
+                <span
+                  key={kw.id}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    fontSize: 11.5,
+                    color: "var(--color-t2)",
+                    background: "var(--color-elev)",
+                    border: "1px solid var(--color-line)",
+                    borderRadius: 20,
+                    padding: "3px 5px 3px 9px",
+                  }}
+                >
+                  {kw.name}
+                  <button
+                    onClick={() => handlers.onRemoveKeyword(kw.id)}
+                    title={`Remove ${kw.name}`}
+                    aria-label={`Remove ${kw.name}`}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: 14,
+                      height: 14,
+                      borderRadius: "50%",
+                      border: "none",
+                      background: "var(--color-line)",
+                      color: "var(--color-t1)",
+                      fontSize: 11,
+                      lineHeight: 1,
+                      cursor: "pointer",
+                    }}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+            <input
+              list="kw-suggestions"
+              value={kwInput}
+              onChange={(e) => setKwInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitKeyword();
+                }
               }}
-            >
-              {kw}
-            </span>
-          ))}
-          <span
-            style={{
-              fontSize: 11.5,
-              color: "var(--color-t3)",
-              background: "transparent",
-              border: "1px dashed var(--color-line)",
-              borderRadius: 20,
-              padding: "3px 9px",
-              cursor: "pointer",
-            }}
-          >
-            + add
-          </span>
+              onBlur={commitKeyword}
+              placeholder="Add keyword…"
+              style={{
+                marginTop: 8,
+                width: "100%",
+                background: "var(--color-panel)",
+                border: "1px solid var(--color-line)",
+                borderRadius: "var(--radius-sm)",
+                color: "var(--color-t1)",
+                fontSize: 12,
+                padding: "5px 8px",
+                outline: "none",
+              }}
+            />
+            <datalist id="kw-suggestions">
+              {suggestions.map((k) => (
+                <option key={k.id} value={k.name} />
+              ))}
+            </datalist>
+          </>
+        )}
+      </div>
+
+      {/* Collections */}
+      <div
+        style={{
+          padding: "14px 16px",
+          borderTop: "1px solid var(--color-line)",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 10.5,
+            letterSpacing: ".06em",
+            textTransform: "uppercase",
+            color: "var(--color-t3)",
+            fontWeight: 600,
+            marginBottom: 10,
+          }}
+        >
+          Collections
         </div>
+        {meta === null ? (
+          <div style={{ fontSize: 12, color: "var(--color-t3)" }}>
+            No image selected
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {imageCollections.length === 0 && (
+                <span style={{ fontSize: 11.5, color: "var(--color-t3)" }}>
+                  Not in any collection
+                </span>
+              )}
+              {imageCollections.map((c) => (
+                <span
+                  key={c.id}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    fontSize: 11.5,
+                    color: "var(--color-t2)",
+                    background: "var(--color-elev)",
+                    border: "1px solid var(--color-line)",
+                    borderRadius: 20,
+                    padding: "3px 5px 3px 9px",
+                  }}
+                >
+                  {c.name}
+                  <button
+                    onClick={() => handlers.onRemoveFromCollection(c.id)}
+                    title={`Remove from ${c.name}`}
+                    aria-label={`Remove from ${c.name}`}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: 14,
+                      height: 14,
+                      borderRadius: "50%",
+                      border: "none",
+                      background: "var(--color-line)",
+                      color: "var(--color-t1)",
+                      fontSize: 11,
+                      lineHeight: 1,
+                      cursor: "pointer",
+                    }}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+            {addableCollections.length > 0 && (
+              <select
+                value=""
+                onChange={(e) => {
+                  const id = Number(e.target.value);
+                  if (id) handlers.onAddToCollection(id);
+                }}
+                style={{
+                  marginTop: 8,
+                  width: "100%",
+                  background: "var(--color-panel)",
+                  border: "1px solid var(--color-line)",
+                  borderRadius: "var(--radius-sm)",
+                  color: "var(--color-t2)",
+                  fontSize: 12,
+                  padding: "5px 8px",
+                  cursor: "pointer",
+                }}
+              >
+                <option value="">Add to collection…</option>
+                {addableCollections.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </>
+        )}
       </div>
     </aside>
   );

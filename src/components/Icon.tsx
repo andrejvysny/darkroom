@@ -22,7 +22,8 @@ export type IconName =
   | "split"
   | "reset"
   | "pick"
-  | "zoom";
+  | "zoom"
+  | "tag";
 
 interface IconProps {
   name: IconName;
@@ -118,6 +119,12 @@ const PATHS: Record<IconName, React.ReactNode> = {
     <>
       <circle cx="6.5" cy="6.5" r="4.5" />
       <path d="M10 10l3.5 3.5M5 6.5h3M6.5 5v3" />
+    </>
+  ),
+  tag: (
+    <>
+      <path d="M8.2 2.5H13a.5.5 0 0 1 .5.5v4.8a1 1 0 0 1-.3.7l-5 5a1 1 0 0 1-1.4 0L3 9.8a1 1 0 0 1 0-1.4l4-4a1 1 0 0 1 .7-.3z" />
+      <circle cx="10.8" cy="5.2" r="0.9" />
     </>
   ),
 };

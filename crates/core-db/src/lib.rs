@@ -14,8 +14,12 @@ use rusqlite_migration::{Migrations, M};
 use std::path::Path;
 use std::sync::LazyLock;
 
-static MIGRATIONS: LazyLock<Migrations<'static>> =
-    LazyLock::new(|| Migrations::new(vec![M::up(include_str!("../migrations/001_init.sql"))]));
+static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
+    Migrations::new(vec![
+        M::up(include_str!("../migrations/001_init.sql")),
+        M::up(include_str!("../migrations/002_keyword_unique.sql")),
+    ])
+});
 
 /// Owns a single SQLite connection to the catalog.
 pub struct Db {

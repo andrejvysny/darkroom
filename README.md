@@ -10,12 +10,18 @@ A local, fast, **non-destructive RAW photo library + develop editor** for macOS.
 
 - **Library** — index watched folders, BLAKE3 identity, EXIF metadata, embedded-JPEG thumbnails
   (240 files indexed in ~2s), virtualized grid, metadata panel, folder nav, loupe zoom/pan.
+- **Organize** — filter by rating threshold / flag / color label / keyword / collection / folder,
+  8 sort orders, full-text-ish search (filename/camera/lens/keyword); **keywords/tags** (per-image
+  editor + batch), **static & smart collections** (saved-predicate), multi-select with a batch
+  toolbar.
 - **Develop** — real wgpu/Metal pipeline: rawler decode + demosaic + color management → linear buffer,
   GPU adjustments (WB, exposure, contrast, highlights/shadows, saturation, blacks/whites) at **~2 ms/slider**;
   non-destructive edits persisted in the catalog.
-- **Culling** — star ratings, pick/reject flags, color labels, keyboard culling loop.
-- **Export** — full-resolution PNG / JPEG through the develop pipeline (⌘E / command palette).
-- **Import** — copy / move (verified) / reference, date-routed `YYYY/YYYY-MM-DD`, hash-verified, dedup-skipping.
+- **Culling** — star ratings, pick/reject flags, color labels, keyboard culling loop (applies to the
+  whole selection when multiple are selected).
+- **Export** — full-resolution PNG / JPEG through the develop pipeline (⌘E / command palette), plus
+  **batch export** of a selection to a folder.
+- **Import** — copy / move (verified) / reference (mode picker), date-routed `YYYY/YYYY-MM-DD`, hash-verified, dedup-skipping.
 - **Dedup** — byte-identical + same-capture grouping, safe resolve to Trash.
 - **⌘K command palette**, keyboard shortcuts, packaged signed `.dmg`.
 

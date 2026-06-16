@@ -12,4 +12,6 @@ pub enum LibError {
     Raw(#[from] core_raw::RawError),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Other(String),
 }

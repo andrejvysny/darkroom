@@ -11,11 +11,17 @@ export interface GridImage {
   label?: string;
 }
 
+export interface SelectMods {
+  meta: boolean;
+  shift: boolean;
+}
+
 interface ThumbGridProps {
   images: GridImage[];
   thumbSize: number;
   selectedId: number | null;
-  onSelect: (id: number) => void;
+  selectedIds: number[];
+  onSelect: (id: number, mods: SelectMods) => void;
 }
 
 function StarRow({ count }: { count: number }) {
@@ -43,10 +49,12 @@ export default function ThumbGrid({
   images,
   thumbSize,
   selectedId,
+  selectedIds,
   onSelect,
 }: ThumbGridProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [colCount, setColCount] = useState(4);
+  const selectedSet = new Set(selectedIds);
 
   // Recompute column count when container width or thumbSize changes
   const updateCols = useCallback(() => {
@@ -107,12 +115,18 @@ export default function ThumbGrid({
               }}
             >
               {rowImages.map((img) => {
-                const sel = img.id === selectedId;
+                const sel = selectedSet.has(img.id);
+                const primary = img.id === selectedId;
                 const hasOverlay = !!img.label || !!img.flag || img.stars > 0;
                 return (
                   <div
                     key={img.id}
-                    onClick={() => onSelect(img.id)}
+                    onClick={(e) =>
+                      onSelect(img.id, {
+                        meta: e.metaKey || e.ctrlKey,
+                        shift: e.shiftKey,
+                      })
+                    }
                     style={{
                       position: "relative",
                       aspectRatio: "3/2",
@@ -120,7 +134,7 @@ export default function ThumbGrid({
                       overflow: "hidden",
                       cursor: "pointer",
                       outline: sel
-                        ? "2px solid var(--color-accent)"
+                        ? `2px solid ${primary ? "var(--color-accent)" : "var(--color-accent-line)"}`
                         : "1px solid var(--color-line)",
                       outlineOffset: 0,
                       background: "#000",

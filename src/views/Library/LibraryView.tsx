@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useState, useRef } from "react";
 import { useAppStore } from "../../store/app";
 import { useLibrary } from "../../lib/useLibrary";
 import {
@@ -6,16 +6,39 @@ import {
   cullSetRating,
   cullSetFlag,
   cullSetLabel,
+  cullSetRatingMany,
+  cullSetFlagMany,
+  cullSetLabelMany,
+  keywordsForImage,
+  keywordAddToImage,
+  keywordAddToImages,
+  keywordRemoveFromImage,
+  keywordDelete,
+  collectionsForImage,
+  collectionAddImages,
+  collectionRemoveImages,
+  collectionCreate,
+  collectionDelete,
+  collectionRename,
+  smartQueryFromParams,
 } from "../../lib/ipc";
-import type { ImageRow } from "../../lib/ipc";
+import type {
+  ImageRow,
+  KeywordRow,
+  CollectionRow,
+  ImportMode,
+} from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
 import { runImport } from "../../lib/importFlow";
+import { runBatchExport } from "../../lib/export";
 import LeftNav from "./LeftNav";
-import ThumbGrid, { GridImage } from "./ThumbGrid";
+import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
 import BottomBar from "./BottomBar";
+import SelectionBar from "./SelectionBar";
 import Loupe from "./Loupe";
 import DedupModal from "./DedupModal";
+import ImportModal from "./ImportModal";
 
 // Map color label name to CSS var for the dot color in ThumbGrid
 const LABEL_COLOR_MAP: Record<string, string> = {
@@ -43,18 +66,24 @@ export default function LibraryView() {
   const thumbSize = useAppStore((s) => s.thumbSize);
   const selectedId = useAppStore((s) => s.selectedId);
   const setSelectedId = useAppStore((s) => s.setSelectedId);
+  const selectedIds = useAppStore((s) => s.selectedIds);
+  const setSelection = useAppStore((s) => s.setSelection);
   const gridMode = useAppStore((s) => s.gridMode);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnOpenDedup = useAppStore((s) => s.setOnOpenDedup);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [dedupOpen, setDedupOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
+  const [selectedCollections, setSelectedCollections] = useState<
+    CollectionRow[]
+  >([]);
 
   const lib = useLibrary();
 
   // Register library action callbacks so TopBar/CommandPalette can call them
   useEffect(() => {
-    const handleImport = () => void runImport("copy", () => void lib.refresh());
-    setOnImport(handleImport);
+    setOnImport(() => setImportOpen(true));
     setOnOpenDedup(() => setDedupOpen(true));
     setOnSearch((q: string) => lib.setSearch(q.trim() ? q.trim() : null));
     return () => {
@@ -62,18 +91,85 @@ export default function LibraryView() {
       setOnOpenDedup(null);
       setOnSearch(null);
     };
-  }, [lib.refresh, lib.setSearch, setOnImport, setOnOpenDedup, setOnSearch]);
+  }, [lib.setSearch, setOnImport, setOnOpenDedup, setOnSearch]);
 
-  // Default selection to first image after load
+  // Keep a valid primary selection: if it's unset or no longer in the current (filtered) set,
+  // fall back to the first visible image.
   useEffect(() => {
-    if (selectedId === null && lib.images.length > 0) {
+    if (
+      lib.images.length > 0 &&
+      !lib.images.some((img) => img.id === selectedId)
+    ) {
       setSelectedId(lib.images[0].id);
     }
   }, [lib.images, selectedId, setSelectedId]);
 
   useCulling({ images: lib.images, patchImage: lib.patchImage });
 
+  // Load the selected image's keywords + collection membership when the selection changes.
+  useEffect(() => {
+    if (selectedId === null) {
+      setSelectedKeywords([]);
+      setSelectedCollections([]);
+      return;
+    }
+    let cancelled = false;
+    void Promise.all([
+      keywordsForImage(selectedId),
+      collectionsForImage(selectedId),
+    ])
+      .then(([ks, cs]) => {
+        if (!cancelled) {
+          setSelectedKeywords(ks);
+          setSelectedCollections(cs);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSelectedKeywords([]);
+          setSelectedCollections([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
+
   const selectedImage = lib.images.find((img) => img.id === selectedId) ?? null;
+
+  const handleAddKeyword = useCallback(
+    async (name: string) => {
+      if (selectedId === null) return;
+      try {
+        const kw = await keywordAddToImage(selectedId, name);
+        setSelectedKeywords((prev) =>
+          prev.some((k) => k.id === kw.id)
+            ? prev
+            : [...prev, kw].sort((a, b) => a.name.localeCompare(b.name)),
+        );
+        void lib.reloadKeywords();
+      } catch {
+        /* ignore — duplicate/empty names are no-ops */
+      }
+    },
+    [selectedId, lib.reloadKeywords],
+  );
+
+  const handleRemoveKeyword = useCallback(
+    async (keywordId: number) => {
+      if (selectedId === null) return;
+      try {
+        await keywordRemoveFromImage(selectedId, keywordId);
+        setSelectedKeywords((prev) => prev.filter((k) => k.id !== keywordId));
+        void lib.reloadKeywords();
+        // Drop the image from the grid if it no longer matches a keyword filter.
+        if (lib.params.keywordId === keywordId) void lib.refresh();
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedId, lib.reloadKeywords, lib.refresh, lib.params.keywordId],
+  );
 
   const handleSetRating = useCallback(
     (stars: number) => {
@@ -102,10 +198,212 @@ export default function LibraryView() {
     [selectedId, lib.patchImage],
   );
 
+  const handleAddToCollection = useCallback(
+    async (collectionId: number) => {
+      if (selectedId === null) return;
+      try {
+        await collectionAddImages(collectionId, [selectedId]);
+        setSelectedCollections(await collectionsForImage(selectedId));
+        void lib.reloadCollections();
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedId, lib.reloadCollections],
+  );
+
+  const handleRemoveFromCollection = useCallback(
+    async (collectionId: number) => {
+      if (selectedId === null) return;
+      try {
+        await collectionRemoveImages(collectionId, [selectedId]);
+        setSelectedCollections((prev) =>
+          prev.filter((c) => c.id !== collectionId),
+        );
+        void lib.reloadCollections();
+        if (lib.params.collectionId === collectionId) void lib.refresh();
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedId, lib.reloadCollections, lib.refresh, lib.params.collectionId],
+  );
+
+  // LeftNav collection management
+  const handleCreateCollection = useCallback(
+    async (name: string) => {
+      try {
+        await collectionCreate(name, false, null);
+        void lib.reloadCollections();
+      } catch {
+        /* ignore — empty names are rejected backend-side */
+      }
+    },
+    [lib.reloadCollections],
+  );
+
+  const handleCreateSmartCollection = useCallback(
+    async (name: string) => {
+      try {
+        await collectionCreate(name, true, smartQueryFromParams(lib.params));
+        void lib.reloadCollections();
+      } catch {
+        /* ignore */
+      }
+    },
+    [lib.reloadCollections, lib.params],
+  );
+
+  const handleDeleteCollection = useCallback(
+    async (id: number) => {
+      try {
+        await collectionDelete(id);
+        void lib.reloadCollections();
+        if (lib.params.collectionId === id) lib.clearFilters();
+      } catch {
+        /* ignore */
+      }
+    },
+    [lib.reloadCollections, lib.clearFilters, lib.params.collectionId],
+  );
+
+  const handleRenameCollection = useCallback(
+    async (id: number, name: string) => {
+      try {
+        await collectionRename(id, name);
+        void lib.reloadCollections();
+      } catch {
+        /* ignore — empty names are rejected backend-side */
+      }
+    },
+    [lib.reloadCollections],
+  );
+
+  const handleDeleteKeyword = useCallback(
+    async (id: number) => {
+      try {
+        await keywordDelete(id);
+        void lib.reloadKeywords();
+        // Clear a keyword filter that no longer exists, and drop its chip from the panel.
+        if (lib.params.keywordId === id) lib.patchParams({ keywordId: null });
+        setSelectedKeywords((prev) => prev.filter((k) => k.id !== id));
+      } catch {
+        /* ignore */
+      }
+    },
+    [lib.reloadKeywords, lib.patchParams, lib.params.keywordId],
+  );
+
+  // ---- Multi-select ----
+  // Fixed range anchor: set by plain/cmd click, NOT moved by shift-click, so a shift range can be
+  // grown/shrunk from a stable pivot (Finder/Lightroom semantics).
+  const anchorRef = useRef<number | null>(null);
+  const handleSelect = useCallback(
+    (id: number, mods: SelectMods) => {
+      const order = lib.images.map((i) => i.id);
+      if (mods.shift) {
+        const anchor = anchorRef.current ?? selectedId;
+        const a = anchor != null ? order.indexOf(anchor) : -1;
+        const b = order.indexOf(id);
+        if (a !== -1 && b !== -1) {
+          const [lo, hi] = a <= b ? [a, b] : [b, a];
+          setSelection(order.slice(lo, hi + 1), id);
+          return; // anchor stays put
+        }
+      }
+      if (mods.meta) {
+        const set = new Set(selectedIds);
+        if (set.has(id)) set.delete(id);
+        else set.add(id);
+        const next = order.filter((x) => set.has(x)); // preserve grid order
+        const primary = set.has(id) ? id : (next[next.length - 1] ?? null);
+        anchorRef.current = id;
+        setSelection(next, primary);
+        return;
+      }
+      anchorRef.current = id;
+      setSelectedId(id);
+    },
+    [lib.images, selectedId, selectedIds, setSelection, setSelectedId],
+  );
+
+  // ---- Batch operations (act on the whole selection) ----
+  const batchRate = useCallback(
+    (stars: number) => {
+      if (selectedIds.length === 0) return;
+      selectedIds.forEach((id) => lib.patchImage(id, { stars }));
+      void cullSetRatingMany(selectedIds, stars);
+    },
+    [selectedIds, lib.patchImage],
+  );
+
+  const batchFlag = useCallback(
+    (flag: "none" | "pick" | "reject") => {
+      if (selectedIds.length === 0) return;
+      selectedIds.forEach((id) => lib.patchImage(id, { flag }));
+      void cullSetFlagMany(selectedIds, flag);
+    },
+    [selectedIds, lib.patchImage],
+  );
+
+  const batchLabel = useCallback(
+    (label: string | null) => {
+      if (selectedIds.length === 0) return;
+      selectedIds.forEach((id) => lib.patchImage(id, { colorLabel: label }));
+      void cullSetLabelMany(selectedIds, label);
+    },
+    [selectedIds, lib.patchImage],
+  );
+
+  const batchAddKeyword = useCallback(
+    async (name: string) => {
+      if (selectedIds.length === 0) return;
+      try {
+        await keywordAddToImages(selectedIds, name);
+        void lib.reloadKeywords();
+        if (selectedId != null)
+          setSelectedKeywords(await keywordsForImage(selectedId));
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedIds, selectedId, lib.reloadKeywords],
+  );
+
+  const batchAddToCollection = useCallback(
+    async (collectionId: number) => {
+      if (selectedIds.length === 0) return;
+      try {
+        await collectionAddImages(collectionId, selectedIds);
+        void lib.reloadCollections();
+        if (selectedId != null)
+          setSelectedCollections(await collectionsForImage(selectedId));
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedIds, selectedId, lib.reloadCollections],
+  );
+
+  const batchExport = useCallback(() => {
+    const items = lib.images
+      .filter((i) => selectedIds.includes(i.id))
+      .map((i) => ({ id: i.id, filename: i.filename }));
+    void runBatchExport(items);
+  }, [lib.images, selectedIds]);
+
+  const collapseSelection = useCallback(() => {
+    setSelectedId(selectedId);
+  }, [selectedId, setSelectedId]);
+
   const rightInfoHandlers: RightInfoHandlers = {
     onSetRating: handleSetRating,
     onSetFlag: handleSetFlag,
     onSetLabel: handleSetLabel,
+    onAddKeyword: handleAddKeyword,
+    onRemoveKeyword: handleRemoveKeyword,
+    onAddToCollection: handleAddToCollection,
+    onRemoveFromCollection: handleRemoveFromCollection,
   };
 
   const gridImages = lib.images.map(toGridImage);
@@ -124,21 +422,45 @@ export default function LibraryView() {
       <div style={{ gridRow: "1 / 3", gridColumn: "1", minHeight: 0 }}>
         <LeftNav
           folders={lib.folders}
-          total={lib.total}
+          keywords={lib.keywords}
+          collections={lib.collections}
+          grandTotal={lib.grandTotal}
           params={lib.params}
-          setFolderId={lib.setFolderId}
+          clearFilters={lib.clearFilters}
+          patchParams={lib.patchParams}
+          setSort={lib.setSort}
+          onCreateCollection={handleCreateCollection}
+          onCreateSmartCollection={handleCreateSmartCollection}
+          onDeleteCollection={handleDeleteCollection}
+          onRenameCollection={handleRenameCollection}
+          onDeleteKeyword={handleDeleteKeyword}
         />
       </div>
 
-      {/* Center: grid or loupe */}
+      {/* Center: optional selection bar + grid or loupe */}
       <div
         style={{
           gridRow: "1",
           gridColumn: "2",
           minHeight: 0,
-          position: "relative",
+          display: "flex",
+          flexDirection: "column",
         }}
       >
+        {selectedIds.length > 1 && (
+          <SelectionBar
+            count={selectedIds.length}
+            collections={lib.collections}
+            onRate={batchRate}
+            onFlag={batchFlag}
+            onLabel={batchLabel}
+            onAddKeyword={batchAddKeyword}
+            onAddToCollection={batchAddToCollection}
+            onExport={batchExport}
+            onClear={collapseSelection}
+          />
+        )}
+        <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
         {lib.indexing && (
           <div
             style={{
@@ -183,15 +505,24 @@ export default function LibraryView() {
               images={gridImages}
               thumbSize={thumbSize}
               selectedId={selectedId}
-              onSelect={setSelectedId}
+              selectedIds={selectedIds}
+              onSelect={handleSelect}
             />
           </>
         )}
+        </div>
       </div>
 
       {/* Right info spans both rows */}
       <div style={{ gridRow: "1 / 3", gridColumn: "3", minHeight: 0 }}>
-        <RightInfo selectedImage={selectedImage} handlers={rightInfoHandlers} />
+        <RightInfo
+          selectedImage={selectedImage}
+          keywords={selectedKeywords}
+          keywordSuggestions={lib.keywords}
+          imageCollections={selectedCollections}
+          allCollections={lib.collections}
+          handlers={rightInfoHandlers}
+        />
       </div>
 
       {/* Bottom bar under center only */}
@@ -199,9 +530,9 @@ export default function LibraryView() {
         <BottomBar
           total={lib.total}
           params={lib.params}
+          patchParams={lib.patchParams}
+          clearFilters={lib.clearFilters}
           setSort={lib.setSort}
-          setMinStars={lib.setMinStars}
-          setFlag={lib.setFlag}
         />
       </div>
 
@@ -209,6 +540,15 @@ export default function LibraryView() {
         open={dedupOpen}
         onClose={() => setDedupOpen(false)}
         onRefresh={() => void lib.refresh()}
+      />
+
+      <ImportModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onChoose={(mode: ImportMode) => {
+          setImportOpen(false);
+          void runImport(mode, () => void lib.refresh());
+        }}
       />
     </div>
   );
