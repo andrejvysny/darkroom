@@ -314,6 +314,54 @@ pub async fn cull_set_label(
     db_write(app, move |c| core_library::set_label(c, image_id, label.as_deref())).await
 }
 
+// Batch culling — applies one value to a whole selection in a single transaction.
+
+#[tauri::command]
+pub async fn cull_set_rating_many(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    stars: i64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_rating_many(&mut db.conn, &image_ids, stars).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cull_set_flag_many(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    flag: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_flag_many(&mut db.conn, &image_ids, &flag).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cull_set_label_many(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    label: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_label_many(&mut db.conn, &image_ids, label.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ---------- Keywords / tags ----------
 
 #[tauri::command]
@@ -348,6 +396,21 @@ pub async fn keyword_add_to_image(
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::add_keyword_to_image(&db.conn, image_id, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keyword_add_to_images(
+    app: AppHandle,
+    image_ids: Vec<i64>,
+    name: String,
+) -> Result<KeywordRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::add_keyword_to_images(&db.conn, &image_ids, &name).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

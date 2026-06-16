@@ -196,6 +196,29 @@ export function cullSetLabel(
   return invoke<void>("cull_set_label", { imageId, label });
 }
 
+// Batch culling (apply one value to a whole selection).
+
+export function cullSetRatingMany(
+  imageIds: number[],
+  stars: number,
+): Promise<void> {
+  return invoke<void>("cull_set_rating_many", { imageIds, stars });
+}
+
+export function cullSetFlagMany(
+  imageIds: number[],
+  flag: "none" | "pick" | "reject",
+): Promise<void> {
+  return invoke<void>("cull_set_flag_many", { imageIds, flag });
+}
+
+export function cullSetLabelMany(
+  imageIds: number[],
+  label: string | null,
+): Promise<void> {
+  return invoke<void>("cull_set_label_many", { imageIds, label });
+}
+
 // ── Keywords / tags ──────────────────────────────────────────────────────────
 
 export type KeywordRow = {
@@ -217,6 +240,13 @@ export function keywordAddToImage(
   name: string,
 ): Promise<KeywordRow> {
   return invoke<KeywordRow>("keyword_add_to_image", { imageId, name });
+}
+
+export function keywordAddToImages(
+  imageIds: number[],
+  name: string,
+): Promise<KeywordRow> {
+  return invoke<KeywordRow>("keyword_add_to_images", { imageIds, name });
 }
 
 export function keywordRemoveFromImage(

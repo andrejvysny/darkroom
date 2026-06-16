@@ -95,6 +95,31 @@ pub fn add_keyword_to_image(
     })
 }
 
+/// Create-or-get the keyword `name` and apply it to every image in `image_ids`; returns the row.
+pub fn add_keyword_to_images(
+    conn: &Connection,
+    image_ids: &[i64],
+    name: &str,
+) -> Result<KeywordRow, LibError> {
+    let id = create_or_get_keyword(conn, name)?;
+    {
+        let mut stmt = conn
+            .prepare("INSERT OR IGNORE INTO image_keywords(image_id, keyword_id) VALUES(?1, ?2)")?;
+        for &image_id in image_ids {
+            stmt.execute(params![image_id, id])?;
+        }
+    }
+    let stored: String =
+        conn.query_row("SELECT name FROM keywords WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })?;
+    Ok(KeywordRow {
+        id,
+        name: stored,
+        count: 0,
+    })
+}
+
 /// Remove a keyword from an image (the keyword itself remains in the catalog).
 pub fn remove_keyword_from_image(
     conn: &Connection,

@@ -3,8 +3,13 @@ import { create } from "zustand";
 interface AppState {
   view: "library" | "develop";
   setView: (v: "library" | "develop") => void;
+  /** Primary/active selection (drives metadata panel + develop). */
   selectedId: number | null;
   setSelectedId: (id: number | null) => void;
+  /** Full multi-selection (always includes selectedId when non-null). */
+  selectedIds: number[];
+  /** Set the whole selection + primary in one update (multi-select clicks). */
+  setSelection: (ids: number[], primary: number | null) => void;
   thumbSize: number;
   setThumbSize: (n: number) => void;
   paletteOpen: boolean;
@@ -28,7 +33,11 @@ export const useAppStore = create<AppState>((set) => ({
   view: "library",
   setView: (v) => set({ view: v }),
   selectedId: 6,
-  setSelectedId: (id) => set({ selectedId: id }),
+  setSelectedId: (id) =>
+    set({ selectedId: id, selectedIds: id == null ? [] : [id] }),
+  selectedIds: [6],
+  setSelection: (ids, primary) =>
+    set({ selectedIds: ids, selectedId: primary }),
   thumbSize: 150,
   setThumbSize: (n) => set({ thumbSize: n }),
   paletteOpen: false,

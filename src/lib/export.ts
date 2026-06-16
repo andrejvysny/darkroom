@@ -1,4 +1,4 @@
-import { save } from "@tauri-apps/plugin-dialog";
+import { save, open } from "@tauri-apps/plugin-dialog";
 import { developGetEdit, exportImage } from "./ipc";
 import { useAppStore } from "../store/app";
 
@@ -35,4 +35,40 @@ export async function runExport(
   } catch (err) {
     setToast(`Export failed: ${String(err)}`);
   }
+}
+
+/**
+ * Batch-export several images as full-resolution JPEGs into a chosen folder, named after each
+ * original file. Each runs through its saved develop params on the GPU.
+ */
+export async function runBatchExport(
+  items: { id: number; filename: string }[],
+): Promise<void> {
+  const setToast = useAppStore.getState().setToast;
+  if (items.length === 0) {
+    setToast("Select photos to export");
+    return;
+  }
+  const dir = await open({ directory: true, title: "Export selected to folder" });
+  if (!dir) return;
+
+  let done = 0;
+  let failed = 0;
+  for (const { id, filename } of items) {
+    try {
+      const params = await developGetEdit(id);
+      const base = filename.replace(/\.[^.]+$/, "");
+      const dest = `${dir}/${base}.jpg`;
+      await exportImage(id, params, "jpeg", dest);
+      done += 1;
+    } catch {
+      failed += 1;
+    }
+    setToast(`Exporting ${done + failed} / ${items.length}…`);
+  }
+  setToast(
+    failed > 0
+      ? `Exported ${done}, ${failed} failed → ${String(dir).split("/").pop()}`
+      : `Exported ${done} → ${String(dir).split("/").pop()}`,
+  );
 }

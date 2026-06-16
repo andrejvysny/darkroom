@@ -1,6 +1,11 @@
 import { useEffect, useCallback } from "react";
 import { useAppStore } from "../store/app";
-import { cullSetRating, cullSetFlag } from "../lib/ipc";
+import {
+  cullSetRating,
+  cullSetFlag,
+  cullSetRatingMany,
+  cullSetFlagMany,
+} from "../lib/ipc";
 import type { ImageRow } from "../lib/ipc";
 
 interface UseCullingParams {
@@ -46,8 +51,10 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
 
       const id = useAppStore.getState().selectedId;
       if (id === null) return;
+      const ids = useAppStore.getState().selectedIds;
+      const multi = ids.length > 1;
 
-      // Arrow navigation / bracket navigation
+      // Arrow navigation / bracket navigation (collapses any multi-selection to one).
       if (e.key === "ArrowLeft" || e.key === "[") {
         e.preventDefault();
         moveSelection(-1);
@@ -62,29 +69,33 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
       // Rating: digits 0–5
       if (/^[0-5]$/.test(e.key) && !e.metaKey && !e.ctrlKey) {
         const stars = parseInt(e.key, 10);
-        patchImage(id, { stars });
-        void cullSetRating(id, stars);
-        advanceSelection(id);
+        if (multi) {
+          ids.forEach((i) => patchImage(i, { stars }));
+          void cullSetRatingMany(ids, stars);
+        } else {
+          patchImage(id, { stars });
+          void cullSetRating(id, stars);
+          advanceSelection(id);
+        }
         return;
       }
 
       // Flag: p=pick, x=reject, u=none
-      if (e.key === "p" && !e.metaKey && !e.ctrlKey) {
-        patchImage(id, { flag: "pick" });
-        void cullSetFlag(id, "pick");
-        advanceSelection(id);
-        return;
-      }
-      if (e.key === "x" && !e.metaKey && !e.ctrlKey) {
-        patchImage(id, { flag: "reject" });
-        void cullSetFlag(id, "reject");
-        advanceSelection(id);
-        return;
-      }
-      if (e.key === "u" && !e.metaKey && !e.ctrlKey) {
-        patchImage(id, { flag: "none" });
-        void cullSetFlag(id, "none");
-        advanceSelection(id);
+      const flagKey: Record<string, "pick" | "reject" | "none"> = {
+        p: "pick",
+        x: "reject",
+        u: "none",
+      };
+      if (e.key in flagKey && !e.metaKey && !e.ctrlKey) {
+        const flag = flagKey[e.key];
+        if (multi) {
+          ids.forEach((i) => patchImage(i, { flag }));
+          void cullSetFlagMany(ids, flag);
+        } else {
+          patchImage(id, { flag });
+          void cullSetFlag(id, flag);
+          advanceSelection(id);
+        }
         return;
       }
     }

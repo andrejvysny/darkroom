@@ -6,8 +6,12 @@ import {
   cullSetRating,
   cullSetFlag,
   cullSetLabel,
+  cullSetRatingMany,
+  cullSetFlagMany,
+  cullSetLabelMany,
   keywordsForImage,
   keywordAddToImage,
+  keywordAddToImages,
   keywordRemoveFromImage,
   collectionsForImage,
   collectionAddImages,
@@ -16,15 +20,23 @@ import {
   collectionDelete,
   smartQueryFromParams,
 } from "../../lib/ipc";
-import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
+import type {
+  ImageRow,
+  KeywordRow,
+  CollectionRow,
+  ImportMode,
+} from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
 import { runImport } from "../../lib/importFlow";
+import { runBatchExport } from "../../lib/export";
 import LeftNav from "./LeftNav";
-import ThumbGrid, { GridImage } from "./ThumbGrid";
+import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
 import BottomBar from "./BottomBar";
+import SelectionBar from "./SelectionBar";
 import Loupe from "./Loupe";
 import DedupModal from "./DedupModal";
+import ImportModal from "./ImportModal";
 
 // Map color label name to CSS var for the dot color in ThumbGrid
 const LABEL_COLOR_MAP: Record<string, string> = {
@@ -52,11 +64,14 @@ export default function LibraryView() {
   const thumbSize = useAppStore((s) => s.thumbSize);
   const selectedId = useAppStore((s) => s.selectedId);
   const setSelectedId = useAppStore((s) => s.setSelectedId);
+  const selectedIds = useAppStore((s) => s.selectedIds);
+  const setSelection = useAppStore((s) => s.setSelection);
   const gridMode = useAppStore((s) => s.gridMode);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnOpenDedup = useAppStore((s) => s.setOnOpenDedup);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [dedupOpen, setDedupOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
   const [selectedCollections, setSelectedCollections] = useState<
     CollectionRow[]
@@ -66,8 +81,7 @@ export default function LibraryView() {
 
   // Register library action callbacks so TopBar/CommandPalette can call them
   useEffect(() => {
-    const handleImport = () => void runImport("copy", () => void lib.refresh());
-    setOnImport(handleImport);
+    setOnImport(() => setImportOpen(true));
     setOnOpenDedup(() => setDedupOpen(true));
     setOnSearch((q: string) => lib.setSearch(q.trim() ? q.trim() : null));
     return () => {
@@ -75,7 +89,7 @@ export default function LibraryView() {
       setOnOpenDedup(null);
       setOnSearch(null);
     };
-  }, [lib.refresh, lib.setSearch, setOnImport, setOnOpenDedup, setOnSearch]);
+  }, [lib.setSearch, setOnImport, setOnOpenDedup, setOnSearch]);
 
   // Default selection to first image after load
   useEffect(() => {
@@ -247,6 +261,102 @@ export default function LibraryView() {
     [lib.reloadCollections, lib.clearFilters, lib.params.collectionId],
   );
 
+  // ---- Multi-select ----
+  const handleSelect = useCallback(
+    (id: number, mods: SelectMods) => {
+      const order = lib.images.map((i) => i.id);
+      if (mods.shift && selectedId != null) {
+        const a = order.indexOf(selectedId);
+        const b = order.indexOf(id);
+        if (a !== -1 && b !== -1) {
+          const [lo, hi] = a <= b ? [a, b] : [b, a];
+          setSelection(order.slice(lo, hi + 1), id);
+          return;
+        }
+      }
+      if (mods.meta) {
+        const set = new Set(selectedIds);
+        if (set.has(id)) set.delete(id);
+        else set.add(id);
+        const next = order.filter((x) => set.has(x)); // preserve grid order
+        const primary = set.has(id) ? id : (next[next.length - 1] ?? null);
+        setSelection(next, primary);
+        return;
+      }
+      setSelectedId(id);
+    },
+    [lib.images, selectedId, selectedIds, setSelection, setSelectedId],
+  );
+
+  // ---- Batch operations (act on the whole selection) ----
+  const batchRate = useCallback(
+    (stars: number) => {
+      if (selectedIds.length === 0) return;
+      selectedIds.forEach((id) => lib.patchImage(id, { stars }));
+      void cullSetRatingMany(selectedIds, stars);
+    },
+    [selectedIds, lib.patchImage],
+  );
+
+  const batchFlag = useCallback(
+    (flag: "none" | "pick" | "reject") => {
+      if (selectedIds.length === 0) return;
+      selectedIds.forEach((id) => lib.patchImage(id, { flag }));
+      void cullSetFlagMany(selectedIds, flag);
+    },
+    [selectedIds, lib.patchImage],
+  );
+
+  const batchLabel = useCallback(
+    (label: string | null) => {
+      if (selectedIds.length === 0) return;
+      selectedIds.forEach((id) => lib.patchImage(id, { colorLabel: label }));
+      void cullSetLabelMany(selectedIds, label);
+    },
+    [selectedIds, lib.patchImage],
+  );
+
+  const batchAddKeyword = useCallback(
+    async (name: string) => {
+      if (selectedIds.length === 0) return;
+      try {
+        await keywordAddToImages(selectedIds, name);
+        void lib.reloadKeywords();
+        if (selectedId != null)
+          setSelectedKeywords(await keywordsForImage(selectedId));
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedIds, selectedId, lib.reloadKeywords],
+  );
+
+  const batchAddToCollection = useCallback(
+    async (collectionId: number) => {
+      if (selectedIds.length === 0) return;
+      try {
+        await collectionAddImages(collectionId, selectedIds);
+        void lib.reloadCollections();
+        if (selectedId != null)
+          setSelectedCollections(await collectionsForImage(selectedId));
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedIds, selectedId, lib.reloadCollections],
+  );
+
+  const batchExport = useCallback(() => {
+    const items = lib.images
+      .filter((i) => selectedIds.includes(i.id))
+      .map((i) => ({ id: i.id, filename: i.filename }));
+    void runBatchExport(items);
+  }, [lib.images, selectedIds]);
+
+  const collapseSelection = useCallback(() => {
+    setSelectedId(selectedId);
+  }, [selectedId, setSelectedId]);
+
   const rightInfoHandlers: RightInfoHandlers = {
     onSetRating: handleSetRating,
     onSetFlag: handleSetFlag,
@@ -286,15 +396,30 @@ export default function LibraryView() {
         />
       </div>
 
-      {/* Center: grid or loupe */}
+      {/* Center: optional selection bar + grid or loupe */}
       <div
         style={{
           gridRow: "1",
           gridColumn: "2",
           minHeight: 0,
-          position: "relative",
+          display: "flex",
+          flexDirection: "column",
         }}
       >
+        {selectedIds.length > 1 && (
+          <SelectionBar
+            count={selectedIds.length}
+            collections={lib.collections}
+            onRate={batchRate}
+            onFlag={batchFlag}
+            onLabel={batchLabel}
+            onAddKeyword={batchAddKeyword}
+            onAddToCollection={batchAddToCollection}
+            onExport={batchExport}
+            onClear={collapseSelection}
+          />
+        )}
+        <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
         {lib.indexing && (
           <div
             style={{
@@ -339,10 +464,12 @@ export default function LibraryView() {
               images={gridImages}
               thumbSize={thumbSize}
               selectedId={selectedId}
-              onSelect={setSelectedId}
+              selectedIds={selectedIds}
+              onSelect={handleSelect}
             />
           </>
         )}
+        </div>
       </div>
 
       {/* Right info spans both rows */}
@@ -372,6 +499,15 @@ export default function LibraryView() {
         open={dedupOpen}
         onClose={() => setDedupOpen(false)}
         onRefresh={() => void lib.refresh()}
+      />
+
+      <ImportModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onChoose={(mode: ImportMode) => {
+          setImportOpen(false);
+          void runImport(mode, () => void lib.refresh());
+        }}
       />
     </div>
   );
