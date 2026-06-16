@@ -28,5 +28,11 @@ src-tauri/target/
 *.sln
 *.sw?
 
-# RAW test data — kept locally, never committed (~6 GB)
-library/
+# RAW test data — kept local, never committed (~6 GB), EXCEPT one reference RAW
+# (_55A3947.CR3) committed for decode/develop tests + the docs sample image.
+library/*
+!library/2026
+library/2026/*
+!library/2026/2026-06-06
+library/2026/2026-06-06/*
+!library/2026/2026-06-06/_55A3947.CR3
