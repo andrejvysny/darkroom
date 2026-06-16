@@ -279,7 +279,13 @@ export function collectionRemoveImages(
   return invoke<number>("collection_remove_images", { collectionId, imageIds });
 }
 
-/** Extract the filter predicate (filter dimensions + search) from params, for a smart collection. */
+/**
+ * Extract the smart-collection predicate from params. Captures the persistent filter dimensions
+ * only — NOT free-text `search` (transient, and not reset by clearedFilters, so it would leak when
+ * toggling a smart collection off) nor `collectionId` (a smart collection defined by membership in
+ * another collection would be circular). Every captured key is in FILTER_DIMENSIONS, so applying /
+ * clearing a smart collection round-trips cleanly. Key order is fixed for stable === comparison.
+ */
 export function smartQueryFromParams(p: QueryParams): string {
   const pred: QueryParams = {};
   if (p.folderId != null) pred.folderId = p.folderId;
@@ -287,7 +293,7 @@ export function smartQueryFromParams(p: QueryParams): string {
   if (p.flag != null) pred.flag = p.flag;
   if (p.colorLabel != null) pred.colorLabel = p.colorLabel;
   if (p.keywordId != null) pred.keywordId = p.keywordId;
-  if (p.search != null) pred.search = p.search;
+  if (p.importSessionId != null) pred.importSessionId = p.importSessionId;
   return JSON.stringify(pred);
 }
 

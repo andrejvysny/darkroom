@@ -78,6 +78,8 @@ export default function LeftNav({
   const staticCollections = collections.filter((c) => !c.isSmart);
   const smartCollections = collections.filter((c) => c.isSmart);
   const currentPredicate = smartQueryFromParams(params);
+  // A predicate worth saving (excludes search/collectionId, which smart collections don't capture).
+  const hasPredicate = currentPredicate !== "{}";
 
   function enterCollection(id: number) {
     if (params.collectionId === id) {
@@ -199,7 +201,7 @@ export default function LeftNav({
             onDelete={() => onDeleteCollection(c.id)}
           />
         ))}
-        {hasActiveFilters(params) ? (
+        {hasPredicate ? (
           <CreateRow
             placeholder="Save filters as…"
             onSubmit={onCreateSmartCollection}
