@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, useEffect } from "react";
+import { useRef, useState, useEffect } from "react";
 import type { CurvePoint, ToneCurve as ToneCurveData } from "../../lib/ipc";
 
 const W = 248;
@@ -86,32 +86,33 @@ export default function ToneCurve({ curve, onChange }: ToneCurveProps) {
   // A persisted curve has its points; otherwise show the editable identity.
   const pts = stored.length >= 2 ? stored : IDENTITY;
 
-  const handlePointerMove = useCallback(
-    (e: PointerEvent) => {
+  // Hold the latest drag inputs in a ref so the global listeners attach ONCE (below) rather than
+  // re-binding on every curve edit / param change.
+  const latest = useRef({ pts, key, onChange });
+  latest.current = { pts, key, onChange };
+
+  useEffect(() => {
+    const handlePointerMove = (e: PointerEvent) => {
       const idx = draggingIdx.current;
       if (idx === null || !svgRef.current) return;
       const rect = svgRef.current.getBoundingClientRect();
       const scaleY = H / rect.height;
       const rawV = 1 - ((e.clientY - rect.top) * scaleY - P) / (H - 2 * P);
       const v = Math.max(0, Math.min(1, rawV));
+      const { pts, key, onChange } = latest.current;
       const next = pts.map((pt, i) => (i === idx ? { ...pt, y: v } : pt));
       onChange(key, next);
-    },
-    [pts, key, onChange],
-  );
-
-  const handlePointerUp = useCallback(() => {
-    draggingIdx.current = null;
-  }, []);
-
-  useEffect(() => {
+    };
+    const handlePointerUp = () => {
+      draggingIdx.current = null;
+    };
     window.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("pointerup", handlePointerUp);
     return () => {
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [handlePointerMove, handlePointerUp]);
+  }, []);
 
   return (
     <div

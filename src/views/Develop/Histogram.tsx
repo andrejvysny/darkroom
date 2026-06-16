@@ -1,10 +1,7 @@
-import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { useDevelopStore } from "../../store/develop";
 
 const W = 276;
 const H = 96;
-
-type HistData = { r: number[]; g: number[]; b: number[] };
 
 // Max bin excluding the pure-black/white spikes (which would otherwise flatten everything).
 function scaleMax(...channels: number[][]): number {
@@ -41,18 +38,7 @@ function meanPct(bins: number[]): number {
 }
 
 export default function Histogram() {
-  const [hist, setHist] = useState<HistData | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    const un = listen<HistData>("develop:histogram", (ev) => {
-      if (active) setHist(ev.payload);
-    });
-    return () => {
-      active = false;
-      void un.then((fn) => fn());
-    };
-  }, []);
+  const hist = useDevelopStore((s) => s.histogram);
 
   const maxv = hist ? scaleMax(hist.r, hist.g, hist.b) : 1;
   const channels: [string, number[] | null][] = [

@@ -28,6 +28,8 @@ pub fn run() {
             commands::develop_get_edit,
             commands::develop_set_edit,
             commands::develop_render,
+            commands::develop_preview_jpeg,
+            commands::develop_get_histogram,
             commands::export_image,
             commands::cull_set_rating,
             commands::cull_set_flag,

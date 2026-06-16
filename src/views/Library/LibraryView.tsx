@@ -69,6 +69,8 @@ export default function LibraryView() {
   const selectedIds = useAppStore((s) => s.selectedIds);
   const setSelection = useAppStore((s) => s.setSelection);
   const gridMode = useAppStore((s) => s.gridMode);
+  const setGridMode = useAppStore((s) => s.setGridMode);
+  const setLibraryImages = useAppStore((s) => s.setLibraryImages);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnOpenDedup = useAppStore((s) => s.setOnOpenDedup);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
@@ -103,6 +105,11 @@ export default function LibraryView() {
       setSelectedId(lib.images[0].id);
     }
   }, [lib.images, selectedId, setSelectedId]);
+
+  // Share the current image set so Develop's filmstrip/chrome can read it after this view unmounts.
+  useEffect(() => {
+    setLibraryImages(lib.images);
+  }, [lib.images, setLibraryImages]);
 
   useCulling({ images: lib.images, patchImage: lib.patchImage });
 
@@ -461,55 +468,59 @@ export default function LibraryView() {
           />
         )}
         <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
-        {lib.indexing && (
-          <div
-            style={{
-              position: "absolute",
-              top: 10,
-              left: "50%",
-              transform: "translateX(-50%)",
-              zIndex: 10,
-              background: "var(--color-elev)",
-              border: "1px solid var(--color-line)",
-              borderRadius: "var(--radius-sm)",
-              padding: "6px 14px",
-              fontSize: 12,
-              color: "var(--color-t2)",
-            }}
-          >
-            {lib.indexing.total > 0
-              ? `Indexing ${lib.indexing.done} / ${lib.indexing.total}…`
-              : "Indexing…"}
-          </div>
-        )}
+          {lib.indexing && (
+            <div
+              style={{
+                position: "absolute",
+                top: 10,
+                left: "50%",
+                transform: "translateX(-50%)",
+                zIndex: 10,
+                background: "var(--color-elev)",
+                border: "1px solid var(--color-line)",
+                borderRadius: "var(--radius-sm)",
+                padding: "6px 14px",
+                fontSize: 12,
+                color: "var(--color-t2)",
+              }}
+            >
+              {lib.indexing.total > 0
+                ? `Indexing ${lib.indexing.done} / ${lib.indexing.total}…`
+                : "Indexing…"}
+            </div>
+          )}
 
-        {gridMode === "loupe" && selectedImage !== null ? (
-          <Loupe image={selectedImage} />
-        ) : (
-          <>
-            {!lib.loading && !lib.indexing && gridImages.length === 0 && (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  height: "100%",
-                  color: "var(--color-t3)",
-                  fontSize: 13,
+          {gridMode === "loupe" && selectedImage !== null ? (
+            <Loupe image={selectedImage} />
+          ) : (
+            <>
+              {!lib.loading && !lib.indexing && gridImages.length === 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    height: "100%",
+                    color: "var(--color-t3)",
+                    fontSize: 13,
+                  }}
+                >
+                  No photos found
+                </div>
+              )}
+              <ThumbGrid
+                images={gridImages}
+                thumbSize={thumbSize}
+                selectedId={selectedId}
+                selectedIds={selectedIds}
+                onSelect={handleSelect}
+                onActivate={(id) => {
+                  setSelectedId(id);
+                  setGridMode("loupe");
                 }}
-              >
-                No photos found
-              </div>
-            )}
-            <ThumbGrid
-              images={gridImages}
-              thumbSize={thumbSize}
-              selectedId={selectedId}
-              selectedIds={selectedIds}
-              onSelect={handleSelect}
-            />
-          </>
-        )}
+              />
+            </>
+          )}
         </div>
       </div>
 

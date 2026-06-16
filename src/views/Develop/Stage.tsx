@@ -1,3 +1,5 @@
+import { useAppStore } from "../../store/app";
+
 const PLACEHOLDER_SRC =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNTAwIDEwMDAiPgo8ZGVmcz4KPGxpbmVhckdyYWRpZW50IGlkPSJzIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+CjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzViN2I5NiIvPjxzdG9wIG9mZnNldD0iLjM4IiBzdG9wLWNvbG9yPSIjODY5NTlhIi8+CjxzdG9wIG9mZnNldD0iLjUyIiBzdG9wLWNvbG9yPSIjOWE4YTZlIi8+PHN0b3Agb2Zmc2V0PSIuNjYiIHN0b3AtY29sb3I9IiM1YzUzNDAiLz4KPHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjMzMyYzIyIi8+PC9saW5lYXJHcmFkaWVudD4KPHJhZGlhbEdyYWRpZW50IGlkPSJ1IiBjeD0iLjUiIGN5PSIuMSIgcj0iLjU1Ij4KPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZTZiZDdkIi8+PHN0b3Agb2Zmc2V0PSIuNDUiIHN0b3AtY29sb3I9IiNiODg5NWEiIHN0b3Atb3BhY2l0eT0iLjUiLz4KPHN0b3Agb2Zmc2V0PSIuOCIgc3RvcC1jb2xvcj0iI2I4ODk1YSIgc3RvcC1vcGFjaXR5PSIwIi8+PC9yYWRpYWxHcmFkaWVudD4KPHJhZGlhbEdyYWRpZW50IGlkPSJ2IiBjeD0iLjUiIGN5PSIuNSIgcj0iLjc1Ij4KPHN0b3Agb2Zmc2V0PSIuNTgiIHN0b3AtY29sb3I9IiMwMDAiIHN0b3Atb3BhY2l0eT0iMCIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzAwMCIgc3RvcC1vcGFjaXR5PSIuNCIvPjwvcmFkaWFsR3JhZGllbnQ+CjwvZGVmcz4KPHJlY3Qgd2lkdGg9IjE1MDAiIGhlaWdodD0iMTAwMCIgZmlsbD0idXJsKCNzKSIvPgo8cmVjdCB3aWR0aD0iMTUwMCIgaGVpZ2h0PSIxMDAwIiBmaWxsPSJ1cmwoI3UpIi8+CjxyZWN0IHdpZHRoPSIxNTAwIiBoZWlnaHQ9IjEwMDAiIGZpbGw9InVybCgjdikiLz4KPC9zdmc+Cg==";
 
@@ -7,6 +9,8 @@ interface StageProps {
   /** Press-and-hold the image to preview the original; release to return. */
   onHoldBefore: (active: boolean) => void;
   imageUrl: string | null;
+  /** Instant embedded-JPEG preview, shown until the processed render lands. */
+  previewUrl: string | null;
   rendering: boolean;
 }
 
@@ -14,9 +18,14 @@ export default function Stage({
   showBefore,
   onHoldBefore,
   imageUrl,
+  previewUrl,
   rendering,
 }: StageProps) {
-  const src = imageUrl ?? PLACEHOLDER_SRC;
+  const src = imageUrl ?? previewUrl ?? PLACEHOLDER_SRC;
+  const dims = useAppStore((s) => {
+    const img = s.libraryImages.find((i) => i.id === s.selectedId);
+    return img?.width && img?.height ? `${img.width} × ${img.height}` : null;
+  });
 
   return (
     <section
@@ -109,7 +118,7 @@ export default function Stage({
             display: "block",
           }}
         />
-        <span>7008 × 4672</span>
+        <span>{dims ?? "—"}</span>
         <span
           style={{
             width: 4,

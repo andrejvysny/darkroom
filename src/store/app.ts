@@ -1,8 +1,13 @@
 import { create } from "zustand";
+import type { ImageRow } from "../lib/ipc";
 
 interface AppState {
   view: "library" | "develop";
   setView: (v: "library" | "develop") => void;
+  /** The current (filtered) library image set — shared so Develop's filmstrip/chrome can read it
+   *  even while the LibraryView is unmounted. */
+  libraryImages: ImageRow[];
+  setLibraryImages: (rows: ImageRow[]) => void;
   /** Primary/active selection (drives metadata panel + develop). */
   selectedId: number | null;
   setSelectedId: (id: number | null) => void;
@@ -32,6 +37,8 @@ interface AppState {
 export const useAppStore = create<AppState>((set) => ({
   view: "library",
   setView: (v) => set({ view: v }),
+  libraryImages: [],
+  setLibraryImages: (rows) => set({ libraryImages: rows }),
   selectedId: 6,
   setSelectedId: (id) =>
     set({ selectedId: id, selectedIds: id == null ? [] : [id] }),

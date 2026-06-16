@@ -401,13 +401,43 @@ export function developSetEdit(
   return invoke<void>("develop_set_edit", { imageId, params });
 }
 
-/** Returns an object URL backed by JPEG bytes. Caller must revoke when done. */
+/** Per-channel 256-bin histogram from the rendered buffer. */
+export type HistData = { r: number[]; g: number[]; b: number[] };
+
+// Monotonic across the whole session (survives component remounts) so the backend can identify
+// and skip superseded render requests.
+let renderRequestSeq = 0;
+
+/**
+ * Render the develop preview. Returns an object URL backed by JPEG bytes (caller must revoke), or
+ * `null` if the backend skipped this request because a newer one superseded it.
+ */
 export async function developRender(
   imageId: number,
   params: DevelopParams,
-): Promise<string> {
-  const buf = await invoke<ArrayBuffer>("develop_render", { imageId, params });
+): Promise<string | null> {
+  const requestId = ++renderRequestSeq;
+  const buf = await invoke<ArrayBuffer>("develop_render", {
+    imageId,
+    params,
+    requestId,
+  });
+  if (buf.byteLength === 0) return null; // superseded — no-op
   return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+}
+
+/**
+ * Instant first paint: the camera's embedded preview JPEG (demosaic-free, no edits applied).
+ * Returns an object URL backed by JPEG bytes. Caller must revoke when done.
+ */
+export async function developPreviewJpeg(imageId: number): Promise<string> {
+  const buf = await invoke<ArrayBuffer>("develop_preview_jpeg", { imageId });
+  return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+}
+
+/** Pull the most recent render's histogram (reliable fallback for the fire-and-forget event). */
+export function developGetHistogram(): Promise<HistData | null> {
+  return invoke<HistData | null>("develop_get_histogram", {});
 }
 
 export function exportImage(

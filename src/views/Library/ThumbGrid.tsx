@@ -22,6 +22,8 @@ interface ThumbGridProps {
   selectedId: number | null;
   selectedIds: number[];
   onSelect: (id: number, mods: SelectMods) => void;
+  /** Double-click / Enter activation — opens the full-size loupe preview. */
+  onActivate?: (id: number) => void;
 }
 
 function StarRow({ count }: { count: number }) {
@@ -51,6 +53,7 @@ export default function ThumbGrid({
   selectedId,
   selectedIds,
   onSelect,
+  onActivate,
 }: ThumbGridProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [colCount, setColCount] = useState(4);
@@ -127,6 +130,7 @@ export default function ThumbGrid({
                         shift: e.shiftKey,
                       })
                     }
+                    onDoubleClick={() => onActivate?.(img.id)}
                     style={{
                       position: "relative",
                       aspectRatio: "3/2",

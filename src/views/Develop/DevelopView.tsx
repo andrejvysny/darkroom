@@ -15,6 +15,7 @@ export default function DevelopView() {
   const {
     params,
     imageUrl,
+    previewUrl,
     onParamChange,
     onCurveChange,
     onHslChange,
@@ -79,6 +80,7 @@ export default function DevelopView() {
           showBefore={showBefore}
           onHoldBefore={setShowBefore}
           imageUrl={imageUrl}
+          previewUrl={previewUrl}
           rendering={rendering}
         />
         <InstrumentPanel

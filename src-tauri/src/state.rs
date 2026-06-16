@@ -1,7 +1,9 @@
 use core_db::Db;
 use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
-use core_pipeline::{DevelopPipeline, GpuContext};
+use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -11,10 +13,45 @@ pub struct GpuRender {
     pub pipeline: DevelopPipeline,
 }
 
-/// The currently-open develop image: its uploaded GPU resources keyed by image id.
+/// One developed image's uploaded GPU resources, keyed by image id.
 pub struct DevelopCache {
     pub image_id: i64,
     pub prepared: PreparedImage,
+}
+
+/// How many images' GPU resources to keep warm at once. Small (back/forward + A/B compare) so
+/// VRAM/unified-memory stays bounded; each 1600 px preview is modest.
+const DEVELOP_CACHE_CAP: usize = 3;
+
+/// LRU of prepared develop images. Front = most-recently-used.
+#[derive(Default)]
+pub struct DevelopLru {
+    entries: VecDeque<DevelopCache>,
+}
+
+impl DevelopLru {
+    pub fn contains(&self, image_id: i64) -> bool {
+        self.entries.iter().any(|c| c.image_id == image_id)
+    }
+
+    /// Fetch a prepared image, promoting it to most-recently-used.
+    pub fn get(&mut self, image_id: i64) -> Option<&PreparedImage> {
+        let pos = self.entries.iter().position(|c| c.image_id == image_id)?;
+        if pos != 0 {
+            let item = self.entries.remove(pos).expect("position is valid");
+            self.entries.push_front(item);
+        }
+        self.entries.front().map(|c| &c.prepared)
+    }
+
+    /// Insert (or replace) an image, evicting the least-recently-used over capacity.
+    pub fn put(&mut self, image_id: i64, prepared: PreparedImage) {
+        self.entries.retain(|c| c.image_id != image_id);
+        self.entries.push_front(DevelopCache { image_id, prepared });
+        while self.entries.len() > DEVELOP_CACHE_CAP {
+            self.entries.pop_back();
+        }
+    }
 }
 
 /// Managed application state.
@@ -22,7 +59,13 @@ pub struct AppState {
     pub db: Mutex<Db>,
     pub thumbs: ThumbCache,
     pub gpu: Option<GpuRender>,
-    pub develop_cache: Mutex<Option<DevelopCache>>,
+    /// Warm GPU resources for recently-developed images.
+    pub develop_cache: Mutex<DevelopLru>,
+    /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
+    /// newer request has already superseded it.
+    pub latest_render: AtomicU64,
+    /// Histogram of the most recent successful render, for a reliable pull (the event can be missed).
+    pub last_histogram: Mutex<Option<Histogram>>,
 }
 
 impl AppState {
@@ -54,7 +97,9 @@ impl AppState {
             db: Mutex::new(db),
             thumbs,
             gpu,
-            develop_cache: Mutex::new(None),
+            develop_cache: Mutex::new(DevelopLru::default()),
+            latest_render: AtomicU64::new(0),
+            last_histogram: Mutex::new(None),
         })
     }
 }

@@ -11,6 +11,9 @@ export default function TopBar() {
   const onOpenDedup = useAppStore((s) => s.onOpenDedup);
   const onSearch = useAppStore((s) => s.onSearch);
   const onDevelopReset = useAppStore((s) => s.onDevelopReset);
+  const currentFilename = useAppStore(
+    (s) => s.libraryImages.find((i) => i.id === s.selectedId)?.filename ?? "—",
+  );
   const showBefore = useDevelopStore((s) => s.showBefore);
   const setShowBefore = useDevelopStore((s) => s.setShowBefore);
 
@@ -170,7 +173,7 @@ export default function TopBar() {
                 color: "var(--color-t1)",
               }}
             >
-              DSC00487.ARW
+              {currentFilename}
             </span>
             <span
               style={{

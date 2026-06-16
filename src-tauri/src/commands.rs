@@ -1,12 +1,13 @@
 //! IPC command handlers. Heavy/DB work runs on `spawn_blocking`; state is fetched via the
 //! `AppHandle` inside the blocking closure (never held across `.await`).
 
-use crate::state::{AppState, DevelopCache};
+use crate::state::AppState;
 use core_library::{CollectionRow, FolderRow, ImageRow, IndexStats, KeywordRow, QueryParams};
-use core_pipeline::DevelopParams;
+use core_pipeline::{DevelopParams, Histogram};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 
 const PROCESS_VERSION: i64 = 1;
@@ -88,8 +89,10 @@ pub async fn library_index_root(app: AppHandle, path: String) -> Result<IndexSta
                 let r = core_library::process_file(p, &st.thumbs, core_library::THUMB_SIZE);
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == total || n.is_multiple_of(4) {
-                    let _ = app2
-                        .emit("import:progress", serde_json::json!({"done": n, "total": total}));
+                    let _ = app2.emit(
+                        "import:progress",
+                        serde_json::json!({"done": n, "total": total}),
+                    );
                 }
                 r
             })
@@ -178,25 +181,82 @@ pub async fn develop_set_edit(
     .map_err(|e| e.to_string())?
 }
 
+const PREVIEW_MAX_EDGE: u32 = 1600;
+const PREVIEW_JPEG_QUALITY: u8 = 82;
+
+fn profiling() -> bool {
+    std::env::var_os("DARKROOM_PROFILE").is_some()
+}
+
+/// Demosaic-free instant first paint: the camera's embedded preview JPEG (no GPU, no decode of the
+/// sensor data, no cache lock). The frontend shows this within ~tens of ms while `develop_render`
+/// produces the color-managed, edit-applied result in the background.
+#[tauri::command]
+pub async fn develop_preview_jpeg(
+    app: AppHandle,
+    image_id: i64,
+) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let path = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::image_by_id(&db.conn, image_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "image not found".to_string())?
+                .path
+        };
+        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+        let thumb = core_raw::thumbnail_jpeg(&src, 2560, 85).map_err(|e| e.to_string())?;
+        Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The histogram of the most recent successful render. A reliable pull-fallback for the
+/// fire-and-forget `develop:histogram` event (which can be missed if it fires before the listener
+/// is registered). Returns `None` if nothing has rendered yet.
+#[tauri::command]
+pub async fn develop_get_histogram(app: AppHandle) -> Result<Option<Histogram>, String> {
+    let st = app.state::<AppState>();
+    let hist = st.last_histogram.lock().map_err(|e| e.to_string())?.clone();
+    Ok(hist)
+}
+
 /// Render the develop preview for `image_id` with `params`, returning JPEG bytes.
-/// First open of an image decodes + uploads (slow once); subsequent slider renders reuse the
-/// cached GPU resources (single-digit ms).
+///
+/// First open of an image decodes (half-resolution superpixel) + uploads — slow once, then cached
+/// in a small LRU so back/forward and A/B compare reuse the GPU resources (single-digit ms). The
+/// expensive decode runs WITHOUT holding the cache lock. `request_id` is a monotonic token: if a
+/// newer request has superseded this one, the decode is skipped and an empty response is returned.
 #[tauri::command]
 pub async fn develop_render(
     app: AppHandle,
     image_id: i64,
     params: DevelopParams,
+    request_id: u64,
 ) -> Result<tauri::ipc::Response, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let prof = profiling();
         let st = app.state::<AppState>();
         let gpu = st
             .gpu
             .as_ref()
             .ok_or_else(|| "GPU develop unavailable".to_string())?;
 
-        let mut cache = st.develop_cache.lock().map_err(|e| e.to_string())?;
-        let needs_load = cache.as_ref().map(|c| c.image_id) != Some(image_id);
-        if needs_load {
+        st.latest_render.fetch_max(request_id, Ordering::SeqCst);
+        let superseded = || st.latest_render.load(Ordering::SeqCst) > request_id;
+
+        // --- Load (decode + GPU upload) on cache miss, WITHOUT holding the cache lock. ---
+        let present = {
+            let cache = st.develop_cache.lock().map_err(|e| e.to_string())?;
+            cache.contains(image_id)
+        };
+        if !present {
+            // Skip the expensive decode if a newer request already arrived.
+            if superseded() {
+                return Ok(tauri::ipc::Response::new(Vec::new()));
+            }
             let path = {
                 let db = st.db.lock().map_err(|e| e.to_string())?;
                 core_library::image_by_id(&db.conn, image_id)
@@ -205,27 +265,63 @@ pub async fn develop_render(
                     .path
             };
             let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-            let lin = core_raw::develop_linear(&src).map_err(|e| e.to_string())?;
-            let preview = lin.downscaled(1600);
+
+            let t = Instant::now();
+            let lin = core_raw::develop_linear_preview(&src).map_err(|e| e.to_string())?;
+            if prof {
+                eprintln!("[profile] decode(superpixel): {:?}", t.elapsed());
+            }
+
+            let t = Instant::now();
+            let preview = lin.downscale_into(PREVIEW_MAX_EDGE);
+            if prof {
+                eprintln!("[profile] downscale_into: {:?}", t.elapsed());
+            }
+
+            let t = Instant::now();
             let prepared = gpu
                 .pipeline
                 .prepare(&gpu.ctx, &preview)
                 .map_err(|e| e.to_string())?;
-            *cache = Some(DevelopCache { image_id, prepared });
+            if prof {
+                eprintln!("[profile] gpu prepare: {:?}", t.elapsed());
+            }
+
+            let mut cache = st.develop_cache.lock().map_err(|e| e.to_string())?;
+            cache.put(image_id, prepared);
         }
 
-        let c = cache.as_ref().expect("cache populated above");
-        let (w, h) = (c.prepared.width, c.prepared.height);
-        let rgba = gpu
-            .pipeline
-            .render(&gpu.ctx, &c.prepared, &params)
+        // --- Render from cache (fast). Lock held only across the GPU render + readback. ---
+        let (rgba, w, h) = {
+            let mut cache = st.develop_cache.lock().map_err(|e| e.to_string())?;
+            let prepared = cache
+                .get(image_id)
+                .ok_or_else(|| "prepared image evicted before render".to_string())?;
+            let (w, h) = (prepared.width, prepared.height);
+            let t = Instant::now();
+            let rgba = gpu
+                .pipeline
+                .render(&gpu.ctx, prepared, &params)
+                .map_err(|e| e.to_string())?;
+            if prof {
+                eprintln!("[profile] gpu render+readback: {:?}", t.elapsed());
+            }
+            (rgba, w, h)
+        };
+
+        // Histogram from the rendered buffer: store for pull + emit for push.
+        let hist = core_pipeline::histogram(&rgba);
+        if let Ok(mut last) = st.last_histogram.lock() {
+            *last = Some(hist.clone());
+        }
+        let _ = app.emit("develop:histogram", hist);
+
+        let t = Instant::now();
+        let jpeg = core_pipeline::rgba8_to_jpeg(&rgba, w, h, PREVIEW_JPEG_QUALITY)
             .map_err(|e| e.to_string())?;
-        drop(cache);
-
-        // Histogram from the actual rendered buffer → drives the develop panel histogram.
-        let _ = app.emit("develop:histogram", core_pipeline::histogram(&rgba));
-
-        let jpeg = core_pipeline::rgba8_to_jpeg(&rgba, w, h, 88).map_err(|e| e.to_string())?;
+        if prof {
+            eprintln!("[profile] jpeg encode: {:?}", t.elapsed());
+        }
         Ok::<_, String>(tauri::ipc::Response::new(jpeg))
     })
     .await
@@ -284,7 +380,9 @@ pub async fn export_image(
 
 async fn db_write<F>(app: AppHandle, f: F) -> Result<(), String>
 where
-    F: FnOnce(&core_db::rusqlite::Connection) -> Result<(), core_library::LibError> + Send + 'static,
+    F: FnOnce(&core_db::rusqlite::Connection) -> Result<(), core_library::LibError>
+        + Send
+        + 'static,
 {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
@@ -311,7 +409,10 @@ pub async fn cull_set_label(
     image_id: i64,
     label: Option<String>,
 ) -> Result<(), String> {
-    db_write(app, move |c| core_library::set_label(c, image_id, label.as_deref())).await
+    db_write(app, move |c| {
+        core_library::set_label(c, image_id, label.as_deref())
+    })
+    .await
 }
 
 // Batch culling — applies one value to a whole selection in a single transaction.
@@ -528,7 +629,9 @@ pub async fn app_library_root(app: AppHandle) -> Result<Option<String>, String> 
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let first: Option<String> = db
             .conn
-            .query_row("SELECT path FROM folders ORDER BY id LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT path FROM folders ORDER BY id LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .ok();
         Ok::<_, String>(first.and_then(|p| {
             Path::new(&p)
@@ -602,8 +705,10 @@ pub async fn import_start(
             Path::new(&dest),
             |done, total| {
                 if done == total || done.is_multiple_of(4) {
-                    let _ = progress_app
-                        .emit("import:progress", serde_json::json!({"done": done, "total": total}));
+                    let _ = progress_app.emit(
+                        "import:progress",
+                        serde_json::json!({"done": done, "total": total}),
+                    );
                 }
             },
         )
