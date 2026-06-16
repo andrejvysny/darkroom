@@ -163,11 +163,39 @@ export function dedupScan(category: "byte" | "capture"): Promise<DupGroup[]> {
   return invoke<DupGroup[]>("dedup_scan", { category });
 }
 
+/** Perceptual near-duplicate scan. `threshold` = max differing dHash bits (0–64; ~10 is typical).
+ *  Lazily computes missing dHashes first (emits `dedup:progress`). */
+export function dedupScanPerceptual(threshold: number): Promise<DupGroup[]> {
+  return invoke<DupGroup[]>("dedup_scan_perceptual", { threshold });
+}
+
 export function dedupResolve(
   keepId: number,
   trashIds: number[],
 ): Promise<number> {
   return invoke<number>("dedup_resolve", { keepId, trashIds });
+}
+
+/** Auto-resolve all byte-identical groups (keep one each, trash the rest). Resolves to count trashed. */
+export function dedupResolveBulk(): Promise<number> {
+  return invoke<number>("dedup_resolve_bulk", {});
+}
+
+// ── Settings ───────────────────────────────────────────────────────────────
+
+/** Configured thumbnail-cache cap, in bytes. */
+export function thumbCacheCap(): Promise<number> {
+  return invoke<number>("thumb_cache_cap", {});
+}
+
+/** Current on-disk size of the thumbnail cache, in bytes. */
+export function thumbCacheSize(): Promise<number> {
+  return invoke<number>("thumb_cache_size", {});
+}
+
+/** Persist a new cap (bytes) and evict down to it. Resolves to bytes freed. */
+export function setThumbCacheCap(bytes: number): Promise<number> {
+  return invoke<number>("set_thumb_cache_cap", { bytes });
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────

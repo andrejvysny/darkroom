@@ -1,6 +1,7 @@
 mod commands;
 mod protocol;
 mod state;
+mod watch;
 
 use state::AppState;
 use tauri::Manager;
@@ -16,6 +17,20 @@ pub fn run() {
         .setup(|app| {
             let state = AppState::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
+
+            // Reconcile against disk, then start the FS watcher — off the setup thread so a slow
+            // stat sweep can't delay window creation. The watcher is parked in AppState to stay alive.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                watch::reconcile_on_launch(&handle);
+                if let Some(w) = watch::spawn_watcher(handle.clone()) {
+                    let st = handle.state::<AppState>();
+                    let lock = st.watcher.lock();
+                    if let Ok(mut slot) = lock {
+                        *slot = Some(w);
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -52,8 +67,13 @@ pub fn run() {
             commands::collection_remove_images,
             commands::app_library_root,
             commands::dedup_scan,
+            commands::dedup_scan_perceptual,
             commands::dedup_resolve,
+            commands::dedup_resolve_bulk,
             commands::import_start,
+            commands::thumb_cache_cap,
+            commands::thumb_cache_size,
+            commands::set_thumb_cache_cap,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

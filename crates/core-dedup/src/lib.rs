@@ -7,7 +7,7 @@ pub mod error;
 
 pub use error::DedupError;
 
-use core_db::rusqlite::{params, Connection};
+use core_db::rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +83,103 @@ fn grouped_by(conn: &Connection, col: &str, category: &str) -> Result<Vec<DupGro
     Ok(groups)
 }
 
+/// 64-bit difference hash (dHash) of a JPEG thumbnail: convert to grayscale, resize to 9×8, and emit
+/// one bit per horizontally-adjacent pixel pair (left < right). Visually similar images differ in
+/// only a few bits. Returns `None` if the bytes can't be decoded.
+pub fn dhash_from_jpeg(bytes: &[u8]) -> Option<u64> {
+    let small = image::load_from_memory(bytes)
+        .ok()?
+        .resize_exact(9, 8, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let mut hash: u64 = 0;
+    let mut bit = 0;
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            if small.get_pixel(x, y)[0] < small.get_pixel(x + 1, y)[0] {
+                hash |= 1 << bit;
+            }
+            bit += 1;
+        }
+    }
+    Some(hash)
+}
+
+/// Hamming distance between two dHashes (number of differing bits, 0..=64).
+#[inline]
+pub fn hamming(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+/// Near-duplicate groups: images whose dHashes are within `threshold` bits of each other, linked
+/// transitively (a burst forms one group via union-find). Reads the precomputed `phash` column —
+/// rows with a NULL `phash` are ignored (the caller fills them lazily before scanning).
+///
+/// O(n²) pairwise over images that have a phash. Fine for an on-demand scan at ≤50k; swap in a
+/// BK-tree if that ever gets too slow.
+pub fn find_perceptual(conn: &Connection, threshold: u32) -> Result<Vec<DupGroup>, DedupError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content_hash, path, original_filename, file_size, capture_date, phash
+         FROM images
+         WHERE status='present' AND phash IS NOT NULL
+         ORDER BY id",
+    )?;
+    let rows: Vec<(DupImage, u64)> = stmt
+        .query_map([], |r| {
+            let hash: Vec<u8> = r.get(1)?;
+            Ok((
+                DupImage {
+                    id: r.get(0)?,
+                    content_hash: hexs(&hash),
+                    path: r.get(2)?,
+                    filename: r.get(3)?,
+                    file_size: r.get(4)?,
+                    capture_date: r.get(5)?,
+                },
+                r.get::<_, i64>(6)? as u64,
+            ))
+        })?
+        .collect::<core_db::rusqlite::Result<_>>()?;
+
+    let n = rows.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if hamming(rows[i].1, rows[j].1) <= threshold {
+                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+
+    let mut by_root: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let r = root(&mut parent, i);
+        by_root.entry(r).or_default().push(i);
+    }
+    let mut out: Vec<DupGroup> = by_root
+        .into_values()
+        .filter(|idxs| idxs.len() > 1)
+        .map(|idxs| DupGroup {
+            key: format!("p{:016x}", rows[idxs[0]].1),
+            category: "perceptual".to_string(),
+            images: idxs.iter().map(|&i| rows[i].0.clone()).collect(),
+        })
+        .collect();
+    // Stable order: by the smallest image id in each group.
+    out.sort_by_key(|g| g.images.iter().map(|i| i.id).min().unwrap_or(0));
+    Ok(out)
+}
+
 /// Byte-identical duplicates (same whole-file `content_hash`).
 pub fn find_byte_identical(conn: &Connection) -> Result<Vec<DupGroup>, DedupError> {
     grouped_by(conn, "content_hash", "byte")
@@ -93,23 +190,100 @@ pub fn find_same_capture(conn: &Connection) -> Result<Vec<DupGroup>, DedupError>
     grouped_by(conn, "capture_fingerprint", "capture")
 }
 
-/// Trash the given images (never the keeper) and remove their catalog rows. Returns the count trashed.
-pub fn resolve(conn: &Connection, keep_id: i64, trash_ids: &[i64]) -> Result<usize, DedupError> {
-    let mut trashed = 0;
+/// Outcome of a resolve. `trashed_hashes` are the hex content-hashes of the removed images, so the
+/// caller can GC orphaned thumbnails for any hash no longer referenced by a present row (a byte-
+/// identical keeper still shares its hash, so the caller must re-check presence before deleting).
+#[derive(Debug, Default, Clone)]
+pub struct ResolveResult {
+    pub trashed: usize,
+    pub trashed_hashes: Vec<String>,
+}
+
+/// Trash the given images (never the keeper) and remove their catalog rows.
+///
+/// Consistency: each file is sent to the Trash *first*; a row is removed only once its file is gone
+/// (or was already missing). A file that fails to trash keeps its row, so the catalog never points
+/// at a still-present file it thinks it deleted. The row removals then run in a single transaction.
+pub fn resolve(
+    conn: &Connection,
+    keep_id: i64,
+    trash_ids: &[i64],
+) -> Result<ResolveResult, DedupError> {
+    // Snapshot (id, path, hash) for each victim; tolerate rows already gone.
+    let mut victims: Vec<(i64, String, Vec<u8>)> = Vec::new();
     for &id in trash_ids {
         if id == keep_id {
             continue;
         }
-        let path: String =
-            conn.query_row("SELECT path FROM images WHERE id=?1", params![id], |r| {
-                r.get(0)
-            })?;
-        // Route to Trash (never hard unlink). Tolerate an already-missing file.
-        if std::path::Path::new(&path).exists() {
-            trash::delete(&path)?;
+        let row = conn
+            .query_row(
+                "SELECT path, content_hash FROM images WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        if let Some((path, hash)) = row {
+            victims.push((id, path, hash));
         }
-        conn.execute("DELETE FROM images WHERE id=?1", params![id])?;
-        trashed += 1;
     }
-    Ok(trashed)
+
+    // Trash files; collect only those whose file is gone (so the row can be safely removed).
+    let mut to_delete: Vec<i64> = Vec::new();
+    let mut hashes: Vec<String> = Vec::new();
+    for (id, path, hash) in &victims {
+        let p = std::path::Path::new(path);
+        if p.exists() && trash::delete(p).is_err() {
+            continue; // leave the row intact; skip this one
+        }
+        to_delete.push(*id);
+        hashes.push(hexs(hash));
+    }
+
+    // Atomic row removal.
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare("DELETE FROM images WHERE id=?1")?;
+        for id in &to_delete {
+            stmt.execute(params![id])?;
+        }
+    }
+    tx.commit()?;
+
+    Ok(ResolveResult {
+        trashed: to_delete.len(),
+        trashed_hashes: hashes,
+    })
+}
+
+/// Keeper for a group: prefer the largest file (most complete), tiebreak by lowest id (stable /
+/// oldest). Returns `(keep_id, trash_ids)`.
+fn pick_keeper(group: &DupGroup) -> (i64, Vec<i64>) {
+    let keep = group
+        .images
+        .iter()
+        .max_by(|a, b| a.file_size.cmp(&b.file_size).then(b.id.cmp(&a.id)))
+        .map(|i| i.id)
+        .unwrap_or(0);
+    let trash = group
+        .images
+        .iter()
+        .map(|i| i.id)
+        .filter(|&id| id != keep)
+        .collect();
+    (keep, trash)
+}
+
+/// Auto-resolve every byte-identical group: keep one copy, trash the bit-for-bit duplicates. Only
+/// applied to byte-identical groups — same-capture / perceptual matches are intentional variants and
+/// are never auto-trashed. Returns the aggregate outcome.
+pub fn auto_resolve_byte_identical(conn: &Connection) -> Result<ResolveResult, DedupError> {
+    let groups = find_byte_identical(conn)?;
+    let mut out = ResolveResult::default();
+    for g in &groups {
+        let (keep, trash) = pick_keeper(g);
+        let r = resolve(conn, keep, &trash)?;
+        out.trashed += r.trashed;
+        out.trashed_hashes.extend(r.trashed_hashes);
+    }
+    Ok(out)
 }

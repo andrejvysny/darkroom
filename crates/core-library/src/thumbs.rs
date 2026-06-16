@@ -46,4 +46,77 @@ impl ThumbCache {
         std::fs::write(&tmp, jpeg)?;
         std::fs::rename(&tmp, &final_path)
     }
+
+    /// Delete every cached size variant for a content hash (`‹hash›_*.jpg`). Call when an image row
+    /// is removed (dedup resolve, import move) and no other present row shares the hash. Returns the
+    /// number of files deleted. Missing files are not an error.
+    pub fn remove_hash(&self, hash_hex: &str) -> std::io::Result<usize> {
+        let prefix = format!("{hash_hex}_");
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix)
+                && name.ends_with(".jpg")
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Total bytes of cached `.jpg` thumbnails (ignores in-flight `.tmp` files).
+    pub fn total_size(&self) -> std::io::Result<u64> {
+        let mut total = 0;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let is_jpg = name.to_str().is_some_and(|n| n.ends_with(".jpg"));
+            if is_jpg {
+                total += entry.metadata()?.len();
+            }
+        }
+        Ok(total)
+    }
+
+    /// Evict least-recently-used thumbnails until the cache is at or under `cap_bytes`. "Recently
+    /// used" is the file's access time, falling back to modified time (atime is unreliable on some
+    /// mounts). Returns bytes freed. A no-op when already under the cap or the dir is missing.
+    pub fn evict_to(&self, cap_bytes: u64) -> std::io::Result<u64> {
+        // (path, last_used, size) for every cached thumbnail.
+        let mut files: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+        let mut total: u64 = 0;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.to_str().is_some_and(|n| n.ends_with(".jpg")) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            let used = meta
+                .accessed()
+                .or_else(|_| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            total += meta.len();
+            files.push((entry.path(), used, meta.len()));
+        }
+        if total <= cap_bytes {
+            return Ok(0);
+        }
+        // Oldest first; delete until under cap.
+        files.sort_by_key(|(_, used, _)| *used);
+        let mut freed = 0;
+        for (path, _, size) in files {
+            if total <= cap_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= size;
+                freed += size;
+            }
+        }
+        Ok(freed)
+    }
 }

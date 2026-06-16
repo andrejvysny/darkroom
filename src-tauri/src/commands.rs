@@ -13,6 +13,39 @@ use tauri::{AppHandle, Emitter, Manager};
 // v2 adds local adjustment masks (DevelopParams.masks). v1 rows deserialize with masks: [].
 const PROCESS_VERSION: i64 = 2;
 
+/// Delete cached thumbnails for content hashes no longer referenced by any present row. A byte-
+/// identical keeper still shares its hash, so presence is re-checked before deleting (lowercase-hex
+/// compare against the stored BLOB).
+fn gc_orphan_thumbs(
+    conn: &core_db::rusqlite::Connection,
+    thumbs: &core_library::ThumbCache,
+    hashes: &[String],
+) {
+    use core_db::rusqlite::OptionalExtension;
+    for h in hashes {
+        let still_present = conn
+            .query_row(
+                "SELECT 1 FROM images WHERE lower(hex(content_hash)) = ?1 AND status='present' LIMIT 1",
+                [h],
+                |_| Ok(()),
+            )
+            .optional();
+        if matches!(still_present, Ok(None)) {
+            let _ = thumbs.remove_hash(h);
+        }
+    }
+}
+
+/// Evict thumbnails down to the configured cache cap (best-effort). The cap is read under a brief
+/// lock, then released before the (slower) filesystem eviction runs.
+fn enforce_thumb_cap(st: &AppState) {
+    let cap = {
+        let Ok(db) = st.db.lock() else { return };
+        core_library::thumb_cache_cap(&db.conn).unwrap_or(core_library::DEFAULT_THUMB_CACHE_CAP)
+    };
+    let _ = st.thumbs.evict_to(cap);
+}
+
 #[tauri::command]
 pub async fn library_query(app: AppHandle, params: QueryParams) -> Result<Vec<ImageRow>, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -122,6 +155,7 @@ pub async fn library_index_root(app: AppHandle, path: String) -> Result<IndexSta
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        enforce_thumb_cap(&st);
         let _ = app2.emit("import:done", &stats);
         Ok::<_, String>(stats)
     })
@@ -673,7 +707,96 @@ pub async fn dedup_resolve(
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_dedup::resolve(&db.conn, keep_id, &trash_ids).map_err(|e| e.to_string())
+        let res = core_dedup::resolve(&db.conn, keep_id, &trash_ids).map_err(|e| e.to_string())?;
+        gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
+        Ok::<_, String>(res.trashed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Auto-resolve all byte-identical duplicate groups (keep one copy each, trash the rest). Returns
+/// the number of files trashed. Same-capture/perceptual matches are never auto-resolved.
+#[tauri::command]
+pub async fn dedup_resolve_bulk(app: AppHandle) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let res = core_dedup::auto_resolve_byte_identical(&db.conn).map_err(|e| e.to_string())?;
+        gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
+        Ok::<_, String>(res.trashed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Perceptual near-duplicate scan. Lazily computes & persists a dHash for any present image that
+/// lacks one (parallel decode of cached thumbnails, emitting `dedup:progress`), then groups images
+/// within `threshold` Hamming bits. Never auto-trashes — resolution stays manual per group.
+#[tauri::command]
+pub async fn dedup_scan_perceptual(
+    app: AppHandle,
+    threshold: u32,
+) -> Result<Vec<core_dedup::DupGroup>, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+
+        // Present rows lacking a phash: (id, lowercase-hex content hash for the thumb lookup).
+        let todo: Vec<(i64, String)> = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT id, lower(hex(content_hash)) FROM images \
+                     WHERE status='present' AND phash IS NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<core_db::rusqlite::Result<Vec<(i64, String)>>>()
+                .map_err(|e| e.to_string())?;
+            rows
+        };
+
+        // Compute dHashes in parallel from the cached thumbnails, then persist in one transaction.
+        if !todo.is_empty() {
+            let total = todo.len();
+            let done = AtomicUsize::new(0);
+            let computed: Vec<(i64, i64)> = todo
+                .par_iter()
+                .filter_map(|(id, hex)| {
+                    let phash = st
+                        .thumbs
+                        .read(hex, core_library::THUMB_SIZE)
+                        .ok()
+                        .and_then(|bytes| core_dedup::dhash_from_jpeg(&bytes));
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == total || n.is_multiple_of(16) {
+                        let _ = app2
+                            .emit("dedup:progress", serde_json::json!({"done": n, "total": total}));
+                    }
+                    phash.map(|p| (*id, p as i64))
+                })
+                .collect();
+
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+            {
+                let mut s = tx
+                    .prepare("UPDATE images SET phash=?1 WHERE id=?2")
+                    .map_err(|e| e.to_string())?;
+                for (id, p) in &computed {
+                    s.execute(core_db::rusqlite::params![p, id])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_dedup::find_perceptual(&db.conn, threshold).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -715,8 +838,49 @@ pub async fn import_start(
         )
         .map_err(|e| e.to_string())?;
         drop(db);
+        enforce_thumb_cap(&st);
         let _ = app2.emit("import:done", &stats);
         Ok::<_, String>(stats)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------- Settings ----------
+
+/// Configured thumbnail-cache cap in bytes (default when unset).
+#[tauri::command]
+pub async fn thumb_cache_cap(app: AppHandle) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::thumb_cache_cap(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Current on-disk size of the thumbnail cache in bytes.
+#[tauri::command]
+pub async fn thumb_cache_size(app: AppHandle) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        st.thumbs.total_size().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Persist a new thumbnail-cache cap and immediately evict down to it. Returns bytes freed.
+#[tauri::command]
+pub async fn set_thumb_cache_cap(app: AppHandle, bytes: u64) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_thumb_cache_cap(&db.conn, bytes).map_err(|e| e.to_string())?;
+        }
+        st.thumbs.evict_to(bytes).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

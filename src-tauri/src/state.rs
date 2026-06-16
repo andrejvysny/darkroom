@@ -66,6 +66,8 @@ pub struct AppState {
     pub latest_render: AtomicU64,
     /// Histogram of the most recent successful render, for a reliable pull (the event can be missed).
     pub last_histogram: Mutex<Option<Histogram>>,
+    /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
+    pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
 impl AppState {
@@ -80,6 +82,10 @@ impl AppState {
             Db::open(&data_dir.join("catalog.db")).map_err(|e| format!("open catalog: {e}"))?;
         let thumbs =
             ThumbCache::new(data_dir.join("thumbs")).map_err(|e| format!("thumb cache: {e}"))?;
+        // Bound the cache to the configured cap on startup (best-effort).
+        if let Ok(cap) = core_library::thumb_cache_cap(&db.conn) {
+            let _ = thumbs.evict_to(cap);
+        }
 
         // GPU init is best-effort: a missing/incompatible adapter must not break the library.
         let gpu = match GpuContext::new() {
@@ -100,6 +106,7 @@ impl AppState {
             develop_cache: Mutex::new(DevelopLru::default()),
             latest_render: AtomicU64::new(0),
             last_histogram: Mutex::new(None),
+            watcher: Mutex::new(None),
         })
     }
 }

@@ -1,11 +1,20 @@
 import { useState, useEffect, useCallback } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../../store/app";
 import {
   dedupScan,
+  dedupScanPerceptual,
   dedupResolve,
+  dedupResolveBulk,
   thumbUrl,
   type DupGroup,
 } from "../../lib/ipc";
+
+const CATEGORY_LABELS: Record<string, string> = {
+  byte: "Exact duplicate",
+  capture: "Same capture time",
+  perceptual: "Similar photos",
+};
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -34,6 +43,13 @@ export default function DedupModal({ open, onClose, onRefresh }: Props) {
   const [loading, setLoading] = useState(false);
   // keeperId per group key
   const [keepers, setKeepers] = useState<Record<string, number>>({});
+  // Perceptual (near-duplicate) scan controls.
+  const [threshold, setThreshold] = useState(10);
+  const [scanningSimilar, setScanningSimilar] = useState(false);
+  const [fillProgress, setFillProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
 
   const scan = useCallback(async () => {
     setLoading(true);
@@ -52,12 +68,6 @@ export default function DedupModal({ open, onClose, onRefresh }: Props) {
         }
       }
 
-      if (merged.length === 0) {
-        setToast("No duplicates found");
-        onClose();
-        return;
-      }
-
       setGroups(merged);
       // Default keeper = first image in each group
       const defaults: Record<string, number> = {};
@@ -72,6 +82,41 @@ export default function DedupModal({ open, onClose, onRefresh }: Props) {
       setLoading(false);
     }
   }, [setToast, onClose]);
+
+  // Merge freshly-found groups in, keeping existing keeper choices and de-duping by key.
+  const mergeGroups = useCallback((found: DupGroup[]) => {
+    setGroups((prev) => {
+      const seen = new Set(prev.map((g) => g.key));
+      const added = found.filter((g) => !seen.has(g.key));
+      if (added.length === 0) return prev;
+      setKeepers((k) => {
+        const next = { ...k };
+        for (const g of added) if (g.images[0]) next[g.key] = g.images[0].id;
+        return next;
+      });
+      return [...prev, ...added];
+    });
+  }, []);
+
+  const handleSimilarScan = useCallback(async () => {
+    setScanningSimilar(true);
+    setFillProgress(null);
+    const unlisten = await listen<{ done: number; total: number }>(
+      "dedup:progress",
+      (ev) => setFillProgress(ev.payload),
+    );
+    try {
+      const found = await dedupScanPerceptual(threshold);
+      mergeGroups(found);
+      if (found.length === 0) setToast("No similar photos found");
+    } catch (err) {
+      setToast(`Similar scan failed: ${String(err)}`);
+    } finally {
+      unlisten();
+      setScanningSimilar(false);
+      setFillProgress(null);
+    }
+  }, [threshold, mergeGroups, setToast]);
 
   useEffect(() => {
     if (open) void scan();
@@ -105,6 +150,19 @@ export default function DedupModal({ open, onClose, onRefresh }: Props) {
     },
     [keepers, setToast, onRefresh],
   );
+
+  const handleBulkResolve = useCallback(async () => {
+    try {
+      const count = await dedupResolveBulk();
+      setToast(`Trashed ${count} exact duplicate${count === 1 ? "" : "s"}`);
+      onRefresh();
+      await scan(); // refresh remaining (same-capture groups are never auto-resolved)
+    } catch (err) {
+      setToast(`Auto-resolve failed: ${String(err)}`);
+    }
+  }, [setToast, onRefresh, scan]);
+
+  const hasByteGroups = groups.some((g) => g.category === "byte");
 
   if (!open) return null;
 
@@ -197,7 +255,7 @@ export default function DedupModal({ open, onClose, onRefresh }: Props) {
                 fontSize: 13,
               }}
             >
-              All duplicates resolved.
+              No exact duplicates. Try scanning for similar photos below.
             </div>
           )}
 
@@ -231,10 +289,8 @@ export default function DedupModal({ open, onClose, onRefresh }: Props) {
                         color: "var(--color-t3)",
                       }}
                     >
-                      {group.category === "byte"
-                        ? "Exact duplicate"
-                        : "Same capture time"}{" "}
-                      · {group.images.length} files
+                      {CATEGORY_LABELS[group.category] ?? group.category} ·{" "}
+                      {group.images.length} files
                     </span>
                     <button
                       className="tbtn ghost"
@@ -367,27 +423,83 @@ export default function DedupModal({ open, onClose, onRefresh }: Props) {
         </div>
 
         {/* Footer */}
-        {!loading && groups.length > 0 && (
+        {!loading && (
           <div
             style={{
               display: "flex",
               alignItems: "center",
               justifyContent: "space-between",
+              gap: 12,
               padding: "10px 16px",
               borderTop: "1px solid var(--color-line)",
               flexShrink: 0,
             }}
           >
-            <span style={{ fontSize: 12, color: "var(--color-t3)" }}>
-              {groups.length} group{groups.length === 1 ? "" : "s"} remaining
-            </span>
-            <button
-              className="tbtn ghost"
-              onClick={onClose}
-              style={{ fontSize: 12 }}
+            {/* Perceptual (similar-photo) controls */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 12,
+                color: "var(--color-t3)",
+              }}
             >
-              Close
-            </button>
+              <button
+                className="tbtn ghost"
+                onClick={() => void handleSimilarScan()}
+                disabled={scanningSimilar}
+                style={{ fontSize: 12, opacity: scanningSimilar ? 0.6 : 1 }}
+                title="Find visually similar photos (bursts, light edits) by perceptual hash"
+              >
+                {scanningSimilar
+                  ? fillProgress
+                    ? `Hashing ${fillProgress.done}/${fillProgress.total}…`
+                    : "Scanning…"
+                  : "Find similar photos"}
+              </button>
+              <label
+                style={{ display: "flex", alignItems: "center", gap: 5 }}
+                title="Max differing bits — lower = stricter, higher = looser"
+              >
+                <span>Similarity</span>
+                <input
+                  type="range"
+                  min={2}
+                  max={20}
+                  value={threshold}
+                  disabled={scanningSimilar}
+                  onChange={(e) => setThreshold(Number(e.target.value))}
+                  style={{ width: 80, accentColor: "var(--color-accent)" }}
+                />
+                <span style={{ fontFamily: "var(--font-mono)", width: 16 }}>
+                  {threshold}
+                </span>
+              </label>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 12, color: "var(--color-t3)" }}>
+                {groups.length} group{groups.length === 1 ? "" : "s"}
+              </span>
+              {hasByteGroups && (
+                <button
+                  className="tbtn ghost"
+                  onClick={() => void handleBulkResolve()}
+                  style={{ fontSize: 12 }}
+                  title="Keep one copy of each exact duplicate and trash the rest"
+                >
+                  Auto-resolve exact
+                </button>
+              )}
+              <button
+                className="tbtn ghost"
+                onClick={onClose}
+                style={{ fontSize: 12 }}
+              >
+                Close
+              </button>
+            </div>
           </div>
         )}
       </div>

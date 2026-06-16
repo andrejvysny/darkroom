@@ -39,8 +39,9 @@ fn groups_byte_and_capture_then_resolve() {
     // so the Trash step is skipped and only the catalog row is removed.
     let keep = byte[0].images[0].id;
     let drop = byte[0].images[1].id;
-    let n = core_dedup::resolve(&db.conn, keep, &[drop]).unwrap();
-    assert_eq!(n, 1);
+    let res = core_dedup::resolve(&db.conn, keep, &[drop]).unwrap();
+    assert_eq!(res.trashed, 1);
+    assert_eq!(res.trashed_hashes.len(), 1, "one trashed hash reported");
 
     let remaining: i64 = db
         .conn
@@ -62,5 +63,59 @@ fn groups_byte_and_capture_then_resolve() {
     assert_eq!(kept, 1, "keeper preserved");
 
     // After resolve, no more byte-identical groups.
+    assert_eq!(core_dedup::find_byte_identical(&db.conn).unwrap().len(), 0);
+}
+
+fn insert_ph(db: &Db, hash: &[u8], path: &str, phash: u64) {
+    db.conn
+        .execute(
+            "INSERT INTO images(content_hash, file_size, path, original_filename, status, imported_at, phash)
+             VALUES(?1, ?2, ?3, ?4, 'present', 0, ?5)",
+            params![hash, 1000i64, path, path, phash as i64],
+        )
+        .unwrap();
+}
+
+#[test]
+fn perceptual_groups_within_threshold() {
+    let db = Db::open_in_memory().unwrap();
+    let base: u64 = 0x00FF_00FF_00FF_00FF;
+    insert_ph(&db, &[10u8; 32], "a.cr3", base);
+    insert_ph(&db, &[11u8; 32], "b.cr3", base ^ 0b1); // 1 bit from base
+    insert_ph(&db, &[12u8; 32], "c.cr3", base ^ 0b11); // 2 bits from base
+    insert_ph(&db, &[13u8; 32], "d.cr3", !base); // ~64 bits away
+
+    let g = core_dedup::find_perceptual(&db.conn, 4).unwrap();
+    assert_eq!(g.len(), 1, "the three near hashes form one group");
+    assert_eq!(g[0].images.len(), 3);
+    assert_eq!(g[0].category, "perceptual");
+    assert!(
+        !g[0].images.iter().any(|i| i.filename == "d.cr3"),
+        "the far hash is excluded"
+    );
+
+    // Threshold 0: only exact-phash matches group — here none, so no groups.
+    assert_eq!(core_dedup::find_perceptual(&db.conn, 0).unwrap().len(), 0);
+}
+
+#[test]
+fn auto_resolve_keeps_one_per_byte_group() {
+    let db = Db::open_in_memory().unwrap();
+    let (h1, h2) = ([1u8; 32], [2u8; 32]);
+    // Group 1: three identical; Group 2: two identical.
+    insert(&db, &h1, None, "g1a.cr3");
+    insert(&db, &h1, None, "g1b.cr3");
+    insert(&db, &h1, None, "g1c.cr3");
+    insert(&db, &h2, None, "g2a.cr3");
+    insert(&db, &h2, None, "g2b.cr3");
+
+    let res = core_dedup::auto_resolve_byte_identical(&db.conn).unwrap();
+    assert_eq!(res.trashed, 3, "2 + 1 duplicates trashed");
+
+    let count: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "one keeper per group survives");
     assert_eq!(core_dedup::find_byte_identical(&db.conn).unwrap().len(), 0);
 }

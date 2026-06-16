@@ -30,4 +30,5 @@ core-pipeline = { path = "../crates/core-pipeline" }
 core-dedup = { path = "../crates/core-dedup" }
 core-import = { path = "../crates/core-import" }
 rayon = "1"
+notify = "8"
 

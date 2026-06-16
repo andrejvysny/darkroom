@@ -24,6 +24,9 @@ interface ThumbGridProps {
   onSelect: (id: number, mods: SelectMods) => void;
   /** Double-click / Enter activation — opens the full-size loupe preview. */
   onActivate?: (id: number) => void;
+  /** Called when the user scrolls near the end of the loaded rows (infinite scroll). No-op when
+   *  there is nothing more to load; the parent guards against concurrent/over-fetch. */
+  onLoadMore?: () => void;
 }
 
 function StarRow({ count }: { count: number }) {
@@ -54,6 +57,7 @@ export default function ThumbGrid({
   selectedIds,
   onSelect,
   onActivate,
+  onLoadMore,
 }: ThumbGridProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [colCount, setColCount] = useState(4);
@@ -84,6 +88,17 @@ export default function ThumbGrid({
     overscan: 3,
   });
 
+  const virtualRows = rowVirtualizer.getVirtualItems();
+
+  // Infinite scroll: when the last rendered row is within a few rows of the loaded tail, ask the
+  // parent for the next page. onLoadMore is parent-guarded (no-op when nothing more / already
+  // loading), so firing it on every scroll frame is cheap.
+  useEffect(() => {
+    if (!onLoadMore) return;
+    const last = virtualRows[virtualRows.length - 1];
+    if (last && last.index >= rowCount - 3) onLoadMore();
+  }, [virtualRows, rowCount, onLoadMore]);
+
   return (
     <div
       ref={containerRef}
@@ -101,7 +116,7 @@ export default function ThumbGrid({
           padding: "14px",
         }}
       >
-        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+        {virtualRows.map((virtualRow) => {
           const startIdx = virtualRow.index * colCount;
           const rowImages = images.slice(startIdx, startIdx + colCount);
           return (

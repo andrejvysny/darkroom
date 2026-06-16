@@ -28,6 +28,8 @@ interface AppState {
   setOnImport: (fn: (() => void) | null) => void;
   onOpenDedup: (() => void) | null;
   setOnOpenDedup: (fn: (() => void) | null) => void;
+  onOpenSettings: (() => void) | null;
+  setOnOpenSettings: (fn: (() => void) | null) => void;
   onSearch: ((query: string) => void) | null;
   setOnSearch: (fn: ((query: string) => void) | null) => void;
   onDevelopReset: (() => void) | null;
@@ -57,6 +59,8 @@ export const useAppStore = create<AppState>((set) => ({
   setOnImport: (fn) => set({ onImport: fn }),
   onOpenDedup: null,
   setOnOpenDedup: (fn) => set({ onOpenDedup: fn }),
+  onOpenSettings: null,
+  setOnOpenSettings: (fn) => set({ onOpenSettings: fn }),
   onSearch: null,
   setOnSearch: (fn) => set({ onSearch: fn }),
   onDevelopReset: null,

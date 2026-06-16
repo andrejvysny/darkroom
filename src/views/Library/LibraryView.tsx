@@ -39,6 +39,7 @@ import SelectionBar from "./SelectionBar";
 import Loupe from "./Loupe";
 import DedupModal from "./DedupModal";
 import ImportModal from "./ImportModal";
+import SettingsModal from "./SettingsModal";
 
 // Map color label name to CSS var for the dot color in ThumbGrid
 const LABEL_COLOR_MAP: Record<string, string> = {
@@ -73,9 +74,11 @@ export default function LibraryView() {
   const setLibraryImages = useAppStore((s) => s.setLibraryImages);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnOpenDedup = useAppStore((s) => s.setOnOpenDedup);
+  const setOnOpenSettings = useAppStore((s) => s.setOnOpenSettings);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
   const [selectedCollections, setSelectedCollections] = useState<
     CollectionRow[]
@@ -87,13 +90,21 @@ export default function LibraryView() {
   useEffect(() => {
     setOnImport(() => setImportOpen(true));
     setOnOpenDedup(() => setDedupOpen(true));
+    setOnOpenSettings(() => setSettingsOpen(true));
     setOnSearch((q: string) => lib.setSearch(q.trim() ? q.trim() : null));
     return () => {
       setOnImport(null);
       setOnOpenDedup(null);
+      setOnOpenSettings(null);
       setOnSearch(null);
     };
-  }, [lib.setSearch, setOnImport, setOnOpenDedup, setOnSearch]);
+  }, [
+    lib.setSearch,
+    setOnImport,
+    setOnOpenDedup,
+    setOnOpenSettings,
+    setOnSearch,
+  ]);
 
   // Keep a valid primary selection: if it's unset or no longer in the current (filtered) set,
   // fall back to the first visible image.
@@ -518,6 +529,7 @@ export default function LibraryView() {
                   setSelectedId(id);
                   setGridMode("loupe");
                 }}
+                onLoadMore={lib.loadMore}
               />
             </>
           )}
@@ -560,6 +572,11 @@ export default function LibraryView() {
           setImportOpen(false);
           void runImport(mode, () => void lib.refresh());
         }}
+      />
+
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
       />
     </div>
   );

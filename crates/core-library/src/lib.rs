@@ -7,6 +7,8 @@ pub mod error;
 pub mod index;
 pub mod keywords;
 pub mod query;
+pub mod reconcile;
+pub mod settings;
 pub mod thumbs;
 
 pub use collections::{
@@ -26,5 +28,9 @@ pub use keywords::{
 };
 pub use query::{
     count_images, image_by_id, list_folders, query_images, FolderRow, ImageRow, QueryParams,
+};
+pub use reconcile::{reconcile, ReconcileStats};
+pub use settings::{
+    get_meta, set_meta, set_thumb_cache_cap, thumb_cache_cap, DEFAULT_THUMB_CACHE_CAP,
 };
 pub use thumbs::ThumbCache;

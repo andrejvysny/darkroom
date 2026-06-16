@@ -18,6 +18,7 @@ export default function CommandPalette() {
   const selectedId = useAppStore((s) => s.selectedId);
   const onImport = useAppStore((s) => s.onImport);
   const onOpenDedup = useAppStore((s) => s.onOpenDedup);
+  const onOpenSettings = useAppStore((s) => s.onOpenSettings);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -52,6 +53,12 @@ export default function CommandPalette() {
       label: "Export selected…",
       shortcut: "⌘E",
       run: () => void runExport(selectedId),
+    },
+    {
+      icon: "bolt",
+      label: "Settings…",
+      shortcut: "⌘,",
+      run: () => onOpenSettings?.(),
     },
   ];
 
