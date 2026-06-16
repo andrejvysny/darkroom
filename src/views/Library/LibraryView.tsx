@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useState, useRef } from "react";
 import { useAppStore } from "../../store/app";
 import { useLibrary } from "../../lib/useLibrary";
 import {
@@ -262,16 +262,20 @@ export default function LibraryView() {
   );
 
   // ---- Multi-select ----
+  // Fixed range anchor: set by plain/cmd click, NOT moved by shift-click, so a shift range can be
+  // grown/shrunk from a stable pivot (Finder/Lightroom semantics).
+  const anchorRef = useRef<number | null>(null);
   const handleSelect = useCallback(
     (id: number, mods: SelectMods) => {
       const order = lib.images.map((i) => i.id);
-      if (mods.shift && selectedId != null) {
-        const a = order.indexOf(selectedId);
+      if (mods.shift) {
+        const anchor = anchorRef.current ?? selectedId;
+        const a = anchor != null ? order.indexOf(anchor) : -1;
         const b = order.indexOf(id);
         if (a !== -1 && b !== -1) {
           const [lo, hi] = a <= b ? [a, b] : [b, a];
           setSelection(order.slice(lo, hi + 1), id);
-          return;
+          return; // anchor stays put
         }
       }
       if (mods.meta) {
@@ -280,9 +284,11 @@ export default function LibraryView() {
         else set.add(id);
         const next = order.filter((x) => set.has(x)); // preserve grid order
         const primary = set.has(id) ? id : (next[next.length - 1] ?? null);
+        anchorRef.current = id;
         setSelection(next, primary);
         return;
       }
+      anchorRef.current = id;
       setSelectedId(id);
     },
     [lib.images, selectedId, selectedIds, setSelection, setSelectedId],

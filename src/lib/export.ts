@@ -54,11 +54,17 @@ export async function runBatchExport(
 
   let done = 0;
   let failed = 0;
+  // De-duplicate destination basenames so two sources sharing a name (common across cards)
+  // don't silently clobber each other. Compare case-insensitively (macOS APFS default).
+  const used = new Set<string>();
   for (const { id, filename } of items) {
     try {
       const params = await developGetEdit(id);
       const base = filename.replace(/\.[^.]+$/, "");
-      const dest = `${dir}/${base}.jpg`;
+      let name = base;
+      for (let n = 1; used.has(name.toLowerCase()); n++) name = `${base}-${n}`;
+      used.add(name.toLowerCase());
+      const dest = `${dir}/${name}.jpg`;
       await exportImage(id, params, "jpeg", dest);
       done += 1;
     } catch {
