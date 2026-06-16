@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Library — RAW Editor</title>
+<style>
+:root{
+  --bg-stage:#121213; --bg-app:#1b1b1d; --bg-panel:#232325; --bg-elev:#2b2b2e; --bg-hover:#303034;
+  --line:rgba(255,255,255,.07); --line-2:rgba(255,255,255,.12);
+  --t1:#e9e9ec; --t2:#9c9ca3; --t3:#66666c;
+  --accent:#5b93cf; --accent-dim:rgba(91,147,207,.16); --accent-line:rgba(91,147,207,.55);
+  --pick:#6db074; --reject:#c56d6d; --star:#d8b15a;
+  --lab-red:#c56d6d; --lab-yellow:#cdb95a; --lab-green:#6db074; --lab-blue:#5b93cf; --lab-purple:#9a7fc0;
+  --r-sm:6px; --r-md:9px; --r-lg:12px;
+  --ui:-apple-system,system-ui,"SF Pro Text","Segoe UI",sans-serif;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg-app);color:var(--t1);font-family:var(--ui);font-size:13px;-webkit-font-smoothing:antialiased;overflow:hidden}
+button{font-family:inherit;color:inherit;background:none;border:none;cursor:pointer}
+::selection{background:var(--accent-dim)}
+
+.app{display:grid;grid-template-rows:46px 1fr 40px;height:100vh}
+
+/* ---- Top bar ---- */
+.topbar{display:flex;align-items:center;gap:16px;padding:0 14px;background:var(--bg-app);border-bottom:1px solid var(--line)}
+.lights{display:flex;gap:8px;margin-right:4px}
+.lights i{width:12px;height:12px;border-radius:50%;display:block}
+.lights i:nth-child(1){background:#e0655b}.lights i:nth-child(2){background:#dba84a}.lights i:nth-child(3){background:#62b95a}
+.seg{display:flex;background:var(--bg-elev);border:1px solid var(--line);border-radius:var(--r-sm);padding:2px}
+.seg button{padding:4px 13px;border-radius:4px;font-size:12.5px;font-weight:500;color:var(--t2)}
+.seg button.on{background:var(--bg-hover);color:var(--t1);box-shadow:0 1px 0 rgba(0,0,0,.25)}
+.search{flex:1;max-width:420px;display:flex;align-items:center;gap:8px;background:var(--bg-panel);border:1px solid var(--line);border-radius:var(--r-sm);padding:6px 10px;color:var(--t3)}
+.search input{flex:1;background:none;border:none;color:var(--t1);font-size:12.5px;outline:none}
+.search input::placeholder{color:var(--t3)}
+.spacer{flex:1}
+.tbtn{display:flex;align-items:center;gap:7px;padding:6px 11px;border-radius:var(--r-sm);color:var(--t2);font-size:12.5px;font-weight:500;border:1px solid transparent}
+.tbtn:hover{background:var(--bg-elev);color:var(--t1)}
+.tbtn.ghost{border-color:var(--line)}
+.kbd{font-family:var(--mono);font-size:11px;background:var(--bg-elev);border:1px solid var(--line);border-radius:4px;padding:2px 6px;color:var(--t2)}
+
+/* ---- Main ---- */
+.main{display:grid;grid-template-columns:208px 1fr 264px;min-height:0}
+.col{min-height:0;overflow:auto}
+.left{background:var(--bg-app);border-right:1px solid var(--line);padding:10px 8px}
+.right{background:var(--bg-app);border-left:1px solid var(--line)}
+.center{background:var(--bg-stage);position:relative}
+
+/* scrollbars */
+.col::-webkit-scrollbar{width:10px}
+.col::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:6px;border:3px solid transparent;background-clip:content-box}
+.col::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.16);background-clip:content-box}
+
+/* left nav */
+.nav-h{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--t3);font-weight:600;padding:12px 8px 6px}
+.nav-h:first-child{padding-top:2px}
+.nav-i{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:var(--r-sm);color:var(--t2);font-size:12.5px;cursor:pointer;position:relative}
+.nav-i:hover{background:var(--bg-panel);color:var(--t1)}
+.nav-i.on{background:var(--accent-dim);color:var(--t1)}
+.nav-i.on::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:2px;border-radius:2px;background:var(--accent)}
+.nav-i .ico{width:14px;height:14px;flex:none;color:var(--t3)}
+.nav-i.on .ico,.nav-i:hover .ico{color:var(--t2)}
+.nav-i .ct{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--t3)}
+.nav-i.child{padding-left:24px;font-size:12px}
+
+/* grid */
+.gridwrap{padding:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
+.cell{position:relative;aspect-ratio:3/2;border-radius:var(--r-sm);overflow:hidden;cursor:pointer;outline:1px solid var(--line);background:#000}
+.cell .ph{position:absolute;inset:0}
+.cell::after{content:"";position:absolute;inset:0;box-shadow:inset 0 0 40px rgba(0,0,0,.35);pointer-events:none}
+.cell .ov{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;padding:7px;opacity:0;transition:opacity .12s;background:linear-gradient(180deg,rgba(0,0,0,.35),transparent 30%,transparent 60%,rgba(0,0,0,.55))}
+.cell:hover .ov,.cell.sel .ov,.cell.has .ov{opacity:1}
+.cell.sel{outline:2px solid var(--accent);outline-offset:0}
+.ov-top{display:flex;align-items:center}
+.lab{width:9px;height:9px;border-radius:50%;box-shadow:0 0 0 2px rgba(0,0,0,.3)}
+.flag{margin-left:auto;font-size:11px;font-weight:600;display:flex;align-items:center;gap:3px}
+.flag.pick{color:var(--pick)} .flag.reject{color:var(--reject)}
+.ov-bot{display:flex;align-items:center;justify-content:space-between}
+.stars{display:flex;gap:1px}
+.stars svg{width:11px;height:11px}
+.fname{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,.78);text-shadow:0 1px 2px rgba(0,0,0,.6)}
+
+/* right info */
+.rp{padding:0}
+.rp-prev{aspect-ratio:3/2;margin:14px;border-radius:var(--r-md);overflow:hidden;outline:1px solid var(--line);position:relative}
+.rp-prev::after{content:"";position:absolute;inset:0;box-shadow:inset 0 0 50px rgba(0,0,0,.4)}
+.sec{padding:14px 16px;border-top:1px solid var(--line)}
+.sec-h{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--t3);font-weight:600;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between}
+.meta{display:grid;grid-template-columns:auto 1fr;gap:7px 14px;font-size:12px}
+.meta dt{color:var(--t3)}
+.meta dd{color:var(--t1);font-family:var(--mono);font-size:11.5px;text-align:right}
+.hist{height:64px;border-radius:var(--r-sm);background:var(--bg-stage);outline:1px solid var(--line);overflow:hidden}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-size:11.5px;color:var(--t2);background:var(--bg-elev);border:1px solid var(--line);border-radius:20px;padding:3px 9px}
+.chip.add{color:var(--t3);border-style:dashed;cursor:pointer}
+.rate-row{display:flex;align-items:center;gap:10px}
+.rate-row .stars svg{width:16px;height:16px;cursor:pointer}
+.pillbtn{display:flex;gap:6px}
+.pillbtn button{flex:1;padding:6px;border-radius:var(--r-sm);border:1px solid var(--line);color:var(--t2);font-size:12px;font-weight:500}
+.pillbtn button.on.p{color:var(--pick);border-color:rgba(109,176,116,.4);background:rgba(109,176,116,.1)}
+.pillbtn button.on.r{color:var(--reject);border-color:rgba(197,109,109,.4);background:rgba(197,109,109,.1)}
+
+/* ---- Bottom bar ---- */
+.bottombar{display:flex;align-items:center;gap:16px;padding:0 14px;background:var(--bg-app);border-top:1px solid var(--line);font-size:12px;color:var(--t2)}
+.bcount{font-family:var(--mono);font-size:11.5px;color:var(--t3)}
+.fbar{display:flex;align-items:center;gap:6px}
+.fchip{display:flex;align-items:center;gap:5px;padding:4px 9px;border-radius:20px;border:1px solid var(--line);color:var(--t2);font-size:12px;cursor:pointer}
+.fchip.on{background:var(--accent-dim);border-color:var(--accent-line);color:var(--t1)}
+.sizer{display:flex;align-items:center;gap:8px;margin-left:auto}
+.sizer input{width:96px}
+.viewtog{display:flex;background:var(--bg-elev);border:1px solid var(--line);border-radius:var(--r-sm);padding:2px}
+.viewtog button{padding:3px 8px;border-radius:4px;color:var(--t3)}
+.viewtog button.on{background:var(--bg-hover);color:var(--t1)}
+.viewtog svg{width:14px;height:14px;display:block}
+
+input[type=range]{-webkit-appearance:none;height:3px;background:var(--bg-hover);border-radius:3px;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--t1);border:2px solid var(--bg-app);cursor:pointer}
+
+.icon{width:14px;height:14px;display:block;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+/* command palette */
+.palette-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);backdrop-filter:blur(2px);display:none;align-items:flex-start;justify-content:center;padding-top:14vh;z-index:50}
+.palette-bg.open{display:flex}
+.palette{width:560px;max-width:92vw;background:#26262a;border:1px solid var(--line-2);border-radius:var(--r-lg);box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden}
+.palette .pin{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.palette input{flex:1;background:none;border:none;color:var(--t1);font-size:15px;outline:none}
+.palette .row{display:flex;align-items:center;gap:11px;padding:10px 16px;color:var(--t2);font-size:13px}
+.palette .row.on{background:var(--accent-dim);color:var(--t1)}
+.palette .row .k{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--t3)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="lights"><i></i><i></i><i></i></div>
+    <div class="seg">
+      <button class="on">Library</button>
+      <button onclick="location.href='edit-screen.html'">Develop</button>
+    </div>
+    <label class="search">
+      <svg class="icon"><use href="#i-search"/></svg>
+      <input placeholder="Search filename, camera, keyword…">
+    </label>
+    <div class="spacer"></div>
+    <button class="tbtn ghost"><svg class="icon"><use href="#i-import"/></svg>Import</button>
+    <button class="tbtn ghost"><svg class="icon"><use href="#i-copy"/></svg>Find duplicates</button>
+    <button class="tbtn" onclick="openPalette()"><svg class="icon"><use href="#i-cmd"/></svg><span class="kbd">⌘K</span></button>
+  </header>
+
+  <!-- MAIN -->
+  <div class="main">
+
+    <!-- LEFT: sources -->
+    <aside class="col left">
+      <div class="nav-h">Catalog</div>
+      <div class="nav-i on"><svg class="ico icon"><use href="#i-photos"/></svg>All photos<span class="ct">52,418</span></div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-flag"/></svg>Picks<span class="ct">1,204</span></div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-clock"/></svg>Recent import<span class="ct">316</span></div>
+
+      <div class="nav-h">Folders</div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-folder"/></svg>2026<span class="ct">8,902</span></div>
+      <div class="nav-i child"><svg class="ico icon"><use href="#i-folder"/></svg>2026-06-15<span class="ct">316</span></div>
+      <div class="nav-i child"><svg class="ico icon"><use href="#i-folder"/></svg>2026-06-02<span class="ct">441</span></div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-folder"/></svg>2025<span class="ct">21,640</span></div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-folder"/></svg>2024<span class="ct">21,876</span></div>
+
+      <div class="nav-h">Collections</div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-stack"/></svg>Portfolio<span class="ct">96</span></div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-stack"/></svg>Print queue<span class="ct">12</span></div>
+
+      <div class="nav-h">Smart</div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-bolt"/></svg>★★★★+<span class="ct">2,051</span></div>
+      <div class="nav-i"><svg class="ico icon"><use href="#i-bolt"/></svg>Untagged<span class="ct">7,330</span></div>
+    </aside>
+
+    <!-- CENTER: grid -->
+    <section class="col center">
+      <div class="gridwrap"><div class="grid" id="grid"></div></div>
+    </section>
+
+    <!-- RIGHT: info -->
+    <aside class="col right rp">
+      <div class="rp-prev" id="rpPrev"></div>
+
+      <div class="sec">
+        <div class="sec-h">Rating</div>
+        <div class="rate-row">
+          <div class="stars" id="rpStars"></div>
+          <div class="pillbtn" style="flex:1">
+            <button class="on p">Pick</button>
+            <button class="r">Reject</button>
+          </div>
+        </div>
+        <div class="chips" style="margin-top:12px">
+          <span style="display:flex;gap:6px;align-items:center">
+            <span class="lab" style="background:var(--lab-red)"></span>
+            <span class="lab" style="background:var(--lab-yellow)"></span>
+            <span class="lab" style="background:var(--lab-green);box-shadow:0 0 0 2px var(--accent-line)"></span>
+            <span class="lab" style="background:var(--lab-blue)"></span>
+            <span class="lab" style="background:var(--lab-purple)"></span>
+          </span>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-h">Histogram</div>
+        <div class="hist"><svg id="histSvg" width="100%" height="100%" viewBox="0 0 232 64" preserveAspectRatio="none"></svg></div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-h">Metadata</div>
+        <dl class="meta">
+          <dt>Camera</dt><dd>Sony α7 IV</dd>
+          <dt>Lens</dt><dd>FE 35mm F1.4</dd>
+          <dt>Focal</dt><dd>35 mm</dd>
+          <dt>Aperture</dt><dd>f/2.0</dd>
+          <dt>Shutter</dt><dd>1/400 s</dd>
+          <dt>ISO</dt><dd>320</dd>
+          <dt>Size</dt><dd>7008×4672</dd>
+          <dt>Date</dt><dd>2026-06-15</dd>
+          <dt>File</dt><dd>DSC00481.ARW</dd>
+        </dl>
+      </div>
+
+      <div class="sec">
+        <div class="sec-h">Keywords</div>
+        <div class="chips">
+          <span class="chip">coast</span>
+          <span class="chip">golden hour</span>
+          <span class="chip">travel</span>
+          <span class="chip add">+ add</span>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- BOTTOM BAR -->
+  <footer class="bottombar">
+    <span class="bcount">316 photos · 1 selected</span>
+    <div class="fbar">
+      <span class="fchip on"><svg class="icon" style="width:12px;height:12px"><use href="#i-star"/></svg>≥ 3</span>
+      <span class="fchip"><svg class="icon" style="width:12px;height:12px"><use href="#i-flag"/></svg>Picks</span>
+      <span class="fchip">Unrated</span>
+    </div>
+    <div class="sizer">
+      <span style="color:var(--t3);font-size:12px">Sort: Capture date ↓</span>
+      <svg class="icon" style="color:var(--t3)"><use href="#i-grid-sm"/></svg>
+      <input type="range" min="110" max="240" value="150" id="sizeRange">
+      <svg class="icon" style="color:var(--t3)"><use href="#i-grid-lg"/></svg>
+      <div class="viewtog">
+        <button class="on" title="Grid"><svg><use href="#i-grid"/></svg></button>
+        <button title="Loupe"><svg><use href="#i-square"/></svg></button>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- COMMAND PALETTE -->
+<div class="palette-bg" id="paletteBg" onclick="if(event.target===this)closePalette()">
+  <div class="palette">
+    <div class="pin"><svg class="icon" style="width:18px;height:18px;color:var(--t3)"><use href="#i-cmd"/></svg><input placeholder="Type a command…" id="palInput"></div>
+    <div class="row on"><svg class="icon" style="color:var(--t2)"><use href="#i-import"/></svg>Import from SD card…<span class="k">⌘I</span></div>
+    <div class="row"><svg class="icon" style="color:var(--t2)"><use href="#i-copy"/></svg>Find duplicates<span class="k">⌘D</span></div>
+    <div class="row"><svg class="icon" style="color:var(--t2)"><use href="#i-flag"/></svg>Flag as pick<span class="k">P</span></div>
+    <div class="row"><svg class="icon" style="color:var(--t2)"><use href="#i-edit"/></svg>Open in Develop<span class="k">D</span></div>
+    <div class="row"><svg class="icon" style="color:var(--t2)"><use href="#i-export"/></svg>Export selected…<span class="k">⌘E</span></div>
+  </div>
+</div>
+
+<!-- ICON SPRITES -->
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <g id="i-search"><circle cx="6.5" cy="6.5" r="5"/><path d="M11 11l3 3"/></g>
+    <g id="i-cmd"><path d="M5 2a3 3 0 1 0 0 6h6a3 3 0 1 0 0-6 3 3 0 0 0-3 3v6a3 3 0 1 0 3-3H5a3 3 0 1 0 3 3"/></g>
+    <g id="i-import"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10"/></g>
+    <g id="i-export"><path d="M8 11V3m0 0l-3 3m3-3l3 3M3 13h10"/></g>
+    <g id="i-copy"><rect x="5" y="5" width="8" height="8" rx="1.5"/><path d="M3 11V4a1 1 0 0 1 1-1h7"/></g>
+    <g id="i-photos"><rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><circle cx="6" cy="7" r="1.2"/><path d="M3 12l3-2.5L9 11l2-1.5 2 1.5"/></g>
+    <g id="i-folder"><path d="M2.5 4.5a1 1 0 0 1 1-1h2.8l1.2 1.4H12.5a1 1 0 0 1 1 1v5.6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/></g>
+    <g id="i-flag"><path d="M4 2.5v11M4 3h7l-1.4 2.4L11 8H4"/></g>
+    <g id="i-clock"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.4"/></g>
+    <g id="i-stack"><path d="M8 2.5l5.5 3-5.5 3-5.5-3z"/><path d="M2.5 8.5L8 11.5l5.5-3"/></g>
+    <g id="i-bolt"><path d="M9 2L4 9h3l-1 5 5-7H8z"/></g>
+    <g id="i-star"><path d="M8 2.2l1.7 3.6 3.9.5-2.9 2.7.8 3.9L8 11l-3.5 1.9.8-3.9L2.4 6.3l3.9-.5z"/></g>
+    <g id="i-edit"><path d="M10.5 2.5l3 3L6 13l-3.5.5L3 10z"/></g>
+    <g id="i-grid"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/></g>
+    <g id="i-square"><rect x="2.5" y="2.5" width="11" height="11" rx="1.5"/></g>
+    <g id="i-grid-sm"><rect x="3" y="3" width="3" height="3"/><rect x="7" y="3" width="3" height="3"/><rect x="3" y="7" width="3" height="3"/><rect x="7" y="7" width="3" height="3"/></g>
+    <g id="i-grid-lg"><rect x="2.5" y="2.5" width="5" height="5"/><rect x="8.5" y="2.5" width="5" height="5"/></g>
+  </defs>
+</svg>
+
+<script>
+const STAR=(f)=>`<svg viewBox="0 0 16 16" fill="${f?'var(--star)':'none'}" stroke="${f?'var(--star)':'var(--t3)'}" stroke-width="1.2"><path d="M8 2.2l1.7 3.6 3.9.5-2.9 2.7.8 3.9L8 11l-3.5 1.9.8-3.9L2.4 6.3l3.9-.5z"/></svg>`;
+function stars(n){let s='';for(let i=0;i<5;i++)s+=STAR(i<n);return s;}
+
+// photographic-ish gradient placeholders (desaturated)
+const PH=[
+ 'linear-gradient(160deg,#3a4a5c,#1d2733 70%)',
+ 'linear-gradient(160deg,#6b5340,#2a211a 70%)',
+ 'radial-gradient(120% 90% at 30% 20%,#7a6a4a,#2b2519 75%)',
+ 'linear-gradient(160deg,#41584f,#1a2420 70%)',
+ 'linear-gradient(200deg,#8a6a5a,#33241f 70%)',
+ 'radial-gradient(120% 100% at 70% 30%,#566a82,#1c242e 75%)',
+ 'linear-gradient(160deg,#5a5560,#23212a 70%)',
+ 'linear-gradient(150deg,#9a7e5a,#3a2e1f 72%)',
+ 'radial-gradient(120% 90% at 40% 80%,#3f5560,#161d20 75%)',
+ 'linear-gradient(170deg,#705a6a,#271f25 70%)',
+ 'linear-gradient(160deg,#4a6157,#1b241f 70%)',
+ 'radial-gradient(120% 100% at 60% 20%,#a98a62,#3c2f20 75%)',
+];
+const LAB=['','','var(--lab-green)','','var(--lab-red)','','var(--lab-blue)','','','var(--lab-yellow)','',''];
+const grid=document.getElementById('grid');
+let html='';
+for(let i=0;i<48;i++){
+  const g=PH[i%PH.length];
+  const r=[5,4,3,0,4,5,2,3,5,4,0,3][i%12];
+  const lab=LAB[i%LAB.length];
+  const pick=(i%7===0), reject=(i%11===4);
+  const sel=i===6;
+  html+=`<div class="cell ${sel?'sel':''} ${(lab||pick||reject)?'':''}" data-i="${i}" onclick="selectCell(this)">
+    <div class="ph" style="background:${g}"></div>
+    <div class="ov">
+      <div class="ov-top">${lab?`<span class="lab" style="background:${lab}"></span>`:''}
+        ${pick?'<span class="flag pick">●</span>':reject?'<span class="flag reject">⌀</span>':''}</div>
+      <div class="ov-bot"><div class="stars">${stars(r)}</div><span class="fname">DSC00${(481+i)}.ARW</span></div>
+    </div></div>`;
+}
+grid.innerHTML=html;
+document.getElementById('rpPrev').style.background=PH[6];
+document.getElementById('rpStars').innerHTML=stars(2);
+
+function selectCell(el){
+  document.querySelectorAll('.cell.sel').forEach(c=>c.classList.remove('sel'));
+  el.classList.add('sel');
+  document.getElementById('rpPrev').style.background=el.querySelector('.ph').style.background;
+}
+// thumbnail sizer
+document.getElementById('sizeRange').addEventListener('input',e=>{
+  grid.style.gridTemplateColumns=`repeat(auto-fill,minmax(${e.target.value}px,1fr))`;
+});
+// histogram
+(function(){
+  const svg=document.getElementById('histSvg');const W=232,H=64;
+  function path(seed,scale){let d=`M0 ${H} `;for(let x=0;x<=W;x+=4){const v=Math.sin(x*0.05+seed)*Math.cos(x*0.013+seed*2);const y=H-(0.5+0.5*v)*H*scale*(0.4+0.6*Math.exp(-Math.pow((x-W*0.45)/110,2)));d+=`L${x} ${y.toFixed(1)} `;}return d+`L${W} ${H} Z`;}
+  const cols=[['#c56d6d',1.5],['#6db074',2],['#5b93cf',1.7]];
+  cols.forEach(([c,s],i)=>{const p=document.createElementNS('http://www.w3.org/2000/svg','path');p.setAttribute('d',path(i*2.1,s));p.setAttribute('fill',c);p.setAttribute('opacity','0.5');p.style.mixBlendMode='screen';svg.appendChild(p);});
+})();
+// palette
+function openPalette(){document.getElementById('paletteBg').classList.add('open');setTimeout(()=>document.getElementById('palInput').focus(),20);}
+function closePalette(){document.getElementById('paletteBg').classList.remove('open');}
+document.addEventListener('keydown',e=>{
+  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette();}
+  if(e.key==='Escape')closePalette();
+});
+</script>
+</body>
+</html>

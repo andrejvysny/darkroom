@@ -1,0 +1,142 @@
+@import "tailwindcss";
+
+@theme {
+  /* Colors */
+  --color-stage: #121213;
+  --color-stage-dev: #101011;
+  --color-app: #1b1b1d;
+  --color-panel: #232325;
+  --color-elev: #2b2b2e;
+  --color-hover: #303034;
+
+  --color-t1: #e9e9ec;
+  --color-t2: #9c9ca3;
+  --color-t3: #66666c;
+
+  --color-accent: #5b93cf;
+  --color-accent-dim: rgba(91, 147, 207, 0.16);
+  --color-accent-line: rgba(91, 147, 207, 0.55);
+
+  --color-pick: #6db074;
+  --color-reject: #c56d6d;
+  --color-star: #d8b15a;
+
+  --color-lab-red: #c56d6d;
+  --color-lab-yellow: #cdb95a;
+  --color-lab-green: #6db074;
+  --color-lab-blue: #5b93cf;
+  --color-lab-purple: #9a7fc0;
+
+  --color-line: rgba(255, 255, 255, 0.07);
+  --color-line-2: rgba(255, 255, 255, 0.12);
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+
+  /* Fonts */
+  --font-ui: -apple-system, system-ui, "SF Pro Text", "Segoe UI", sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", monospace;
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    background: var(--color-app);
+    color: var(--color-t1);
+    font-family: var(--font-ui);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  button {
+    font-family: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: var(--color-accent-dim);
+  }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.16);
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* Range inputs */
+  input[type="range"] {
+    -webkit-appearance: none;
+    height: 3px;
+    background: var(--color-hover);
+    border-radius: 3px;
+    outline: none;
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: var(--color-t1);
+    border: 2px solid var(--color-app);
+    cursor: pointer;
+  }
+}
+
+/* Shared utility classes used across components */
+.tbtn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px;
+  border-radius: var(--radius-sm);
+  color: var(--color-t2);
+  font-size: 12.5px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  flex: none;
+}
+.tbtn:hover {
+  background: var(--color-elev);
+  color: var(--color-t1);
+}
+.tbtn.ghost {
+  border-color: var(--color-line);
+}

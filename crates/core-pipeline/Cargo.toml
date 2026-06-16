@@ -1,0 +1,17 @@
+[package]
+name = "core-pipeline"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-raw = { path = "../core-raw" }
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+image = "0.25"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+anyhow = "1"

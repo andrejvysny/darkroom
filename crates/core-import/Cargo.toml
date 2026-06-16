@@ -1,0 +1,17 @@
+[package]
+name = "core-import"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-db = { path = "../core-db" }
+core-raw = { path = "../core-raw" }
+core-library = { path = "../core-library" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+trash = "5"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"

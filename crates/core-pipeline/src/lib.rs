@@ -1,0 +1,22 @@
+//! core-pipeline — GPU (wgpu/Metal) develop pipeline.
+//!
+//! Input: a cached linear, color-managed RGB f32 buffer (from `core_raw::develop_linear`).
+//! GPU applies the interactive downstream modules (WB tweak, exposure, contrast, highlights/
+//! shadows, saturation, display transform) and outputs RGBA8 for the webview canvas / export.
+
+pub mod backend;
+pub mod curve;
+pub mod encode;
+pub mod error;
+pub mod histogram;
+pub mod params;
+
+pub use backend::{DevelopPipeline, GpuContext};
+pub use curve::build_lut;
+pub use encode::{rgba8_to_jpeg, rgba8_to_png};
+pub use error::PipelineError;
+pub use histogram::{histogram, Histogram};
+pub use params::{CurvePoint, DevelopParams, HslBand, ToneCurve};
+
+// Re-export the linear buffer type for convenience.
+pub use core_raw::LinearImage;
