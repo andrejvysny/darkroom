@@ -13,11 +13,13 @@ import {
   keywordAddToImage,
   keywordAddToImages,
   keywordRemoveFromImage,
+  keywordDelete,
   collectionsForImage,
   collectionAddImages,
   collectionRemoveImages,
   collectionCreate,
   collectionDelete,
+  collectionRename,
   smartQueryFromParams,
 } from "../../lib/ipc";
 import type {
@@ -91,9 +93,13 @@ export default function LibraryView() {
     };
   }, [lib.setSearch, setOnImport, setOnOpenDedup, setOnSearch]);
 
-  // Default selection to first image after load
+  // Keep a valid primary selection: if it's unset or no longer in the current (filtered) set,
+  // fall back to the first visible image.
   useEffect(() => {
-    if (selectedId === null && lib.images.length > 0) {
+    if (
+      lib.images.length > 0 &&
+      !lib.images.some((img) => img.id === selectedId)
+    ) {
       setSelectedId(lib.images[0].id);
     }
   }, [lib.images, selectedId, setSelectedId]);
@@ -261,6 +267,33 @@ export default function LibraryView() {
     [lib.reloadCollections, lib.clearFilters, lib.params.collectionId],
   );
 
+  const handleRenameCollection = useCallback(
+    async (id: number, name: string) => {
+      try {
+        await collectionRename(id, name);
+        void lib.reloadCollections();
+      } catch {
+        /* ignore — empty names are rejected backend-side */
+      }
+    },
+    [lib.reloadCollections],
+  );
+
+  const handleDeleteKeyword = useCallback(
+    async (id: number) => {
+      try {
+        await keywordDelete(id);
+        void lib.reloadKeywords();
+        // Clear a keyword filter that no longer exists, and drop its chip from the panel.
+        if (lib.params.keywordId === id) lib.patchParams({ keywordId: null });
+        setSelectedKeywords((prev) => prev.filter((k) => k.id !== id));
+      } catch {
+        /* ignore */
+      }
+    },
+    [lib.reloadKeywords, lib.patchParams, lib.params.keywordId],
+  );
+
   // ---- Multi-select ----
   // Fixed range anchor: set by plain/cmd click, NOT moved by shift-click, so a shift range can be
   // grown/shrunk from a stable pivot (Finder/Lightroom semantics).
@@ -399,6 +432,8 @@ export default function LibraryView() {
           onCreateCollection={handleCreateCollection}
           onCreateSmartCollection={handleCreateSmartCollection}
           onDeleteCollection={handleDeleteCollection}
+          onRenameCollection={handleRenameCollection}
+          onDeleteKeyword={handleDeleteKeyword}
         />
       </div>
 

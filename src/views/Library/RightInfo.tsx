@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import {
   thumbUrl,
   type ImageRow,
@@ -393,12 +393,9 @@ export default function RightInfo({
             }}
           >
             {metaRows.map(({ label, value }) => (
-              <>
-                <dt key={`dt-${label}`} style={{ color: "var(--color-t3)" }}>
-                  {label}
-                </dt>
+              <Fragment key={label}>
+                <dt style={{ color: "var(--color-t3)" }}>{label}</dt>
                 <dd
-                  key={`dd-${label}`}
                   style={{
                     color: "var(--color-t1)",
                     fontFamily: "var(--font-mono)",
@@ -408,7 +405,7 @@ export default function RightInfo({
                 >
                   {value}
                 </dd>
-              </>
+              </Fragment>
             ))}
           </dl>
         )}

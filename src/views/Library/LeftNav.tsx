@@ -24,6 +24,8 @@ interface LeftNavProps {
   onCreateCollection: (name: string) => void;
   onCreateSmartCollection: (name: string) => void;
   onDeleteCollection: (id: number) => void;
+  onRenameCollection: (id: number, name: string) => void;
+  onDeleteKeyword: (id: number) => void;
 }
 
 function basename(p: string): string {
@@ -69,6 +71,8 @@ export default function LeftNav({
   onCreateCollection,
   onCreateSmartCollection,
   onDeleteCollection,
+  onRenameCollection,
+  onDeleteKeyword,
 }: LeftNavProps) {
   const activeFolderId = params.folderId ?? null;
   const noFilters = !hasActiveFilters(params);
@@ -182,6 +186,7 @@ export default function LeftNav({
             active={params.collectionId === c.id}
             onClick={() => enterCollection(c.id)}
             onDelete={() => onDeleteCollection(c.id)}
+            onRename={(name) => onRenameCollection(c.id, name)}
           />
         ))}
         <CreateRow placeholder="New collection…" onSubmit={onCreateCollection} />
@@ -199,6 +204,7 @@ export default function LeftNav({
             active={c.query !== null && c.query === currentPredicate}
             onClick={() => applySmart(c)}
             onDelete={() => onDeleteCollection(c.id)}
+            onRename={(name) => onRenameCollection(c.id, name)}
           />
         ))}
         {hasPredicate ? (
@@ -229,6 +235,7 @@ export default function LeftNav({
                   keywordId: params.keywordId === kw.id ? null : kw.id,
                 })
               }
+              onDelete={() => onDeleteKeyword(kw.id)}
             />
           ))}
         </div>
@@ -322,6 +329,7 @@ interface NavRowProps {
   child?: boolean;
   onClick?: () => void;
   onDelete?: () => void;
+  onRename?: (name: string) => void;
 }
 
 function NavRow({
@@ -332,8 +340,47 @@ function NavRow({
   child,
   onClick,
   onDelete,
+  onRename,
 }: NavRowProps) {
   const [hover, setHover] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(label);
+
+  if (renaming) {
+    const commit = () => {
+      const name = draft.trim();
+      if (name && name !== label) onRename?.(name);
+      setRenaming(false);
+    };
+    return (
+      <input
+        autoFocus
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Escape") {
+            setRenaming(false);
+          }
+        }}
+        onBlur={commit}
+        style={{
+          width: "100%",
+          background: "var(--color-panel)",
+          border: "1px solid var(--color-accent-line)",
+          borderRadius: "var(--radius-sm)",
+          color: "var(--color-t1)",
+          fontSize: 12.5,
+          padding: "5px 8px",
+          outline: "none",
+        }}
+      />
+    );
+  }
+
+  const showActions = hover && (onDelete != null || onRename != null);
   return (
     <div
       onClick={onClick}
@@ -385,27 +432,36 @@ function NavRow({
       >
         {label}
       </span>
-      {onDelete && hover ? (
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          title={`Delete ${label}`}
-          aria-label={`Delete ${label}`}
-          style={{
-            marginLeft: "auto",
-            border: "none",
-            background: "transparent",
-            color: "var(--color-t3)",
-            fontSize: 13,
-            lineHeight: 1,
-            cursor: "pointer",
-            padding: "0 2px",
-          }}
-        >
-          ×
-        </button>
+      {showActions ? (
+        <span style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+          {onRename && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setDraft(label);
+                setRenaming(true);
+              }}
+              title={`Rename ${label}`}
+              aria-label={`Rename ${label}`}
+              style={iconBtn()}
+            >
+              <Icon name="edit" size={11} />
+            </button>
+          )}
+          {onDelete && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete();
+              }}
+              title={`Delete ${label}`}
+              aria-label={`Delete ${label}`}
+              style={{ ...iconBtn(), fontSize: 13 }}
+            >
+              ×
+            </button>
+          )}
+        </span>
       ) : (
         count && (
           <span
@@ -422,4 +478,17 @@ function NavRow({
       )}
     </div>
   );
+}
+
+function iconBtn(): React.CSSProperties {
+  return {
+    display: "flex",
+    alignItems: "center",
+    border: "none",
+    background: "transparent",
+    color: "var(--color-t3)",
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: "0 2px",
+  };
 }
