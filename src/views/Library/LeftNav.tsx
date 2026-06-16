@@ -2,12 +2,14 @@ import Icon, { IconName } from "../../components/Icon";
 import {
   hasActiveFilters,
   type FolderRow,
+  type KeywordRow,
   type QueryParams,
   type SortKey,
 } from "../../lib/ipc";
 
 interface LeftNavProps {
   folders: FolderRow[];
+  keywords: KeywordRow[];
   grandTotal: number;
   params: QueryParams;
   clearFilters: () => void;
@@ -38,6 +40,7 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
 
 export default function LeftNav({
   folders,
+  keywords,
   grandTotal,
   params,
   clearFilters,
@@ -131,6 +134,27 @@ export default function LeftNav({
           ))
         )}
       </div>
+
+      {/* Keywords section */}
+      {keywords.length > 0 && (
+        <div>
+          <SectionHeading>Keywords</SectionHeading>
+          {keywords.map((kw) => (
+            <NavRow
+              key={kw.id}
+              icon="tag"
+              label={kw.name}
+              count={kw.count.toLocaleString()}
+              active={params.keywordId === kw.id}
+              onClick={() =>
+                patchParams({
+                  keywordId: params.keywordId === kw.id ? null : kw.id,
+                })
+              }
+            />
+          ))}
+        </div>
+      )}
     </aside>
   );
 }

@@ -6,8 +6,11 @@ import {
   cullSetRating,
   cullSetFlag,
   cullSetLabel,
+  keywordsForImage,
+  keywordAddToImage,
+  keywordRemoveFromImage,
 } from "../../lib/ipc";
-import type { ImageRow } from "../../lib/ipc";
+import type { ImageRow, KeywordRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
 import { runImport } from "../../lib/importFlow";
 import LeftNav from "./LeftNav";
@@ -48,6 +51,7 @@ export default function LibraryView() {
   const setOnOpenDedup = useAppStore((s) => s.setOnOpenDedup);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [dedupOpen, setDedupOpen] = useState(false);
+  const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
 
   const lib = useLibrary();
 
@@ -73,7 +77,60 @@ export default function LibraryView() {
 
   useCulling({ images: lib.images, patchImage: lib.patchImage });
 
+  // Load the selected image's keywords whenever the selection changes.
+  useEffect(() => {
+    if (selectedId === null) {
+      setSelectedKeywords([]);
+      return;
+    }
+    let cancelled = false;
+    void keywordsForImage(selectedId)
+      .then((ks) => {
+        if (!cancelled) setSelectedKeywords(ks);
+      })
+      .catch(() => {
+        if (!cancelled) setSelectedKeywords([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
+
   const selectedImage = lib.images.find((img) => img.id === selectedId) ?? null;
+
+  const handleAddKeyword = useCallback(
+    async (name: string) => {
+      if (selectedId === null) return;
+      try {
+        const kw = await keywordAddToImage(selectedId, name);
+        setSelectedKeywords((prev) =>
+          prev.some((k) => k.id === kw.id)
+            ? prev
+            : [...prev, kw].sort((a, b) => a.name.localeCompare(b.name)),
+        );
+        void lib.reloadKeywords();
+      } catch {
+        /* ignore — duplicate/empty names are no-ops */
+      }
+    },
+    [selectedId, lib.reloadKeywords],
+  );
+
+  const handleRemoveKeyword = useCallback(
+    async (keywordId: number) => {
+      if (selectedId === null) return;
+      try {
+        await keywordRemoveFromImage(selectedId, keywordId);
+        setSelectedKeywords((prev) => prev.filter((k) => k.id !== keywordId));
+        void lib.reloadKeywords();
+        // Drop the image from the grid if it no longer matches a keyword filter.
+        if (lib.params.keywordId === keywordId) void lib.refresh();
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedId, lib.reloadKeywords, lib.refresh, lib.params.keywordId],
+  );
 
   const handleSetRating = useCallback(
     (stars: number) => {
@@ -106,6 +163,8 @@ export default function LibraryView() {
     onSetRating: handleSetRating,
     onSetFlag: handleSetFlag,
     onSetLabel: handleSetLabel,
+    onAddKeyword: handleAddKeyword,
+    onRemoveKeyword: handleRemoveKeyword,
   };
 
   const gridImages = lib.images.map(toGridImage);
@@ -124,6 +183,7 @@ export default function LibraryView() {
       <div style={{ gridRow: "1 / 3", gridColumn: "1", minHeight: 0 }}>
         <LeftNav
           folders={lib.folders}
+          keywords={lib.keywords}
           grandTotal={lib.grandTotal}
           params={lib.params}
           clearFilters={lib.clearFilters}
@@ -193,7 +253,12 @@ export default function LibraryView() {
 
       {/* Right info spans both rows */}
       <div style={{ gridRow: "1 / 3", gridColumn: "3", minHeight: 0 }}>
-        <RightInfo selectedImage={selectedImage} handlers={rightInfoHandlers} />
+        <RightInfo
+          selectedImage={selectedImage}
+          keywords={selectedKeywords}
+          keywordSuggestions={lib.keywords}
+          handlers={rightInfoHandlers}
+        />
       </div>
 
       {/* Bottom bar under center only */}

@@ -196,6 +196,40 @@ export function cullSetLabel(
   return invoke<void>("cull_set_label", { imageId, label });
 }
 
+// ── Keywords / tags ──────────────────────────────────────────────────────────
+
+export type KeywordRow = {
+  id: number;
+  name: string;
+  count: number;
+};
+
+export function keywordsList(): Promise<KeywordRow[]> {
+  return invoke<KeywordRow[]>("keywords_list", {});
+}
+
+export function keywordsForImage(imageId: number): Promise<KeywordRow[]> {
+  return invoke<KeywordRow[]>("keywords_for_image", { imageId });
+}
+
+export function keywordAddToImage(
+  imageId: number,
+  name: string,
+): Promise<KeywordRow> {
+  return invoke<KeywordRow>("keyword_add_to_image", { imageId, name });
+}
+
+export function keywordRemoveFromImage(
+  imageId: number,
+  keywordId: number,
+): Promise<void> {
+  return invoke<void>("keyword_remove_from_image", { imageId, keywordId });
+}
+
+export function keywordDelete(keywordId: number): Promise<void> {
+  return invoke<void>("keyword_delete", { keywordId });
+}
+
 // ── Develop IPC ────────────────────────────────────────────────────────────
 
 export type CurvePoint = { x: number; y: number };

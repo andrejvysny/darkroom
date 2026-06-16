@@ -2,7 +2,7 @@
 //! `AppHandle` inside the blocking closure (never held across `.await`).
 
 use crate::state::{AppState, DevelopCache};
-use core_library::{FolderRow, ImageRow, IndexStats, QueryParams};
+use core_library::{FolderRow, ImageRow, IndexStats, KeywordRow, QueryParams};
 use core_pipeline::DevelopParams;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -312,6 +312,62 @@ pub async fn cull_set_label(
     label: Option<String>,
 ) -> Result<(), String> {
     db_write(app, move |c| core_library::set_label(c, image_id, label.as_deref())).await
+}
+
+// ---------- Keywords / tags ----------
+
+#[tauri::command]
+pub async fn keywords_list(app: AppHandle) -> Result<Vec<KeywordRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::list_keywords(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keywords_for_image(app: AppHandle, image_id: i64) -> Result<Vec<KeywordRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::keywords_for_image(&db.conn, image_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keyword_add_to_image(
+    app: AppHandle,
+    image_id: i64,
+    name: String,
+) -> Result<KeywordRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::add_keyword_to_image(&db.conn, image_id, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn keyword_remove_from_image(
+    app: AppHandle,
+    image_id: i64,
+    keyword_id: i64,
+) -> Result<(), String> {
+    db_write(app, move |c| {
+        core_library::remove_keyword_from_image(c, image_id, keyword_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), String> {
+    db_write(app, move |c| core_library::delete_keyword(c, keyword_id)).await
 }
 
 /// A sensible default import destination: the parent of the first watched folder (the library root

@@ -6,10 +6,12 @@ import {
   libraryFolders,
   libraryIndexRoot,
   appDefaultLibrary,
+  keywordsList,
   clearedFilters,
   type QueryParams,
   type ImageRow,
   type FolderRow,
+  type KeywordRow,
 } from "./ipc";
 
 export type IndexingState = { done: number; total: number };
@@ -17,6 +19,7 @@ export type IndexingState = { done: number; total: number };
 export interface LibraryState {
   images: ImageRow[];
   folders: FolderRow[];
+  keywords: KeywordRow[];
   /** Count of the current (filtered) query. */
   total: number;
   /** Count of all present images, ignoring filters (for the "All photos" nav). */
@@ -37,6 +40,8 @@ export interface LibraryActions {
   setSearch: (search: string | null) => void;
   reindex: () => Promise<void>;
   patchImage: (id: number, patch: Partial<ImageRow>) => void;
+  /** Refetch only the keyword list + counts (after tagging changes). */
+  reloadKeywords: () => Promise<void>;
 }
 
 const DEFAULT_PARAMS: QueryParams = {
@@ -48,6 +53,7 @@ const DEFAULT_PARAMS: QueryParams = {
 export function useLibrary(): LibraryState & LibraryActions {
   const [images, setImages] = useState<ImageRow[]>([]);
   const [folders, setFolders] = useState<FolderRow[]>([]);
+  const [keywords, setKeywords] = useState<KeywordRow[]>([]);
   const [total, setTotal] = useState(0);
   const [grandTotal, setGrandTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -70,16 +76,18 @@ export function useLibrary(): LibraryState & LibraryActions {
       const merged = overrides
         ? { ...paramsRef.current, ...overrides }
         : paramsRef.current;
-      const [imgs, cnt, flds, grand] = await Promise.all([
+      const [imgs, cnt, flds, grand, kws] = await Promise.all([
         libraryQuery(merged),
         libraryCount(merged),
         libraryFolders(),
         libraryCount({}),
+        keywordsList(),
       ]);
       setImages(imgs);
       setTotal(cnt);
       setGrandTotal(grand);
       setFolders(flds);
+      setKeywords(kws);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -138,10 +146,12 @@ export function useLibrary(): LibraryState & LibraryActions {
     async function bootstrap() {
       setLoading(true);
       try {
-        const [flds, cnt] = await Promise.all([
+        const [flds, cnt, kws] = await Promise.all([
           libraryFolders(),
           libraryCount(DEFAULT_PARAMS),
+          keywordsList(),
         ]);
+        setKeywords(kws);
 
         if (flds.length === 0 || cnt === 0) {
           const defaultPath = await appDefaultLibrary();
@@ -206,9 +216,18 @@ export function useLibrary(): LibraryState & LibraryActions {
     );
   }, []);
 
+  const reloadKeywords = useCallback(async () => {
+    try {
+      setKeywords(await keywordsList());
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
   return {
     images,
     folders,
+    keywords,
     total,
     grandTotal,
     loading,
@@ -222,5 +241,6 @@ export function useLibrary(): LibraryState & LibraryActions {
     setSearch,
     reindex,
     patchImage,
+    reloadKeywords,
   };
 }
