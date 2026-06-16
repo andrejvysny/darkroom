@@ -209,6 +209,22 @@ pub fn resolve(
     keep_id: i64,
     trash_ids: &[i64],
 ) -> Result<ResolveResult, DedupError> {
+    // Guard: the keeper must be a present catalog row. A stale/already-resolved or foreign keeper
+    // would otherwise let us trash every id in `trash_ids` with nothing guaranteed to survive — the
+    // worst case being the last copy of a byte-identical group. Validate first; trash nothing on miss.
+    let keeper_present: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM images WHERE id=?1 AND status='present'",
+            params![keep_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if keeper_present.is_none() {
+        return Err(DedupError::InvalidKeeper(format!(
+            "id {keep_id} is not a present image"
+        )));
+    }
+
     // Snapshot (id, path, hash) for each victim; tolerate rows already gone.
     let mut victims: Vec<(i64, String, Vec<u8>)> = Vec::new();
     for &id in trash_ids {

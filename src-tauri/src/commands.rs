@@ -356,12 +356,16 @@ pub async fn develop_render(
             (rgba, w, h)
         };
 
-        // Histogram from the rendered buffer: store for pull + emit for push.
-        let hist = core_pipeline::histogram(&rgba);
-        if let Ok(mut last) = st.last_histogram.lock() {
-            *last = Some(hist.clone());
+        // Histogram from the rendered buffer: store for pull + emit for push. Skip if a newer render
+        // has superseded this one — otherwise a slower earlier render (e.g. a cache hit racing a
+        // just-started newer request) could clobber the live histogram with a stale buffer's stats.
+        if !superseded() {
+            let hist = core_pipeline::histogram(&rgba);
+            if let Ok(mut last) = st.last_histogram.lock() {
+                *last = Some(hist.clone());
+            }
+            let _ = app.emit("develop:histogram", hist);
         }
-        let _ = app.emit("develop:histogram", hist);
 
         let t = Instant::now();
         let jpeg = core_pipeline::rgba8_to_jpeg(&rgba, w, h, PREVIEW_JPEG_QUALITY)

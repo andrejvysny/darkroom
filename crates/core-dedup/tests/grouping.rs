@@ -66,6 +66,53 @@ fn groups_byte_and_capture_then_resolve() {
     assert_eq!(core_dedup::find_byte_identical(&db.conn).unwrap().len(), 0);
 }
 
+#[test]
+fn resolve_rejects_invalid_keeper_and_trashes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let h1 = [1u8; 32];
+    insert(&db, &h1, None, "a1.cr3");
+    insert(&db, &h1, None, "a2.cr3");
+
+    let group = core_dedup::find_byte_identical(&db.conn).unwrap();
+    let a1 = group[0].images[0].id;
+    let a2 = group[0].images[1].id;
+
+    // A keeper id that does not exist must abort with no deletions.
+    let stale_keeper = a1.max(a2) + 999;
+    let err = core_dedup::resolve(&db.conn, stale_keeper, &[a1, a2]);
+    assert!(
+        matches!(err, Err(core_dedup::DedupError::InvalidKeeper(_))),
+        "stale keeper must error"
+    );
+    let count: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "nothing trashed when the keeper is invalid");
+
+    // A keeper that was already trashed (row gone) is likewise rejected.
+    db.conn
+        .execute("DELETE FROM images WHERE id=?1", params![a1])
+        .unwrap();
+    let err = core_dedup::resolve(&db.conn, a1, &[a2]);
+    assert!(
+        matches!(err, Err(core_dedup::DedupError::InvalidKeeper(_))),
+        "already-resolved keeper must error"
+    );
+    let kept: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM images WHERE id=?1",
+            params![a2],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kept, 1,
+        "the last copy is preserved when the keeper is stale"
+    );
+}
+
 fn insert_ph(db: &Db, hash: &[u8], path: &str, phash: u64) {
     db.conn
         .execute(
