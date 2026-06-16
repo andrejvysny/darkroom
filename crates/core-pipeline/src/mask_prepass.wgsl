@@ -56,6 +56,16 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
   return select(hi, lo, c < cut);
 }
 
+// Linear ProPhoto (working space) → linear sRGB, matching develop.wgsl so range masks select on the
+// same colors the user sees. Kept in sync with crates/core-raw/examples/print_color_matrices.rs.
+fn pp_to_srgb(c: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    dot(vec3<f32>( 1.8215216, -0.5579748, -0.2635469), c),
+    dot(vec3<f32>(-0.2385862,  1.2344216,  0.0041646), c),
+    dot(vec3<f32>(-0.0199185, -0.1907297,  1.2106482), c),
+  );
+}
+
 fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
   let K = vec4<f32>(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
   let p = mix(vec4<f32>(c.bg, K.wz), vec4<f32>(c.gb, K.xy), step(c.b, c.g));
@@ -69,7 +79,7 @@ fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
 fn sample_display(uv: vec2<f32>) -> vec3<f32> {
   let dims = vec2<f32>(textureDimensions(input_tex));
   let px = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (dims - 1.0));
-  let lin = textureLoad(input_tex, px, 0).rgb;
+  let lin = pp_to_srgb(textureLoad(input_tex, px, 0).rgb);
   return srgb_encode(clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0)));
 }
 
@@ -136,7 +146,12 @@ fn fs_prepass(in: VsOut) -> @location(0) vec4<f32> {
     // kind 5 (ai): 0 coverage for now.
     if (c.invert == 1u) { cov = 1.0 - cov; }
 
-    if (c.op == 0u) {
+    // The first component seeds the running coverage regardless of its op — there is no prior alpha
+    // to subtract from / intersect with, and a Subtract/Intersect-first component would otherwise
+    // pin alpha at 0 forever (a silently inert mask). Add/Subtract/Intersect only apply to later ones.
+    if (i == 0u) {
+      alpha = cov;
+    } else if (c.op == 0u) {
       alpha = max(alpha, cov);          // Add (union)
     } else if (c.op == 1u) {
       alpha = alpha * (1.0 - cov);      // Subtract

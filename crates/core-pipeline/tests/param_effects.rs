@@ -112,3 +112,44 @@ fn develop_params_have_correct_effects() {
         "saturation+ must increase R-B spread ({spread0} -> {spread1})"
     );
 }
+
+/// Scene-referred highlight headroom: linear values >1.0 must NOT hard-clip to pure white. The soft
+/// rolloff keeps them below 255 and keeps brighter inputs brighter (so a Highlights pull can recover
+/// detail). Regression guard for removing the old `clamp(lin,0,1)` pre-OETF.
+#[test]
+fn highlights_above_one_roll_off_not_clip() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+
+    let render_val = |v: f32| {
+        let img = solid(8, 8, [v, v, v]);
+        let prep = pipe.prepare(&ctx, &img).unwrap();
+        let out = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+        mean_channel(&out, 0)
+    };
+
+    let at_one = render_val(1.0);
+    let at_onefive = render_val(1.5);
+    let at_two = render_val(2.0);
+
+    // A linear 1.0 must roll off below pure white (the old hard clamp would make it exactly 255).
+    assert!(
+        at_one < 252.0,
+        "linear 1.0 must roll off below 255 (got {at_one})"
+    );
+    // Headroom above 1.0 is preserved as distinguishable brightness (detail to recover), not all-255.
+    assert!(
+        at_onefive > at_one + 3.0,
+        "linear 1.5 must read brighter than 1.0 ({at_one} -> {at_onefive})"
+    );
+    assert!(
+        at_two >= at_onefive - 1.0,
+        "monotonic into the shoulder ({at_onefive} -> {at_two})"
+    );
+}

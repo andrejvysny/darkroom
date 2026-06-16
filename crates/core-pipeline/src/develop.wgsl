@@ -1,4 +1,6 @@
-// Develop fragment pipeline: cached linear RGB → display-referred sRGB RGBA8.
+// Develop fragment pipeline: cached linear **ProPhoto** RGB → display-referred sRGB RGBA8.
+// Scene-linear edits (WB/exposure/highlights/shadows/saturation + masks) run in wide-gamut ProPhoto;
+// the display transition converts ProPhoto→sRGB, rolls off highlights, then applies the sRGB OETF.
 
 struct Params {
   wb_gain: vec3<f32>,
@@ -80,6 +82,28 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
   let lo = c * 12.92;
   let hi = 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
   return select(hi, lo, c < cut);
+}
+
+// Linear ProPhoto (working space) → linear sRGB (display primaries). Row-normalized so neutral maps
+// to neutral; derived in crates/core-raw/examples/print_color_matrices.rs. Out-of-sRGB colors land
+// <0 or >1 and are gamut-clipped downstream (the rolloff's max(.,0) + the OETF's clamp).
+fn pp_to_srgb(c: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    dot(vec3<f32>( 1.8215216, -0.5579748, -0.2635469), c),
+    dot(vec3<f32>(-0.2385862,  1.2344216,  0.0041646), c),
+    dot(vec3<f32>(-0.0199185, -0.1907297,  1.2106482), c),
+  );
+}
+
+// Soft highlight shoulder: identity below `a`, asymptotes toward 1.0 above it (C1-continuous at `a`).
+// Scene-linear values >1.0 (preserved by the decoder's clip_negative) roll into the top of the
+// display range instead of hard-clipping to white — recovering highlight detail the old clamp lost.
+fn highlight_rolloff(c: vec3<f32>) -> vec3<f32> {
+  let a = 0.75;
+  let x = max(c, vec3<f32>(0.0));
+  let over = max(x - vec3<f32>(a), vec3<f32>(0.0));
+  let rolled = vec3<f32>(a) + (1.0 - a) * (1.0 - exp(-over / (1.0 - a)));
+  return select(x, rolled, x > vec3<f32>(a));
 }
 
 fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
@@ -164,7 +188,9 @@ fn apply_local_linear(
   // 3. highlights / shadows (luminance-masked, linear)
   let luma = dot(rgb, LUMA);
   let shadow_mask = exp(-luma * 4.0);
-  let highlight_mask = 1.0 - exp(-max(luma - 0.5, 0.0) * 4.0);
+  // Engage highlights from upper-midtones up (linear 0.25 ≈ sRGB 0.54), not just bright highlights,
+  // so the slider reaches more of the tonal range (closer to Lightroom's Highlights behavior).
+  let highlight_mask = 1.0 - exp(-max(luma - 0.25, 0.0) * 4.0);
   rgb = rgb * (1.0 + 0.6 * shadows * shadow_mask);
   rgb = rgb * (1.0 + 0.6 * highlights * highlight_mask);
   rgb = max(rgb, vec3<f32>(0.0));
@@ -177,8 +203,10 @@ fn apply_local_linear(
 // Display-space local adjustments (contrast, blacks, whites), applied after the sRGB transform.
 fn apply_local_display(d_in: vec3<f32>, contrast: f32, blacks: f32, whites: f32) -> vec3<f32> {
   var d = (d_in - vec3<f32>(0.5)) * (1.0 + contrast) + vec3<f32>(0.5); // contrast, pivot mid-gray
-  d = d + vec3<f32>(blacks * 0.2);
+  // Endpoint pivots so the two don't fight: whites scales about the black point (0 fixed); blacks
+  // pivots about the white point (1 fixed). Lifting blacks no longer also lifts the whites.
   d = d * (1.0 + whites * 0.2);
+  d = vec3<f32>(1.0) - (vec3<f32>(1.0) - d) * (1.0 - blacks * 0.2);
   return d;
 }
 
@@ -204,8 +232,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     lin = mix(lin, li, a);
   }
 
-  // --- DISPLAY TRANSITION (shared, once): sRGB OETF, HSL mixer, tone curve (all global) ---
-  var d = srgb_encode(clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0)));
+  // --- DISPLAY TRANSITION (shared, once): ProPhoto→sRGB, highlight rolloff, OETF, HSL, tone curve ---
+  var d = srgb_encode(highlight_rolloff(pp_to_srgb(lin)));
   d = apply_hsl(d);
   d = vec3<f32>(
     curve_ch(d.r, vec3<f32>(1.0, 0.0, 0.0)),

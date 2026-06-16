@@ -6,21 +6,23 @@
 //!   sensors. Skips the expensive full-res interpolation (each 2×2 quad → one RGB pixel), so a
 //!   "Fit" preview decodes ~3-4× faster. Falls back to [`develop_linear`] for non-RGB-Bayer.
 //!
-//! Both omit the `SRgb` (gamma) step, so the output is linear, sRGB-primaries RGB — ready for
-//! scene-linear adjustments (exposure, WB, etc.) on the GPU.
+//! Output is **linear, wide-gamut ProPhoto-primaries** RGB (no `SRgb` gamma), preserving scene
+//! values above 1.0 (`clip_negative`) — ready for scene-linear adjustments (exposure, WB, etc.) on
+//! the GPU, which converts ProPhoto→sRGB only at the display transition.
 
 use crate::error::RawError;
 use image::{imageops::FilterType, Rgb32FImage};
 use rawler::decoders::RawDecodeParams;
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::matrix::{multiply, normalize, pseudo_inverse};
-use rawler::imgop::raw::clip_euclidean_norm_avg;
+use rawler::imgop::raw::clip_negative;
 use rawler::imgop::sensor::bayer::superpixel::Superpixel3Channel;
 use rawler::imgop::sensor::bayer::Demosaic;
-use rawler::imgop::xyz::{Illuminant, SRGB_TO_XYZ_D65};
+use rawler::imgop::xyz::{Illuminant, XYZ_TO_PROFOTORGB_D50};
 use rawler::pixarray::{Color2D, PixF32, RgbF32};
 use rawler::rawimage::RawPhotometricInterpretation;
 use rawler::rawsource::RawSource;
+use rawler::RawImage;
 
 /// Interleaved linear RGB f32 image.
 #[derive(Clone)]
@@ -80,6 +82,72 @@ impl LinearImage {
 /// Decode + demosaic + white-balance + color-matrix (NO sRGB gamma) → full-resolution linear RGB f32.
 pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
     let raw = rawler::decode(src, &RawDecodeParams::default()).map_err(de)?;
+    develop_linear_from(&raw)
+}
+
+/// Select the camera→XYZ color matrix (prefer the D65 illuminant), padded to `[[f32;3];4]`.
+/// `None` when no matrix is present or it is malformed — callers fall back to the calibrated path.
+fn cam_xyz2cam(raw: &RawImage) -> Option<[[f32; 3]; 4]> {
+    let (_ill, color_matrix) = raw
+        .color_matrix
+        .iter()
+        .find(|(ill, _)| **ill == Illuminant::D65)
+        .or_else(|| raw.color_matrix.iter().next())?;
+    if color_matrix.is_empty() || color_matrix.len() % 3 != 0 {
+        return None;
+    }
+    let mut xyz2cam = [[0f32; 3]; 4];
+    let comps = (color_matrix.len() / 3).min(4);
+    for i in 0..comps {
+        for j in 0..3 {
+            xyz2cam[i][j] = color_matrix[i * 3 + j];
+        }
+    }
+    Some(xyz2cam)
+}
+
+/// As-shot white-balance coeffs, or neutral when the camera reported none.
+fn wb_or_neutral(raw: &RawImage) -> [f32; 4] {
+    if raw.wb_coeffs[0].is_nan() {
+        [1.0; 4]
+    } else {
+        raw.wb_coeffs
+    }
+}
+
+/// Full-res linear develop from an already-decoded `RawImage`.
+///
+/// Standard RGB sensors with a usable color matrix take the **headroom-preserving** path: demosaic +
+/// crop WITHOUT rawler's `Calibrate`, then our own camera→linear-ProPhoto map with `clip_negative` — so
+/// scene values >1.0 survive into the GPU buffer (the develop shader's soft highlight rolloff then
+/// uses that headroom). This shares `map_3ch_to_rgb` with the preview path, so export == preview.
+/// 4-colour / monochrome / matrix-less sensors fall back to rawler's calibrated develop.
+fn develop_linear_from(raw: &RawImage) -> Result<LinearImage, RawError> {
+    if let Some(xyz2cam) = cam_xyz2cam(raw) {
+        let dev = RawDevelop {
+            steps: vec![
+                ProcessingStep::Rescale,
+                ProcessingStep::Demosaic,
+                ProcessingStep::CropActiveArea,
+                ProcessingStep::CropDefault,
+            ],
+        };
+        if let Intermediate::ThreeColor(px) = dev.develop_intermediate(raw).map_err(de)? {
+            let wb = wb_or_neutral(raw);
+            let rgb = map_3ch_to_rgb(&px, &wb, xyz2cam);
+            return Ok(LinearImage {
+                width: rgb.width as u32,
+                height: rgb.height as u32,
+                data: rgb.flatten(),
+            });
+        }
+    }
+    develop_calibrated(raw)
+}
+
+/// rawler's calibrated develop (clips highlights via `clip_euclidean_norm_avg`). Fallback for
+/// non-RGB-Bayer sensors / images without a usable color matrix.
+fn develop_calibrated(raw: &RawImage) -> Result<LinearImage, RawError> {
     let dev = RawDevelop {
         steps: vec![
             ProcessingStep::Rescale,
@@ -90,7 +158,7 @@ pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
             ProcessingStep::CropDefault,
         ],
     };
-    let inter = dev.develop_intermediate(&raw).map_err(de)?;
+    let inter = dev.develop_intermediate(raw).map_err(de)?;
     Ok(match inter {
         Intermediate::ThreeColor(px) => {
             let d = px.dim();
@@ -134,7 +202,7 @@ pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
 ///
 /// For standard RGB Bayer sensors this uses rawler's superpixel debayer (each 2×2 Bayer quad → one
 /// real RGB pixel, output is ½×½), skipping the costly full-res PPG interpolation. The color math
-/// (black/white-level rescale, white-balance, camera→sRGB-linear matrix, recommended crop) mirrors
+/// (black/white-level rescale, white-balance, camera→ProPhoto-linear matrix, recommended crop) mirrors
 /// rawler's own `develop_intermediate` exactly, composed from its public helpers.
 ///
 /// Anything that is not a standard RGB Bayer CFA (X-Trans, 4-colour CYGM, monochrome, linear-raw),
@@ -165,31 +233,12 @@ pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> 
         _ => unreachable!("guarded by is_rgb_bayer"),
     };
 
-    // Calibrate: pick D65 (or first available) color matrix; bail to full decode if unusable.
-    let matrix = raw
-        .color_matrix
-        .iter()
-        .find(|(ill, _)| **ill == Illuminant::D65)
-        .or_else(|| raw.color_matrix.iter().next());
-    let Some((_ill, color_matrix)) = matrix else {
+    // Calibrate: camera→linear-ProPhoto via the shared helpers (same matrix selection + as-shot WB as the
+    // full-res path); bail to the full decode if the matrix is missing/malformed.
+    let Some(xyz2cam) = cam_xyz2cam(&raw) else {
         return develop_linear(src);
     };
-    if color_matrix.is_empty() || color_matrix.len() % 3 != 0 {
-        return develop_linear(src);
-    }
-    let mut xyz2cam = [[0f32; 3]; 4];
-    let comps = (color_matrix.len() / 3).min(4);
-    for i in 0..comps {
-        for j in 0..3 {
-            xyz2cam[i][j] = color_matrix[i * 3 + j];
-        }
-    }
-    // WhiteBalance: as-shot coeffs (or neutral if the camera reported none).
-    let wb = if raw.wb_coeffs[0].is_nan() {
-        [1.0; 4]
-    } else {
-        raw.wb_coeffs
-    };
+    let wb = wb_or_neutral(&raw);
     let mut rgb = map_3ch_to_rgb(&demosaiced, &wb, xyz2cam);
 
     // CropDefault: trim to the recommended crop, made relative to the active area and halved to
@@ -211,13 +260,20 @@ pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> 
     })
 }
 
-/// White-balance + camera→sRGB-linear matrix map for 3-channel data.
+/// White-balance + camera→**linear ProPhoto** matrix map for 3-channel data. Shared by the preview
+/// and full-res paths so they are pixel-identical.
 ///
-/// Ported verbatim from rawler's `imgop::raw::map_3ch_to_rgb` (which is `pub(crate)`), composed
-/// from rawler's public matrix/xyz helpers so the result is bit-for-bit equivalent to the
-/// full-resolution path's `Calibrate` step.
+/// Two deliberate departures from rawler's own `map_3ch_to_rgb` (which targets linear sRGB and is
+/// `pub(crate)`): (1) the working space is **wide-gamut linear ProPhoto** ("Melissa RGB", what
+/// Lightroom edits in) instead of sRGB/Rec.709 — so saturated camera colors are not gamut-clipped at
+/// decode; the GPU develop converts ProPhoto→sRGB only at the display transition. (2) highlights are
+/// clipped with `clip_negative` (floor negatives only, **keep values >1.0**) instead of
+/// `clip_euclidean_norm_avg`, preserving scene-referred highlight headroom for the soft rolloff.
 fn map_3ch_to_rgb(src: &Color2D<f32, 3>, wb_coeff: &[f32; 4], xyz2cam: [[f32; 3]; 4]) -> RgbF32 {
-    let rgb2cam = normalize(multiply(&xyz2cam, &SRGB_TO_XYZ_D65));
+    // camera→linear-ProPhoto: ProPhoto→XYZ(D50) (rawler's XYZ→ProPhoto inverse) → cam, row-normalized
+    // so camera neutral maps to ProPhoto neutral, then inverted to cam→ProPhoto.
+    let pp_to_xyz = pseudo_inverse(XYZ_TO_PROFOTORGB_D50);
+    let rgb2cam = normalize(multiply(&xyz2cam, &pp_to_xyz));
     let cam2rgb = pseudo_inverse(rgb2cam);
 
     let out: Vec<[f32; 3]> = src
@@ -227,12 +283,12 @@ fn map_3ch_to_rgb(src: &Color2D<f32, 3>, wb_coeff: &[f32; 4], xyz2cam: [[f32; 3]
             let r = pix[0] * wb_coeff[0];
             let g = pix[1] * wb_coeff[1];
             let b = pix[2] * wb_coeff[2];
-            let srgb = [
+            let pp = [
                 cam2rgb[0][0] * r + cam2rgb[0][1] * g + cam2rgb[0][2] * b,
                 cam2rgb[1][0] * r + cam2rgb[1][1] * g + cam2rgb[1][2] * b,
                 cam2rgb[2][0] * r + cam2rgb[2][1] * g + cam2rgb[2][2] * b,
             ];
-            clip_euclidean_norm_avg(&srgb)
+            clip_negative(&pp)
         })
         .collect();
 

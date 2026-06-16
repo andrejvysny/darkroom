@@ -235,6 +235,61 @@ fn component_intersect_narrows_coverage() {
     );
 }
 
+#[test]
+fn subtract_or_intersect_first_component_still_covers() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let gray = solid(16, 16, [0.2, 0.2, 0.2]);
+    let prep = pipe.prepare(&ctx, &gray).unwrap();
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+
+    // A single full-coverage component whose op is Subtract/Intersect must NOT be silently inert:
+    // the pre-pass seeds running coverage from the first component regardless of its op (regression
+    // guard for the zero-alpha trap where a Subtract/Intersect-first mask stayed at alpha 0 forever).
+    for op in [MaskOp::Subtract, MaskOp::Intersect] {
+        let mask = Mask {
+            name: "first-op".into(),
+            components: vec![MaskComponent {
+                kind: ComponentKind::Radial {
+                    center: [0.5, 0.5],
+                    radius: [10.0, 10.0], // rr≈0 across [0,1] ⇒ coverage 1 everywhere
+                    angle: 0.0,
+                    feather: 0.0,
+                },
+                op,
+                invert: false,
+                feather: false,
+            }],
+            adjust: LocalAdjust {
+                exposure: 1.0,
+                ..Default::default()
+            },
+            opacity: 1.0,
+            enabled: true,
+        };
+        let out = pipe
+            .render(
+                &ctx,
+                &prep,
+                &DevelopParams {
+                    masks: vec![mask],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            mean_channel(&out, 0) > mean_channel(&base, 0) + 10.0,
+            "{op:?}-first component must still cover (brighten vs base)"
+        );
+    }
+}
+
 /// A radial component large enough to cover the whole image with alpha≈1 (full coverage).
 fn full_coverage_mask(adjust: LocalAdjust) -> Mask {
     Mask {
