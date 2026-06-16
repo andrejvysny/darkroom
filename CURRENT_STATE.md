@@ -63,9 +63,19 @@ Views: `views/Library/{LeftNav,ThumbGrid,RightInfo,BottomBar,Loupe,DedupModal}.t
   `library_folders`, `image_meta`, `library_index_root`
 - Develop: `develop_get_edit`, `develop_set_edit`, `develop_render` (returns JPEG ArrayBuffer)
 - Export: `export_image`
-- Culling: `cull_set_rating`, `cull_set_flag`, `cull_set_label`
+- Culling: `cull_set_rating`, `cull_set_flag`, `cull_set_label`,
+  `cull_set_rating_many`, `cull_set_flag_many`, `cull_set_label_many` (batch)
+- Keywords: `keywords_list`, `keywords_for_image`, `keyword_add_to_image`,
+  `keyword_add_to_images` (batch), `keyword_remove_from_image`, `keyword_delete`
+- Collections: `collections_list`, `collections_for_image`, `collection_create`,
+  `collection_rename`, `collection_delete`, `collection_add_images`, `collection_remove_images`
 - Dedup: `dedup_scan`, `dedup_resolve`
 - Import: `import_start`
+
+`QueryParams` filter dimensions: `folder_id`, `min_stars`, `flag`, `color_label`
+(`"__none__"` = unlabeled), `keyword_id`, `collection_id`, `import_session_id`, `search`
+(filename/camera/lens/keyword), `sort` ∈ {capture_desc|asc, filename|_desc, rating_desc|asc,
+imported_desc|asc}.
 - Protocol: `thumb://localhost/<content_hash_hex>?size=N`
 - Events: `import:progress {done,total}`, `import:done {ImportStats}`
 
@@ -110,12 +120,21 @@ per-module reset, library search bar. All new GPU data uses NEW bindings — `Pa
 alignment is untouched (`param_effects` still green). New golden tests: `tone_curve.rs`, `hsl.rs`,
 `curve`/`histogram` unit tests. New files: `core-pipeline/src/{curve,histogram}.rs`.
 
-**Partial / UI-only (NOT wired to the GPU pipeline):** Detail (sharpen/NR), Lens corrections,
-Crop/geometry — sliders render in the UI but have no pipeline effect (Phase 2).
+**Library organization — DONE & validated (catalog-logic tested; UI builds clean):**
+Filtering & sorting across stars/flags/color-labels (+ unlabeled), 8 sort orders, folder nav;
+keywords/tags (full CRUD, per-image editor + autocomplete, batch tag, nav filter, keyword search);
+static + smart collections (membership + saved-predicate, nav create/filter/delete, "save filters
+as smart"); multi-select (cmd/shift) with a batch toolbar (rating/flag/label/keyword/collection/
+export) + batch keyboard culling; import-mode picker (copy/move/reference); single + batch export.
+Backed by `core-library/{query,keywords,collections,cull}.rs` (30 backend tests) and thin Tauri
+commands; all SQL filters are bound named params (injection-safe).
 
-**Not done (deferred from spec):** FS watcher reconciliation (`notify`), smart collections, keywords UI,
-before/after wired toggle, per-display ICC, highlight reconstruction, RCD/AMaZE demosaic, Windows/Linux,
-notarization, CSP hardening, thumbnail LRU eviction.
+**Partial / UI-only (NOT wired to the GPU pipeline):** Detail (sharpen/NR), Lens corrections,
+Crop/geometry — sliders render in the UI but have no pipeline effect.
+
+**Not done (deferred from spec):** FS watcher reconciliation (`notify`), keyword hierarchy UI,
+"recent import" as a true session filter, per-display ICC, highlight reconstruction, RCD/AMaZE
+demosaic, Windows/Linux, notarization, CSP hardening, thumbnail LRU eviction.
 
 ## Known issues / caveats
 
