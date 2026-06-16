@@ -55,6 +55,19 @@ struct MaskBuffer {
 };
 @group(0) @binding(7) var<storage, read> M: MaskBuffer;
 
+// Global white-balance chromatic-adaptation matrix (std140 mat3 = 3 vec4 columns). Built on the CPU
+// from temp/tint (Planckian-locus target white + Bradford CAT); identity at temp=tint=0.
+struct Wb {
+  c0: vec4<f32>,
+  c1: vec4<f32>,
+  c2: vec4<f32>,
+};
+@group(0) @binding(8) var<uniform> WB: Wb;
+
+fn wb_apply(v: vec3<f32>) -> vec3<f32> {
+  return mat3x3<f32>(WB.c0.xyz, WB.c1.xyz, WB.c2.xyz) * v;
+}
+
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
@@ -213,17 +226,20 @@ fn apply_local_display(d_in: vec3<f32>, contrast: f32, blacks: f32, whites: f32)
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let base_rgb = textureSampleLevel(input_tex, input_smp, in.uv, 0.0).rgb;
+  // Global white balance (chromatic adaptation), once, in linear ProPhoto before everything else.
+  // P.wb_gain is held at identity now that global WB rides this matrix; masks keep their gain delta.
+  let base_wb = wb_apply(base_rgb);
 
   // --- SCENE-LINEAR STAGE: base develop, then composite each mask's linear deltas ---
   var lin = apply_local_linear(
-    base_rgb, P.wb_gain, P.exposure, P.highlights, P.shadows, P.saturation);
+    base_wb, vec3<f32>(1.0), P.exposure, P.highlights, P.shadows, P.saturation);
   for (var i = 0u; i < M.count; i = i + 1u) {
     let mp = M.masks[i];
     let a = textureSampleLevel(mask_tex, mask_smp, in.uv, i32(i), 0.0).r * mp.opacity;
     if (a < 1e-4) { continue; }
     let li = apply_local_linear(
-      base_rgb,
-      P.wb_gain * mp.wb_gain,
+      base_wb,
+      mp.wb_gain,
       P.exposure + mp.exposure,
       P.highlights + mp.highlights,
       P.shadows + mp.shadows,
