@@ -153,3 +153,101 @@ fn highlights_above_one_roll_off_not_clip() {
         "monotonic into the shoulder ({at_onefive} -> {at_two})"
     );
 }
+
+/// Two vertical halves (dark | bright) — a hard edge down the middle, for sharpen tests.
+fn edge(w: u32, h: u32) -> LinearImage {
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..h {
+        for x in 0..w {
+            let v = if x < w / 2 { 0.2 } else { 0.5 };
+            data.extend_from_slice(&[v, v, v]);
+        }
+    }
+    LinearImage {
+        width: w,
+        height: h,
+        data,
+    }
+}
+
+#[test]
+fn vignette_darkens_corners() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = solid(32, 32, [0.4, 0.4, 0.4]);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let out = pipe
+        .render(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                vignette: -100.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let at = |c: usize, r: usize| out[(r * 32 + c) * 4] as i32;
+    let corner = at(0, 0);
+    let center = at(16, 16);
+    assert!(
+        corner < center - 15,
+        "negative vignette must darken the corner vs center ({corner} vs {center})"
+    );
+}
+
+#[test]
+fn sharpen_overshoots_edges_keeps_flats() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+
+    // Flat region: sharpen is a no-op (base − blur ≈ 0).
+    let flat = solid(32, 32, [0.4, 0.4, 0.4]);
+    let pf = pipe.prepare(&ctx, &flat).unwrap();
+    let base_flat = pipe.render(&ctx, &pf, &DevelopParams::default()).unwrap();
+    let sharp_flat = pipe
+        .render(
+            &ctx,
+            &pf,
+            &DevelopParams {
+                sharpen: 150.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(base_flat, sharp_flat, "sharpen must not touch flat regions");
+
+    // Hard edge: sharpen overshoots — the bright pixel adjacent to the edge gets brighter.
+    let img = edge(64, 16);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let sharp = pipe
+        .render(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                sharpen: 150.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Column 32 is the first bright column (right of the edge at x=32).
+    let at = |buf: &[u8], col: usize| buf[(8 * 64 + col) * 4] as i32;
+    assert!(
+        at(&sharp, 32) > at(&base, 32),
+        "sharpen must overshoot the bright edge ({} -> {})",
+        at(&base, 32),
+        at(&sharp, 32)
+    );
+}

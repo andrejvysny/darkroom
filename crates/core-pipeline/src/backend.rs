@@ -72,6 +72,8 @@ pub struct PreparedImage {
     fx_uniform: wgpu::Buffer,
     // Global white-balance CAT matrix, rewritten per render() from the current params.
     wb_uniform: wgpu::Buffer,
+    // Detail (sharpen/NR) + vignette scalars + texel size, rewritten per render().
+    extra_uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     output: wgpu::Texture,
     readback: wgpu::Buffer,
@@ -205,6 +207,17 @@ impl DevelopPipeline {
                 // Global white-balance CAT matrix (uniform).
                 wgpu::BindGroupLayoutEntry {
                     binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Detail (sharpen/NR) + vignette + texel size (uniform).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -363,6 +376,11 @@ impl DevelopPipeline {
         let wb_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("develop-wb-uniform"),
             contents: bytemuck::bytes_of(&crate::params::WbUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let extra_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("develop-extra-uniform"),
+            contents: bytemuck::bytes_of(&crate::params::ExtraUniform::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -547,6 +565,10 @@ impl DevelopPipeline {
                     binding: 8,
                     resource: wb_uniform.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: extra_uniform.as_entire_binding(),
+                },
             ],
         });
 
@@ -570,6 +592,7 @@ impl DevelopPipeline {
             uniform,
             fx_uniform,
             wb_uniform,
+            extra_uniform,
             bind_group,
             output,
             readback,
@@ -609,6 +632,12 @@ impl DevelopPipeline {
             &prepared.wb_uniform,
             0,
             bytemuck::bytes_of(&params.to_wb_uniform()),
+        );
+        let texel = [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32];
+        ctx.queue.write_buffer(
+            &prepared.extra_uniform,
+            0,
+            bytemuck::bytes_of(&params.to_extra(texel)),
         );
         ctx.queue.write_buffer(
             &prepared.mask_buffer,

@@ -194,6 +194,14 @@ pub struct DevelopParams {
     pub blacks: f32,
     /// White point, -100..100.
     pub whites: f32,
+    /// Sharpening amount, 0..150 (unsharp mask). 0 = off.
+    pub sharpen: f32,
+    /// Luminance noise reduction, 0..100. 0 = off.
+    pub nr_luma: f32,
+    /// Color noise reduction, 0..100. 0 = off.
+    pub nr_color: f32,
+    /// Lens vignette, -100..100 (negative darkens corners, positive brightens).
+    pub vignette: f32,
     /// Tone curve (display-space LUT). Identity by default.
     pub tone_curve: ToneCurve,
     /// Per-hue HSL mixer (8 bands). All-zero by default.
@@ -215,6 +223,10 @@ impl Default for DevelopParams {
             shadows: 0.0,
             blacks: 0.0,
             whites: 0.0,
+            sharpen: 0.0,
+            nr_luma: 0.0,
+            nr_color: 0.0,
+            vignette: 0.0,
             tone_curve: ToneCurve::default(),
             hsl: [HslBand::default(); HSL_BANDS],
             masks: Vec::new(),
@@ -408,6 +420,20 @@ impl DevelopParams {
         }
     }
 
+    /// Pack the Detail (sharpen/NR) + Lens (vignette) scalars for the GPU. `texel` = (1/w, 1/h) of
+    /// the image being rendered (for neighborhood sampling), supplied by the backend.
+    pub fn to_extra(&self, texel: [f32; 2]) -> ExtraUniform {
+        ExtraUniform {
+            detail: [
+                (self.sharpen / 100.0).max(0.0), // 0..1.5
+                (self.nr_luma / 100.0).clamp(0.0, 1.0),
+                (self.nr_color / 100.0).clamp(0.0, 1.0),
+                (self.vignette / 100.0).clamp(-1.0, 1.0),
+            ],
+            texel: [texel[0], texel[1], 0.0, 0.0],
+        }
+    }
+
     /// Pack the global white-balance CAT matrix for the GPU (std140 mat3 = 3 × `vec4` columns).
     pub fn to_wb_uniform(&self) -> WbUniform {
         let m = wb_matrix(self.temp, self.tint); // row-major
@@ -536,6 +562,23 @@ pub struct WbUniform {
 impl Default for WbUniform {
     fn default() -> Self {
         DevelopParams::default().to_wb_uniform()
+    }
+}
+
+/// Detail (sharpen / luma+color NR) + Lens (vignette) scalars + the image texel size, for the GPU.
+/// std140-clean: two `vec4` rows (32 bytes). `@binding(9)` in `develop.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ExtraUniform {
+    /// (sharpen 0..1.5, nr_luma 0..1, nr_color 0..1, vignette -1..1).
+    pub detail: [f32; 4],
+    /// (1/width, 1/height, _, _).
+    pub texel: [f32; 4],
+}
+
+impl Default for ExtraUniform {
+    fn default() -> Self {
+        DevelopParams::default().to_extra([0.0, 0.0])
     }
 }
 

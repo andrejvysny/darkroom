@@ -479,6 +479,10 @@ export type DevelopParams = {
   shadows: number;
   blacks: number;
   whites: number;
+  sharpen: number;
+  nrLuma: number;
+  nrColor: number;
+  vignette: number;
   toneCurve: ToneCurve;
   hsl: HslBand[];
   masks: Mask[];
@@ -499,6 +503,10 @@ export const DEFAULT_PARAMS: DevelopParams = {
   shadows: 0,
   blacks: 0,
   whites: 0,
+  sharpen: 0,
+  nrLuma: 0,
+  nrColor: 0,
+  vignette: 0,
   toneCurve: { rgb: [], r: [], g: [], b: [] },
   hsl: Array.from({ length: HSL_BANDS }, () => ({ h: 0, s: 0, l: 0 })),
   masks: [],

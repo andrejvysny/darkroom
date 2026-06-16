@@ -68,6 +68,13 @@ fn wb_apply(v: vec3<f32>) -> vec3<f32> {
   return mat3x3<f32>(WB.c0.xyz, WB.c1.xyz, WB.c2.xyz) * v;
 }
 
+// Detail (sharpen / luma+color NR) + lens vignette + image texel size. @binding(9).
+struct Extra {
+  detail: vec4<f32>, // sharpen (0..1.5), nr_luma (0..1), nr_color (0..1), vignette (-1..1)
+  texel: vec4<f32>,  // 1/width, 1/height, _, _
+};
+@group(0) @binding(9) var<uniform> EX: Extra;
+
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
@@ -184,6 +191,45 @@ fn curve_ch(x: f32, sel: vec3<f32>) -> f32 {
   return dot(mix(v0, v1, f), sel);
 }
 
+// Exact texel fetch at uv + pixel offset (input is non-filterable Rgba32Float — textureLoad only).
+fn load_px(uv: vec2<f32>, off: vec2<f32>) -> vec3<f32> {
+  let dims = vec2<f32>(textureDimensions(input_tex));
+  let p = clamp((uv + off) * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0));
+  return textureLoad(input_tex, vec2<i32>(p), 0).rgb;
+}
+
+// 3×3 Gaussian blur (1-2-1) of the input at uv — shared by NR and unsharp sharpening.
+fn blur3(uv: vec2<f32>) -> vec3<f32> {
+  let t = EX.texel.xy;
+  let s =
+      load_px(uv, vec2<f32>(-t.x, -t.y)) + load_px(uv, vec2<f32>(0.0, -t.y)) * 2.0 + load_px(uv, vec2<f32>(t.x, -t.y))
+    + load_px(uv, vec2<f32>(-t.x, 0.0)) * 2.0 + load_px(uv, vec2<f32>(0.0, 0.0)) * 4.0 + load_px(uv, vec2<f32>(t.x, 0.0)) * 2.0
+    + load_px(uv, vec2<f32>(-t.x, t.y)) + load_px(uv, vec2<f32>(0.0, t.y)) * 2.0 + load_px(uv, vec2<f32>(t.x, t.y));
+  return s / 16.0;
+}
+
+// Detail stage: luma/color noise reduction (blend toward the blurred neighborhood, independently per
+// luminance + chroma) then unsharp-mask sharpening. Operates on the linear input before WB/develop.
+fn apply_detail(uv: vec2<f32>, base: vec3<f32>) -> vec3<f32> {
+  let sharpen = EX.detail.x;
+  let nr_l = EX.detail.y;
+  let nr_c = EX.detail.z;
+  if (sharpen < 1e-4 && nr_l < 1e-4 && nr_c < 1e-4) { return base; }
+  let b = blur3(uv);
+  var rgb = base;
+  if (nr_l > 1e-4 || nr_c > 1e-4) {
+    let yl = dot(rgb, LUMA);
+    let yb = dot(b, LUMA);
+    let y = mix(yl, yb, nr_l);                              // luminance NR
+    let c = mix(rgb - vec3<f32>(yl), b - vec3<f32>(yb), nr_c); // chroma (color) NR
+    rgb = vec3<f32>(y) + c;
+  }
+  if (sharpen > 1e-4) {
+    rgb = rgb + (rgb - b) * sharpen;                        // unsharp mask
+  }
+  return max(rgb, vec3<f32>(0.0));
+}
+
 // Scene-linear local adjustments (WB, exposure, highlights/shadows, saturation), parameterized so
 // the base develop and every per-mask variant share identical math. Masking happens in linear light.
 fn apply_local_linear(
@@ -225,9 +271,10 @@ fn apply_local_display(d_in: vec3<f32>, contrast: f32, blacks: f32, whites: f32)
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let base_rgb = textureSampleLevel(input_tex, input_smp, in.uv, 0.0).rgb;
-  // Global white balance (chromatic adaptation), once, in linear ProPhoto before everything else.
-  // P.wb_gain is held at identity now that global WB rides this matrix; masks keep their gain delta.
+  // Detail stage (sharpen + NR) on the linear input, then global white balance (chromatic
+  // adaptation), once, in linear ProPhoto before everything else. P.wb_gain is held at identity now
+  // that global WB rides this matrix; masks keep their gain delta.
+  let base_rgb = apply_detail(in.uv, textureSampleLevel(input_tex, input_smp, in.uv, 0.0).rgb);
   let base_wb = wb_apply(base_rgb);
 
   // --- SCENE-LINEAR STAGE: base develop, then composite each mask's linear deltas ---
@@ -266,6 +313,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let di = apply_local_display(
       d, P.contrast + mp.contrast, P.blacks + mp.blacks, P.whites + mp.whites);
     out = mix(out, di, a);
+  }
+
+  // Lens vignette: radial darken(−) / brighten(+) toward the corners (display space, after masks).
+  let vig = EX.detail.w;
+  if (abs(vig) > 1e-4) {
+    let rad = distance(in.uv, vec2<f32>(0.5)) / 0.70710678; // 0 center .. 1 corner
+    out = out * (1.0 + vig * 0.6 * smoothstep(0.3, 1.0, rad));
   }
 
   return vec4<f32>(clamp(out, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);

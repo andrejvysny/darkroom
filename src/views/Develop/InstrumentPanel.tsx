@@ -17,54 +17,6 @@ import type {
   HslBand,
 } from "../../lib/ipc";
 
-function Toggle({
-  label,
-  defaultOn = false,
-}: {
-  label: string;
-  defaultOn?: boolean;
-}) {
-  const [on, setOn] = useState(defaultOn);
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-      }}
-    >
-      <span style={{ fontSize: 12, color: "var(--color-t2)" }}>{label}</span>
-      <div
-        onClick={() => setOn((v) => !v)}
-        style={{
-          width: 34,
-          height: 19,
-          borderRadius: 12,
-          background: on ? "var(--color-accent)" : "var(--color-hover)",
-          position: "relative",
-          cursor: "pointer",
-          transition: "background .15s",
-          flexShrink: 0,
-        }}
-      >
-        <div
-          style={{
-            position: "absolute",
-            top: 2,
-            left: 2,
-            width: 15,
-            height: 15,
-            borderRadius: "50%",
-            background: "#fff",
-            transition: "transform .15s",
-            transform: on ? "translateX(15px)" : "none",
-          }}
-        />
-      </div>
-    </div>
-  );
-}
-
 type AspectRatio = "3:2" | "16:9" | "1:1" | "4:5" | "Free";
 const ASPECTS: AspectRatio[] = ["3:2", "16:9", "1:1", "4:5", "Free"];
 
@@ -290,22 +242,51 @@ export default function InstrumentPanel({
       </Module>
 
       {/* Detail */}
-      <Module title="Detail" defaultCollapsed>
-        <Slider label="Sharpening" min={0} max={150} defaultValue={42} />
-        <Slider label="Noise · luminance" min={0} max={100} defaultValue={14} />
-        <Slider label="Noise · color" min={0} max={100} defaultValue={25} />
+      <Module
+        title="Detail"
+        defaultCollapsed
+        onReset={() => resetKeys(["sharpen", "nrLuma", "nrColor"])}
+      >
+        <Slider
+          label="Sharpening"
+          min={0}
+          max={150}
+          defaultValue={0}
+          value={params.sharpen}
+          onChange={(v) => onParamChange("sharpen", v)}
+        />
+        <Slider
+          label="Noise · luminance"
+          min={0}
+          max={100}
+          defaultValue={0}
+          value={params.nrLuma}
+          onChange={(v) => onParamChange("nrLuma", v)}
+        />
+        <Slider
+          label="Noise · color"
+          min={0}
+          max={100}
+          defaultValue={0}
+          value={params.nrColor}
+          onChange={(v) => onParamChange("nrColor", v)}
+        />
       </Module>
 
       {/* Lens Corrections */}
-      <Module title="Lens corrections" defaultCollapsed>
-        <Toggle label="Profile (FE 35mm F1.4)" defaultOn />
-        <Toggle label="Remove chromatic aberration" defaultOn />
+      <Module
+        title="Lens corrections"
+        defaultCollapsed
+        onReset={() => resetKeys(["vignette"])}
+      >
         <Slider
           label="Vignette"
           min={-100}
           max={100}
           defaultValue={0}
           bipolar
+          value={params.vignette}
+          onChange={(v) => onParamChange("vignette", v)}
         />
       </Module>
 
