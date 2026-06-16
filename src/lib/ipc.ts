@@ -2,15 +2,61 @@ import { invoke } from "@tauri-apps/api/core";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
+export type SortKey =
+  | "capture_desc"
+  | "capture_asc"
+  | "filename"
+  | "filename_desc"
+  | "rating_desc"
+  | "rating_asc"
+  | "imported_desc"
+  | "imported_asc";
+
+/** Sentinel `colorLabel` value that matches images with no color label. */
+export const LABEL_NONE = "__none__";
+
 export type QueryParams = {
   folderId?: number | null;
   minStars?: number | null;
   flag?: string | null;
+  colorLabel?: string | null;
+  keywordId?: number | null;
+  collectionId?: number | null;
+  importSessionId?: number | null;
   search?: string | null;
-  sort?: "capture_desc" | "capture_asc" | "filename";
+  sort?: SortKey;
   limit?: number;
   offset?: number;
 };
+
+/** The filter dimensions (excludes sort/search/paging) — the keys "All photos" clears. */
+export const FILTER_DIMENSIONS: (keyof QueryParams)[] = [
+  "folderId",
+  "minStars",
+  "flag",
+  "colorLabel",
+  "keywordId",
+  "collectionId",
+  "importSessionId",
+];
+
+/** True when any filter dimension is active. Single source of truth for nav/footer state. */
+export function hasActiveFilters(p: QueryParams): boolean {
+  return FILTER_DIMENSIONS.some((k) => p[k] != null);
+}
+
+/** A params patch that clears every filter dimension (keeps sort & search). */
+export function clearedFilters(): Partial<QueryParams> {
+  return {
+    folderId: null,
+    minStars: null,
+    flag: null,
+    colorLabel: null,
+    keywordId: null,
+    collectionId: null,
+    importSessionId: null,
+  };
+}
 
 export type ImageRow = {
   id: number;

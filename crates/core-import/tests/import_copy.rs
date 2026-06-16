@@ -36,6 +36,9 @@ fn copy_import_routes_and_dedupes() {
         eprintln!("library/2026 not present — skipping");
         return;
     }
+    // The full 240-file library is not committed (only reference fixtures are), so assert
+    // against however many CR3s are actually present rather than a hardcoded count.
+    let n = files.len();
 
     let card = tempfile::tempdir().unwrap();
     for f in &files {
@@ -55,7 +58,7 @@ fn copy_import_routes_and_dedupes() {
         |_, _| {},
     )
     .unwrap();
-    assert_eq!(stats.added, 3, "all three imported");
+    assert_eq!(stats.added, n, "all available files imported");
     assert_eq!(stats.skipped, 0);
     assert_eq!(stats.failed, 0);
 
@@ -67,7 +70,7 @@ fn copy_import_routes_and_dedupes() {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         rows.filter_map(Result::ok).collect()
     };
-    assert_eq!(routed.len(), 3);
+    assert_eq!(routed.len(), n);
     for p in &routed {
         assert!(p.contains("/2026/2026-06-06/"), "date-routed: {p}");
         assert!(std::path::Path::new(p).exists(), "copied file exists: {p}");
@@ -84,11 +87,11 @@ fn copy_import_routes_and_dedupes() {
     )
     .unwrap();
     assert_eq!(again.added, 0, "idempotent re-import adds nothing");
-    assert_eq!(again.skipped, 3);
+    assert_eq!(again.skipped, n);
 
     let count: i64 = db
         .conn
         .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 3, "no duplicate rows");
+    assert_eq!(count, n as i64, "no duplicate rows");
 }

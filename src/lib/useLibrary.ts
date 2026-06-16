@@ -6,6 +6,7 @@ import {
   libraryFolders,
   libraryIndexRoot,
   appDefaultLibrary,
+  clearedFilters,
   type QueryParams,
   type ImageRow,
   type FolderRow,
@@ -16,7 +17,10 @@ export type IndexingState = { done: number; total: number };
 export interface LibraryState {
   images: ImageRow[];
   folders: FolderRow[];
+  /** Count of the current (filtered) query. */
   total: number;
+  /** Count of all present images, ignoring filters (for the "All photos" nav). */
+  grandTotal: number;
   loading: boolean;
   indexing: IndexingState | null;
   error: string | null;
@@ -25,11 +29,12 @@ export interface LibraryState {
 
 export interface LibraryActions {
   refresh: (overrides?: Partial<QueryParams>) => Promise<void>;
+  /** Merge a partial set of params in one update (single refresh). */
+  patchParams: (patch: Partial<QueryParams>) => void;
+  /** Clear every filter dimension (keeps sort & search). */
+  clearFilters: () => void;
   setSort: (sort: QueryParams["sort"]) => void;
   setSearch: (search: string | null) => void;
-  setMinStars: (minStars: number | null) => void;
-  setFlag: (flag: string | null) => void;
-  setFolderId: (folderId: number | null) => void;
   reindex: () => Promise<void>;
   patchImage: (id: number, patch: Partial<ImageRow>) => void;
 }
@@ -44,6 +49,7 @@ export function useLibrary(): LibraryState & LibraryActions {
   const [images, setImages] = useState<ImageRow[]>([]);
   const [folders, setFolders] = useState<FolderRow[]>([]);
   const [total, setTotal] = useState(0);
+  const [grandTotal, setGrandTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [indexing, setIndexing] = useState<IndexingState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -64,13 +70,15 @@ export function useLibrary(): LibraryState & LibraryActions {
       const merged = overrides
         ? { ...paramsRef.current, ...overrides }
         : paramsRef.current;
-      const [imgs, cnt, flds] = await Promise.all([
+      const [imgs, cnt, flds, grand] = await Promise.all([
         libraryQuery(merged),
         libraryCount(merged),
         libraryFolders(),
+        libraryCount({}),
       ]);
       setImages(imgs);
       setTotal(cnt);
+      setGrandTotal(grand);
       setFolders(flds);
     } catch (e) {
       setError(String(e));
@@ -148,7 +156,9 @@ export function useLibrary(): LibraryState & LibraryActions {
           const imgs = await libraryQuery(DEFAULT_PARAMS);
           setFolders(flds);
           setImages(imgs);
+          // DEFAULT_PARAMS carries no filter dimensions, so cnt is the unfiltered total.
           setTotal(cnt);
+          setGrandTotal(cnt);
         }
       } catch (e) {
         setError(String(e));
@@ -174,24 +184,20 @@ export function useLibrary(): LibraryState & LibraryActions {
     void refresh();
   }, [params, refresh]);
 
+  const patchParams = useCallback((patch: Partial<QueryParams>) => {
+    setParams((p) => ({ ...p, ...patch }));
+  }, []);
+
+  const clearFilters = useCallback(() => {
+    setParams((p) => ({ ...p, ...clearedFilters() }));
+  }, []);
+
   const setSort = useCallback((sort: QueryParams["sort"]) => {
     setParams((p) => ({ ...p, sort }));
   }, []);
 
   const setSearch = useCallback((search: string | null) => {
     setParams((p) => ({ ...p, search }));
-  }, []);
-
-  const setMinStars = useCallback((minStars: number | null) => {
-    setParams((p) => ({ ...p, minStars }));
-  }, []);
-
-  const setFlag = useCallback((flag: string | null) => {
-    setParams((p) => ({ ...p, flag }));
-  }, []);
-
-  const setFolderId = useCallback((folderId: number | null) => {
-    setParams((p) => ({ ...p, folderId }));
   }, []);
 
   const patchImage = useCallback((id: number, patch: Partial<ImageRow>) => {
@@ -204,16 +210,16 @@ export function useLibrary(): LibraryState & LibraryActions {
     images,
     folders,
     total,
+    grandTotal,
     loading,
     indexing,
     error,
     params,
     refresh,
+    patchParams,
+    clearFilters,
     setSort,
     setSearch,
-    setMinStars,
-    setFlag,
-    setFolderId,
     reindex,
     patchImage,
   };

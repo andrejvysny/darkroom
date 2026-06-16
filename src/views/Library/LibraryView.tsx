@@ -124,9 +124,11 @@ export default function LibraryView() {
       <div style={{ gridRow: "1 / 3", gridColumn: "1", minHeight: 0 }}>
         <LeftNav
           folders={lib.folders}
-          total={lib.total}
+          grandTotal={lib.grandTotal}
           params={lib.params}
-          setFolderId={lib.setFolderId}
+          clearFilters={lib.clearFilters}
+          patchParams={lib.patchParams}
+          setSort={lib.setSort}
         />
       </div>
 
@@ -199,9 +201,9 @@ export default function LibraryView() {
         <BottomBar
           total={lib.total}
           params={lib.params}
+          patchParams={lib.patchParams}
+          clearFilters={lib.clearFilters}
           setSort={lib.setSort}
-          setMinStars={lib.setMinStars}
-          setFlag={lib.setFlag}
         />
       </div>
 

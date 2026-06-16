@@ -11,9 +11,19 @@ use serde::{Deserialize, Serialize};
 pub struct QueryParams {
     pub folder_id: Option<i64>,
     pub min_stars: Option<i64>,
+    /// Exact flag match: "pick" | "reject" | "none".
     pub flag: Option<String>,
+    /// Exact color-label match (e.g. "red"); use the sentinel "__none__" to match unlabeled.
+    pub color_label: Option<String>,
+    /// Restrict to images tagged with this keyword id.
+    pub keyword_id: Option<i64>,
+    /// Restrict to members of this (static) collection id.
+    pub collection_id: Option<i64>,
+    /// Restrict to images added by this import session id.
+    pub import_session_id: Option<i64>,
     pub search: Option<String>,
-    /// "capture_desc" (default) | "capture_asc" | "filename".
+    /// "capture_desc" (default) | "capture_asc" | "filename" | "filename_desc"
+    /// | "rating_desc" | "rating_asc" | "imported_desc" | "imported_asc".
     pub sort: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -47,18 +57,38 @@ const COLUMNS: &str = "i.id, i.content_hash, i.path, i.original_filename, i.capt
     i.width, i.height, i.orientation,
     COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label";
 
+// All filter dimensions are bound named params; NULL no-ops each clause. Keyword/collection
+// membership use EXISTS subqueries so there is no row duplication and the static SELECT stays
+// simple. The keyword-name search branch sits inside the `:search IS NULL OR …` group, so it is
+// never evaluated on unfiltered queries.
 const WHERE: &str = "i.status = 'present'
     AND (:folder_id IS NULL OR i.folder_id = :folder_id)
     AND (:min_stars IS NULL OR COALESCE(rf.stars,0) >= :min_stars)
     AND (:flag IS NULL OR COALESCE(rf.flag,'none') = :flag)
+    AND (:color_label IS NULL
+         OR (:color_label = '__none__' AND rf.color_label IS NULL)
+         OR rf.color_label = :color_label)
+    AND (:keyword_id IS NULL OR EXISTS
+         (SELECT 1 FROM image_keywords ik WHERE ik.image_id = i.id AND ik.keyword_id = :keyword_id))
+    AND (:collection_id IS NULL OR EXISTS
+         (SELECT 1 FROM collection_images ci WHERE ci.image_id = i.id AND ci.collection_id = :collection_id))
+    AND (:import_session_id IS NULL OR i.import_session_id = :import_session_id)
     AND (:search IS NULL OR i.original_filename LIKE :search
                          OR i.camera_model LIKE :search
-                         OR i.lens LIKE :search)";
+                         OR i.lens LIKE :search
+                         OR EXISTS (SELECT 1 FROM image_keywords ik
+                                    JOIN keywords k ON k.id = ik.keyword_id
+                                    WHERE ik.image_id = i.id AND k.name LIKE :search))";
 
 fn sort_sql(sort: Option<&str>) -> &'static str {
     match sort {
         Some("capture_asc") => "i.capture_date ASC, i.id ASC",
-        Some("filename") => "i.original_filename ASC",
+        Some("filename") => "i.original_filename ASC, i.id ASC",
+        Some("filename_desc") => "i.original_filename DESC, i.id DESC",
+        Some("rating_desc") => "COALESCE(rf.stars,0) DESC, i.capture_date DESC, i.id DESC",
+        Some("rating_asc") => "COALESCE(rf.stars,0) ASC, i.capture_date DESC, i.id DESC",
+        Some("imported_desc") => "i.imported_at DESC, i.id DESC",
+        Some("imported_asc") => "i.imported_at ASC, i.id ASC",
         _ => "i.capture_date DESC, i.id DESC",
     }
 }
@@ -109,6 +139,10 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":folder_id": p.folder_id,
             ":min_stars": p.min_stars,
             ":flag": p.flag,
+            ":color_label": p.color_label,
+            ":keyword_id": p.keyword_id,
+            ":collection_id": p.collection_id,
+            ":import_session_id": p.import_session_id,
             ":search": search,
             ":limit": p.limit.unwrap_or(5000),
             ":offset": p.offset.unwrap_or(0),
@@ -169,6 +203,10 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":folder_id": p.folder_id,
             ":min_stars": p.min_stars,
             ":flag": p.flag,
+            ":color_label": p.color_label,
+            ":keyword_id": p.keyword_id,
+            ":collection_id": p.collection_id,
+            ":import_session_id": p.import_session_id,
             ":search": search,
         },
         |r| r.get(0),
