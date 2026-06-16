@@ -1,5 +1,6 @@
 //! core-library — watched-root indexing, thumbnail cache, and catalog queries.
 
+pub mod analysis;
 pub mod collections;
 pub mod cull;
 pub mod edits;
@@ -11,6 +12,11 @@ pub mod reconcile;
 pub mod settings;
 pub mod thumbs;
 
+pub use analysis::{
+    analysis_facets, caption_for_image, detections_for_image, existing_analysis, insert_analysis,
+    present_image_count, present_images, AnalysisInput, AnalyzeTarget, CaptionRow, DetectionRow,
+    FacetRow,
+};
 pub use collections::{
     add_images_to_collection, collections_for_image, create_collection, delete_collection,
     list_collections, remove_images_from_collection, rename_collection, CollectionRow,

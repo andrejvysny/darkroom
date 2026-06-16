@@ -53,6 +53,54 @@ Quality: `cargo test --workspace` (7 integration + unit, all green) · `cargo cl
 > All phases: `cargo test -p core-pipeline` (16 tests) + clippy clean · `tsc` + `npm run build` clean. Visual QA in Tauri app still pending (user to run).
 > Deferred polish: brush dirty-cache (re-bakes every render), cursor-anchored zoom, radial rotation handle, full guided-filter, AI component impl.
 
+## AI scan analysis (object detection + captioning) — in progress
+
+> Plan: `~/.claude/plans/act-as-expert-on-tidy-wave.md`. Spike: `crates/core-analyze/SPIKE.md`.
+> Modular `Analyzer` pipeline; background pass after scan; results in side-tables + separate "Detected/AI"
+> panel (keywords untouched). License-clean: D-FINE (Apache) + Florence-2 (MIT) via `ort` + CoreML.
+
+### Phase 0 — runtime + model spike — DONE ✅ (validated on real CR3 + COCO images)
+
+- [x] `core-analyze` crate; `ort =2.0.0-rc.12` (coreml) builds on rustc 1.91; CoreML EP registers/runs.
+- [x] D-FINE-S detector end-to-end: correct decode, ~108ms/img CoreML; validated (cats→2 cats, street→14 people).
+- [x] Florence-2 captioner viable: non-merged decoder pair + `GraphOptimizationLevel::Level1` + f32 I/O (no half). Two ORT gotchas documented in SPIKE.md. usls rejected (alpha, ort pin mismatch).
+- [x] Harnesses: `examples/detect_one.rs`, `examples/onnx_io.rs`.
+
+### Phase 1 — analyzer engine (`core-analyze`) — DONE ✅ (validated end-to-end)
+
+- [x] `Analyzer` trait + `AnalysisCtx`/`AnalysisRecord` + payloads + `AnalyzerRegistry` (`lib.rs`).
+- [x] `ObjectDetector` (D-FINE, `detector.rs`): preprocess + sigmoid/argmax decode + IoU dedup + COCO→bucket. Validated (cats→2 cats, street→14 people).
+- [x] `Captioner` (Florence-2, `caption.rs`): 4-session seq2seq, full-recompute greedy decode (with-past export fixes seq=16 → unusable), keywords = caption nouns ∪ prior detection labels. Validated: cats→"Two cats laying on a pink blanket with remotes."
+- [x] `models.rs` first-run download/verify (min-size guard) + `build_session` (CoreML + per-model opt level).
+- [x] Harnesses: `examples/{caption_one,analyze_one}.rs`. clippy clean.
+- [ ] Note: download path (`ModelStore::ensure`) structured but runtime-tested in Phase 3 integration.
+
+### Phase 2 — persistence — DONE ✅
+
+- [x] Migration `005_analysis.sql` (003/004 already used by scale/phash): `analysis_results` (PK image×analyzer×version), `image_detections` (denorm + indexes), `image_captions`. Registered in `core-db/src/lib.rs`.
+- [x] `core-library/src/analysis.rs`: `existing_analysis` (skip-set), `insert_analysis` (idempotent JSON→projections), `present_images`, read rows + `analysis_facets`. No ML/ort dep.
+- [x] `query.rs`: `QueryParams.detected_category` + EXISTS subquery. Tests `tests/analysis.rs` green; clippy clean.
+
+### Phase 3 — background analysis pass + IPC — DONE ✅
+
+- [x] `src-tauri/src/analysis.rs` (orchestration lives in app layer, keeping `core-library` ML-free): `run_pass` (rayon decode→analyze→1-tx insert, version-gated skip, RAII running-guard, failure isolation), `ensure_models`, lazy `registry`, `status`, `decode_srgb` (preview→1024px). Detector bbox now normalized [0,1].
+- [x] `state.rs`: `models_dir` + lazy `analyzers` + `analysis_running`. `commands.rs`: 6 commands (status/models_ensure/run/facets/image_detections/image_caption) + auto-trigger after index when models ready. Registered in `lib.rs`. App builds + clippy clean.
+- [x] Validated: `ModelStore::ensure` downloads `dfine_m` (ureq) + D-FINE-M detects (cats→2 cats, normalized bbox). `examples/models_smoke.rs`.
+- [ ] Full app-run (download Florence + analyze library in-app) deferred to verification.
+
+### Phase 4 — frontend "Detected/AI" panel + LeftNav facet — DONE ✅
+
+- [x] `src/lib/ipc.ts`: analysis types + 6 wrappers + `QueryParams.detectedCategory` (in FILTER_DIMENSIONS + clearedFilters).
+- [x] `src/lib/useAnalysis.ts` (new hook): status/facets/progress/doneVersion + `analysis:models|progress|done` listeners + `triggerAnalysis`/`reloadFacets`.
+- [x] `LeftNav.tsx`: "Detected" facet (People/Animals/Vehicles → `detectedCategory`) + Analyze/Re-analyze buttons. `RightInfo.tsx`: read-only Detected/AI panel (caption + keywords + per-category chips, race-safe). `LibraryView.tsx` wiring + progress overlay. `npm run build` clean.
+
+### Phase 5 — gates — DONE ✅ (one manual step remaining)
+
+- [x] `cargo test --workspace` green (incl. new analysis tests, no regressions); feature code clippy-clean; `npm run build` clean.
+- [x] Release links `ort` under `panic=abort`+`lto`; **onnxruntime STATICALLY linked** (no dylib to bundle) + system CoreML.framework — big packaging win.
+- [ ] MANUAL: `npm run tauri dev` → Analyze (first run downloads ~360MB models) → verify Detected facet/panel. (Optional: pre-stage models into app-data `models/` to skip download.)
+- [ ] Pre-existing (not this feature): `core-pipeline` `tests/masks.rs` 1 clippy warning (concurrent masking work).
+
 ## Remaining work (prioritized)
 
 > Full plan: `~/.claude/plans/act-as-senior-software-flickering-candle.md` (5 phases).

@@ -1,0 +1,259 @@
+//! Persistence for AI scan-analysis results (object detection + captioning).
+//!
+//! Storage is generic over analyzers: the canonical `analysis_results` row (image × analyzer ×
+//! model_version) holds the JSON payload; known analyzer ids are also projected into the
+//! denormalized `image_detections` / `image_captions` tables for fast filtering and display.
+//! Kept free of any ML/ort dependency — it reads the payload JSON directly.
+
+use std::collections::HashSet;
+
+use core_db::rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+
+use crate::error::LibError;
+
+pub const OBJECT_DETECTION_ID: &str = "object_detection";
+pub const CAPTION_ID: &str = "caption";
+
+/// One analyzer result to persist (mirror of the ML crate's `AnalysisRecord`, kept local so
+/// `core-library` doesn't depend on `core-analyze`/ort).
+pub struct AnalysisInput {
+    pub analyzer_id: String,
+    pub model_version: String,
+    pub payload: serde_json::Value,
+}
+
+/// All `(image_id, analyzer_id, model_version)` triples already stored — drives version-gated
+/// incremental skip in the analysis pass.
+pub fn existing_analysis(conn: &Connection) -> Result<HashSet<(i64, String, String)>, LibError> {
+    let mut stmt =
+        conn.prepare("SELECT image_id, analyzer_id, model_version FROM analysis_results")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Persist one image's analyzer records (idempotent). Writes `analysis_results` plus the
+/// denormalized projection tables. MUST be called inside a transaction by the caller.
+pub fn insert_analysis(
+    conn: &Connection,
+    image_id: i64,
+    ran_at: i64,
+    records: &[AnalysisInput],
+) -> Result<(), LibError> {
+    for rec in records {
+        let payload = serde_json::to_string(&rec.payload)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO analysis_results
+               (image_id, analyzer_id, model_version, ran_at, status, payload)
+             VALUES (?1, ?2, ?3, ?4, 'ok', ?5)",
+            params![
+                image_id,
+                rec.analyzer_id,
+                rec.model_version,
+                ran_at,
+                payload
+            ],
+        )?;
+        match rec.analyzer_id.as_str() {
+            OBJECT_DETECTION_ID => project_detections(conn, image_id, rec)?,
+            CAPTION_ID => project_caption(conn, image_id, ran_at, rec)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn project_detections(
+    conn: &Connection,
+    image_id: i64,
+    rec: &AnalysisInput,
+) -> Result<(), LibError> {
+    conn.execute(
+        "DELETE FROM image_detections WHERE image_id = ?1",
+        params![image_id],
+    )?;
+    let Some(arr) = rec.payload.get("detections").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    let mut stmt = conn.prepare(
+        "INSERT INTO image_detections
+           (image_id, label, category, confidence, bbox_x0, bbox_y0, bbox_x1, bbox_y1, model_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for d in arr {
+        let label = d.get("label").and_then(|v| v.as_str()).unwrap_or_default();
+        let category = d
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let conf = d.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let bb = d.get("bbox").and_then(|v| v.as_array());
+        let g = |i: usize| {
+            bb.and_then(|a| a.get(i))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+        };
+        stmt.execute(params![
+            image_id,
+            label,
+            category,
+            conf,
+            g(0),
+            g(1),
+            g(2),
+            g(3),
+            rec.model_version
+        ])?;
+    }
+    Ok(())
+}
+
+fn project_caption(
+    conn: &Connection,
+    image_id: i64,
+    ran_at: i64,
+    rec: &AnalysisInput,
+) -> Result<(), LibError> {
+    let caption = rec
+        .payload
+        .get("caption")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let empty = serde_json::Value::Array(Vec::new());
+    let keywords = serde_json::to_string(rec.payload.get("keywords").unwrap_or(&empty))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO image_captions
+           (image_id, caption, keywords, model_version, generated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![image_id, caption, keywords, rec.model_version, ran_at],
+    )?;
+    Ok(())
+}
+
+/// A present image to (potentially) analyze.
+pub struct AnalyzeTarget {
+    pub id: i64,
+    pub path: String,
+    pub content_hash_hex: String,
+}
+
+/// All present images (id, path, content-hash hex) in id order — the analysis pass filters these
+/// against [`existing_analysis`].
+pub fn present_images(conn: &Connection) -> Result<Vec<AnalyzeTarget>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, content_hash FROM images WHERE status = 'present' ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, path, hb) = row?;
+        let content_hash_hex = if hb.len() == 32 {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&hb);
+            core_raw::hex(&a)
+        } else {
+            String::new()
+        };
+        out.push(AnalyzeTarget {
+            id,
+            path,
+            content_hash_hex,
+        });
+    }
+    Ok(out)
+}
+
+// ---- read side (IPC) ----
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionRow {
+    pub label: String,
+    pub category: String,
+    pub confidence: f64,
+    /// `[x0, y0, x1, y1]` in original-image pixel coords.
+    pub bbox: [f64; 4],
+}
+
+pub fn detections_for_image(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Vec<DetectionRow>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT label, category, confidence, bbox_x0, bbox_y0, bbox_x1, bbox_y1
+         FROM image_detections WHERE image_id = ?1 ORDER BY confidence DESC",
+    )?;
+    let rows = stmt.query_map([image_id], |r| {
+        Ok(DetectionRow {
+            label: r.get(0)?,
+            category: r.get(1)?,
+            confidence: r.get(2)?,
+            bbox: [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?],
+        })
+    })?;
+    Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionRow {
+    pub caption: String,
+    pub keywords: Vec<String>,
+}
+
+pub fn caption_for_image(conn: &Connection, image_id: i64) -> Result<Option<CaptionRow>, LibError> {
+    let row = conn
+        .query_row(
+            "SELECT caption, keywords FROM image_captions WHERE image_id = ?1",
+            [image_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(caption, kw)| CaptionRow {
+        caption,
+        keywords: serde_json::from_str(&kw).unwrap_or_default(),
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FacetRow {
+    pub category: String,
+    pub count: i64,
+}
+
+/// Distinct-image counts per detected category (LeftNav "Detected" facet).
+pub fn analysis_facets(conn: &Connection) -> Result<Vec<FacetRow>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT category, COUNT(DISTINCT image_id) FROM image_detections
+         GROUP BY category ORDER BY category",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(FacetRow {
+            category: r.get(0)?,
+            count: r.get(1)?,
+        })
+    })?;
+    Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Count of present images (denominator for analysis progress / status).
+pub fn present_image_count(conn: &Connection) -> Result<i64, LibError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM images WHERE status = 'present'",
+        [],
+        |r| r.get(0),
+    )?)
+}

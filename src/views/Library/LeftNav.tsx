@@ -5,12 +5,15 @@ import {
   clearedFilters,
   parseSmartQuery,
   smartQueryFromParams,
+  DETECTION_CATEGORIES,
   type FolderRow,
   type KeywordRow,
   type CollectionRow,
   type QueryParams,
   type SortKey,
+  type FacetRow,
 } from "../../lib/ipc";
+import type { AnalysisState, AnalysisActions } from "../../lib/useAnalysis";
 
 interface LeftNavProps {
   folders: FolderRow[];
@@ -26,6 +29,8 @@ interface LeftNavProps {
   onDeleteCollection: (id: number) => void;
   onRenameCollection: (id: number, name: string) => void;
   onDeleteKeyword: (id: number) => void;
+  /** AI analysis facets + actions — passed from LibraryView via useAnalysis */
+  analysis: AnalysisState & AnalysisActions;
 }
 
 function basename(p: string): string {
@@ -73,6 +78,7 @@ export default function LeftNav({
   onDeleteCollection,
   onRenameCollection,
   onDeleteKeyword,
+  analysis,
 }: LeftNavProps) {
   const activeFolderId = params.folderId ?? null;
   const noFilters = !hasActiveFilters(params);
@@ -189,7 +195,10 @@ export default function LeftNav({
             onRename={(name) => onRenameCollection(c.id, name)}
           />
         ))}
-        <CreateRow placeholder="New collection…" onSubmit={onCreateCollection} />
+        <CreateRow
+          placeholder="New collection…"
+          onSubmit={onCreateCollection}
+        />
       </div>
 
       {/* Smart collections section */}
@@ -240,6 +249,42 @@ export default function LeftNav({
           ))}
         </div>
       )}
+
+      {/* Detected section */}
+      <div>
+        <SectionHeading
+          action={
+            <AnalyzeButton
+              running={
+                analysis.status?.running === true || analysis.progress !== null
+              }
+              onAnalyze={() => void analysis.triggerAnalysis(false)}
+              onReanalyze={() => void analysis.triggerAnalysis(true)}
+            />
+          }
+        >
+          Detected
+        </SectionHeading>
+        {DETECTION_CATEGORIES.map((cat) => {
+          const row: FacetRow | undefined = analysis.facets.find(
+            (f) => f.category === cat,
+          );
+          const count = row?.count ?? 0;
+          const active = params.detectedCategory === cat;
+          return (
+            <NavRow
+              key={cat}
+              icon="scan"
+              label={cat}
+              count={count.toLocaleString()}
+              active={active}
+              onClick={() =>
+                patchParams({ detectedCategory: active ? null : cat })
+              }
+            />
+          );
+        })}
+      </div>
     </aside>
   );
 }
@@ -491,4 +536,69 @@ function iconBtn(): React.CSSProperties {
     cursor: "pointer",
     padding: "0 2px",
   };
+}
+
+/** Small header-action button for the Detected section. */
+function AnalyzeButton({
+  running,
+  onAnalyze,
+  onReanalyze,
+}: {
+  running: boolean;
+  onAnalyze: () => void;
+  onReanalyze: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+
+  return (
+    <span style={{ display: "flex", gap: 3 }}>
+      <button
+        disabled={running}
+        onClick={(e) => {
+          e.stopPropagation();
+          onAnalyze();
+        }}
+        onMouseEnter={() => setHover(false)}
+        title="Analyze new images"
+        aria-label="Analyze new images"
+        style={{
+          fontSize: 10,
+          padding: "1px 6px",
+          borderRadius: "var(--radius-sm)",
+          border: "1px solid var(--color-line)",
+          background: "transparent",
+          color: running ? "var(--color-t3)" : "var(--color-t2)",
+          cursor: running ? "default" : "pointer",
+          lineHeight: 1.5,
+          opacity: running ? 0.5 : 1,
+        }}
+      >
+        {running ? "Running…" : "Analyze"}
+      </button>
+      {!running && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onReanalyze();
+          }}
+          onMouseEnter={() => setHover(true)}
+          onMouseLeave={() => setHover(false)}
+          title="Re-analyze all images"
+          aria-label="Re-analyze all images"
+          style={{
+            fontSize: 10,
+            padding: "1px 5px",
+            borderRadius: "var(--radius-sm)",
+            border: "1px solid var(--color-line)",
+            background: hover ? "var(--color-hover)" : "transparent",
+            color: "var(--color-t3)",
+            cursor: "pointer",
+            lineHeight: 1.5,
+          }}
+        >
+          ↺
+        </button>
+      )}
+    </span>
+  );
 }

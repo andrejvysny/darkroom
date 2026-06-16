@@ -21,6 +21,8 @@ pub struct QueryParams {
     pub collection_id: Option<i64>,
     /// Restrict to images added by this import session id.
     pub import_session_id: Option<i64>,
+    /// Restrict to images with a detected object in this bucket ("People" | "Animals" | "Vehicles").
+    pub detected_category: Option<String>,
     pub search: Option<String>,
     /// "capture_desc" (default) | "capture_asc" | "filename" | "filename_desc"
     /// | "rating_desc" | "rating_asc" | "imported_desc" | "imported_asc".
@@ -73,6 +75,8 @@ const WHERE: &str = "i.status = 'present'
     AND (:collection_id IS NULL OR EXISTS
          (SELECT 1 FROM collection_images ci WHERE ci.image_id = i.id AND ci.collection_id = :collection_id))
     AND (:import_session_id IS NULL OR i.import_session_id = :import_session_id)
+    AND (:detected_category IS NULL OR EXISTS
+         (SELECT 1 FROM image_detections d WHERE d.image_id = i.id AND d.category = :detected_category))
     AND (:search IS NULL OR i.original_filename LIKE :search
                          OR i.camera_model LIKE :search
                          OR i.lens LIKE :search
@@ -143,6 +147,7 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":keyword_id": p.keyword_id,
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
+            ":detected_category": p.detected_category,
             ":search": search,
             ":limit": p.limit.unwrap_or(5000),
             ":offset": p.offset.unwrap_or(0),
@@ -207,6 +212,7 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":keyword_id": p.keyword_id,
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
+            ":detected_category": p.detected_category,
             ":search": search,
         },
         |r| r.get(0),

@@ -8,6 +8,7 @@ members = [
     "crates/core-pipeline",
     "crates/core-dedup",
     "crates/core-import",
+    "crates/core-analyze",
 ]
 
 [workspace.package]

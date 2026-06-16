@@ -2,7 +2,10 @@
 //! `AppHandle` inside the blocking closure (never held across `.await`).
 
 use crate::state::AppState;
-use core_library::{CollectionRow, FolderRow, ImageRow, IndexStats, KeywordRow, QueryParams};
+use core_library::{
+    CaptionRow, CollectionRow, DetectionRow, FacetRow, FolderRow, ImageRow, IndexStats, KeywordRow,
+    QueryParams,
+};
 use core_pipeline::{DevelopParams, Histogram};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -157,6 +160,15 @@ pub async fn library_index_root(app: AppHandle, path: String) -> Result<IndexSta
 
         enforce_thumb_cap(&st);
         let _ = app2.emit("import:done", &stats);
+
+        // Auto-analyze newly indexed images in the background — but only if the models are already
+        // downloaded (never trigger a ~400 MB download implicitly). First-time analysis is explicit.
+        if stats.added > 0 && crate::analysis::models_ready(&st) {
+            let app3 = app2.clone();
+            std::thread::spawn(move || {
+                let _ = crate::analysis::run_pass(&app3, false);
+            });
+        }
         Ok::<_, String>(stats)
     })
     .await
@@ -774,8 +786,10 @@ pub async fn dedup_scan_perceptual(
                         .and_then(|bytes| core_dedup::dhash_from_jpeg(&bytes));
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == total || n.is_multiple_of(16) {
-                        let _ = app2
-                            .emit("dedup:progress", serde_json::json!({"done": n, "total": total}));
+                        let _ = app2.emit(
+                            "dedup:progress",
+                            serde_json::json!({"done": n, "total": total}),
+                        );
                     }
                     phash.map(|p| (*id, p as i64))
                 })
@@ -881,6 +895,74 @@ pub async fn set_thumb_cache_cap(app: AppHandle, bytes: u64) -> Result<u64, Stri
             core_library::set_thumb_cache_cap(&db.conn, bytes).map_err(|e| e.to_string())?;
         }
         st.thumbs.evict_to(bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------- AI analysis ----------
+
+/// Total / analyzed / pending image counts + models-ready + running flags (for the Detected panel).
+#[tauri::command]
+pub async fn analysis_status(app: AppHandle) -> Result<crate::analysis::AnalysisStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        crate::analysis::status(&st)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Download any missing model files (first run only). Emits `analysis:models` progress.
+#[tauri::command]
+pub async fn analysis_models_ensure(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::analysis::ensure_models(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Run the background analysis pass. `force` re-analyzes everything. Emits `analysis:progress`/`:done`.
+#[tauri::command]
+pub async fn analysis_run(
+    app: AppHandle,
+    force: bool,
+) -> Result<crate::analysis::RunStats, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::analysis::run_pass(&app, force))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Detected-object category counts (distinct images) for the LeftNav facet.
+#[tauri::command]
+pub async fn analysis_facets(app: AppHandle) -> Result<Vec<FacetRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::analysis_facets(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Detected objects for one image (metadata panel).
+#[tauri::command]
+pub async fn image_detections(app: AppHandle, id: i64) -> Result<Vec<DetectionRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::detections_for_image(&db.conn, id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Generated caption + keywords for one image (metadata panel).
+#[tauri::command]
+pub async fn image_caption(app: AppHandle, id: i64) -> Result<Option<CaptionRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::caption_for_image(&db.conn, id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

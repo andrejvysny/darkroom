@@ -1,10 +1,12 @@
+use core_analyze::AnalyzerRegistry;
 use core_db::Db;
 use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, Runtime};
 
 /// GPU device + the compiled develop pipeline. Optional — the library works without a GPU.
@@ -68,6 +70,13 @@ pub struct AppState {
     pub last_histogram: Mutex<Option<Histogram>>,
     /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Directory holding downloaded ML model files (`<app-data>/models`).
+    pub models_dir: PathBuf,
+    /// AI analyzer registry, lazily built on first analysis run (loading ~300 MB of ONNX is deferred
+    /// until the user actually analyzes). `None` until then.
+    pub analyzers: Mutex<Option<Arc<AnalyzerRegistry>>>,
+    /// Guards against two analysis passes running at once.
+    pub analysis_running: AtomicBool,
 }
 
 impl AppState {
@@ -99,6 +108,8 @@ impl AppState {
             }
         };
 
+        let models_dir = data_dir.join("models");
+
         Ok(Self {
             db: Mutex::new(db),
             thumbs,
@@ -107,6 +118,9 @@ impl AppState {
             latest_render: AtomicU64::new(0),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
+            models_dir,
+            analyzers: Mutex::new(None),
+            analysis_running: AtomicBool::new(false),
         })
     }
 }

@@ -31,6 +31,7 @@ import type {
 import { useCulling } from "../../hooks/useCulling";
 import { runImport } from "../../lib/importFlow";
 import { runBatchExport } from "../../lib/export";
+import { useAnalysis } from "../../lib/useAnalysis";
 import LeftNav from "./LeftNav";
 import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
@@ -85,6 +86,7 @@ export default function LibraryView() {
   >([]);
 
   const lib = useLibrary();
+  const analysis = useAnalysis();
 
   // Register library action callbacks so TopBar/CommandPalette can call them
   useEffect(() => {
@@ -452,6 +454,7 @@ export default function LibraryView() {
           onDeleteCollection={handleDeleteCollection}
           onRenameCollection={handleRenameCollection}
           onDeleteKeyword={handleDeleteKeyword}
+          analysis={analysis}
         />
       </div>
 
@@ -500,6 +503,28 @@ export default function LibraryView() {
                 : "Indexing…"}
             </div>
           )}
+          {analysis.progress && (
+            <div
+              style={{
+                position: "absolute",
+                top: lib.indexing ? 46 : 10,
+                left: "50%",
+                transform: "translateX(-50%)",
+                zIndex: 10,
+                background: "var(--color-elev)",
+                border: "1px solid var(--color-line)",
+                borderRadius: "var(--radius-sm)",
+                padding: "6px 14px",
+                fontSize: 12,
+                color: "var(--color-t2)",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {analysis.progress.kind === "models"
+                ? `Downloading models ${analysis.progress.done} / ${analysis.progress.total}…`
+                : `Analyzing ${analysis.progress.done} / ${analysis.progress.total}…`}
+            </div>
+          )}
 
           {gridMode === "loupe" && selectedImage !== null ? (
             <Loupe image={selectedImage} />
@@ -545,6 +570,7 @@ export default function LibraryView() {
           imageCollections={selectedCollections}
           allCollections={lib.collections}
           handlers={rightInfoHandlers}
+          analysisVersion={analysis.doneVersion}
         />
       </div>
 

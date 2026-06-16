@@ -1,3 +1,4 @@
+mod analysis;
 mod commands;
 mod protocol;
 mod state;
@@ -74,6 +75,12 @@ pub fn run() {
             commands::thumb_cache_cap,
             commands::thumb_cache_size,
             commands::set_thumb_cache_cap,
+            commands::analysis_status,
+            commands::analysis_models_ensure,
+            commands::analysis_run,
+            commands::analysis_facets,
+            commands::image_detections,
+            commands::image_caption,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

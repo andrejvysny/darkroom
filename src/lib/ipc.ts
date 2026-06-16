@@ -23,6 +23,8 @@ export type QueryParams = {
   keywordId?: number | null;
   collectionId?: number | null;
   importSessionId?: number | null;
+  /** Detected-object bucket filter: "People" | "Animals" | "Vehicles". */
+  detectedCategory?: string | null;
   search?: string | null;
   sort?: SortKey;
   limit?: number;
@@ -38,6 +40,7 @@ export const FILTER_DIMENSIONS: (keyof QueryParams)[] = [
   "keywordId",
   "collectionId",
   "importSessionId",
+  "detectedCategory",
 ];
 
 /** True when any filter dimension is active. Single source of truth for nav/footer state. */
@@ -55,6 +58,7 @@ export function clearedFilters(): Partial<QueryParams> {
     keywordId: null,
     collectionId: null,
     importSessionId: null,
+    detectedCategory: null,
   };
 }
 
@@ -557,4 +561,70 @@ export function exportImage(
   dest: string,
 ): Promise<void> {
   return invoke<void>("export_image", { imageId, params, format, dest });
+}
+
+// ── AI scan analysis (object detection + caption) ────────────────────────────
+
+/** The three detected-object buckets, in display order. */
+export const DETECTION_CATEGORIES = ["People", "Animals", "Vehicles"] as const;
+export type DetectionCategory = (typeof DETECTION_CATEGORIES)[number];
+
+/** One detected object. `bbox` is normalized `[x0,y0,x1,y1]` in [0,1]. */
+export type Detection = {
+  label: string;
+  category: string;
+  confidence: number;
+  bbox: [number, number, number, number];
+};
+
+export type ImageCaption = {
+  caption: string;
+  keywords: string[];
+};
+
+/** Detected-object category count (distinct images) for the LeftNav facet. */
+export type FacetRow = {
+  category: string;
+  count: number;
+};
+
+export type AnalysisStatus = {
+  total: number;
+  analyzed: number;
+  pending: number;
+  modelsReady: boolean;
+  running: boolean;
+};
+
+export type AnalysisRunStats = {
+  analyzed: number;
+  failed: number;
+};
+
+/** Total/analyzed/pending counts + models-ready/running flags. */
+export function analysisStatus(): Promise<AnalysisStatus> {
+  return invoke<AnalysisStatus>("analysis_status", {});
+}
+
+/** Download missing model files (first run). Emits `analysis:models` `{done,total}`. */
+export function analysisModelsEnsure(): Promise<void> {
+  return invoke<void>("analysis_models_ensure", {});
+}
+
+/** Run the background analysis pass. Emits `analysis:progress` `{done,total}` then `analysis:done`. */
+export function analysisRun(force = false): Promise<AnalysisRunStats> {
+  return invoke<AnalysisRunStats>("analysis_run", { force });
+}
+
+/** Per-category detected-image counts. */
+export function analysisFacets(): Promise<FacetRow[]> {
+  return invoke<FacetRow[]>("analysis_facets", {});
+}
+
+export function imageDetections(id: number): Promise<Detection[]> {
+  return invoke<Detection[]>("image_detections", { id });
+}
+
+export function imageCaption(id: number): Promise<ImageCaption | null> {
+  return invoke<ImageCaption | null>("image_caption", { id });
 }

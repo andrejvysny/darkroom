@@ -1,9 +1,14 @@
-import { Fragment, useState } from "react";
+import { Fragment, useState, useEffect } from "react";
 import {
   thumbUrl,
+  imageDetections,
+  imageCaption,
+  DETECTION_CATEGORIES,
   type ImageRow,
   type KeywordRow,
   type CollectionRow,
+  type Detection,
+  type ImageCaption,
 } from "../../lib/ipc";
 
 const LABEL_COLORS: { key: string; bg: string }[] = [
@@ -88,6 +93,8 @@ interface RightInfoProps {
   /** All collections (static + smart) — used to populate the add-to dropdown. */
   allCollections: CollectionRow[];
   handlers: RightInfoHandlers;
+  /** Bumped after analysis:done so the AI section re-fetches for the same image. */
+  analysisVersion: number;
 }
 
 export default function RightInfo({
@@ -97,9 +104,32 @@ export default function RightInfo({
   imageCollections,
   allCollections,
   handlers,
+  analysisVersion,
 }: RightInfoProps) {
   const meta = selectedImage;
   const [kwInput, setKwInput] = useState("");
+  const [aiCaption, setAiCaption] = useState<ImageCaption | null>(null);
+  const [aiDetections, setAiDetections] = useState<Detection[]>([]);
+
+  useEffect(() => {
+    if (meta === null) {
+      setAiCaption(null);
+      setAiDetections([]);
+      return;
+    }
+    let cancelled = false;
+    void Promise.all([imageCaption(meta.id), imageDetections(meta.id)]).then(
+      ([cap, dets]) => {
+        if (!cancelled) {
+          setAiCaption(cap);
+          setAiDetections(dets);
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [meta?.id, analysisVersion]);
 
   const memberIds = new Set(imageCollections.map((c) => c.id));
   const addableCollections = allCollections.filter(
@@ -511,6 +541,111 @@ export default function RightInfo({
                 <option key={k.id} value={k.name} />
               ))}
             </datalist>
+          </>
+        )}
+      </div>
+
+      {/* Detected / AI */}
+      <div
+        style={{
+          padding: "14px 16px",
+          borderTop: "1px solid var(--color-line)",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 10.5,
+            letterSpacing: ".06em",
+            textTransform: "uppercase",
+            color: "var(--color-t3)",
+            fontWeight: 600,
+            marginBottom: 10,
+          }}
+        >
+          Detected / AI
+        </div>
+        {meta === null ? (
+          <div style={{ fontSize: 12, color: "var(--color-t3)" }}>
+            No image selected
+          </div>
+        ) : aiCaption === null && aiDetections.length === 0 ? (
+          <div style={{ fontSize: 11.5, color: "var(--color-t3)" }}>
+            Not analyzed yet
+          </div>
+        ) : (
+          <>
+            {aiCaption !== null && (
+              <>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: "var(--color-t2)",
+                    fontStyle: "italic",
+                    lineHeight: 1.45,
+                    marginBottom: aiCaption.keywords.length > 0 ? 6 : 0,
+                  }}
+                >
+                  {aiCaption.caption}
+                </div>
+                {aiCaption.keywords.length > 0 && (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "var(--color-t3)",
+                      marginBottom: aiDetections.length > 0 ? 10 : 0,
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    {aiCaption.keywords.join(", ")}
+                  </div>
+                )}
+              </>
+            )}
+            {DETECTION_CATEGORIES.map((cat) => {
+              const dets = aiDetections.filter((d) => d.category === cat);
+              if (dets.length === 0) return null;
+              return (
+                <div key={cat} style={{ marginBottom: 8 }}>
+                  <div
+                    style={{
+                      fontSize: 10,
+                      letterSpacing: ".05em",
+                      textTransform: "uppercase",
+                      color: "var(--color-t3)",
+                      fontWeight: 600,
+                      marginBottom: 5,
+                    }}
+                  >
+                    {cat}
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {dets.map((d, i) => (
+                      <span
+                        key={i}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 4,
+                          fontSize: 11,
+                          color: "var(--color-t2)",
+                          background: "var(--color-elev)",
+                          border: "1px solid var(--color-line)",
+                          borderRadius: 20,
+                          padding: "2px 8px",
+                        }}
+                      >
+                        {d.label}
+                        <span
+                          style={{ color: "var(--color-t3)", fontSize: 10 }}
+                        >
+                          {Math.round(d.confidence * 100)}%
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
           </>
         )}
       </div>
