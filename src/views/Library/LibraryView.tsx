@@ -9,8 +9,14 @@ import {
   keywordsForImage,
   keywordAddToImage,
   keywordRemoveFromImage,
+  collectionsForImage,
+  collectionAddImages,
+  collectionRemoveImages,
+  collectionCreate,
+  collectionDelete,
+  smartQueryFromParams,
 } from "../../lib/ipc";
-import type { ImageRow, KeywordRow } from "../../lib/ipc";
+import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
 import { runImport } from "../../lib/importFlow";
 import LeftNav from "./LeftNav";
@@ -52,6 +58,9 @@ export default function LibraryView() {
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
+  const [selectedCollections, setSelectedCollections] = useState<
+    CollectionRow[]
+  >([]);
 
   const lib = useLibrary();
 
@@ -77,19 +86,29 @@ export default function LibraryView() {
 
   useCulling({ images: lib.images, patchImage: lib.patchImage });
 
-  // Load the selected image's keywords whenever the selection changes.
+  // Load the selected image's keywords + collection membership when the selection changes.
   useEffect(() => {
     if (selectedId === null) {
       setSelectedKeywords([]);
+      setSelectedCollections([]);
       return;
     }
     let cancelled = false;
-    void keywordsForImage(selectedId)
-      .then((ks) => {
-        if (!cancelled) setSelectedKeywords(ks);
+    void Promise.all([
+      keywordsForImage(selectedId),
+      collectionsForImage(selectedId),
+    ])
+      .then(([ks, cs]) => {
+        if (!cancelled) {
+          setSelectedKeywords(ks);
+          setSelectedCollections(cs);
+        }
       })
       .catch(() => {
-        if (!cancelled) setSelectedKeywords([]);
+        if (!cancelled) {
+          setSelectedKeywords([]);
+          setSelectedCollections([]);
+        }
       });
     return () => {
       cancelled = true;
@@ -159,12 +178,83 @@ export default function LibraryView() {
     [selectedId, lib.patchImage],
   );
 
+  const handleAddToCollection = useCallback(
+    async (collectionId: number) => {
+      if (selectedId === null) return;
+      try {
+        await collectionAddImages(collectionId, [selectedId]);
+        setSelectedCollections(await collectionsForImage(selectedId));
+        void lib.reloadCollections();
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedId, lib.reloadCollections],
+  );
+
+  const handleRemoveFromCollection = useCallback(
+    async (collectionId: number) => {
+      if (selectedId === null) return;
+      try {
+        await collectionRemoveImages(collectionId, [selectedId]);
+        setSelectedCollections((prev) =>
+          prev.filter((c) => c.id !== collectionId),
+        );
+        void lib.reloadCollections();
+        if (lib.params.collectionId === collectionId) void lib.refresh();
+      } catch {
+        /* ignore */
+      }
+    },
+    [selectedId, lib.reloadCollections, lib.refresh, lib.params.collectionId],
+  );
+
+  // LeftNav collection management
+  const handleCreateCollection = useCallback(
+    async (name: string) => {
+      try {
+        await collectionCreate(name, false, null);
+        void lib.reloadCollections();
+      } catch {
+        /* ignore — empty names are rejected backend-side */
+      }
+    },
+    [lib.reloadCollections],
+  );
+
+  const handleCreateSmartCollection = useCallback(
+    async (name: string) => {
+      try {
+        await collectionCreate(name, true, smartQueryFromParams(lib.params));
+        void lib.reloadCollections();
+      } catch {
+        /* ignore */
+      }
+    },
+    [lib.reloadCollections, lib.params],
+  );
+
+  const handleDeleteCollection = useCallback(
+    async (id: number) => {
+      try {
+        await collectionDelete(id);
+        void lib.reloadCollections();
+        if (lib.params.collectionId === id) lib.clearFilters();
+      } catch {
+        /* ignore */
+      }
+    },
+    [lib.reloadCollections, lib.clearFilters, lib.params.collectionId],
+  );
+
   const rightInfoHandlers: RightInfoHandlers = {
     onSetRating: handleSetRating,
     onSetFlag: handleSetFlag,
     onSetLabel: handleSetLabel,
     onAddKeyword: handleAddKeyword,
     onRemoveKeyword: handleRemoveKeyword,
+    onAddToCollection: handleAddToCollection,
+    onRemoveFromCollection: handleRemoveFromCollection,
   };
 
   const gridImages = lib.images.map(toGridImage);
@@ -184,11 +274,15 @@ export default function LibraryView() {
         <LeftNav
           folders={lib.folders}
           keywords={lib.keywords}
+          collections={lib.collections}
           grandTotal={lib.grandTotal}
           params={lib.params}
           clearFilters={lib.clearFilters}
           patchParams={lib.patchParams}
           setSort={lib.setSort}
+          onCreateCollection={handleCreateCollection}
+          onCreateSmartCollection={handleCreateSmartCollection}
+          onDeleteCollection={handleDeleteCollection}
         />
       </div>
 
@@ -257,6 +351,8 @@ export default function LibraryView() {
           selectedImage={selectedImage}
           keywords={selectedKeywords}
           keywordSuggestions={lib.keywords}
+          imageCollections={selectedCollections}
+          allCollections={lib.collections}
           handlers={rightInfoHandlers}
         />
       </div>

@@ -1,5 +1,6 @@
 //! core-library — watched-root indexing, thumbnail cache, and catalog queries.
 
+pub mod collections;
 pub mod cull;
 pub mod edits;
 pub mod error;
@@ -8,6 +9,10 @@ pub mod keywords;
 pub mod query;
 pub mod thumbs;
 
+pub use collections::{
+    add_images_to_collection, collections_for_image, create_collection, delete_collection,
+    list_collections, remove_images_from_collection, rename_collection, CollectionRow,
+};
 pub use cull::{set_flag, set_label, set_rating};
 pub use edits::{get_edit, set_edit};
 pub use error::LibError;

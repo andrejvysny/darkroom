@@ -230,6 +230,77 @@ export function keywordDelete(keywordId: number): Promise<void> {
   return invoke<void>("keyword_delete", { keywordId });
 }
 
+// ── Collections ──────────────────────────────────────────────────────────────
+
+export type CollectionRow = {
+  id: number;
+  name: string;
+  isSmart: boolean;
+  /** Predicate JSON (serialized QueryParams) for smart collections; null for static. */
+  query: string | null;
+  count: number;
+};
+
+export function collectionsList(): Promise<CollectionRow[]> {
+  return invoke<CollectionRow[]>("collections_list", {});
+}
+
+export function collectionsForImage(imageId: number): Promise<CollectionRow[]> {
+  return invoke<CollectionRow[]>("collections_for_image", { imageId });
+}
+
+export function collectionCreate(
+  name: string,
+  isSmart: boolean,
+  query: string | null,
+): Promise<number> {
+  return invoke<number>("collection_create", { name, isSmart, query });
+}
+
+export function collectionRename(id: number, name: string): Promise<void> {
+  return invoke<void>("collection_rename", { id, name });
+}
+
+export function collectionDelete(id: number): Promise<void> {
+  return invoke<void>("collection_delete", { id });
+}
+
+export function collectionAddImages(
+  collectionId: number,
+  imageIds: number[],
+): Promise<number> {
+  return invoke<number>("collection_add_images", { collectionId, imageIds });
+}
+
+export function collectionRemoveImages(
+  collectionId: number,
+  imageIds: number[],
+): Promise<number> {
+  return invoke<number>("collection_remove_images", { collectionId, imageIds });
+}
+
+/** Extract the filter predicate (filter dimensions + search) from params, for a smart collection. */
+export function smartQueryFromParams(p: QueryParams): string {
+  const pred: QueryParams = {};
+  if (p.folderId != null) pred.folderId = p.folderId;
+  if (p.minStars != null) pred.minStars = p.minStars;
+  if (p.flag != null) pred.flag = p.flag;
+  if (p.colorLabel != null) pred.colorLabel = p.colorLabel;
+  if (p.keywordId != null) pred.keywordId = p.keywordId;
+  if (p.search != null) pred.search = p.search;
+  return JSON.stringify(pred);
+}
+
+/** Parse a smart collection's stored predicate JSON back into QueryParams (safe). */
+export function parseSmartQuery(query: string | null): Partial<QueryParams> {
+  if (!query) return {};
+  try {
+    return JSON.parse(query) as Partial<QueryParams>;
+  } catch {
+    return {};
+  }
+}
+
 // ── Develop IPC ────────────────────────────────────────────────────────────
 
 export type CurvePoint = { x: number; y: number };
