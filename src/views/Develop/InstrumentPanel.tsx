@@ -4,9 +4,13 @@ import Module from "./Module";
 import Slider from "./Slider";
 import ToneCurve from "./ToneCurve";
 import ColorMixer from "./ColorMixer";
+import MaskPanel from "./MaskPanel";
 import Icon from "../../components/Icon";
 import type {
   DevelopParams,
+  LocalAdjust,
+  Mask,
+  MaskComponent,
   ScalarParamKey,
   ToneCurveChannel,
   CurvePoint,
@@ -71,6 +75,17 @@ interface InstrumentPanelProps {
   onHslChange: (index: number, patch: Partial<HslBand>) => void;
   resetKeys: (keys: ScalarParamKey[]) => void;
   onReset: () => void;
+  onAddMask: (mask: Mask) => void;
+  onDeleteMask: (index: number) => void;
+  onUpdateMask: (index: number, patch: Partial<Mask>) => void;
+  onUpdateMaskAdjust: (index: number, patch: Partial<LocalAdjust>) => void;
+  onAddComponent: (index: number, component: MaskComponent) => void;
+  onUpdateComponent: (
+    index: number,
+    compIndex: number,
+    patch: Partial<MaskComponent>,
+  ) => void;
+  onDeleteComponent: (index: number, compIndex: number) => void;
 }
 
 export default function InstrumentPanel({
@@ -80,6 +95,13 @@ export default function InstrumentPanel({
   onHslChange,
   resetKeys,
   onReset,
+  onAddMask,
+  onDeleteMask,
+  onUpdateMask,
+  onUpdateMaskAdjust,
+  onAddComponent,
+  onUpdateComponent,
+  onDeleteComponent,
 }: InstrumentPanelProps) {
   const [aspect, setAspect] = useState<AspectRatio>("3:2");
 
@@ -96,6 +118,18 @@ export default function InstrumentPanel({
       }}
     >
       <Histogram />
+
+      {/* Masks */}
+      <MaskPanel
+        masks={params.masks}
+        onAddMask={onAddMask}
+        onDeleteMask={onDeleteMask}
+        onUpdateMask={onUpdateMask}
+        onUpdateMaskAdjust={onUpdateMaskAdjust}
+        onAddComponent={onAddComponent}
+        onUpdateComponent={onUpdateComponent}
+        onDeleteComponent={onDeleteComponent}
+      />
 
       {/* White Balance */}
       <Module title="White balance" onReset={() => resetKeys(["temp", "tint"])}>

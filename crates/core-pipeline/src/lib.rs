@@ -9,6 +9,7 @@ pub mod curve;
 pub mod encode;
 pub mod error;
 pub mod histogram;
+pub mod mask;
 pub mod params;
 
 pub use backend::{DevelopPipeline, GpuContext};
@@ -16,7 +17,10 @@ pub use curve::build_lut;
 pub use encode::{rgba8_to_jpeg, rgba8_to_png};
 pub use error::PipelineError;
 pub use histogram::{histogram, Histogram};
-pub use params::{CurvePoint, DevelopParams, HslBand, ToneCurve};
+pub use params::{
+    BrushStroke, ComponentKind, CurvePoint, DevelopParams, HslBand, LocalAdjust, Mask,
+    MaskComponent, MaskOp, ToneCurve, MASK_CAP,
+};
 
 // Re-export the linear buffer type for convenience.
 pub use core_raw::LinearImage;

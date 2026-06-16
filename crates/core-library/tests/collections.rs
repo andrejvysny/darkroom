@@ -11,7 +11,11 @@ fn insert_img(conn: &Connection, tag: u8, stars: i64) -> i64 {
     conn.execute(
         "INSERT INTO images(content_hash, file_size, path, original_filename, status, imported_at)
          VALUES (?1, 1, ?2, ?3, 'present', 0)",
-        params![vec![tag; 32], format!("/lib/{tag}.cr3"), format!("{tag}.cr3")],
+        params![
+            vec![tag; 32],
+            format!("/lib/{tag}.cr3"),
+            format!("{tag}.cr3")
+        ],
     )
     .unwrap();
     let id = conn.last_insert_rowid();

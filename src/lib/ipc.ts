@@ -357,6 +357,86 @@ export type HslBand = { h: number; s: number; l: number };
 /** Number of hue bands (must match Rust `HSL_BANDS`). */
 export const HSL_BANDS = 8;
 
+/** Local adjustment set a mask carries (deltas on top of the global develop). Mirrors Rust `LocalAdjust`. */
+export type LocalAdjust = {
+  exposure: number;
+  temp: number;
+  tint: number;
+  contrast: number;
+  saturation: number;
+  highlights: number;
+  shadows: number;
+  blacks: number;
+  whites: number;
+};
+
+export const DEFAULT_LOCAL_ADJUST: LocalAdjust = {
+  exposure: 0,
+  temp: 0,
+  tint: 0,
+  contrast: 0,
+  saturation: 0,
+  highlights: 0,
+  shadows: 0,
+  blacks: 0,
+  whites: 0,
+};
+
+/** One brush stroke (bezier control points normalized to the longest edge). Mirrors Rust `BrushStroke`. */
+export type BrushStroke = {
+  points: [number, number][];
+  size: number;
+  hardness: number;
+  flow: number;
+  opacity: number;
+  isErase: boolean;
+};
+
+/** A mask component's shape/source (serde-tagged enum, `type` discriminant). Mirrors Rust `ComponentKind`. */
+export type ComponentKind =
+  | { type: "linear"; p0: [number, number]; p1: [number, number] }
+  | {
+      type: "radial";
+      center: [number, number];
+      radius: [number, number];
+      angle: number;
+      feather: number;
+    }
+  | { type: "brush"; strokes: BrushStroke[] }
+  | { type: "luminanceRange"; lo: number; hi: number; feather: number }
+  | {
+      type: "colorRange";
+      hue: number;
+      sat: number;
+      tol: number;
+      feather: number;
+    }
+  | { type: "ai"; model: string };
+
+/** How a component combines with the running mask alpha. Mirrors Rust `MaskOp`. */
+export type MaskOp = "add" | "subtract" | "intersect";
+
+/** One component of a mask. Mirrors Rust `MaskComponent`. */
+export type MaskComponent = {
+  kind: ComponentKind;
+  op: MaskOp;
+  invert: boolean;
+  /** Request guided-filter edge-aware refinement (brush/range only). */
+  feather: boolean;
+};
+
+/** A local adjustment mask. Mirrors Rust `Mask`. */
+export type Mask = {
+  name: string;
+  components: MaskComponent[];
+  adjust: LocalAdjust;
+  opacity: number;
+  enabled: boolean;
+};
+
+/** Maximum masks per image (must match Rust `MASK_CAP`). */
+export const MASK_CAP = 16;
+
 export type DevelopParams = {
   exposure: number;
   temp: number;
@@ -369,6 +449,7 @@ export type DevelopParams = {
   whites: number;
   toneCurve: ToneCurve;
   hsl: HslBand[];
+  masks: Mask[];
 };
 
 /** The numeric (scalar) develop params — everything except the structured curve/hsl fields. */
@@ -388,6 +469,7 @@ export const DEFAULT_PARAMS: DevelopParams = {
   whites: 0,
   toneCurve: { rgb: [], r: [], g: [], b: [] },
   hsl: Array.from({ length: HSL_BANDS }, () => ({ h: 0, s: 0, l: 0 })),
+  masks: [],
 };
 
 export function developGetEdit(imageId: number): Promise<DevelopParams> {

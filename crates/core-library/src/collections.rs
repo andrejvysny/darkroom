@@ -25,11 +25,10 @@ pub struct CollectionRow {
 /// All collections with counts, ordered by name. Smart counts are evaluated against the catalog.
 pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRow>, LibError> {
     let rows: Vec<(i64, String, i64, Option<String>)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, name, is_smart, query FROM collections ORDER BY name COLLATE NOCASE")?;
-        let mapped = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, is_smart, query FROM collections ORDER BY name COLLATE NOCASE",
+        )?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
         mapped.collect::<core_db::rusqlite::Result<Vec<_>>>()?
     };
 

@@ -84,10 +84,11 @@ pub fn add_keyword_to_image(
         "INSERT OR IGNORE INTO image_keywords(image_id, keyword_id) VALUES(?1, ?2)",
         params![image_id, id],
     )?;
-    let stored: String =
-        conn.query_row("SELECT name FROM keywords WHERE id = ?1", params![id], |r| {
-            r.get(0)
-        })?;
+    let stored: String = conn.query_row(
+        "SELECT name FROM keywords WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
     Ok(KeywordRow {
         id,
         name: stored,
@@ -109,10 +110,11 @@ pub fn add_keyword_to_images(
             stmt.execute(params![image_id, id])?;
         }
     }
-    let stored: String =
-        conn.query_row("SELECT name FROM keywords WHERE id = ?1", params![id], |r| {
-            r.get(0)
-        })?;
+    let stored: String = conn.query_row(
+        "SELECT name FROM keywords WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
     Ok(KeywordRow {
         id,
         name: stored,

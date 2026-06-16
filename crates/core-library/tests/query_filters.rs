@@ -77,7 +77,11 @@ fn seed() -> Db {
 }
 
 fn ids(conn: &Connection, p: &QueryParams) -> Vec<i64> {
-    query_images(conn, p).unwrap().into_iter().map(|r| r.id).collect()
+    query_images(conn, p)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
 }
 
 #[test]

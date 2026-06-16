@@ -8,8 +8,14 @@ import {
   developPreviewJpeg,
   developRender,
   developSetEdit,
+  MASK_CAP,
+  type BrushStroke,
+  type ComponentKind,
   type DevelopParams,
   type HistData,
+  type LocalAdjust,
+  type Mask,
+  type MaskComponent,
   type ScalarParamKey,
   type ToneCurveChannel,
   type CurvePoint,
@@ -139,6 +145,8 @@ export function useDevelop() {
 
     const id = selectedId;
     let cancelled = false;
+    // New image: drop any mask selection / armed eyedropper from the previous image.
+    useDevelopStore.setState({ selectedMaskIndex: null, pickingColor: false });
 
     // 1. Instant first paint — embedded camera JPEG (demosaic-free), in parallel with the render.
     developPreviewJpeg(id)
@@ -243,6 +251,164 @@ export function useDevelop() {
     [selectedId, commit],
   );
 
+  // ── Mask operations ───────────────────────────────────────────────────────
+  // All build a new params.masks and route through commit() (same render/persist path as sliders).
+
+  const addMask = useCallback(
+    (mask: Mask) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      if (cur.masks.length >= MASK_CAP) return;
+      const masks = [...cur.masks, mask];
+      commit(selectedId, { ...cur, masks });
+      useDevelopStore.setState({
+        selectedMaskIndex: masks.length - 1,
+        selectedComponentIndex: 0,
+      });
+    },
+    [selectedId, commit],
+  );
+
+  const updateMask = useCallback(
+    (index: number, patch: Partial<Mask>) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const masks = cur.masks.map((m, i) =>
+        i === index ? { ...m, ...patch } : m,
+      );
+      commit(selectedId, { ...cur, masks });
+    },
+    [selectedId, commit],
+  );
+
+  const updateMaskAdjust = useCallback(
+    (index: number, patch: Partial<LocalAdjust>) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const m = cur.masks[index];
+      if (!m) return;
+      const masks = cur.masks.map((mm, i) =>
+        i === index ? { ...mm, adjust: { ...mm.adjust, ...patch } } : mm,
+      );
+      commit(selectedId, { ...cur, masks });
+    },
+    [selectedId, commit],
+  );
+
+  // Replace the kind (geometry) of one component of a mask — used by the overlay drag handlers.
+  const updateMaskComponentKind = useCallback(
+    (index: number, compIndex: number, kind: ComponentKind) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const m = cur.masks[index];
+      if (!m || !m.components[compIndex]) return;
+      const components = m.components.map((c, i) =>
+        i === compIndex ? { ...c, kind } : c,
+      );
+      const masks = cur.masks.map((mm, i) =>
+        i === index ? { ...mm, components } : mm,
+      );
+      commit(selectedId, { ...cur, masks });
+    },
+    [selectedId, commit],
+  );
+
+  // Append a new component to a mask (for Add/Subtract/Intersect combining).
+  const addComponent = useCallback(
+    (index: number, component: MaskComponent) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const m = cur.masks[index];
+      if (!m) return;
+      const components = [...m.components, component];
+      const masks = cur.masks.map((mm, i) =>
+        i === index ? { ...mm, components } : mm,
+      );
+      commit(selectedId, { ...cur, masks });
+      useDevelopStore.setState({
+        selectedComponentIndex: components.length - 1,
+      });
+    },
+    [selectedId, commit],
+  );
+
+  // Patch a component's top-level fields (op / invert / feather).
+  const updateComponent = useCallback(
+    (index: number, compIndex: number, patch: Partial<MaskComponent>) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const m = cur.masks[index];
+      if (!m || !m.components[compIndex]) return;
+      const components = m.components.map((c, i) =>
+        i === compIndex ? { ...c, ...patch } : c,
+      );
+      const masks = cur.masks.map((mm, i) =>
+        i === index ? { ...mm, components } : mm,
+      );
+      commit(selectedId, { ...cur, masks });
+    },
+    [selectedId, commit],
+  );
+
+  const deleteComponent = useCallback(
+    (index: number, compIndex: number) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const m = cur.masks[index];
+      if (!m || m.components.length <= 1) return; // keep at least one
+      const components = m.components.filter((_, i) => i !== compIndex);
+      const masks = cur.masks.map((mm, i) =>
+        i === index ? { ...mm, components } : mm,
+      );
+      commit(selectedId, { ...cur, masks });
+      const sel = useDevelopStore.getState().selectedComponentIndex;
+      useDevelopStore.setState({
+        selectedComponentIndex: Math.min(sel, components.length - 1),
+      });
+    },
+    [selectedId, commit],
+  );
+
+  // Append a brush stroke to a mask's first brush component (used by the painting overlay).
+  const appendStroke = useCallback(
+    (index: number, stroke: BrushStroke) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const m = cur.masks[index];
+      if (!m) return;
+      const ci = m.components.findIndex((c) => c.kind.type === "brush");
+      if (ci < 0) return;
+      const comp = m.components[ci];
+      if (comp.kind.type !== "brush") return;
+      const strokes = [...comp.kind.strokes, stroke];
+      const components = m.components.map((c, i) =>
+        i === ci ? { ...c, kind: { type: "brush" as const, strokes } } : c,
+      );
+      const masks = cur.masks.map((mm, i) =>
+        i === index ? { ...mm, components } : mm,
+      );
+      commit(selectedId, { ...cur, masks });
+    },
+    [selectedId, commit],
+  );
+
+  const deleteMask = useCallback(
+    (index: number) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const masks = cur.masks.filter((_, i) => i !== index);
+      commit(selectedId, { ...cur, masks });
+      const sel = useDevelopStore.getState().selectedMaskIndex;
+      // Keep the selection valid after removal.
+      const next =
+        sel === null || masks.length === 0
+          ? null
+          : Math.min(sel, masks.length - 1);
+      useDevelopStore.setState({ selectedMaskIndex: next });
+    },
+    [selectedId, commit],
+  );
+
   // Reset a single module's scalar keys to their defaults in one render/persist.
   const resetKeys = useCallback(
     (keys: ScalarParamKey[]) => {
@@ -276,5 +442,14 @@ export function useDevelop() {
     onHslChange,
     resetKeys,
     reset,
+    addMask,
+    updateMask,
+    updateMaskAdjust,
+    updateMaskComponentKind,
+    addComponent,
+    updateComponent,
+    deleteComponent,
+    appendStroke,
+    deleteMask,
   };
 }

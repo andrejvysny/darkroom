@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 
-const PROCESS_VERSION: i64 = 1;
+// v2 adds local adjustment masks (DevelopParams.masks). v1 rows deserialize with masks: [].
+const PROCESS_VERSION: i64 = 2;
 
 #[tauri::command]
 pub async fn library_query(app: AppHandle, params: QueryParams) -> Result<Vec<ImageRow>, String> {

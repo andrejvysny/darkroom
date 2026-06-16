@@ -15,6 +15,44 @@
 
 Quality: `cargo test --workspace` (7 integration + unit, all green) · `cargo clippy --workspace` clean · `npm run build` clean.
 
+## Local Adjustment Masks (in progress) — plan: `~/.claude/plans/act-as-expert-on-lucky-journal.md`
+
+> LR component model · masks reuse global scalars as deltas · Range + guided-filter included · AI schema-only.
+> Guard intact: `ParamsUniform`/`wb_gain` untouched — all mask data via NEW bindings 5–7 + storage buffer.
+
+### Phase 1 — Backend refactor + schema (no behavior change) — DONE ✅
+
+- [x] `params.rs`: mask schema (Mask/MaskComponent/ComponentKind/MaskOp/LocalAdjust/BrushStroke) + `masks: Vec<Mask>` on DevelopParams (`#[serde(default)]`)
+- [x] `params.rs`: MASK_CAP=16, MaskParamsUniform, MaskBufferUniform, `to_mask_buffer()`
+- [x] `develop.wgsl`: split `fs()` → `apply_local_linear`/`apply_local_display` (lossless); bindings 5–7 + count==0 guard
+- [x] `backend.rs`: PreparedImage gains mask-alpha D2Array (R16Float RENDER_ATTACHMENT — not storage-bindable on Metal) + filtering sampler + MaskBuffer storage
+- [x] `commands.rs`: PROCESS_VERSION 1→2 · TS: mirror `masks` in `ipc.ts` + store `freshDefaults`
+- [x] Test: `tests/masks.rs` (packing + Phase-1 inertness); golden tests green = lossless refactor. clippy + tsc clean.
+
+### Phase 2 — Parametric (linear+radial)
+
+- [x] **Backend DONE ✅**: `mask.rs` (PrepassUniform/PrepassComponent/MaskPrepass) + `mask_prepass.wgsl` (linear/radial coverage + Add/Sub/Intersect composite). `backend.rs` runs pre-pass per enabled mask → alpha layer; develop loops composite. Test `full_coverage_mask_matches_global` proves end-to-end compositing == global. clippy/tests green.
+- [x] **Frontend DONE ✅**: `lib/maskGeom.ts` (coord util + factories); store (`selectedMaskIndex`, `maskOverlayVisible`); `useDevelop` mask CRUD (add/update/delete/adjust/component-kind → commit); `MaskOverlay.tsx` SVG drag handles (linear endpoints, radial center+resize); `Stage.tsx` deterministic fit + wheel-zoom + drag-pan + overlay; `MaskPanel.tsx` (add/select/enable/invert/opacity + 9 adjustment sliders) in InstrumentPanel. tsc + `npm run build` clean.
+- [ ] Note: pre-pass recomputes every render (cheap for parametric); brush dirty-cache deferred to Phase 3. Visual QA in Tauri app pending (user to run).
+- [ ] Polish later: cursor-anchored zoom (currently center-origin), radial rotation handle, click-empty-to-deselect.
+
+### Phase 3 — Brush — DONE ✅
+
+- [x] Backend: `brush_bake.wgsl` (instanced dabs; paint=MAX blend, erase=multiply) + `BrushBake`/`flatten_strokes` in `mask.rs`; `bake_brush()` in backend.rs bakes per brush mask before its pre-pass; prepass samples brush coverage (binding 1). Test `brush_stroke_brightens_locally` green.
+- [x] Frontend: brush settings in store; `newBrushMask`; `appendStroke`; `BrushLayer` in `MaskOverlay` (capture + live preview + committed-stroke preview); `+ Brush` + size/hardness/strength/erase sliders in MaskPanel. Strokes commit on pointer-up (coalesced).
+
+### Phase 4 — Range + edge-aware refine — DONE ✅
+
+- [x] Backend: `mask_prepass.wgsl` luma/color range coverage (samples input image, binding 3). `mask_refine.wgsl` separable cross-bilateral (luma-guided) — `MaskRefine` + `refine_pass()`; pre-pass→scratch_a, refine (feathered: H/V) or passthrough → alpha layer. Tests `luminance_range_selects_brights_only` green. (Bilateral form of edge-aware feather; full guided-filter He 5-step is a future swap-in.)
+- [x] Frontend: `newLuminanceMask`/`newColorMask`; range sliders + eyedropper (`samplePixelHsv`, store `pickingColor`) + "Refine edges" toggle.
+
+### Phase 5 — Combine + multi-mask polish — DONE ✅
+
+- [x] Component combine (Add/Subtract/Intersect + invert) — math already in prepass; UI: per-mask Components list with op selector, active-component select, add/remove component buttons, `selectedComponentIndex` store, overlay + param sliders target active component. Test `component_intersect_narrows_coverage` green.
+
+> All phases: `cargo test -p core-pipeline` (16 tests) + clippy clean · `tsc` + `npm run build` clean. Visual QA in Tauri app still pending (user to run).
+> Deferred polish: brush dirty-cache (re-bakes every render), cursor-anchored zoom, radial rotation handle, full guided-filter, AI component impl.
+
 ## Remaining work (prioritized)
 
 > Full plan: `~/.claude/plans/act-as-senior-software-flickering-candle.md` (5 phases).

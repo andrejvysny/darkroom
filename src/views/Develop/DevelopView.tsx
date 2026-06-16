@@ -21,6 +21,15 @@ export default function DevelopView() {
     onHslChange,
     resetKeys,
     reset,
+    addMask,
+    updateMask,
+    updateMaskAdjust,
+    updateMaskComponentKind,
+    addComponent,
+    updateComponent,
+    deleteComponent,
+    appendStroke,
+    deleteMask,
   } = useDevelop();
 
   // Expose develop reset to the TopBar / command palette.
@@ -78,10 +87,12 @@ export default function DevelopView() {
       >
         <Stage
           showBefore={showBefore}
-          onHoldBefore={setShowBefore}
           imageUrl={imageUrl}
           previewUrl={previewUrl}
           rendering={rendering}
+          masks={params.masks}
+          onChangeMaskKind={updateMaskComponentKind}
+          onCommitStroke={appendStroke}
         />
         <InstrumentPanel
           params={params}
@@ -90,6 +101,13 @@ export default function DevelopView() {
           onHslChange={onHslChange}
           resetKeys={resetKeys}
           onReset={reset}
+          onAddMask={addMask}
+          onDeleteMask={deleteMask}
+          onUpdateMask={updateMask}
+          onUpdateMaskAdjust={updateMaskAdjust}
+          onAddComponent={addComponent}
+          onUpdateComponent={updateComponent}
+          onDeleteComponent={deleteComponent}
         />
       </div>
       <Filmstrip />
