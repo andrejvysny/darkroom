@@ -74,15 +74,16 @@ Views: `views/Library/{LeftNav,ThumbGrid,RightInfo,BottomBar,Loupe,DedupModal}.t
 
 `QueryParams` filter dimensions: `folder_id`, `min_stars`, `flag`, `color_label`
 (`"__none__"` = unlabeled), `keyword_id`, `collection_id`, `import_session_id`, `search`
-(filename/camera/lens/keyword), `sort` ∈ {capture_desc|asc, filename|_desc, rating_desc|asc,
+(filename/camera/lens/keyword), `sort` ∈ {capture_desc|asc, filename|\_desc, rating_desc|asc,
 imported_desc|asc}.
+
 - Protocol: `thumb://localhost/<content_hash_hex>?size=N`
 - Events: `import:progress {done,total}`, `import:done {ImportStats}`
 
 ### Data flow
 
 - **Thumbnails:** `core-raw` extracts embedded preview JPEG → downscale 512px → disk cache keyed by hash → `thumb://` protocol → `<img>`.
-- **Develop:** `core-raw::develop_linear` (rawler `RawDevelop` minus SRgb step → linear color-managed RGB) cached once per image (`prepare()` uploads to GPU); slider change → `render()` (uniform rewrite + draw + readback) → JPEG → `ipc::Response` → `createObjectURL` → stage `<img>`.
+- **Develop:** `core-raw::develop_linear` (rawler demosaic + our own camera→**linear wide-gamut ProPhoto** map via `clip_negative`, keeping >1.0 highlight headroom) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG → `ipc::Response` → `createObjectURL` → stage `<img>`. The shader converts ProPhoto→sRGB only at the display transition.
 - **Export:** re-decode full-res → `render_once` (full-res GPU) → PNG/JPEG → save dialog dest.
 
 ## Critical technical facts / gotchas (verified against installed crate sources)
@@ -129,17 +130,26 @@ export) + batch keyboard culling; import-mode picker (copy/move/reference); sing
 Backed by `core-library/{query,keywords,collections,cull}.rs` (30 backend tests) and thin Tauri
 commands; all SQL filters are bound named params (injection-safe).
 
-**Partial / UI-only (NOT wired to the GPU pipeline):** Detail (sharpen/NR), Lens corrections,
-Crop/geometry — sliders render in the UI but have no pipeline effect.
+**Develop fidelity (post-V1, wired + validated):** working space is now **linear wide-gamut
+ProPhoto** ("Melissa RGB") — `core-raw::map_3ch_to_rgb` targets ProPhoto, `develop.wgsl` converts
+ProPhoto→sRGB at the display transition. Scene highlight headroom preserved (`clip_negative`) + soft
+rolloff (no hard pre-OETF clamp). **Kelvin white balance** via Planckian locus (Kim 2002) + Bradford
+CAT on `@binding(8)` (GPT-5.5-reviewed; `wb_matrix(0,0)` is exact identity). Independent endpoint
+blacks/whites. **Detail** (3×3 unsharp sharpen + luma/color NR) + **Lens vignette** on `@binding(9)`.
 
-**Not done (deferred from spec):** FS watcher reconciliation (`notify`), keyword hierarchy UI,
-"recent import" as a true session filter, per-display ICC, highlight reconstruction, RCD/AMaZE
-demosaic, Windows/Linux, notarization, CSP hardening, thumbnail LRU eviction.
+**Partial / UI-only (NOT wired — geometric, need bilinear remap + visual QA):** Crop/geometry
+(aspect + straighten angle), Lens distortion / chromatic-aberration. Sliders render but have no effect.
+
+**Not done (deferred from spec):** keyword hierarchy UI, "recent import" as a true session filter,
+per-display ICC, RCD/AMaZE demosaic, Windows/Linux, notarization, CSP hardening. (Thumbnail LRU
+eviction and FS-watcher reconciliation are DONE — see `thumbs.rs::evict_to` and `src-tauri/watch.rs`.)
 
 ## Known issues / caveats
 
-- `develop_render`/`import_start` hold the `db`/`develop_cache` lock during long work (decode/import).
-  Fine for single-user v1; revisit for concurrency at scale (noted in reviews).
+- `import_start` holds the `db` lock across the entire multi-file import (copy/move/hash/thumbnail),
+  freezing all DB-backed IPC for the duration — annoying-not-dangerous for single-user; refactor
+  deferred. (NOTE: `develop_render` does **not** hold the cache lock during decode — it decodes +
+  GPU-prepares unlocked, locking only the brief render+readback. An earlier doc claim was stale.)
 - Loupe uses the 512px cached thumb upscaled (no dedicated larger preview yet).
 - Export re-decodes full-res (≈1.6s) each time; not cached.
 - Unsigned dmg blocked by Gatekeeper on other Macs (`xattr -dr com.apple.quarantine`).

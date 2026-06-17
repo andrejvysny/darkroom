@@ -59,13 +59,13 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 ### Data flow (three paths)
 
 - **Thumbnails:** embedded JPEG → downscale 512px → disk cache keyed by content hash → `thumb://localhost/<hash_hex>?size=N` protocol → `<img>`.
-- **Develop preview:** `core-raw::develop_linear` (rawler `RawDevelop` minus SRgb = linear color-managed RGB) cached once per image (`prepare()` uploads to GPU); slider change → `render()` (uniform rewrite + draw + readback) → JPEG bytes → `tauri::ipc::Response` → JS `invoke<ArrayBuffer>` → `URL.createObjectURL`. **Never base64 over IPC.**
+- **Develop preview:** `core-raw::develop_linear` (rawler demosaic + our camera→**linear wide-gamut ProPhoto** map via `clip_negative`, >1.0 headroom kept; ProPhoto→sRGB happens in-shader at the display transition) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG bytes → `tauri::ipc::Response` → JS `invoke<ArrayBuffer>` → `URL.createObjectURL`. **Never base64 over IPC.**
 - **Export:** re-decode full-res → full-res GPU render → PNG/JPEG → save dialog dest (not cached).
 
 ## Hard constraints (do not violate — see CURRENT_STATE.md for detail)
 
 - **Do NOT add padding to the `vec3 wb_gain` uniform** (`params.rs` ↔ `develop.wgsl`). A scalar packs into the vec3 tail per std140/WGSL; it is correct. A past review false-flagged it. Guarded by golden test `param_effects.rs`.
-- **All new GPU data must use new bindings**, never alter `ParamsUniform`. Tone curve = `@binding(3)`, HSL `FxUniform` = `@binding(4)`.
+- **All new GPU data must use new bindings**, never alter `ParamsUniform`. Tone curve = `@binding(3)`, HSL `FxUniform` = `@binding(4)`, masks = `@binding(5-7)`, **white-balance CAT mat3 = `@binding(8)`**, **Detail+vignette `ExtraUniform` = `@binding(9)`**. (Global WB now rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
 - **rawler `=0.7.2`** pinned (non-SemVer; CR3/EOS R7 validated, no LibRaw). Keep every rawler call inside `core-raw`.
 - **wgpu `=29`** — API differs substantially from older majors (Instance/device/pipeline-descriptor changes catalogued in CURRENT_STATE.md).
 - **rusqlite `0.39` + rusqlite_migration `=2.5.0`** pinned for rustc 1.91 (newer needs ≥1.95). Don't bump without checking MSRV.
@@ -74,6 +74,9 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 
 ## Status shorthand
 
-V1 complete + validated on 240 real Canon R7 CR3. **UI-only / not wired to GPU pipeline:** Crop/geometry,
-Lens corrections, Detail (sharpen/NR) — sliders render but have no effect. Check `TODO.md` before
+V1 complete (validated on 240 real Canon R7 CR3 **on the dev machine** — only 1 CR3 is committed;
+GPU/real-CR3 tests skip without the fixture/Metal). Post-V1 develop fidelity landed: linear-ProPhoto
+working space, scene-referred highlights, Kelvin WB (CAT), Detail (sharpen/NR), Lens vignette.
+**Still UI-only / not wired (geometric, need visual QA):** Crop/geometry (aspect + straighten),
+Lens distortion / chromatic-aberration — sliders render but have no effect. Check `TODO.md` before
 assuming a develop module is functional.

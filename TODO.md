@@ -123,15 +123,21 @@ Quality: `cargo test --workspace` (7 integration + unit, all green) · `cargo cl
 
 > Guard intact: `ParamsUniform` untouched — all new GPU data via new bindings. `param_effects` green.
 
-### Phase 2 — Develop facade II (next)
+### Phase 2 — Develop facade II
 
-- [ ] **Crop / geometry** (UV remap in new sampling stage; export-aware output dims). UI-only today.
-- [ ] **Lens corrections** (manual distortion/CA/vignette in sampling stage). UI-only today.
-- [ ] **Detail** (sharpen + luma/chroma NR; needs texel-size binding). UI-only today.
+- [x] **Detail** (3×3 unsharp sharpen + luma/color NR) — wired single-pass via `@binding(9)`
+      `ExtraUniform`; goldens in `param_effects.rs`.
+- [x] **Lens vignette** — radial darken/brighten in the display stage (`@binding(9)`). Dead
+      Profile/CA toggles removed.
+- [ ] **Crop / geometry** (aspect + straighten angle) — still UI-only. Needs bilinear remap +
+      export-aware output dims/overlay + interactive crop box + **visual QA**.
+- [ ] **Lens distortion / chromatic-aberration** (manual k1 / per-channel radial) — still UI-only.
+      Needs the same bilinear-remap infra + visual QA.
 
 ### Performance / robustness
 
-- [ ] Thumbnail cache **LRU eviction** (`core-library/src/thumbs.rs` — currently unbounded).
+- [x] Thumbnail cache **LRU eviction** — implemented (`core-library/src/thumbs.rs::evict_to`,
+      size-bounded, wired at startup/post-index/post-import/cap-change).
 - [ ] Dedicated **loupe preview** (≥1536px) instead of upscaled 512 thumb.
 - [ ] Cache full-res developed buffer for repeat export; shorten `db`/`develop_cache` lock hold during decode/import.
 
@@ -148,7 +154,9 @@ Quality: `cargo test --workspace` (7 integration + unit, all green) · `cargo cl
 - [x] **Multi-select + batch ops** — cmd/shift-click selection, `SelectionBar` (batch
       rating/flag/label/keyword/collection/export), batch culling via keyboard, batch export.
 - [x] **Import modes** — copy/move/reference picker (`ImportModal`).
-- [ ] FS **watcher** (`notify`) + move reconciliation by content hash (spec §9).
+- [x] FS **watcher** (`notify`) + reconciliation — implemented (`src-tauri/src/watch.rs` +
+      `core-library/src/reconcile.rs`, real SQL status flips). Watch-out: can contend the DB lock /
+      re-process files during an app import (gate it — see review).
 - [ ] Keyword **hierarchy** (parent_id) UI; keyword rename/merge.
 - [ ] "Recent import" as a true import-session filter (currently `imported_desc` sort).
 
@@ -165,6 +173,11 @@ Quality: `cargo test --workspace` (7 integration + unit, all green) · `cargo cl
 ## Watch-outs for whoever continues (see CURRENT_STATE.md for detail)
 
 - Do NOT "fix" the `vec3 wb_gain` uniform alignment — it's correct; guarded by `param_effects` golden test.
+- Develop works in **linear ProPhoto** now (`core-raw::map_3ch_to_rgb`); the shader converts
+  ProPhoto→sRGB at the display transition (`PP_TO_SRGB`, derived in
+  `core-raw/examples/print_color_matrices.rs`). Global WB is a **CAT mat3 on `@binding(8)`**
+  (`params.rs::wb_matrix`, Planckian+Bradford, identity at temp=0); `ParamsUniform.wb_gain` stays
+  identity. Detail/vignette = `ExtraUniform` on `@binding(9)`. Next free GPU binding = 10.
 - Keep ALL rawler calls in `core-raw` (pinned `=0.7.2`, non-SemVer).
 - `rusqlite 0.39` / `rusqlite_migration =2.5.0` pinned for rustc 1.91 — don't bump without checking MSRV.
 - wgpu is `=29`; its API differs a lot from older majors (see CURRENT_STATE.md).
