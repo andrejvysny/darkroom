@@ -118,6 +118,12 @@ export function libraryIndexRoot(path: string): Promise<IndexStats> {
   return invoke<IndexStats>("library_index_root", { path });
 }
 
+/** Wipe the catalog (index/metadata/settings) and rebuild it from disk. Files on disk are never
+ *  touched. Resolves with the aggregate re-index stats. */
+export function databaseReset(): Promise<IndexStats> {
+  return invoke<IndexStats>("database_reset", {});
+}
+
 export function appDefaultLibrary(): Promise<string | null> {
   return invoke<string | null>("app_default_library", {});
 }
@@ -159,8 +165,9 @@ export function importStart(
   source: string,
   mode: ImportMode,
   dest: string,
+  recursive = true,
 ): Promise<ImportStats> {
-  return invoke<ImportStats>("import_start", { source, mode, dest });
+  return invoke<ImportStats>("import_start", { source, mode, dest, recursive });
 }
 
 export function dedupScan(category: "byte" | "capture"): Promise<DupGroup[]> {
@@ -176,8 +183,17 @@ export function dedupScanPerceptual(threshold: number): Promise<DupGroup[]> {
 export function dedupResolve(
   keepId: number,
   trashIds: number[],
+  /** Decision context for the behavioral log (optional): the full group, the rule's suggested
+   *  keeper, and the group key — lets us later learn keeper ranking + detect user overrides. */
+  ctx?: { candidateIds?: number[]; autoKeeperId?: number; groupId?: string },
 ): Promise<number> {
-  return invoke<number>("dedup_resolve", { keepId, trashIds });
+  return invoke<number>("dedup_resolve", {
+    keepId,
+    trashIds,
+    candidateIds: ctx?.candidateIds,
+    autoKeeperId: ctx?.autoKeeperId,
+    groupId: ctx?.groupId,
+  });
 }
 
 /** Auto-resolve all byte-identical groups (keep one each, trash the rest). Resolves to count trashed. */
@@ -210,45 +226,78 @@ export function thumbUrl(hash: string, size = 512): string {
 
 // ── Cull IPC ───────────────────────────────────────────────────────────────
 
-export function cullSetRating(imageId: number, stars: number): Promise<void> {
-  return invoke<void>("cull_set_rating", { imageId, stars });
+/** Optional decision context for the behavioral log (cheap implicit weights + within-group set). */
+export type CullCtx = {
+  latencyMs?: number;
+  groupId?: string;
+  candidateIds?: number[];
+};
+
+export function cullSetRating(
+  imageId: number,
+  stars: number,
+  ctx?: CullCtx,
+): Promise<void> {
+  return invoke<void>("cull_set_rating", {
+    imageId,
+    stars,
+    latencyMs: ctx?.latencyMs,
+    groupId: ctx?.groupId,
+    candidateIds: ctx?.candidateIds,
+  });
 }
 
 export function cullSetFlag(
   imageId: number,
   flag: "none" | "pick" | "reject",
+  ctx?: CullCtx,
 ): Promise<void> {
-  return invoke<void>("cull_set_flag", { imageId, flag });
+  return invoke<void>("cull_set_flag", {
+    imageId,
+    flag,
+    latencyMs: ctx?.latencyMs,
+    groupId: ctx?.groupId,
+    candidateIds: ctx?.candidateIds,
+  });
 }
 
 export function cullSetLabel(
   imageId: number,
   label: string | null,
+  ctx?: CullCtx,
 ): Promise<void> {
-  return invoke<void>("cull_set_label", { imageId, label });
+  return invoke<void>("cull_set_label", {
+    imageId,
+    label,
+    latencyMs: ctx?.latencyMs,
+    groupId: ctx?.groupId,
+  });
 }
 
-// Batch culling (apply one value to a whole selection).
+// Batch culling (apply one value to a whole selection). The selection is the candidate group.
 
 export function cullSetRatingMany(
   imageIds: number[],
   stars: number,
+  groupId?: string,
 ): Promise<void> {
-  return invoke<void>("cull_set_rating_many", { imageIds, stars });
+  return invoke<void>("cull_set_rating_many", { imageIds, stars, groupId });
 }
 
 export function cullSetFlagMany(
   imageIds: number[],
   flag: "none" | "pick" | "reject",
+  groupId?: string,
 ): Promise<void> {
-  return invoke<void>("cull_set_flag_many", { imageIds, flag });
+  return invoke<void>("cull_set_flag_many", { imageIds, flag, groupId });
 }
 
 export function cullSetLabelMany(
   imageIds: number[],
   label: string | null,
+  groupId?: string,
 ): Promise<void> {
-  return invoke<void>("cull_set_label_many", { imageIds, label });
+  return invoke<void>("cull_set_label_many", { imageIds, label, groupId });
 }
 
 // ── Keywords / tags ──────────────────────────────────────────────────────────
@@ -519,8 +568,10 @@ export function developGetEdit(imageId: number): Promise<DevelopParams> {
 export function developSetEdit(
   imageId: number,
   params: DevelopParams,
+  /** Slider interactions in this edit session — a deliberation weight for the behavioral log. */
+  touchCount?: number,
 ): Promise<void> {
-  return invoke<void>("develop_set_edit", { imageId, params });
+  return invoke<void>("develop_set_edit", { imageId, params, touchCount });
 }
 
 /** Per-channel 256-bin histogram from the rendered buffer. */
@@ -642,6 +693,12 @@ export function analysisCancel(): Promise<void> {
   return invoke<void>("analysis_cancel", {});
 }
 
+/** Backfill per-image feature vectors (lighting/best-shot/dedup model inputs) for images missing
+ *  them. Emits `features:progress` `{done,total}` then `features:done`. Resolves to count computed. */
+export function featuresBackfill(): Promise<number> {
+  return invoke<number>("features_backfill", {});
+}
+
 /** Per-category detected-image counts. */
 export function analysisFacets(): Promise<FacetRow[]> {
   return invoke<FacetRow[]>("analysis_facets", {});
@@ -653,4 +710,32 @@ export function imageDetections(id: number): Promise<Detection[]> {
 
 export function imageCaption(id: number): Promise<ImageCaption | null> {
   return invoke<ImageCaption | null>("image_caption", { id });
+}
+
+/** Manual ground-truth labels (tri-state: `null` = unlabeled). Doubles as detection eval data. */
+export type UserLabels = {
+  containsPerson: boolean | null;
+  containsAnimal: boolean | null;
+};
+
+export function imageUserLabels(id: number): Promise<UserLabels> {
+  return invoke<UserLabels>("image_user_labels", { id });
+}
+
+/** Set one label field (`"person"` | `"animal"`); `value = null` clears it. */
+export function setImageUserLabel(
+  id: number,
+  field: "person" | "animal",
+  value: boolean | null,
+): Promise<void> {
+  return invoke<void>("set_image_user_label", { id, field, value });
+}
+
+/** MegaDetector (animal) input resolution: 640 (faster) or 1280 (best recall). */
+export function analysisDetectorSize(): Promise<number> {
+  return invoke<number>("analysis_detector_size", {});
+}
+
+export function setAnalysisDetectorSize(size: number): Promise<void> {
+  return invoke<void>("set_analysis_detector_size", { size });
 }

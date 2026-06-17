@@ -20,13 +20,20 @@ fn seed_image(db: &Db) -> i64 {
 }
 
 fn records() -> Vec<AnalysisInput> {
+    // Per the detector ownership split: D-FINE → People/Vehicles, MegaDetector → Animals.
     vec![
         AnalysisInput {
             analyzer_id: "object_detection".into(),
             model_version: "dfine-m-v1".into(),
             payload: json!({"detections": [
-                {"label": "dog", "category": "Animals", "confidence": 0.91, "bbox": [1.0, 2.0, 3.0, 4.0]},
                 {"label": "car", "category": "Vehicles", "confidence": 0.77, "bbox": [5.0, 6.0, 7.0, 8.0]}
+            ]}),
+        },
+        AnalysisInput {
+            analyzer_id: "animal_detection".into(),
+            model_version: "mdv5a-v1".into(),
+            payload: json!({"detections": [
+                {"label": "dog", "category": "Animals", "confidence": 0.91, "bbox": [1.0, 2.0, 3.0, 4.0]}
             ]}),
         },
         AnalysisInput {
@@ -103,9 +110,11 @@ fn incremental_skip_set_and_idempotent_reinsert() {
 
     let seen = existing_analysis(&db.conn).unwrap();
     assert!(seen.contains(&(img, "object_detection".into(), "dfine-m-v1".into())));
+    assert!(seen.contains(&(img, "animal_detection".into(), "mdv5a-v1".into())));
     assert!(seen.contains(&(img, "caption".into(), "florence-v1".into())));
 
-    // Re-running the same analyzers is idempotent: no duplicate detection rows, single results row.
+    // Re-running the same analyzers is idempotent: no duplicate detection rows (car + dog), one
+    // results row per analyzer.
     let tx = db.conn.transaction().unwrap();
     insert_analysis(&tx, img, 200, &records()).unwrap();
     tx.commit().unwrap();
@@ -114,5 +123,5 @@ fn incremental_skip_set_and_idempotent_reinsert() {
         .conn
         .query_row("SELECT COUNT(*) FROM analysis_results", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(n, 2);
+    assert_eq!(n, 3);
 }

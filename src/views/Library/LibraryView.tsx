@@ -636,9 +636,9 @@ export default function LibraryView() {
       <ImportModal
         open={importOpen}
         onClose={() => setImportOpen(false)}
-        onChoose={(mode: ImportMode) => {
+        onChoose={(mode: ImportMode, recursive: boolean) => {
           setImportOpen(false);
-          void runImport(mode, () => void lib.refresh());
+          void runImport(mode, () => void lib.refresh(), recursive);
         }}
       />
 

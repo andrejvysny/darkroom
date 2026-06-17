@@ -8,7 +8,7 @@ pub mod hash;
 pub mod meta;
 pub mod thumb;
 
-pub use develop::{develop_linear, develop_linear_preview, LinearImage};
+pub use develop::{as_shot_wb, develop_linear, develop_linear_preview, LinearImage};
 pub use error::RawError;
 pub use hash::{content_hash, hash_file, hex};
 pub use meta::{capture_fingerprint, read_metadata, RawMeta};

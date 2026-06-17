@@ -1,11 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import Icon, { IconName } from "../../components/Icon";
 import type { ImportMode } from "../../lib/ipc";
 
 interface Props {
   open: boolean;
   onClose: () => void;
-  onChoose: (mode: ImportMode) => void;
+  onChoose: (mode: ImportMode, recursive: boolean) => void;
 }
 
 const MODES: {
@@ -35,6 +35,8 @@ const MODES: {
 ];
 
 export default function ImportModal({ open, onClose, onChoose }: Props) {
+  const [recursive, setRecursive] = useState(true);
+
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
@@ -89,7 +91,7 @@ export default function ImportModal({ open, onClose, onChoose }: Props) {
           {MODES.map((m) => (
             <button
               key={m.mode}
-              onClick={() => onChoose(m.mode)}
+              onClick={() => onChoose(m.mode, recursive)}
               style={{
                 display: "flex",
                 gap: 12,
@@ -109,7 +111,10 @@ export default function ImportModal({ open, onClose, onChoose }: Props) {
                 name={m.icon}
                 size={18}
                 style={
-                  { color: "var(--color-accent)", marginTop: 1 } as React.CSSProperties
+                  {
+                    color: "var(--color-accent)",
+                    marginTop: 1,
+                  } as React.CSSProperties
                 }
               />
               <span style={{ display: "block" }}>
@@ -132,6 +137,26 @@ export default function ImportModal({ open, onClose, onChoose }: Props) {
               </span>
             </button>
           ))}
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "4px 4px 2px",
+              fontSize: 12,
+              color: "var(--color-t2)",
+              cursor: "pointer",
+              userSelect: "none",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={recursive}
+              onChange={(e) => setRecursive(e.target.checked)}
+              style={{ accentColor: "var(--color-accent)", cursor: "pointer" }}
+            />
+            Include subfolders (recursive)
+          </label>
         </div>
       </div>
     </div>

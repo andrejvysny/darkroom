@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::error::LibError;
 
 pub const OBJECT_DETECTION_ID: &str = "object_detection";
+pub const ANIMAL_DETECTION_ID: &str = "animal_detection";
 pub const CAPTION_ID: &str = "caption";
 
 /// One analyzer result to persist (mirror of the ML crate's `AnalysisRecord`, kept local so
@@ -60,8 +61,13 @@ pub fn insert_analysis(
                 payload
             ],
         )?;
+        // Each detector owns disjoint categories; scope the delete so two detectors don't clobber
+        // each other's rows for the same image. D-FINE → People/Vehicles; MegaDetector → Animals.
         match rec.analyzer_id.as_str() {
-            OBJECT_DETECTION_ID => project_detections(conn, image_id, rec)?,
+            OBJECT_DETECTION_ID => {
+                project_detections(conn, image_id, rec, &["People", "Vehicles"])?
+            }
+            ANIMAL_DETECTION_ID => project_detections(conn, image_id, rec, &["Animals"])?,
             CAPTION_ID => project_caption(conn, image_id, ran_at, rec)?,
             _ => {}
         }
@@ -73,11 +79,14 @@ fn project_detections(
     conn: &Connection,
     image_id: i64,
     rec: &AnalysisInput,
+    owned_categories: &[&str],
 ) -> Result<(), LibError> {
-    conn.execute(
-        "DELETE FROM image_detections WHERE image_id = ?1",
-        params![image_id],
-    )?;
+    for cat in owned_categories {
+        conn.execute(
+            "DELETE FROM image_detections WHERE image_id = ?1 AND category = ?2",
+            params![image_id, cat],
+        )?;
+    }
     let Some(arr) = rec.payload.get("detections").and_then(|v| v.as_array()) else {
         return Ok(());
     };
@@ -227,6 +236,51 @@ pub fn caption_for_image(conn: &Connection, image_id: i64) -> Result<Option<Capt
     }))
 }
 
+/// Manual ground-truth labels (tri-state per field: `None` = unlabeled). Distinct from AI detections.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserLabels {
+    pub contains_person: Option<bool>,
+    pub contains_animal: Option<bool>,
+}
+
+pub fn user_labels(conn: &Connection, image_id: i64) -> Result<UserLabels, LibError> {
+    let row = conn
+        .query_row(
+            "SELECT contains_person, contains_animal FROM image_user_labels WHERE image_id = ?1",
+            [image_id],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    Ok(row.map_or(UserLabels::default(), |(p, a)| UserLabels {
+        contains_person: p.map(|v| v != 0),
+        contains_animal: a.map(|v| v != 0),
+    }))
+}
+
+/// Upsert one label field (`"person"` | `"animal"`) to a tri-state value (`None` clears it).
+pub fn set_user_label(
+    conn: &Connection,
+    image_id: i64,
+    field: &str,
+    value: Option<bool>,
+    now: i64,
+) -> Result<(), LibError> {
+    // Whitelist → column name (never interpolate caller input directly).
+    let col = match field {
+        "person" => "contains_person",
+        "animal" => "contains_animal",
+        _ => return Err(LibError::Other(format!("unknown label field: {field}"))),
+    };
+    let v: Option<i64> = value.map(|b| b as i64);
+    let sql = format!(
+        "INSERT INTO image_user_labels(image_id, {col}, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(image_id) DO UPDATE SET {col} = ?2, updated_at = ?3"
+    );
+    conn.execute(&sql, params![image_id, v, now])?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FacetRow {
@@ -234,10 +288,12 @@ pub struct FacetRow {
     pub count: i64,
 }
 
-/// Distinct-image counts per detected category (LeftNav "Detected" facet).
+/// Distinct-image counts per detected category (LeftNav "Detected" facet). A query-time confidence
+/// floor (mirrors the detector's decode floor) guards against bucketing an image on a borderline row.
 pub fn analysis_facets(conn: &Connection) -> Result<Vec<FacetRow>, LibError> {
     let mut stmt = conn.prepare(
         "SELECT category, COUNT(DISTINCT image_id) FROM image_detections
+         WHERE confidence >= 0.5
          GROUP BY category ORDER BY category",
     )?;
     let rows = stmt.query_map([], |r| {

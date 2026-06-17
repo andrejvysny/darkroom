@@ -18,6 +18,7 @@ import {
 export async function runImport(
   mode: ImportMode = "copy",
   onComplete?: () => void,
+  recursive = true,
 ): Promise<void> {
   const { setToast } = useAppStore.getState();
 
@@ -54,7 +55,7 @@ export async function runImport(
   });
 
   try {
-    await importStart(source as string, mode, dest);
+    await importStart(source as string, mode, dest, recursive);
   } catch (err) {
     unProgress();
     unDone();

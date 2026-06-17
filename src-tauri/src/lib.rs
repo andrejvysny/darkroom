@@ -1,5 +1,7 @@
 mod analysis;
 mod commands;
+mod events;
+mod features;
 mod protocol;
 mod state;
 mod watch;
@@ -18,6 +20,18 @@ pub fn run() {
         .setup(|app| {
             let state = AppState::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
+
+            // Mark the start of a usage session in the behavioral-signal log (best-effort).
+            {
+                let st = app.state::<AppState>();
+                crate::events::log_event(
+                    st.inner(),
+                    core_library::Event {
+                        event_type: "session.start".into(),
+                        ..Default::default()
+                    },
+                );
+            }
 
             // Reconcile against disk, then start the FS watcher — off the setup thread so a slow
             // stat sweep can't delay window creation. The watcher is parked in AppState to stay alive.
@@ -40,6 +54,7 @@ pub fn run() {
             commands::library_folders,
             commands::image_meta,
             commands::library_index_root,
+            commands::database_reset,
             commands::app_default_library,
             commands::develop_get_edit,
             commands::develop_set_edit,
@@ -83,6 +98,11 @@ pub fn run() {
             commands::analysis_facets,
             commands::image_detections,
             commands::image_caption,
+            commands::image_user_labels,
+            commands::set_image_user_label,
+            commands::analysis_detector_size,
+            commands::set_analysis_detector_size,
+            commands::features_backfill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

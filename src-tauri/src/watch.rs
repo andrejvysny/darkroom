@@ -110,7 +110,7 @@ fn index_new(st: &AppState, root: &Path) {
         )
     };
 
-    let todo: Vec<PathBuf> = core_library::enumerate_raws(root)
+    let todo: Vec<PathBuf> = core_library::enumerate_raws(root, true)
         .into_iter()
         .filter(|p| !known.contains(&p.display().to_string()))
         .collect();

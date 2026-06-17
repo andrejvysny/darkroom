@@ -8,6 +8,10 @@ pub const DEFAULT_THUMB_CACHE_CAP: u64 = 2 * 1024 * 1024 * 1024;
 
 const KEY_THUMB_CACHE_CAP: &str = "thumb_cache_cap_bytes";
 
+/// MegaDetector letterbox input size (px). 1280 = best recall, 640 = ~4× faster.
+pub const DEFAULT_ANIMAL_DETECTOR_SIZE: u32 = 1280;
+const KEY_ANIMAL_DETECTOR_SIZE: &str = "animal_detector_size";
+
 /// Read a raw `app_meta` value.
 pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, LibError> {
     Ok(conn
@@ -39,4 +43,18 @@ pub fn thumb_cache_cap(conn: &Connection) -> Result<u64, LibError> {
 /// Persist the thumbnail-cache cap in bytes.
 pub fn set_thumb_cache_cap(conn: &Connection, bytes: u64) -> Result<(), LibError> {
     set_meta(conn, KEY_THUMB_CACHE_CAP, &bytes.to_string())
+}
+
+/// Configured MegaDetector input size (640 or 1280), or the default when unset/invalid.
+pub fn animal_detector_size(conn: &Connection) -> Result<u32, LibError> {
+    Ok(get_meta(conn, KEY_ANIMAL_DETECTOR_SIZE)?
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&s| s == 640 || s == 1280)
+        .unwrap_or(DEFAULT_ANIMAL_DETECTOR_SIZE))
+}
+
+/// Persist the MegaDetector input size (clamped to 640/1280).
+pub fn set_animal_detector_size(conn: &Connection, size: u32) -> Result<(), LibError> {
+    let size = if size <= 640 { 640 } else { 1280 };
+    set_meta(conn, KEY_ANIMAL_DETECTOR_SIZE, &size.to_string())
 }

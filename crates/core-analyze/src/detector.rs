@@ -5,7 +5,7 @@
 //! NMS-free — we apply only a light per-label IoU dedup for occasional near-duplicate queries.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use image::RgbImage;
 use ort::session::Session;
@@ -14,32 +14,57 @@ use ort::value::Tensor;
 use crate::error::AnalyzeError;
 use crate::{
     coco, models, preprocess, AnalysisCtx, AnalysisRecord, Analyzer, Detection, DetectionPayload,
+    Verifier,
 };
 
 const INPUT: u32 = 640;
-const DEFAULT_THRESHOLD: f32 = 0.45;
+/// Absolute candidate floor. D-FINE's focal-loss sigmoid heads have NO background class, so every one
+/// of the 300 queries always emits a best-guess; on featureless frames unmatched queries score in the
+/// ~0.45–0.60 noise band (`sigmoid(−0.2)≈0.45`). Nothing below this floor is ever considered; the
+/// per-category gate in `coco::threshold` then sets the real accept bar.
+const DEFAULT_THRESHOLD: f32 = 0.50;
+/// Reject ambiguous "background" queries whose class distribution is flat: a real detection's top
+/// class dominates the runner-up, whereas a noise query has `best ≈ second`. Keep only if
+/// `best_s ≥ MARGIN_RATIO × second_s`.
+const MARGIN_RATIO: f32 = 1.5;
 const DEDUP_IOU: f32 = 0.6;
+
+// Box-sanity bounds (normalized [0,1] coords). Kill degenerate noise boxes that survive thresholding.
+const MIN_AREA: f32 = 0.003; // dust-speck boxes
+const MAX_AREA: f32 = 0.85; // near-whole-frame "detections"
+const PERSON_MAX_ASPECT: f32 = 1.5; // people are taller than wide; very wide person boxes are noise
+const EDGE_EPS: f32 = 0.01;
+const TINY_EDGE_AREA: f32 = 0.01; // small boxes hugging a frame edge are usually artifacts
 
 pub struct ObjectDetector {
     session: Mutex<Session>,
     model_version: &'static str,
     threshold: f32,
+    verifier: Option<Arc<Verifier>>,
 }
 
 impl ObjectDetector {
     /// Load a D-FINE ONNX model. `model_version` is a stable tag stored per result row (bump to force
     /// re-analysis). The detector loads at the default optimization level.
     pub fn new(model_path: &Path, model_version: &'static str) -> Result<Self, AnalyzeError> {
-        let session = models::build_session(model_path, false)?;
+        let session = models::build_session(model_path, false, true)?;
         Ok(Self {
             session: Mutex::new(session),
             model_version,
             threshold: DEFAULT_THRESHOLD,
+            verifier: None,
         })
     }
 
     pub fn with_threshold(mut self, threshold: f32) -> Self {
         self.threshold = threshold;
+        self
+    }
+
+    /// Attach a CLIP verifier — every kept detection is confirmed by a crop re-check (kills
+    /// confident-but-wrong boxes like a poppy scored `person`).
+    pub fn with_verifier(mut self, verifier: Arc<Verifier>) -> Self {
+        self.verifier = Some(verifier);
         self
     }
 
@@ -74,33 +99,52 @@ impl ObjectDetector {
 
         let mut dets = Vec::new();
         for q in 0..nq {
-            let (mut best_c, mut best_s) = (0usize, 0f32);
+            // Top-2 sigmoid scores across the 80 classes (for the argmax + the margin gate).
+            let (mut best_c, mut best_s, mut second_s) = (0usize, 0f32, 0f32);
             for c in 0..80 {
                 let s = sigmoid(logits[[0, q, c]]);
                 if s > best_s {
+                    second_s = best_s;
                     best_s = s;
                     best_c = c;
+                } else if s > second_s {
+                    second_s = s;
                 }
             }
-            if best_s < self.threshold {
+            // Absolute floor + flat-distribution (background) rejection.
+            if best_s < self.threshold || best_s < MARGIN_RATIO * second_s {
                 continue;
             }
             let label = coco::COCO_LABELS[best_c];
             let Some(cat) = coco::category(label) else {
+                continue; // drop non-target classes (Animals owned by MegaDetector)
+            };
+            // Per-category accept gate.
+            if best_s < coco::threshold(cat) {
                 continue;
-            }; // drop non-target classes
+            }
             let (cx, cy, w, h) = (
                 boxes[[0, q, 0]],
                 boxes[[0, q, 1]],
                 boxes[[0, q, 2]],
                 boxes[[0, q, 3]],
             );
+            // Normalized [0,1] xyxy (decode-size-independent).
+            let bbox = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
+            if !box_ok(label, &bbox) {
+                continue;
+            }
+            // CLIP crop re-check (if attached) — drops confident-but-wrong detections.
+            if let Some(v) = &self.verifier {
+                if !v.confirm(img, &bbox, cat)? {
+                    continue;
+                }
+            }
             dets.push(Detection {
                 label: label.to_string(),
                 category: cat.to_string(),
                 confidence: best_s,
-                // Normalized [0,1] (decode-size-independent).
-                bbox: [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0],
+                bbox,
             });
         }
         Ok(dedup(dets))
@@ -126,6 +170,27 @@ impl Analyzer for ObjectDetector {
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// Geometric sanity check on a normalized xyxy box. Rejects degenerate noise boxes that survive the
+/// score gates: dust specks, near-whole-frame "detections", implausibly wide people, and tiny boxes
+/// hugging a frame edge.
+fn box_ok(label: &str, b: &[f32; 4]) -> bool {
+    let w = (b[2] - b[0]).max(0.0);
+    let h = (b[3] - b[1]).max(0.0);
+    let area = w * h;
+    if !(MIN_AREA..=MAX_AREA).contains(&area) {
+        return false;
+    }
+    if label == "person" && h > 0.0 && w / h > PERSON_MAX_ASPECT {
+        return false;
+    }
+    let touches_edge =
+        b[0] <= EDGE_EPS || b[1] <= EDGE_EPS || b[2] >= 1.0 - EDGE_EPS || b[3] >= 1.0 - EDGE_EPS;
+    if area < TINY_EDGE_AREA && touches_edge {
+        return false;
+    }
+    true
 }
 
 fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {

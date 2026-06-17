@@ -1,5 +1,13 @@
 import { useEffect, useState } from "react";
-import { thumbCacheCap, thumbCacheSize, setThumbCacheCap } from "../../lib/ipc";
+import {
+  thumbCacheCap,
+  thumbCacheSize,
+  setThumbCacheCap,
+  analysisDetectorSize,
+  setAnalysisDetectorSize,
+  featuresBackfill,
+  databaseReset,
+} from "../../lib/ipc";
 
 const GB = 1024 * 1024 * 1024;
 
@@ -19,17 +27,45 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [usedBytes, setUsedBytes] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [mdSize, setMdSize] = useState(1280);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [backfilling, setBackfilling] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setStatus(null);
-    void Promise.all([thumbCacheCap(), thumbCacheSize()])
-      .then(([cap, used]) => {
+    setConfirmReset(false);
+    void Promise.all([
+      thumbCacheCap(),
+      thumbCacheSize(),
+      analysisDetectorSize(),
+    ])
+      .then(([cap, used, size]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
+        setMdSize(size);
       })
       .catch(() => setStatus("Failed to load settings"));
   }, [open]);
+
+  const handleMdSize = (size: number) => {
+    setMdSize(size);
+    void setAnalysisDetectorSize(size)
+      .then(() =>
+        setStatus(`Animal detection set to ${size}px — re-analyze to apply`),
+      )
+      .catch(() => setStatus("Failed to save resolution"));
+  };
+
+  const handleBackfill = () => {
+    setBackfilling(true);
+    setStatus(null);
+    void featuresBackfill()
+      .then((n) => setStatus(`Computed features for ${n} image(s)`))
+      .catch(() => setStatus("Failed to compute features"))
+      .finally(() => setBackfilling(false));
+  };
 
   if (!open) return null;
 
@@ -50,6 +86,24 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       setStatus("Failed to save");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleReset = async () => {
+    if (!confirmReset) {
+      setConfirmReset(true);
+      return;
+    }
+    setResetting(true);
+    setStatus(null);
+    try {
+      await databaseReset();
+      // Rebuilt the catalog from disk; reload to re-bootstrap the UI with fresh data.
+      window.location.reload();
+    } catch {
+      setStatus("Reset failed");
+      setResetting(false);
+      setConfirmReset(false);
     }
   };
 
@@ -150,6 +204,112 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
               {status}
             </div>
           )}
+        </div>
+
+        <div style={{ padding: "0 18px 18px" }}>
+          <div
+            style={{ fontSize: 13, color: "var(--color-t1)", marginBottom: 4 }}
+          >
+            Animal detection resolution
+          </div>
+          <div
+            style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
+          >
+            MegaDetector input size. Higher = better recall on small/distant
+            animals but slower. Re-analyze to apply.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {[
+              [1280, "1280px — best recall"],
+              [640, "640px — faster"],
+            ].map(([size, label]) => (
+              <button
+                key={size}
+                onClick={() => handleMdSize(size as number)}
+                style={{
+                  flex: 1,
+                  background:
+                    mdSize === size
+                      ? "var(--color-accent)"
+                      : "var(--color-elev)",
+                  color: mdSize === size ? "#fff" : "var(--color-t1)",
+                  border: "1px solid var(--color-line-2)",
+                  borderRadius: "var(--radius-sm)",
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ padding: "0 18px 18px" }}>
+          <div
+            style={{ fontSize: 13, color: "var(--color-t1)", marginBottom: 4 }}
+          >
+            Compute image features
+          </div>
+          <div
+            style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
+          >
+            Analyzes each photo's lighting/sharpness (as-shot white balance,
+            histograms, focus) for future AI assistance. Runs in the background;
+            safe to leave.
+          </div>
+          <button
+            onClick={handleBackfill}
+            disabled={backfilling}
+            style={{
+              background: "var(--color-elev)",
+              color: "var(--color-t1)",
+              border: "1px solid var(--color-line-2)",
+              borderRadius: "var(--radius-sm)",
+              padding: "6px 14px",
+              fontSize: 12,
+              cursor: backfilling ? "default" : "pointer",
+              opacity: backfilling ? 0.6 : 1,
+            }}
+          >
+            {backfilling ? "Computing…" : "Compute features"}
+          </button>
+        </div>
+
+        <div style={{ padding: "0 18px 18px" }}>
+          <div
+            style={{ fontSize: 13, color: "var(--color-t1)", marginBottom: 4 }}
+          >
+            Reset catalog
+          </div>
+          <div
+            style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
+          >
+            Wipes the database (index, metadata, ratings, keywords, settings)
+            and the thumbnail cache, then re-scans from disk. Your photo files
+            are never touched.
+          </div>
+          <button
+            onClick={() => void handleReset()}
+            disabled={resetting}
+            style={{
+              background: confirmReset ? "#b3261e" : "var(--color-elev)",
+              color: confirmReset ? "#fff" : "var(--color-danger, #e5685f)",
+              border: `1px solid ${confirmReset ? "#b3261e" : "var(--color-line-2)"}`,
+              borderRadius: "var(--radius-sm)",
+              padding: "6px 14px",
+              fontSize: 12,
+              cursor: resetting ? "default" : "pointer",
+              opacity: resetting ? 0.6 : 1,
+            }}
+          >
+            {resetting
+              ? "Resetting…"
+              : confirmReset
+                ? "Click again to confirm wipe"
+                : "Reset catalog…"}
+          </button>
         </div>
 
         <div

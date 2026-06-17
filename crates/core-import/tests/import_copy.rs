@@ -55,6 +55,7 @@ fn copy_import_routes_and_dedupes() {
         card.path(),
         ImportMode::Copy,
         libdir.path(),
+        true,
         |_, _| {},
     )
     .unwrap();
@@ -83,6 +84,7 @@ fn copy_import_routes_and_dedupes() {
         card.path(),
         ImportMode::Copy,
         libdir.path(),
+        true,
         |_, _| {},
     )
     .unwrap();

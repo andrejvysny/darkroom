@@ -5,6 +5,8 @@ pub mod collections;
 pub mod cull;
 pub mod edits;
 pub mod error;
+pub mod events;
+pub mod features;
 pub mod index;
 pub mod keywords;
 pub mod query;
@@ -14,8 +16,8 @@ pub mod thumbs;
 
 pub use analysis::{
     analysis_facets, caption_for_image, detections_for_image, existing_analysis, insert_analysis,
-    present_image_count, present_images, AnalysisInput, AnalyzeTarget, CaptionRow, DetectionRow,
-    FacetRow,
+    present_image_count, present_images, set_user_label, user_labels, AnalysisInput, AnalyzeTarget,
+    CaptionRow, DetectionRow, FacetRow, UserLabels,
 };
 pub use collections::{
     add_images_to_collection, collections_for_image, create_collection, delete_collection,
@@ -24,6 +26,10 @@ pub use collections::{
 pub use cull::{set_flag, set_flag_many, set_label, set_label_many, set_rating, set_rating_many};
 pub use edits::{get_edit, set_edit};
 pub use error::LibError;
+pub use events::{append_event, event_count, ids_json, Event};
+pub use features::{
+    compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
+};
 pub use index::{
     add_root, enumerate_raws, existing_paths, insert_image, now_epoch, process_file, scan_root,
     IndexStats, ProcessedImage, SUPPORTED_EXT, THUMB_SIZE,
@@ -37,6 +43,7 @@ pub use query::{
 };
 pub use reconcile::{reconcile, ReconcileStats};
 pub use settings::{
-    get_meta, set_meta, set_thumb_cache_cap, thumb_cache_cap, DEFAULT_THUMB_CACHE_CAP,
+    animal_detector_size, get_meta, set_animal_detector_size, set_meta, set_thumb_cache_cap,
+    thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP,
 };
 pub use thumbs::ThumbCache;

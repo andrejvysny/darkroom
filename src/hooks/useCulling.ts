@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from "react";
+import { useEffect, useCallback, useRef } from "react";
 import { useAppStore } from "../store/app";
 import {
   cullSetRating,
@@ -17,6 +17,13 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
   const selectedId = useAppStore((s) => s.selectedId);
   const setSelectedId = useAppStore((s) => s.setSelectedId);
   const view = useAppStore((s) => s.view);
+
+  // When the current image was selected — decision latency = time on image before a cull action
+  // (a cheap implicit confidence weight for the behavioral log).
+  const selectedAt = useRef<number>(Date.now());
+  useEffect(() => {
+    selectedAt.current = Date.now();
+  }, [selectedId]);
 
   const advanceSelection = useCallback(
     (fromId: number | null) => {
@@ -74,7 +81,9 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
           void cullSetRatingMany(ids, stars);
         } else {
           patchImage(id, { stars });
-          void cullSetRating(id, stars);
+          void cullSetRating(id, stars, {
+            latencyMs: Date.now() - selectedAt.current,
+          });
           advanceSelection(id);
         }
         return;
@@ -92,7 +101,9 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
           void cullSetFlagMany(ids, flag);
         } else {
           patchImage(id, { flag });
-          void cullSetFlag(id, flag);
+          void cullSetFlag(id, flag, {
+            latencyMs: Date.now() - selectedAt.current,
+          });
           advanceSelection(id);
         }
         return;

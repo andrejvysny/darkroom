@@ -3,12 +3,15 @@ import {
   thumbUrl,
   imageDetections,
   imageCaption,
+  imageUserLabels,
+  setImageUserLabel,
   DETECTION_CATEGORIES,
   type ImageRow,
   type KeywordRow,
   type CollectionRow,
   type Detection,
   type ImageCaption,
+  type UserLabels,
 } from "../../lib/ipc";
 
 const LABEL_COLORS: { key: string; bg: string }[] = [
@@ -110,26 +113,43 @@ export default function RightInfo({
   const [kwInput, setKwInput] = useState("");
   const [aiCaption, setAiCaption] = useState<ImageCaption | null>(null);
   const [aiDetections, setAiDetections] = useState<Detection[]>([]);
+  const [labels, setLabels] = useState<UserLabels>({
+    containsPerson: null,
+    containsAnimal: null,
+  });
 
   useEffect(() => {
     if (meta === null) {
       setAiCaption(null);
       setAiDetections([]);
+      setLabels({ containsPerson: null, containsAnimal: null });
       return;
     }
     let cancelled = false;
-    void Promise.all([imageCaption(meta.id), imageDetections(meta.id)]).then(
-      ([cap, dets]) => {
-        if (!cancelled) {
-          setAiCaption(cap);
-          setAiDetections(dets);
-        }
-      },
-    );
+    void Promise.all([
+      imageCaption(meta.id),
+      imageDetections(meta.id),
+      imageUserLabels(meta.id),
+    ]).then(([cap, dets, lab]) => {
+      if (!cancelled) {
+        setAiCaption(cap);
+        setAiDetections(dets);
+        setLabels(lab);
+      }
+    });
     return () => {
       cancelled = true;
     };
   }, [meta?.id, analysisVersion]);
+
+  const toggleLabel = (field: "person" | "animal", checked: boolean) => {
+    if (meta === null) return;
+    const key = field === "person" ? "containsPerson" : "containsAnimal";
+    setLabels((prev) => ({ ...prev, [key]: checked })); // optimistic
+    void setImageUserLabel(meta.id, field, checked).catch(() => {
+      setLabels((prev) => ({ ...prev, [key]: !checked })); // revert on error
+    });
+  };
 
   const memberIds = new Set(imageCollections.map((c) => c.id));
   const addableCollections = allCollections.filter(
@@ -647,6 +667,45 @@ export default function RightInfo({
               );
             })}
           </>
+        )}
+        {/* Ground truth — manual labels (eval dataset). Checked = image contains the subject. */}
+        {meta !== null && (
+          <div
+            style={{
+              display: "flex",
+              gap: 16,
+              marginTop: 12,
+              paddingTop: 10,
+              borderTop: "1px solid var(--color-line)",
+            }}
+          >
+            {(
+              [
+                ["person", "Contains person", labels.containsPerson],
+                ["animal", "Contains animal", labels.containsAnimal],
+              ] as const
+            ).map(([field, lbl, val]) => (
+              <label
+                key={field}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 11.5,
+                  color: "var(--color-t2)",
+                  cursor: "pointer",
+                  userSelect: "none",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={val === true}
+                  onChange={(e) => toggleLabel(field, e.target.checked)}
+                />
+                {lbl}
+              </label>
+            ))}
+          </div>
         )}
       </div>
 

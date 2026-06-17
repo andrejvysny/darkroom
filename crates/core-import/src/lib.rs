@@ -104,19 +104,22 @@ fn finish_session(conn: &Connection, stats: &ImportStats) -> Result<(), ImportEr
     Ok(())
 }
 
-/// Run an import. `progress(done, total)` fires per file.
+/// Run an import. `progress(done, total)` fires per file. When `recursive` is false only the
+/// top-level of `source` is scanned; when true the whole subtree is walked.
+#[allow(clippy::too_many_arguments)]
 pub fn import<F>(
     conn: &mut Connection,
     thumbs: &ThumbCache,
     source: &Path,
     mode: ImportMode,
     library_root: &Path,
+    recursive: bool,
     progress: F,
 ) -> Result<ImportStats, ImportError>
 where
     F: Fn(usize, usize),
 {
-    let files = core_library::enumerate_raws(source);
+    let files = core_library::enumerate_raws(source, recursive);
     let total = files.len();
 
     // Destination folder row (copy/move target = library root; reference = the source itself).

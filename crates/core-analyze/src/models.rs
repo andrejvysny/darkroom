@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ort::ep::coreml::ComputeUnits;
+use ort::ep::coreml::{ComputeUnits, ModelFormat};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 
@@ -15,13 +15,28 @@ use crate::error::AnalyzeError;
 /// Build an `ort` Session with CoreML (graceful CPU fallback if unavailable) at the given graph
 /// optimization level. `level1=true` is REQUIRED for the Florence-2 q4f16 components (default `All`
 /// trips a layernorm-fusion bug — see SPIKE.md); the D-FINE detector loads fine at `All` (`level1=false`).
-pub fn build_session(model_path: &Path, level1: bool) -> Result<Session, AnalyzeError> {
+///
+/// `mlprogram=true` selects CoreML's newer **MLProgram** model format (vs the legacy `NeuralNetwork`
+/// default, which silently downcasts intermediates to FP16 and broadens op coverage). Used for the
+/// detector to keep score boundaries stable/deterministic for the precision-gated decode; Florence-2
+/// keeps the default (its q4f16 graph is tuned for it).
+pub fn build_session(
+    model_path: &Path,
+    level1: bool,
+    mlprogram: bool,
+) -> Result<Session, AnalyzeError> {
     if !model_path.exists() {
         return Err(AnalyzeError::ModelMissing(model_path.display().to_string()));
     }
-    let coreml = ort::ep::CoreML::default()
-        .with_compute_units(ComputeUnits::All)
-        .build();
+    let mut coreml = ort::ep::CoreML::default().with_compute_units(ComputeUnits::All);
+    if mlprogram {
+        // MLProgram can't compile the model's dynamic input dims; we always feed a fixed shape, so
+        // require static input shapes (dynamic-shape nodes fall back to CPU).
+        coreml = coreml
+            .with_model_format(ModelFormat::MLProgram)
+            .with_static_input_shapes(true);
+    }
+    let coreml = coreml.build();
     let mut b = Session::builder().map_err(AnalyzeError::inference)?;
     if level1 {
         b = b
@@ -33,6 +48,19 @@ pub fn build_session(model_path: &Path, level1: bool) -> Result<Session, Analyze
         .with_execution_providers([coreml])
         .map_err(AnalyzeError::inference)?;
     b.commit_from_file(model_path)
+        .map_err(AnalyzeError::inference)
+}
+
+/// Build a CPU-only `ort` Session (no CoreML EP). Used for models with dynamic sequence lengths that
+/// the CoreML EP can't resize (e.g. the MobileCLIP text encoder, which runs only a handful of times
+/// at startup so CPU latency is irrelevant).
+pub fn build_session_cpu(model_path: &Path) -> Result<Session, AnalyzeError> {
+    if !model_path.exists() {
+        return Err(AnalyzeError::ModelMissing(model_path.display().to_string()));
+    }
+    Session::builder()
+        .map_err(AnalyzeError::inference)?
+        .commit_from_file(model_path)
         .map_err(AnalyzeError::inference)
 }
 
@@ -79,6 +107,33 @@ pub const CAPTION_FILES: &[RemoteFile] = &[
     },
 ];
 
+/// Animal detector: MegaDetector v5a (MIT, YOLOv5x6). Community dynamic-axis ONNX — one file serves
+/// both 640² and 1280² (the resolution is a runtime letterbox-target setting).
+pub const ANIMAL_DETECTOR_FILES: &[RemoteFile] = &[RemoteFile {
+    rel: "megadetector/md_v5a_dynamic.onnx",
+    url: "https://github.com/bencevans/megadetector-onnx/releases/download/v0.2.0/md_v5a.0.0-dynamic.onnx",
+    min_size: 400_000_000,
+}];
+
+/// Detection verifier: MobileCLIP-S1 (Apple, MIT) — fp32 vision + text encoders + CLIP tokenizer.
+pub const VERIFIER_FILES: &[RemoteFile] = &[
+    RemoteFile {
+        rel: "mobileclip/vision_model.onnx",
+        url: "https://huggingface.co/Xenova/mobileclip_s1/resolve/main/onnx/vision_model.onnx",
+        min_size: 60_000_000,
+    },
+    RemoteFile {
+        rel: "mobileclip/text_model.onnx",
+        url: "https://huggingface.co/Xenova/mobileclip_s1/resolve/main/onnx/text_model.onnx",
+        min_size: 150_000_000,
+    },
+    RemoteFile {
+        rel: "mobileclip/tokenizer.json",
+        url: "https://huggingface.co/Xenova/mobileclip_s1/resolve/main/tokenizer.json",
+        min_size: 1_000_000,
+    },
+];
+
 /// On-disk model directory (typically `<app-data>/models`).
 pub struct ModelStore {
     dir: PathBuf,
@@ -99,6 +154,19 @@ impl ModelStore {
 
     pub fn florence_dir(&self) -> PathBuf {
         self.path("florence2")
+    }
+
+    pub fn animal_detector_path(&self) -> PathBuf {
+        self.path("megadetector/md_v5a_dynamic.onnx")
+    }
+
+    /// `(vision, text, tokenizer)` paths for the MobileCLIP verifier.
+    pub fn verifier_paths(&self) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            self.path("mobileclip/vision_model.onnx"),
+            self.path("mobileclip/text_model.onnx"),
+            self.path("mobileclip/tokenizer.json"),
+        )
     }
 
     fn present(&self, f: &RemoteFile) -> bool {

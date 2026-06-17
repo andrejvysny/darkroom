@@ -11,7 +11,8 @@
 //! the GPU, which converts ProPhoto→sRGB only at the display transition.
 
 use crate::error::RawError;
-use image::{imageops::FilterType, Rgb32FImage};
+use image::metadata::Orientation;
+use image::{imageops::FilterType, DynamicImage, Rgb32FImage};
 use rawler::decoders::RawDecodeParams;
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::matrix::{multiply, normalize, pseudo_inverse};
@@ -77,12 +78,51 @@ impl LinearImage {
             data: resized.into_raw(),
         }
     }
+
+    /// Upright the buffer from its EXIF orientation (1–8), swapping width/height for the 90°/270°
+    /// cases. Absent/unknown orientation (or `1`) returns `self` untouched. Applied in linear light
+    /// on the CPU before GPU upload, so the develop pipeline, histogram and export all stay upright
+    /// with correct aspect — and (unlike a shader uv-transform) the GPU bindings are left alone.
+    pub fn oriented(self, orientation: Option<u16>) -> LinearImage {
+        let Some(o) = orientation.and_then(|v| Orientation::from_exif(v as u8)) else {
+            return self;
+        };
+        if o == Orientation::NoTransforms {
+            return self;
+        }
+        let buf = Rgb32FImage::from_raw(self.width, self.height, self.data)
+            .expect("linear buffer dims match data length");
+        let mut img = DynamicImage::ImageRgb32F(buf);
+        img.apply_orientation(o);
+        let buf = img.into_rgb32f();
+        LinearImage {
+            width: buf.width(),
+            height: buf.height(),
+            data: buf.into_raw(),
+        }
+    }
 }
 
-/// Decode + demosaic + white-balance + color-matrix (NO sRGB gamma) → full-resolution linear RGB f32.
+/// Decode + demosaic + white-balance + color-matrix (NO sRGB gamma) → full-resolution linear RGB f32,
+/// uprighted to its EXIF orientation. One decoder serves both the metadata (orientation) read and the
+/// pixel decode.
 pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
+    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let params = RawDecodeParams::default();
+    // `RawImage.orientation` is hardcoded to Normal in rawler 0.7.2, so read EXIF orientation here.
+    let orientation = decoder
+        .raw_metadata(src, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation);
+    let raw = decoder.raw_image(src, &params, false).map_err(de)?;
+    Ok(develop_linear_from(&raw)?.oriented(orientation))
+}
+
+/// As-shot white-balance coefficients `[r, g, b, g2]` from the camera (neutral `[1;4]` if absent).
+/// Used as a model input for learned auto-white-balance / lighting normalization. One raw decode.
+pub fn as_shot_wb(src: &RawSource) -> Result<[f32; 4], RawError> {
     let raw = rawler::decode(src, &RawDecodeParams::default()).map_err(de)?;
-    develop_linear_from(&raw)
+    Ok(wb_or_neutral(&raw))
 }
 
 /// Select the camera→XYZ color matrix (prefer the D65 illuminant), padded to `[[f32;3];4]`.
@@ -209,7 +249,15 @@ fn develop_calibrated(raw: &RawImage) -> Result<LinearImage, RawError> {
 /// or any image whose color matrix is missing/malformed, transparently falls back to the
 /// full-quality [`develop_linear`].
 pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> {
-    let mut raw = rawler::decode(src, &RawDecodeParams::default()).map_err(de)?;
+    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let params = RawDecodeParams::default();
+    // EXIF orientation (rawler's `RawImage.orientation` is unreliable); applied to the result below.
+    // Fallbacks to `develop_linear` are already uprighted there, so only the fast path applies it.
+    let orientation = decoder
+        .raw_metadata(src, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation);
+    let mut raw = decoder.raw_image(src, &params, false).map_err(de)?;
 
     // Fast path only for standard 3-colour RGB Bayer; everything else uses the full pipeline.
     let is_rgb_bayer = matches!(
@@ -257,7 +305,8 @@ pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> 
         width: rgb.width as u32,
         height: rgb.height as u32,
         data: rgb.flatten(),
-    })
+    }
+    .oriented(orientation))
 }
 
 /// White-balance + camera→**linear ProPhoto** matrix map for 3-channel data. Shared by the preview

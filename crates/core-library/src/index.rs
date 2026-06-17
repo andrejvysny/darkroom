@@ -55,9 +55,11 @@ fn is_supported(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Recursively list supported RAW files under `root`.
-pub fn enumerate_raws(root: &Path) -> Vec<PathBuf> {
+/// List supported RAW files under `root`. When `recursive` is false, only the top-level directory
+/// is scanned (subfolders are ignored); when true, the whole tree is walked.
+pub fn enumerate_raws(root: &Path, recursive: bool) -> Vec<PathBuf> {
     WalkDir::new(root)
+        .max_depth(if recursive { usize::MAX } else { 1 })
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -191,7 +193,7 @@ pub fn scan_root<F>(
 where
     F: Fn(usize, usize) + Sync + Send,
 {
-    let all = enumerate_raws(root);
+    let all = enumerate_raws(root, true);
     let known = existing_paths(conn)?;
     let todo: Vec<PathBuf> = all
         .into_iter()

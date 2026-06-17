@@ -41,6 +41,8 @@ export function useDevelop() {
 
   // Sequence counter for stale-drop: only the latest render wins.
   const renderSeq = useRef(0);
+  // Slider interactions since the last persist — a deliberation weight for the behavioral log.
+  const touchCount = useRef(0);
   // Object URLs we own, so we can revoke them.
   const currentUrl = useRef<string | null>(null);
   const previewObjUrl = useRef<string | null>(null);
@@ -99,7 +101,9 @@ export function useDevelop() {
       return (id: number, p: DevelopParams) => {
         if (timer !== null) clearTimeout(timer);
         timer = setTimeout(() => {
-          developSetEdit(id, p).catch((e) =>
+          const tc = touchCount.current;
+          touchCount.current = 0;
+          developSetEdit(id, p, tc).catch((e) =>
             console.error("develop_set_edit failed", e),
           );
         }, 500);
@@ -111,6 +115,7 @@ export function useDevelop() {
   // Apply a new param set: update the store, render (unless showing "before"), and persist.
   const commit = useCallback(
     (id: number, next: DevelopParams) => {
+      touchCount.current += 1;
       useDevelopStore.setState({ params: next });
       if (!useDevelopStore.getState().showBefore) debouncedRender(id, next);
       debouncedPersist(id, next);

@@ -5,6 +5,7 @@
 
 use crate::error::RawError;
 use image::codecs::jpeg::JpegEncoder;
+use image::metadata::Orientation;
 use image::{DynamicImage, ExtendedColorType, GenericImageView};
 use rawler::decoders::RawDecodeParams;
 use rawler::rawsource::RawSource;
@@ -33,11 +34,38 @@ pub fn preview_image(src: &RawSource) -> Result<DynamicImage, RawError> {
     Err(RawError::NoPreview)
 }
 
-/// Extract the embedded preview, downscale so the longest edge ≤ `max_edge`, encode JPEG at `quality`.
+/// Extract the embedded preview, apply EXIF orientation, downscale so the longest edge ≤ `max_edge`,
+/// encode JPEG at `quality`.
+///
+/// One decoder handles both the preview decode and the orientation read (the embedded preview is
+/// sensor-native, so portraits arrive sideways until we upright them from the EXIF tag). The
+/// returned `src_*` dims are the *native* preview dimensions (pre-orientation) so the capture
+/// fingerprint stays stable across this change.
 pub fn thumbnail_jpeg(src: &RawSource, max_edge: u32, quality: u8) -> Result<Thumb, RawError> {
-    let img = preview_image(src)?;
+    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let params = RawDecodeParams::default();
+    let img = match decoder.preview_image(src, &params).map_err(de)? {
+        Some(img) => img,
+        None => decoder
+            .full_image(src, &params)
+            .map_err(de)?
+            .ok_or(RawError::NoPreview)?,
+    };
     let (w, h) = img.dimensions();
-    let scaled = if w.max(h) > max_edge {
+
+    // Upright the preview from its EXIF orientation (1–8). Absent/unknown → already upright.
+    let mut img = img;
+    if let Some(o) = decoder
+        .raw_metadata(src, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation)
+        .and_then(|v| Orientation::from_exif(v as u8))
+    {
+        img.apply_orientation(o);
+    }
+
+    let (ow, oh) = img.dimensions();
+    let scaled = if ow.max(oh) > max_edge {
         // `thumbnail` preserves aspect ratio, fitting within the box; fast triangle filter.
         img.thumbnail(max_edge, max_edge)
     } else {

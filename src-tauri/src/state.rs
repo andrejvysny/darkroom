@@ -79,6 +79,10 @@ pub struct AppState {
     pub analysis_running: AtomicBool,
     /// Set by `analysis_cancel` to request the running pass stop between batches.
     pub analysis_cancel: AtomicBool,
+    /// Per-launch id stamped on every captured user-event (groups a usage session).
+    pub session_id: String,
+    /// App version stamped on events (label provenance / pipeline isolation).
+    pub app_version: &'static str,
 }
 
 impl AppState {
@@ -112,6 +116,13 @@ impl AppState {
 
         let models_dir = data_dir.join("models");
 
+        // Per-launch session id: start-millis + pid (no extra dep; unique enough for a local app).
+        let start_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let session_id = format!("{start_ms:x}-{}", std::process::id());
+
         Ok(Self {
             db: Mutex::new(db),
             thumbs,
@@ -124,6 +135,8 @@ impl AppState {
             analyzers: Mutex::new(None),
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),
+            session_id,
+            app_version: env!("CARGO_PKG_VERSION"),
         })
     }
 }

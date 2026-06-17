@@ -11,22 +11,27 @@ pub mod caption;
 pub mod coco;
 pub mod detector;
 pub mod error;
+pub mod megadetector;
 pub mod models;
 mod preprocess;
+pub mod verify;
 
 use std::sync::Arc;
 
 pub use caption::Captioner;
 pub use detector::ObjectDetector;
 pub use error::AnalyzeError;
+pub use megadetector::MegaDetector;
 /// Re-export so downstream crates link the exact same `ort`.
 pub use ort;
+pub use verify::Verifier;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Stable analyzer ids (also the `analyzer_id` stored per result row).
 pub const OBJECT_DETECTION_ID: &str = "object_detection";
+pub const ANIMAL_DETECTION_ID: &str = "animal_detection";
 pub const CAPTION_ID: &str = "caption";
 
 /// Per-image input handed to each analyzer. sRGB pixels are already decoded (analyzers resize as

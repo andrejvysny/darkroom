@@ -1,6 +1,9 @@
-//! COCO 80-class labels (D-FINE / RT-DETR order) and the mapping to the user-facing target buckets:
-//! People / Animals / Vehicles. Only these three categories are surfaced; other COCO classes are
-//! still detected but map to `None` and are dropped by the object-detection analyzer.
+//! COCO 80-class labels (D-FINE / RT-DETR order) and the mapping to the user-facing target buckets.
+//!
+//! D-FINE owns **People** and **Vehicles** only. **Animals** are owned by the dedicated MegaDetector
+//! analyzer (purpose-built, far better wildlife coverage + vegetation hard-negatives), so D-FINE's
+//! 10 COCO animal classes — and the notorious `teddy bear` false-positive magnet — are intentionally
+//! NOT mapped here. Other COCO classes map to `None` and are dropped by the object detector.
 
 #[rustfmt::skip]
 pub const COCO_LABELS: [&str; 80] = [
@@ -15,34 +18,30 @@ pub const COCO_LABELS: [&str; 80] = [
     "teddy bear","hair drier","toothbrush",
 ];
 
-/// Target buckets surfaced in the UI.
+/// Target buckets surfaced in the UI. ("Animals" is populated by the MegaDetector analyzer.)
 pub const CATEGORIES: [&str; 3] = ["People", "Animals", "Vehicles"];
 
-const ANIMALS: &[&str] = &[
-    "bird",
-    "cat",
-    "dog",
-    "horse",
-    "sheep",
-    "cow",
-    "elephant",
-    "bear",
-    "zebra",
-    "giraffe",
-    "teddy bear",
-];
-// "car" plus other road vehicles. ("teddy bear" intentionally excluded here.)
+// "car" plus other road vehicles.
 const VEHICLES: &[&str] = &["bicycle", "car", "motorbike", "motorcycle", "bus", "truck"];
 
-/// Map a COCO label to a target bucket, or `None` if it is not a People/Animals/Vehicles class.
+/// Map a COCO label to a D-FINE-owned bucket (People / Vehicles), or `None` otherwise.
+/// Animals are owned by MegaDetector — see module docs.
 pub fn category(label: &str) -> Option<&'static str> {
     if label == "person" {
         Some("People")
-    } else if ANIMALS.contains(&label) {
-        Some("Animals")
     } else if VEHICLES.contains(&label) {
         Some("Vehicles")
     } else {
         None
+    }
+}
+
+/// Per-category accept threshold on the sigmoid score (balanced precision/recall). `person` is COCO's
+/// most-fired class so it needs a higher gate; vehicles a touch lower. Applied AFTER [`category`].
+pub fn threshold(category: &str) -> f32 {
+    match category {
+        "People" => 0.55,
+        "Vehicles" => 0.50,
+        _ => 0.60,
     }
 }

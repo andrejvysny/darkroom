@@ -21,6 +21,8 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../migrations/003_scale.sql")),
         M::up(include_str!("../migrations/004_phash.sql")),
         M::up(include_str!("../migrations/005_analysis.sql")),
+        M::up(include_str!("../migrations/006_labels.sql")),
+        M::up(include_str!("../migrations/007_user_events.sql")),
     ])
 });
 
@@ -42,6 +44,33 @@ impl Db {
         )?;
         MIGRATIONS.to_latest(&mut conn)?;
         Ok(Self { conn })
+    }
+
+    /// Delete every row from every catalog table, keeping the schema (and migration `user_version`)
+    /// intact, then reclaim the freed pages. Used by the "reset catalog" action — it wipes the
+    /// index/metadata/settings only; files on disk are never touched.
+    pub fn wipe(&mut self) -> Result<(), DbError> {
+        // Table names come from sqlite_master (trusted), not user input — safe to interpolate.
+        let tables: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        // FKs off so deletion order across referencing tables doesn't matter.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        {
+            let tx = self.conn.transaction()?;
+            for t in &tables {
+                tx.execute(&format!("DELETE FROM \"{t}\""), [])?;
+            }
+            tx.commit()?;
+        }
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // VACUUM cannot run inside a transaction — reclaim pages now the rows are gone.
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
     }
 
     /// In-memory catalog for tests.
@@ -73,8 +102,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // 10 catalog tables (rusqlite_migration adds no extra user tables).
-        assert!(n >= 10, "expected >=10 tables, got {n}");
+        // 13 catalog tables (rusqlite_migration adds no extra user tables).
+        assert!(n >= 13, "expected >=13 tables, got {n}");
     }
 
     #[test]

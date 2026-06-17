@@ -8,8 +8,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use core_analyze::models::{ModelStore, CAPTION_FILES, DETECTOR_FILES};
-use core_analyze::{AnalysisCtx, AnalyzerRegistry, Captioner, ObjectDetector};
+use core_analyze::models::{
+    ModelStore, ANIMAL_DETECTOR_FILES, CAPTION_FILES, DETECTOR_FILES, VERIFIER_FILES,
+};
+use core_analyze::{
+    AnalysisCtx, AnalyzerRegistry, Captioner, MegaDetector, ObjectDetector, Verifier,
+};
 use core_library::{existing_analysis, insert_analysis, present_images, AnalysisInput};
 use image::imageops::FilterType;
 use rayon::prelude::*;
@@ -19,8 +23,13 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use crate::state::AppState;
 
 /// Model-version tags stored per result row; bump to force re-analysis of all images.
-pub const DETECTOR_VERSION: &str = "dfine-m-coco-v1";
+/// v2: precision-gated decode (per-category thresholds + confidence floor + margin gate + box-sanity),
+/// Animals removed from D-FINE (now MegaDetector), MLProgram CoreML format.
+pub const DETECTOR_VERSION: &str = "dfine-m-coco-v2";
 pub const CAPTION_VERSION: &str = "florence2-base-ft-q4f16-v1";
+/// MegaDetector version is resolution-specific, so changing the size re-analyzes.
+pub const ANIMAL_DETECTOR_VERSION_1280: &str = "mdv5a-1280-v1";
+pub const ANIMAL_DETECTOR_VERSION_640: &str = "mdv5a-640-v1";
 
 /// Longest-edge the analysis decode is downscaled to (boxes are normalized, so this is loss-only).
 const ANALYZE_EDGE: u32 = 1024;
@@ -48,17 +57,23 @@ pub struct RunStats {
     pub failed: usize,
 }
 
-/// True once every detector + caption model file is present.
+/// True once every detector + animal-detector + caption + verifier model file is present.
 pub fn models_ready(st: &AppState) -> bool {
     let store = ModelStore::new(st.models_dir.clone());
-    store.has_all(DETECTOR_FILES) && store.has_all(CAPTION_FILES)
+    store.has_all(DETECTOR_FILES)
+        && store.has_all(ANIMAL_DETECTOR_FILES)
+        && store.has_all(CAPTION_FILES)
+        && store.has_all(VERIFIER_FILES)
 }
 
 /// Download any missing model files, emitting `analysis:models` `{done,total}` progress.
 pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let st = app.state::<AppState>();
     let store = ModelStore::new(st.models_dir.clone());
-    let total = DETECTOR_FILES.len() + CAPTION_FILES.len();
+    let total = DETECTOR_FILES.len()
+        + ANIMAL_DETECTOR_FILES.len()
+        + CAPTION_FILES.len()
+        + VERIFIER_FILES.len();
     let emit = |done: usize| {
         let _ = app.emit(
             "analysis:models",
@@ -66,12 +81,20 @@ pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         );
     };
     emit(0);
-    let offset = DETECTOR_FILES.len();
     store
         .ensure(DETECTOR_FILES, |i, _| emit(i))
         .map_err(|e| e.to_string())?;
+    let off1 = DETECTOR_FILES.len();
     store
-        .ensure(CAPTION_FILES, |i, _| emit(offset + i))
+        .ensure(ANIMAL_DETECTOR_FILES, |i, _| emit(off1 + i))
+        .map_err(|e| e.to_string())?;
+    let off2 = off1 + ANIMAL_DETECTOR_FILES.len();
+    store
+        .ensure(CAPTION_FILES, |i, _| emit(off2 + i))
+        .map_err(|e| e.to_string())?;
+    let off3 = off2 + CAPTION_FILES.len();
+    store
+        .ensure(VERIFIER_FILES, |i, _| emit(off3 + i))
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -86,9 +109,29 @@ fn registry(st: &AppState) -> Result<Arc<AnalyzerRegistry>, String> {
     }
     let store = ModelStore::new(st.models_dir.clone());
     let florence = store.florence_dir();
+    // Shared CLIP verifier — crop re-check that drops confident-but-wrong detections.
+    let (v_vision, v_text, v_tok) = store.verifier_paths();
+    let verifier = Arc::new(Verifier::new(&v_vision, &v_text, &v_tok).map_err(|e| e.to_string())?);
+    // MegaDetector resolution is a user setting; its version encodes the size so a change re-analyzes.
+    let an_size = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::animal_detector_size(&db.conn).map_err(|e| e.to_string())?
+    };
+    let an_ver = if an_size == 640 {
+        ANIMAL_DETECTOR_VERSION_640
+    } else {
+        ANIMAL_DETECTOR_VERSION_1280
+    };
     let mut reg = AnalyzerRegistry::new();
     reg.register(Arc::new(
-        ObjectDetector::new(&store.detector_path(), DETECTOR_VERSION).map_err(|e| e.to_string())?,
+        ObjectDetector::new(&store.detector_path(), DETECTOR_VERSION)
+            .map_err(|e| e.to_string())?
+            .with_verifier(verifier.clone()),
+    ));
+    reg.register(Arc::new(
+        MegaDetector::new(&store.animal_detector_path(), an_ver, an_size)
+            .map_err(|e| e.to_string())?
+            .with_verifier(verifier.clone()),
     ));
     reg.register(Arc::new(
         Captioner::new(&florence, &florence.join("tokenizer.json"), CAPTION_VERSION)

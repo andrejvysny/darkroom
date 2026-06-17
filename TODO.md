@@ -2,6 +2,87 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## DONE: Behavioral-signal capture (Phase 0 — labeled data for future AI)
+
+> Plan: `~/.claude/plans/act-as-senior-ai-linked-peacock.md`. Captures decision/label signals so the
+> four future models (dedup · best-shot · lighting · auto-edit) can train on real usage. The app
+> previously kept only final state + discarded decision context. Compiles, clippy-clean, tests pass,
+> real-data compute verified.
+
+- [x] Migration `007_user_events.sql`: append-only `user_events` log + per-image `image_features`.
+- [x] `core-library/events.rs` (`append_event`/`Event`/`ids_json`) + `features.rs`
+      (`compute_features`: luma+log-chroma histograms, sharpness, clip/DR; `set_image_features`,
+      `images_missing_features`). `core-raw::as_shot_wb` (as-shot WB coeffs).
+- [x] `src-tauri/events.rs` (`stamp`/`log_event`) + `session_id`/`app_version` in `AppState` +
+      `session.start` at setup.
+- [x] Wired events into `cull_set_*` (+`_many`, latency/group/candidates), `develop_set_edit`
+      (params before/after + touch_count), `export_image` (endorsement), and **`dedup_resolve`
+      extended** to log candidate set + auto-keeper + override.
+- [x] `features_backfill` pass + IPC + Settings "Compute features" button; `image_features` overwrite.
+- [x] Frontend: ipc wrappers (optional ctx), `useDevelop` touch_count, `useCulling` latency.
+- [x] `examples/export_training_data.rs` (per-feature JSONL), `features_one.rs` (real-data check),
+      `tests/events_features.rs` round-trip.
+- [ ] In-app smoke (`npm run tauri dev`): cull/edit/export/dedup → inspect `user_events`; run
+      "Compute features" → inspect `image_features`. (Deferred — needs GUI.)
+- [ ] FOLLOW-UP MODELS (deferred, consume the log): dedup keeper-ranking → best-shot → lighting
+      normalization → auto-edit style. Training-time grouping for best-shot via `capture_fingerprint`.
+
+## ACTIVE: AI People/Animal detection accuracy overhaul
+
+> Plan: `~/.claude/plans/act-as-senior-ai-linked-peacock.md`. Root cause: D-FINE no-background sigmoid
+> heads + 0.45 gate + no precision filters → false positives on empty frames. One integrated release.
+> Architecture: D-FINE-M → People+Vehicles · MegaDetector-v5a → Animals · MobileCLIP-S1 → verify gate.
+
+### WS1 — D-FINE precision fixes (no new models)
+
+- [x] `coco.rs`: per-category `threshold()` (person 0.55, vehicles 0.50); `category()` → People/Vehicles
+      only (drop Animals + `teddy bear`).
+- [x] `detector.rs`: confidence floor (0.50) + margin gate (best < 1.5×second → reject); box-sanity
+      (area 0.003–0.85; person aspect w/h ≤1.5; drop tiny edge-touching).
+- [x] `models.rs`: detector `ModelFormat::MLProgram` + `static_input_shapes` (dynamic-dim model).
+- [x] bump `DETECTOR_VERSION` → `dfine-m-coco-v2`.
+- [~] EXIF orientation in `decode_srgb` — DEFERRED (preview may be pre-oriented; regression risk; nit).
+- VALIDATED: 3/4 FP frames clean. `_55A4063` (poppy) still person@0.825 — WS3 verifier's job.
+
+### WS5 — manual ground-truth labeling (feature + eval source) ✅ (compiles + tsc clean)
+
+- [x] migration `006_labels.sql`: `image_user_labels(image_id PK, contains_person, contains_animal, updated_at)`.
+- [x] core-library getter/setter (whitelisted col, bound params); IPC + `lib/ipc.ts`; checkboxes in `RightInfo.tsx`.
+- [x] `examples/detect_eval.rs`: FP-regression mode via real ObjectDetector + prod decode path.
+- [ ] extend `detect_eval.rs`: read labels from catalog.db → precision/recall (once positives labeled).
+
+### WS2 — MegaDetector-v5a → Animals ✅ DONE (validated: dog@0.931, FP frames→0)
+
+- [x] MDv5a ONNX I/O confirmed via `onnx_io`: `images[1,3,−1,−1]` (dynamic) → `output[1,N,8]`.
+- [x] `megadetector.rs`: YOLOv5x6 letterbox(stride-square) + obj×cls decode + NMS; class 0=animal →
+      Animals ("animal"); runs CPU (dynamic dims unsupported by CoreML EP); verifier-gated.
+- [x] single **dynamic** ONNX (`md_v5a_dynamic.onnx`, MIT) serves both 1280²/640² — no dual download.
+- [x] resolution setting via `app_meta` (`animal_detector_size`); IPC get/set; set invalidates registry
+      cache; `ANIMAL_DETECTOR_VERSION_{1280,640}` encodes size.
+- [x] registered in `registry()`; scoped projection (`project_detections` owns categories) so D-FINE
+      (People/Vehicles) + MegaDetector (Animals) don't clobber each other.
+
+### WS3 — MobileCLIP-S1 verifier ✅ DONE (validated: poppy rejected, people/dog kept)
+
+- [x] MobileCLIP-S1 ONNX (`Xenova/mobileclip_s1`, MIT): vision (CoreML) + text (CPU, fixed 77-token).
+- [x] `verify.rs`: precompute prompt embeds; crop(+20% pad)+cosine softmax gate (`VERIFY_ACCEPT=0.40`);
+      gates People + Animals.
+- [x] wired shared `Verifier` into ObjectDetector + MegaDetector.
+
+### WS4 — query floor + UI ✅ DONE
+
+- [x] confidence floor `>= 0.5` in `analysis_facets` + `detectedCategory` filter.
+- [x] Settings: MD-resolution selector (1280/640) in `SettingsModal.tsx`.
+
+### Verify ✅ (all green)
+
+- [x] `detect_eval` (D-FINE+verifier): 0 People/Animals on the 4 FP frames; recall kept on people imgs.
+- [x] `animal_eval` (MegaDetector+verifier): dog@0.931 (1280 & 640), FP frames → 0 animals.
+- [x] `cargo test --workspace` (incl. updated analysis.rs fixture), `cargo clippy --workspace`, `tsc` — clean.
+- [ ] CoreML CPU-vs-CoreML parity diff (deferred — thresholds now far from the FP16 boundary).
+- [ ] e2e in-app `npm run tauri dev` ↺ re-analyze (needs ~900MB model download on first run).
+- [ ] tune `VERIFY_ACCEPT`/prompts + MD threshold once user labels positive CR3s (WS5 eval harness).
+
 ## Leftovers / next (after the post-V1 develop-fidelity + review session)
 
 > Develop fidelity (ProPhoto working space, scene-referred highlights, Kelvin WB CAT, endpoint

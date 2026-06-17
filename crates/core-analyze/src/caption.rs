@@ -61,7 +61,7 @@ impl Captioner {
         tokenizer_path: &Path,
         model_version: &'static str,
     ) -> Result<Self, AnalyzeError> {
-        let load = |name: &str| models::build_session(&dir.join(name), true);
+        let load = |name: &str| models::build_session(&dir.join(name), true, false);
         let inner = Florence2 {
             vision: load("vision_encoder.onnx")?,
             embed: load("embed_tokens.onnx")?,

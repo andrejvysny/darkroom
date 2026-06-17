@@ -4,7 +4,7 @@
 use crate::state::AppState;
 use core_library::{
     CaptionRow, CollectionRow, DetectionRow, FacetRow, FolderRow, ImageRow, IndexStats, KeywordRow,
-    QueryParams,
+    QueryParams, UserLabels,
 };
 use core_pipeline::{DevelopParams, Histogram};
 use rayon::prelude::*;
@@ -103,73 +103,141 @@ pub async fn library_index_root(app: AppHandle, path: String) -> Result<IndexSta
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let st = app2.state::<AppState>();
-        let root = PathBuf::from(&path);
+        index_root_blocking(&app2, &st, &PathBuf::from(&path), true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
-        // --- brief lock: upsert folder + snapshot known paths ---
-        let (folder_id, known) = {
+/// Index every supported RAW under `root` into the catalog: upsert the folder, enumerate
+/// (recursively), parallel hash+meta+thumbnail, then a single transactional insert. Emits
+/// `import:progress` / `import:done`. When `analyze`, kicks off background AI analysis of the
+/// newly-added images (only if models are already downloaded). Runs synchronously on the caller's
+/// (blocking) thread.
+fn index_root_blocking(
+    app: &AppHandle,
+    st: &AppState,
+    root: &Path,
+    analyze: bool,
+) -> Result<IndexStats, String> {
+    // --- brief lock: upsert folder + snapshot known paths ---
+    let (folder_id, known) = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let fid = core_library::add_root(&db.conn, root).map_err(|e| e.to_string())?;
+        let known = core_library::existing_paths(&db.conn).map_err(|e| e.to_string())?;
+        (fid, known)
+    };
+
+    // --- unlocked: enumerate + parallel process (hash + meta + thumbnail) ---
+    let todo: Vec<PathBuf> = core_library::enumerate_raws(root, true)
+        .into_iter()
+        .filter(|p| !known.contains(&p.display().to_string()))
+        .collect();
+    let total = todo.len();
+    let done = AtomicUsize::new(0);
+    let results: Vec<_> = todo
+        .par_iter()
+        .map(|p| {
+            let r = core_library::process_file(p, &st.thumbs, core_library::THUMB_SIZE);
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == total || n.is_multiple_of(4) {
+                let _ = app.emit(
+                    "import:progress",
+                    serde_json::json!({"done": n, "total": total}),
+                );
+            }
+            r
+        })
+        .collect();
+
+    // --- brief lock: transactional insert ---
+    let imported_at = core_library::now_epoch();
+    let mut stats = IndexStats {
+        scanned: total,
+        ..Default::default()
+    };
+    {
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+        for r in &results {
+            match r {
+                Ok(p) => match core_library::insert_image(&tx, folder_id, imported_at, p)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(_) => stats.added += 1,
+                    None => stats.skipped += 1,
+                },
+                Err(_) => stats.failed += 1,
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+
+    enforce_thumb_cap(st);
+    let _ = app.emit("import:done", &stats);
+
+    // Auto-analyze newly indexed images in the background — but only if the models are already
+    // downloaded (never trigger a ~400 MB download implicitly). First-time analysis is explicit.
+    if analyze && stats.added > 0 && crate::analysis::models_ready(st) {
+        let app3 = app.clone();
+        std::thread::spawn(move || {
+            let _ = crate::analysis::run_pass(&app3, false);
+        });
+    }
+    Ok(stats)
+}
+
+/// Wipe the catalog (index/metadata/settings) and rebuild it from disk. Files on disk are never
+/// touched: it deletes DB rows, clears the thumbnail + warm GPU caches, then re-scans the
+/// previously-watched folders (regenerating thumbnails with correct orientation). Returns the
+/// aggregate re-index stats.
+#[tauri::command]
+pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+
+        // Snapshot the watched roots before wiping so we can rebuild from them.
+        let roots: Vec<String> = {
             let db = st.db.lock().map_err(|e| e.to_string())?;
-            let fid = core_library::add_root(&db.conn, &root).map_err(|e| e.to_string())?;
-            let known = core_library::existing_paths(&db.conn).map_err(|e| e.to_string())?;
-            (fid, known)
+            let mut stmt = db
+                .conn
+                .prepare("SELECT path FROM folders ORDER BY id")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(Result::ok).collect()
         };
 
-        // --- unlocked: enumerate + parallel process (hash + meta + thumbnail) ---
-        let todo: Vec<PathBuf> = core_library::enumerate_raws(&root)
-            .into_iter()
-            .filter(|p| !known.contains(&p.display().to_string()))
-            .collect();
-        let total = todo.len();
-        let done = AtomicUsize::new(0);
-        let results: Vec<_> = todo
-            .par_iter()
-            .map(|p| {
-                let r = core_library::process_file(p, &st.thumbs, core_library::THUMB_SIZE);
-                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == total || n.is_multiple_of(4) {
-                    let _ = app2.emit(
-                        "import:progress",
-                        serde_json::json!({"done": n, "total": total}),
-                    );
-                }
-                r
-            })
-            .collect();
-
-        // --- brief lock: transactional insert ---
-        let imported_at = core_library::now_epoch();
-        let mut stats = IndexStats {
-            scanned: total,
-            ..Default::default()
-        };
+        // Wipe catalog rows.
         {
             let mut db = st.db.lock().map_err(|e| e.to_string())?;
-            let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-            for r in &results {
-                match r {
-                    Ok(p) => match core_library::insert_image(&tx, folder_id, imported_at, p)
-                        .map_err(|e| e.to_string())?
-                    {
-                        Some(_) => stats.added += 1,
-                        None => stats.skipped += 1,
-                    },
-                    Err(_) => stats.failed += 1,
-                }
+            db.wipe().map_err(|e| e.to_string())?;
+        }
+        // Clear derived caches (thumbnails on disk + warm GPU resources + last histogram).
+        let _ = st.thumbs.evict_to(0);
+        if let Ok(mut lru) = st.develop_cache.lock() {
+            *lru = Default::default();
+        }
+        if let Ok(mut h) = st.last_histogram.lock() {
+            *h = None;
+        }
+
+        // Rebuild from disk. Skip auto-analyze (the rebuild is already heavy; analysis is explicit).
+        let mut agg = IndexStats::default();
+        for r in &roots {
+            let root = PathBuf::from(r);
+            if !root.exists() {
+                continue;
             }
-            tx.commit().map_err(|e| e.to_string())?;
+            let s = index_root_blocking(&app2, &st, &root, false)?;
+            agg.scanned += s.scanned;
+            agg.added += s.added;
+            agg.skipped += s.skipped;
+            agg.failed += s.failed;
         }
-
-        enforce_thumb_cap(&st);
-        let _ = app2.emit("import:done", &stats);
-
-        // Auto-analyze newly indexed images in the background — but only if the models are already
-        // downloaded (never trigger a ~400 MB download implicitly). First-time analysis is explicit.
-        if stats.added > 0 && crate::analysis::models_ready(&st) {
-            let app3 = app2.clone();
-            std::thread::spawn(move || {
-                let _ = crate::analysis::run_pass(&app3, false);
-            });
-        }
-        Ok::<_, String>(stats)
+        Ok::<_, String>(agg)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -210,11 +278,14 @@ pub async fn develop_set_edit(
     app: AppHandle,
     image_id: i64,
     params: DevelopParams,
+    touch_count: Option<i64>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
+        // Snapshot the prior params for the event before overwriting.
+        let before = core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())?;
         core_library::set_edit(
             &db.conn,
             image_id,
@@ -222,7 +293,23 @@ pub async fn develop_set_edit(
             &json,
             core_library::now_epoch(),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let _ = core_library::append_event(
+            &db.conn,
+            &crate::events::stamp(
+                st.inner(),
+                core_library::Event {
+                    event_type: "develop.params_commit".into(),
+                    image_id: Some(image_id),
+                    process_version: Some(PROCESS_VERSION),
+                    params_before: before,
+                    params_after: Some(json),
+                    touch_count,
+                    ..Default::default()
+                },
+            ),
+        );
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -450,6 +537,18 @@ pub async fn export_image(
         .map_err(|e| e.to_string())?;
 
         std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+        // Export is the strongest edit-quality endorsement — log it (best-effort, separate lock).
+        crate::events::log_event(
+            st.inner(),
+            core_library::Event {
+                event_type: "develop.export".into(),
+                image_id: Some(image_id),
+                process_version: Some(PROCESS_VERSION),
+                params_after: serde_json::to_string(&params).ok(),
+                context: Some(serde_json::json!({ "format": format }).to_string()),
+                ..Default::default()
+            },
+        );
         Ok::<_, String>(())
     })
     .await
@@ -473,14 +572,82 @@ where
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub async fn cull_set_rating(app: AppHandle, image_id: i64, stars: i64) -> Result<(), String> {
-    db_write(app, move |c| core_library::set_rating(c, image_id, stars)).await
+/// `flag` value → event-type label (for the behavioral log).
+fn flag_event_type(flag: &str) -> &'static str {
+    match flag {
+        "pick" => "culling.flag_pick",
+        "reject" => "culling.flag_reject",
+        _ => "culling.flag_clear",
+    }
 }
 
 #[tauri::command]
-pub async fn cull_set_flag(app: AppHandle, image_id: i64, flag: String) -> Result<(), String> {
-    db_write(app, move |c| core_library::set_flag(c, image_id, &flag)).await
+pub async fn cull_set_rating(
+    app: AppHandle,
+    image_id: i64,
+    stars: i64,
+    latency_ms: Option<i64>,
+    group_id: Option<String>,
+    candidate_ids: Option<Vec<i64>>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_rating(&db.conn, image_id, stars).map_err(|e| e.to_string())?;
+        let _ = core_library::append_event(
+            &db.conn,
+            &crate::events::stamp(
+                st.inner(),
+                core_library::Event {
+                    event_type: "culling.rate".into(),
+                    image_id: Some(image_id),
+                    stars: Some(stars),
+                    group_id,
+                    candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
+                    latency_ms,
+                    ..Default::default()
+                },
+            ),
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cull_set_flag(
+    app: AppHandle,
+    image_id: i64,
+    flag: String,
+    latency_ms: Option<i64>,
+    group_id: Option<String>,
+    candidate_ids: Option<Vec<i64>>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_flag(&db.conn, image_id, &flag).map_err(|e| e.to_string())?;
+        let _ = core_library::append_event(
+            &db.conn,
+            &crate::events::stamp(
+                st.inner(),
+                core_library::Event {
+                    event_type: flag_event_type(&flag).into(),
+                    image_id: Some(image_id),
+                    chosen_id: (flag == "pick").then_some(image_id),
+                    flag: Some(flag),
+                    group_id,
+                    candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
+                    latency_ms,
+                    ..Default::default()
+                },
+            ),
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -488,25 +655,73 @@ pub async fn cull_set_label(
     app: AppHandle,
     image_id: i64,
     label: Option<String>,
+    latency_ms: Option<i64>,
+    group_id: Option<String>,
 ) -> Result<(), String> {
-    db_write(app, move |c| {
-        core_library::set_label(c, image_id, label.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_label(&db.conn, image_id, label.as_deref()).map_err(|e| e.to_string())?;
+        let _ = core_library::append_event(
+            &db.conn,
+            &crate::events::stamp(
+                st.inner(),
+                core_library::Event {
+                    event_type: "culling.label".into(),
+                    image_id: Some(image_id),
+                    color_label: label,
+                    group_id,
+                    latency_ms,
+                    ..Default::default()
+                },
+            ),
+        );
+        Ok(())
     })
     .await
+    .map_err(|e| e.to_string())?
 }
 
-// Batch culling — applies one value to a whole selection in a single transaction.
+// Batch culling — applies one value to a whole selection in a single transaction. The selection IS
+// the candidate group, so one event per image carries the shared `group_id` + candidate set.
+
+/// Append one `culling.*` event per image in a batch (same tx). `build` produces the per-image event.
+fn log_batch(
+    st: &AppState,
+    conn: &core_db::rusqlite::Connection,
+    image_ids: &[i64],
+    group_id: &Option<String>,
+    build: impl Fn(i64) -> core_library::Event,
+) {
+    let cands = core_library::ids_json(image_ids);
+    for &id in image_ids {
+        let mut e = build(id);
+        e.image_id = Some(id);
+        e.group_id = group_id.clone();
+        e.candidate_ids = Some(cands.clone());
+        let _ = core_library::append_event(conn, &crate::events::stamp(st, e));
+    }
+}
 
 #[tauri::command]
 pub async fn cull_set_rating_many(
     app: AppHandle,
     image_ids: Vec<i64>,
     stars: i64,
+    group_id: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_rating_many(&mut db.conn, &image_ids, stars).map_err(|e| e.to_string())
+        core_library::set_rating_many(&mut db.conn, &image_ids, stars).map_err(|e| e.to_string())?;
+        log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
+            core_library::Event {
+                event_type: "culling.rate".into(),
+                stars: Some(stars),
+                ..Default::default()
+            }
+        });
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -517,11 +732,22 @@ pub async fn cull_set_flag_many(
     app: AppHandle,
     image_ids: Vec<i64>,
     flag: String,
+    group_id: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_flag_many(&mut db.conn, &image_ids, &flag).map_err(|e| e.to_string())
+        core_library::set_flag_many(&mut db.conn, &image_ids, &flag).map_err(|e| e.to_string())?;
+        let et = flag_event_type(&flag);
+        log_batch(st.inner(), &db.conn, &image_ids, &group_id, |id| {
+            core_library::Event {
+                event_type: et.into(),
+                chosen_id: (flag == "pick").then_some(id),
+                flag: Some(flag.clone()),
+                ..Default::default()
+            }
+        });
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -532,12 +758,21 @@ pub async fn cull_set_label_many(
     app: AppHandle,
     image_ids: Vec<i64>,
     label: Option<String>,
+    group_id: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_label_many(&mut db.conn, &image_ids, label.as_deref())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
+            core_library::Event {
+                event_type: "culling.label".into(),
+                color_label: label.clone(),
+                ..Default::default()
+            }
+        });
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -748,12 +983,58 @@ pub async fn dedup_resolve(
     app: AppHandle,
     keep_id: i64,
     trash_ids: Vec<i64>,
+    // Optional decision context (frontend passes from the DupGroup): the full set shown, the rule's
+    // suggested keeper, and the group key. Backward-compatible — absent → derived/None.
+    candidate_ids: Option<Vec<i64>>,
+    auto_keeper_id: Option<i64>,
+    group_id: Option<String>,
 ) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let res = core_dedup::resolve(&db.conn, keep_id, &trash_ids).map_err(|e| e.to_string())?;
         gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
+
+        // Behavioral log: the keeper choice + full candidate set + (if known) the auto-suggested
+        // keeper, so we can later learn keeper ranking and detect user overrides.
+        let candidates = candidate_ids.unwrap_or_else(|| {
+            let mut v = trash_ids.clone();
+            v.push(keep_id);
+            v.sort_unstable();
+            v
+        });
+        let gid = group_id.or_else(|| candidates.iter().min().map(|m| format!("dedup-{m}")));
+        let cands_json = core_library::ids_json(&candidates);
+        let ev = |event_type: &str| {
+            crate::events::stamp(
+                st.inner(),
+                core_library::Event {
+                    event_type: event_type.into(),
+                    group_id: gid.clone(),
+                    candidate_ids: Some(cands_json.clone()),
+                    suggestion_id: auto_keeper_id,
+                    ..Default::default()
+                },
+            )
+        };
+        let _ = core_library::append_event(&db.conn, &ev("dedup.group_shown"));
+        let _ = core_library::append_event(
+            &db.conn,
+            &core_library::Event {
+                chosen_id: Some(keep_id),
+                rejected_ids: Some(core_library::ids_json(&trash_ids)),
+                ..ev("dedup.keeper_chosen")
+            },
+        );
+        if auto_keeper_id.is_some_and(|ak| ak != keep_id) {
+            let _ = core_library::append_event(
+                &db.conn,
+                &core_library::Event {
+                    chosen_id: Some(keep_id),
+                    ..ev("dedup.override")
+                },
+            );
+        }
         Ok::<_, String>(res.trashed)
     })
     .await
@@ -857,6 +1138,7 @@ pub async fn import_start(
     source: String,
     mode: String,
     dest: String,
+    recursive: Option<bool>,
 ) -> Result<core_import::ImportStats, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -874,6 +1156,7 @@ pub async fn import_start(
             Path::new(&source),
             import_mode,
             Path::new(&dest),
+            recursive.unwrap_or(true),
             |done, total| {
                 if done == total || done.is_multiple_of(4) {
                     let _ = progress_app.emit(
@@ -1006,6 +1289,75 @@ pub async fn image_caption(app: AppHandle, id: i64) -> Result<Option<CaptionRow>
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::caption_for_image(&db.conn, id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Backfill per-image feature vectors (lighting/best-shot/dedup model inputs) for images missing
+/// them. Explicit action; emits `features:progress`/`features:done`. Returns the count computed.
+#[tauri::command]
+pub async fn features_backfill(app: AppHandle) -> Result<usize, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::features::run_backfill(&app2))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Manual ground-truth labels for one image (the "Contains person/animal" checkboxes).
+#[tauri::command]
+pub async fn image_user_labels(app: AppHandle, id: i64) -> Result<UserLabels, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::user_labels(&db.conn, id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set one manual label field (`field` = "person" | "animal"; `value` = Some(bool) or None to clear).
+#[tauri::command]
+pub async fn set_image_user_label(
+    app: AppHandle,
+    id: i64,
+    field: String,
+    value: Option<bool>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_user_label(&db.conn, id, &field, value, core_library::now_epoch())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Configured MegaDetector input size (640 or 1280).
+#[tauri::command]
+pub async fn analysis_detector_size(app: AppHandle) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::animal_detector_size(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set the MegaDetector input size; invalidates the cached analyzer registry so the next pass
+/// rebuilds at the new resolution.
+#[tauri::command]
+pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_animal_detector_size(&db.conn, size).map_err(|e| e.to_string())?;
+        }
+        *st.analyzers.lock().map_err(|e| e.to_string())? = None;
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
