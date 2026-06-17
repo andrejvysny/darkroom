@@ -288,12 +288,14 @@ pub struct FacetRow {
     pub count: i64,
 }
 
-/// Distinct-image counts per detected category (LeftNav "Detected" facet). A query-time confidence
-/// floor (mirrors the detector's decode floor) guards against bucketing an image on a borderline row.
+/// Distinct-image counts per detected category (LeftNav "Detected" facet). No query-side confidence
+/// floor: every `image_detections` row was already accepted at write time by its analyzer's per-
+/// category bar (D-FINE People 0.55 / Vehicles 0.50; MegaDetector Animals 0.35, both then CLIP-gated).
+/// A blanket `>= 0.5` floor here was strictly higher than the Animals bar, so CLIP-confirmed animals
+/// scored in [0.35, 0.50) were silently dropped from the facet (and the matching library filter).
 pub fn analysis_facets(conn: &Connection) -> Result<Vec<FacetRow>, LibError> {
     let mut stmt = conn.prepare(
         "SELECT category, COUNT(DISTINCT image_id) FROM image_detections
-         WHERE confidence >= 0.5
          GROUP BY category ORDER BY category",
     )?;
     let rows = stmt.query_map([], |r| {

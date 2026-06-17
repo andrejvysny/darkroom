@@ -17,6 +17,8 @@ thiserror = "2"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # First-run model download (ureq is already in the tree via ort).
 ureq = "3"
+# Integrity verification of downloaded model files (pinned SHA-256 per file).
+sha2 = "0.10"
 
 [dev-dependencies]
 anyhow = "1"

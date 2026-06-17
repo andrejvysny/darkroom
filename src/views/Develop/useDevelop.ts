@@ -85,10 +85,16 @@ export function useDevelop() {
   const debouncedRender = useCallback(
     (() => {
       let timer: ReturnType<typeof setTimeout> | null = null;
-      return (id: number, p: DevelopParams) => {
+      const run = (id: number, p: DevelopParams) => {
         if (timer !== null) clearTimeout(timer);
         timer = setTimeout(() => render(id, p), RENDER_DEBOUNCE_MS);
       };
+      return Object.assign(run, {
+        cancel: () => {
+          if (timer !== null) clearTimeout(timer);
+          timer = null;
+        },
+      });
     })(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -98,7 +104,7 @@ export function useDevelop() {
   const debouncedPersist = useCallback(
     (() => {
       let timer: ReturnType<typeof setTimeout> | null = null;
-      return (id: number, p: DevelopParams) => {
+      const run = (id: number, p: DevelopParams) => {
         if (timer !== null) clearTimeout(timer);
         timer = setTimeout(() => {
           const tc = touchCount.current;
@@ -108,6 +114,12 @@ export function useDevelop() {
           );
         }, 500);
       };
+      return Object.assign(run, {
+        cancel: () => {
+          if (timer !== null) clearTimeout(timer);
+          timer = null;
+        },
+      });
     })(),
     [],
   );
@@ -429,14 +441,21 @@ export function useDevelop() {
 
   const reset = useCallback(() => {
     if (selectedId === null) return;
+    // Cancel any pending debounced persist/render armed by a just-moved slider. Without this, a
+    // persist scheduled by the last commit() fires ~500 ms later and writes the PRE-reset params
+    // back over the defaults we're about to save — silently reverting the reset on disk.
+    debouncedPersist.cancel();
+    debouncedRender.cancel();
+    touchCount.current = 0;
     resetParams();
     const p = freshDefaults();
     render(selectedId, p);
-    developSetEdit(selectedId, p).catch((e) =>
+    // force=true: Reset deliberately discards the stored edit, even if the prior blob was unreadable.
+    developSetEdit(selectedId, p, undefined, true).catch((e) =>
       console.error("develop_set_edit failed", e),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedId, resetParams]);
+  }, [selectedId, resetParams, debouncedPersist, debouncedRender]);
 
   return {
     params,

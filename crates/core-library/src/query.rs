@@ -77,7 +77,7 @@ const WHERE: &str = "i.status = 'present'
     AND (:import_session_id IS NULL OR i.import_session_id = :import_session_id)
     AND (:detected_category IS NULL OR EXISTS
          (SELECT 1 FROM image_detections d
-          WHERE d.image_id = i.id AND d.category = :detected_category AND d.confidence >= 0.5))
+          WHERE d.image_id = i.id AND d.category = :detected_category))
     AND (:search IS NULL OR i.original_filename LIKE :search
                          OR i.camera_model LIKE :search
                          OR i.lens LIKE :search

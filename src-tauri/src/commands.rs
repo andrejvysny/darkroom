@@ -263,7 +263,16 @@ pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopPa
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let params = match core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())? {
-            Some(json) => serde_json::from_str::<DevelopParams>(&json).unwrap_or_default(),
+            Some(json) => serde_json::from_str::<DevelopParams>(&json).unwrap_or_else(|e| {
+                // Don't silently default — surface the parse failure. The stored blob is left intact
+                // on disk; `develop_set_edit` refuses to overwrite an unreadable blob (unless forced
+                // by an explicit Reset), so the user's real edit isn't destroyed by the next auto-save.
+                eprintln!(
+                    "[darkroom] develop params for image {image_id} failed to parse ({e}); \
+                     showing defaults but preserving the stored edit"
+                );
+                DevelopParams::default()
+            }),
             None => DevelopParams::default(),
         };
         Ok::<_, String>(params)
@@ -279,6 +288,8 @@ pub async fn develop_set_edit(
     image_id: i64,
     params: DevelopParams,
     touch_count: Option<i64>,
+    // `true` to overwrite even an unreadable stored blob (explicit Reset). Defaults to `false`.
+    force: Option<bool>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
@@ -286,6 +297,20 @@ pub async fn develop_set_edit(
         let db = st.db.lock().map_err(|e| e.to_string())?;
         // Snapshot the prior params for the event before overwriting.
         let before = core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())?;
+        // Refuse to clobber a stored edit that exists but no longer parses into the current schema
+        // (corruption / breaking change). Overwriting it would permanently destroy the user's real
+        // adjustments — the non-destructive guarantee. An explicit Reset passes `force=true` to
+        // discard it deliberately; a stray slider commit (no force) cannot.
+        if !force.unwrap_or(false) {
+            if let Some(prev) = &before {
+                if serde_json::from_str::<DevelopParams>(prev).is_err() {
+                    return Err(format!(
+                        "stored edit for image {image_id} is unreadable (schema mismatch or \
+                         corruption); Reset to discard it"
+                    ));
+                }
+            }
+        }
         core_library::set_edit(
             &db.conn,
             image_id,

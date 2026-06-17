@@ -46,8 +46,12 @@ export default function Slider({
     (clientX: number) => {
       if (!trackRef.current) return;
       const rect = trackRef.current.getBoundingClientRect();
+      // A zero-width track (collapsed/unmeasured module) makes the position ratio NaN/±Infinity,
+      // which would flow through onChange straight into the persisted develop params. Bail instead.
+      if (rect.width <= 0) return;
       const p = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
       const next = min + p * (max - min);
+      if (!Number.isFinite(next)) return;
       if (isControlled) {
         onChange(next);
       } else {

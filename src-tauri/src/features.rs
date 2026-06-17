@@ -42,10 +42,13 @@ pub fn run_backfill<R: Runtime>(app: &AppHandle<R>) -> Result<usize, String> {
         let now = core_library::now_epoch();
         {
             let db = st.db.lock().map_err(|e| e.to_string())?;
+            // One transaction per chunk: atomic (no half-written batch on error) and a single fsync
+            // instead of one per row, matching the index/analysis write passes.
+            let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
             for (id, f) in &batch {
-                core_library::set_image_features(&db.conn, *id, f, now)
-                    .map_err(|e| e.to_string())?;
+                core_library::set_image_features(&tx, *id, f, now).map_err(|e| e.to_string())?;
             }
+            tx.commit().map_err(|e| e.to_string())?;
         }
         computed += batch.len();
         let _ = app.emit(

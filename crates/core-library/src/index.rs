@@ -180,6 +180,35 @@ pub fn insert_image(
     Ok(Some(conn.last_insert_rowid()))
 }
 
+/// Recover a deleted-then-re-imported file. If a row with this `content_hash` exists but is
+/// `status='missing'` (its on-disk original was removed, so `reconcile` flagged it), repoint that row
+/// to the freshly-imported copy and mark it present — keeping the original image id so any
+/// edits/keywords/collections stay attached. Returns the relinked id, or `None` when no missing row
+/// matches (the caller then inserts a fresh row). A still-`present` duplicate is left untouched.
+pub fn relink_missing_image(
+    conn: &Connection,
+    folder_id: i64,
+    imported_at: i64,
+    p: &ProcessedImage,
+) -> Result<Option<i64>, LibError> {
+    let missing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM images WHERE content_hash = ?1 AND status = 'missing'",
+            params![&p.content_hash[..]],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(id) = missing else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE images SET path = ?1, folder_id = ?2, status = 'present', imported_at = ?3
+         WHERE id = ?4",
+        params![p.path, folder_id, imported_at, id],
+    )?;
+    Ok(Some(id))
+}
+
 /// End-to-end scan of a folder: enumerate → parallel process → transactional insert.
 /// `progress(done, total)` is invoked as each file finishes processing.
 pub fn scan_root<F>(

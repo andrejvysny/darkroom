@@ -570,8 +570,15 @@ export function developSetEdit(
   params: DevelopParams,
   /** Slider interactions in this edit session — a deliberation weight for the behavioral log. */
   touchCount?: number,
+  /** Force overwrite even an unreadable stored blob (explicit Reset only). */
+  force?: boolean,
 ): Promise<void> {
-  return invoke<void>("develop_set_edit", { imageId, params, touchCount });
+  return invoke<void>("develop_set_edit", {
+    imageId,
+    params,
+    touchCount,
+    force,
+  });
 }
 
 /** Per-channel 256-bin histogram from the rendered buffer. */

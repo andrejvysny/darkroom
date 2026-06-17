@@ -60,14 +60,19 @@ impl Db {
         };
         // FKs off so deletion order across referencing tables doesn't matter.
         self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        {
+        let wiped = (|| {
             let tx = self.conn.transaction()?;
             for t in &tables {
                 tx.execute(&format!("DELETE FROM \"{t}\""), [])?;
             }
-            tx.commit()?;
-        }
+            tx.commit()
+        })();
+        // ALWAYS restore enforcement, even if the wipe errored mid-way. This is the single
+        // process-wide connection (see `state.rs`), so leaving `foreign_keys` OFF would silently
+        // break every later cascade delete (dedup resolve, keyword/collection delete) for the rest
+        // of the session — orphaned child rows with no surfaced error.
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        wiped?;
         // VACUUM cannot run inside a transaction — reclaim pages now the rows are gone.
         self.conn.execute_batch("VACUUM;")?;
         Ok(())
@@ -94,16 +99,40 @@ mod tests {
     #[test]
     fn opens_and_creates_all_tables() {
         let db = Db::open_in_memory().unwrap();
-        let n: i64 = db
+        let mut names: Vec<String> = db
             .conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
-                [],
-                |r| r.get(0),
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
             )
-            .unwrap();
-        // 13 catalog tables (rusqlite_migration adds no extra user tables).
-        assert!(n >= 13, "expected >=13 tables, got {n}");
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        names.sort();
+        // Exact catalog table set across migrations 001–007 (rusqlite_migration tracks its version
+        // via PRAGMA user_version, adding no table). Asserting the explicit set — not a loose count —
+        // so a dropped/renamed/forgotten table in a future migration fails the test.
+        let mut expected = vec![
+            "analysis_results",
+            "app_meta",
+            "collection_images",
+            "collections",
+            "edits",
+            "folders",
+            "image_captions",
+            "image_detections",
+            "image_features",
+            "image_keywords",
+            "image_user_labels",
+            "images",
+            "import_sessions",
+            "keywords",
+            "ratings_flags",
+            "user_events",
+        ];
+        expected.sort();
+        assert_eq!(names, expected, "catalog table set drifted from migrations");
     }
 
     #[test]

@@ -6,6 +6,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use ort::ep::coreml::{ComputeUnits, ModelFormat};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -64,11 +66,16 @@ pub fn build_session_cpu(model_path: &Path) -> Result<Session, AnalyzeError> {
         .map_err(AnalyzeError::inference)
 }
 
-/// A remote model file fetched on first run. `min_size` guards against truncated / HTML-error bodies.
+/// A remote model file fetched on first run. `min_size` is a cheap pre-filter against truncated /
+/// HTML-error bodies; `sha256` is the authoritative integrity check (lowercase hex, verified before
+/// the atomic rename so a truncated / redirected / tampered body is never committed). The `.onnx`
+/// pins are the Hugging Face LFS oids (= the file SHA-256); the two `tokenizer.json` and the
+/// GitHub-hosted MegaDetector are pinned to the validated downloaded bytes.
 pub struct RemoteFile {
     pub rel: &'static str,
     pub url: &'static str,
     pub min_size: u64,
+    pub sha256: &'static str,
 }
 
 /// Object detector: D-FINE-M (52.3 mAP COCO, Apache-2.0). Same I/O as the spike's D-FINE-S.
@@ -76,6 +83,7 @@ pub const DETECTOR_FILES: &[RemoteFile] = &[RemoteFile {
     rel: "dfine_m.onnx",
     url: "https://huggingface.co/onnx-community/dfine_m_coco-ONNX/resolve/main/onnx/model.onnx",
     min_size: 40_000_000,
+    sha256: "70aaa837978a06ba44ad17398c7079ae5a1a7b1a9032b5d7053981e1ada02d6b",
 }];
 
 /// Captioner: Florence-2-base-ft (MIT), q4f16 components + non-merged decoder pair + tokenizer.
@@ -84,26 +92,31 @@ pub const CAPTION_FILES: &[RemoteFile] = &[
         rel: "florence2/vision_encoder.onnx",
         url: "https://huggingface.co/onnx-community/Florence-2-base-ft/resolve/main/onnx/vision_encoder_q4f16.onnx",
         min_size: 40_000_000,
+        sha256: "1e993fb7081302294b5c286b2cc6c2a63283959f399317dc2be49eca94f2dd18",
     },
     RemoteFile {
         rel: "florence2/embed_tokens.onnx",
         url: "https://huggingface.co/onnx-community/Florence-2-base-ft/resolve/main/onnx/embed_tokens_q4f16.onnx",
         min_size: 40_000_000,
+        sha256: "2c2a1663e8db3189699762d8e29ace6235cc9179b710326c99baa822c9ec96b8",
     },
     RemoteFile {
         rel: "florence2/encoder_model.onnx",
         url: "https://huggingface.co/onnx-community/Florence-2-base-ft/resolve/main/onnx/encoder_model_q4f16.onnx",
         min_size: 15_000_000,
+        sha256: "1550d697836639b0fec53023dac96253342c2ec1e7fa682595fda80d157e9f64",
     },
     RemoteFile {
         rel: "florence2/decoder_model.onnx",
         url: "https://huggingface.co/onnx-community/Florence-2-base-ft/resolve/main/onnx/decoder_model_q4f16.onnx",
         min_size: 40_000_000,
+        sha256: "ba61f607285efe9ee2c30c968ae7f4705957353479f76900a95c8d60573c54f3",
     },
     RemoteFile {
         rel: "florence2/tokenizer.json",
         url: "https://huggingface.co/onnx-community/Florence-2-base-ft/resolve/main/tokenizer.json",
         min_size: 1_000_000,
+        sha256: "d69dcdb2323e124ac4f800cb9863ddccea0d7bb11e16125e8df3bd60f2f8aeac",
     },
 ];
 
@@ -113,6 +126,7 @@ pub const ANIMAL_DETECTOR_FILES: &[RemoteFile] = &[RemoteFile {
     rel: "megadetector/md_v5a_dynamic.onnx",
     url: "https://github.com/bencevans/megadetector-onnx/releases/download/v0.2.0/md_v5a.0.0-dynamic.onnx",
     min_size: 400_000_000,
+    sha256: "d00e778327cc2e67f0d4927d94da5a0494a470e23a13520d0fad569abf78adff",
 }];
 
 /// Detection verifier: MobileCLIP-S1 (Apple, MIT) — fp32 vision + text encoders + CLIP tokenizer.
@@ -121,16 +135,19 @@ pub const VERIFIER_FILES: &[RemoteFile] = &[
         rel: "mobileclip/vision_model.onnx",
         url: "https://huggingface.co/Xenova/mobileclip_s1/resolve/main/onnx/vision_model.onnx",
         min_size: 60_000_000,
+        sha256: "5dece7da38f907d440f91c86cca841919c5a1affd2329ca0e94f8593fd0bfbfb",
     },
     RemoteFile {
         rel: "mobileclip/text_model.onnx",
         url: "https://huggingface.co/Xenova/mobileclip_s1/resolve/main/onnx/text_model.onnx",
         min_size: 150_000_000,
+        sha256: "33b298fe97cfc9007e2a067fc8b5f8ae63689a161b4b72c9944e5078c1139b47",
     },
     RemoteFile {
         rel: "mobileclip/tokenizer.json",
         url: "https://huggingface.co/Xenova/mobileclip_s1/resolve/main/tokenizer.json",
         min_size: 1_000_000,
+        sha256: "72ed5c96db5729294468543e4bc75fce14ca63f58e37300290189ba1c1e52b85",
     },
 ];
 
@@ -196,7 +213,7 @@ impl ModelStore {
                 if let Some(parent) = dst.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                download(f.url, &dst, f.min_size)?;
+                download(f.url, &dst, f.min_size, f.sha256)?;
             }
             progress(i + 1, total);
         }
@@ -204,14 +221,15 @@ impl ModelStore {
     }
 }
 
-fn download(url: &str, dst: &Path, min_size: u64) -> Result<(), AnalyzeError> {
+fn download(url: &str, dst: &Path, min_size: u64, sha256: &str) -> Result<(), AnalyzeError> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| AnalyzeError::Download(format!("{url}: {e}")))?;
     let tmp = dst.with_extension("part");
-    {
+    let digest = {
         let mut reader = resp.into_body().into_reader();
         let mut out = std::fs::File::create(&tmp)?;
+        let mut hasher = Sha256::new();
         let mut buf = [0u8; 1 << 16];
         let mut written: u64 = 0;
         loop {
@@ -219,16 +237,39 @@ fn download(url: &str, dst: &Path, min_size: u64) -> Result<(), AnalyzeError> {
             if n == 0 {
                 break;
             }
+            hasher.update(&buf[..n]);
             std::io::Write::write_all(&mut out, &buf[..n])?;
             written += n as u64;
         }
+        // Cheap pre-filter: a body shorter than the floor is a truncated / HTML-error response.
         if written < min_size {
             let _ = std::fs::remove_file(&tmp);
             return Err(AnalyzeError::Download(format!(
                 "{url}: short body ({written} < {min_size})"
             )));
         }
+        hex_lower(&hasher.finalize())
+    };
+    // Authoritative integrity gate: a truncated-but-large, redirected, or tampered/substituted body
+    // fails here and is removed BEFORE the atomic rename, so a corrupt file never lands on disk (and
+    // can never get stuck passing the `min_size`-only `present()` check forever). This rename is the
+    // trust boundary; we never re-hash on the routine startup `present()`/`has_all()` path.
+    if !digest.eq_ignore_ascii_case(sha256) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AnalyzeError::Download(format!(
+            "{url}: sha256 mismatch (expected {sha256}, got {digest})"
+        )));
     }
     std::fs::rename(&tmp, dst)?;
     Ok(())
+}
+
+/// Lowercase-hex encoding of a digest.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

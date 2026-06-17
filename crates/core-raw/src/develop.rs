@@ -132,7 +132,12 @@ fn cam_xyz2cam(raw: &RawImage) -> Option<[[f32; 3]; 4]> {
         .color_matrix
         .iter()
         .find(|(ill, _)| **ill == Illuminant::D65)
-        .or_else(|| raw.color_matrix.iter().next())?;
+        // Deterministic fallback. `color_matrix` is a `HashMap`, whose `iter().next()` order is
+        // unspecified and varies per instantiation — so a multi-illuminant body lacking a D65 entry
+        // could yield a DIFFERENT matrix on the preview decode vs the export decode (two independent
+        // decodes), silently breaking the documented `export == preview` invariant. Pick a stable
+        // matrix via `min_by_key` over the (Ord) `Illuminant`.
+        .or_else(|| raw.color_matrix.iter().min_by_key(|(ill, _)| **ill))?;
     if color_matrix.is_empty() || color_matrix.len() % 3 != 0 {
         return None;
     }

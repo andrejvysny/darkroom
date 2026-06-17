@@ -10,7 +10,9 @@ pub use error::ImportError;
 
 use chrono::DateTime;
 use core_db::rusqlite::{params, Connection};
-use core_library::{insert_image, now_epoch, process_file, ThumbCache, THUMB_SIZE};
+use core_library::{
+    insert_image, now_epoch, process_file, relink_missing_image, ThumbCache, THUMB_SIZE,
+};
 use core_raw::{hash_file, read_metadata, source_from_path};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -128,10 +130,12 @@ where
         _ => core_library::add_root(conn, library_root)?,
     };
 
-    // Preload existing content hashes to skip already-catalogued files.
+    // Preload existing content hashes to skip already-catalogued files. Only `present` rows pre-skip:
+    // a `missing` row (its original was deleted) must NOT short-circuit a re-import — `import_one`
+    // relinks that row to the freshly-imported copy instead (recovering the file, keeping its id).
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     {
-        let mut stmt = conn.prepare("SELECT content_hash FROM images")?;
+        let mut stmt = conn.prepare("SELECT content_hash FROM images WHERE status = 'present'")?;
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
         for h in rows.flatten() {
             if h.len() == 32 {
@@ -235,7 +239,15 @@ fn import_one(
     };
 
     let processed = process_file(&dest_path, thumbs, THUMB_SIZE)?;
-    if let Some(id) = insert_image(conn, folder_id, imported_at, &processed)? {
+    // Recover a deleted-then-re-imported file by repointing its `missing` row (keeps the image id and
+    // its edits/keywords/collections); otherwise insert a fresh row. A still-`present` duplicate
+    // yields `None` from both and is skipped. The `seen` preload is present-only, so a missing row no
+    // longer short-circuits the re-import before reaching here.
+    let inserted = match relink_missing_image(conn, folder_id, imported_at, &processed)? {
+        Some(id) => Some(id),
+        None => insert_image(conn, folder_id, imported_at, &processed)?,
+    };
+    if let Some(id) = inserted {
         conn.execute(
             "UPDATE images SET import_session_id=?1 WHERE id=?2",
             params![session_id, id],
