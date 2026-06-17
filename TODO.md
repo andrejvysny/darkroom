@@ -1,7 +1,40 @@
 # Darkroom — TODO
 
-> Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`.
-> Plan: `~/.claude/plans/act-as-senior-software-piped-meteor.md`. Spec: `SPEC_V1.md`.
+> Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
+
+## Leftovers / next (after the post-V1 develop-fidelity + review session)
+
+> Develop fidelity (ProPhoto working space, scene-referred highlights, Kelvin WB CAT, endpoint
+> blacks/whites, Detail sharpen/NR, Lens vignette) + data-safety fixes are DONE & on `main`
+> (commits `442f547`→`b5b3eda`). What's left, prioritized:
+
+- [ ] **Visual QA the develop pass in-app** (`npm run tauri dev`) — Temp/Tint, Highlights, Sharpen,
+      NR, Vignette on real CR3. Math verified headless; _feel_ is subjective. Single-constant tunables:
+      mired span `params.rs::white_xy` (±range), rolloff shoulder `develop.wgsl::highlight_rolloff`
+      (`a=0.75`), highlight-mask threshold (`0.25`), NR/sharpen response, vignette `0.6` gain.
+- [ ] **Geometric develop modules** (still UI-only) — Crop (aspect + straighten angle) + Lens
+      manual distortion / chromatic-aberration. Need: a `sample_bilinear` 4-tap helper (input is
+      non-filterable `Rgba32Float`), straighten = rotate+autozoom UV in-shader, crop = overlay rect
+      in `Stage.tsx` + apply at export (avoid preview output-dims churn), distortion = radial UV /
+      per-channel scale. All need **visual QA**. Crop UI = aspect buttons + Angle slider (unwired).
+- [ ] **`import_start` lock refactor** — restructure `core_import::import` to brief-lock-snapshot →
+      unlocked parallel copy/move/hash/thumbnail → brief-lock single-tx insert (mirror
+      `library_index_root`/`run_pass`); + startup sweep for dangling sessions; + dedup seen-set
+      `status='present'` filter & relink path. Ends the whole-import IPC freeze.
+- [ ] **Higher-leverage review items:** dedup `dhash_from_jpeg` — normalize orientation before
+      hashing (rotation-sensitive); per-mask WB as a CAT (currently per-channel gain delta);
+      bilateral/edge-aware NR (currently a plain 3×3 box → softens edges); dedicated loupe preview
+      (≥1536px, not upscaled 512 thumb); cache full-res developed buffer for repeat export.
+- [ ] **Minor / honesty:** aspect-correct the linear gradient mask (`mask_prepass.wgsl::linear_cov`,
+      needs FE+BE coord consistency); decide brush `flow` (wire buildup off MAX-blend, or remove from
+      schema+UI); frontend nits (init `selectedId` to null not `6`; re-key `Stage` zoom/pan on
+      `selectedId` not `imageUrl`; remove the fake `RightInfo` histogram + dead Filmstrip zoom/1:1).
+- [ ] **Pre-distribution only** (de-scoped while personal/single-user): CSP hardening; canonicalize
+      `export_image`/`import_start`/`library_index_root` dest/source/path against allowed roots in the
+      Rust command layer; ort dylib bundling (`externalBin`/frameworks) so the AI feature loads in a
+      built `.app`; Developer-ID codesign + notarize; tests for `core-analyze` + `src-tauri` (both
+      currently 0 tests) + the highest-risk import/dedup branches (Move source-delete, copy
+      hash-mismatch, stale-keeper resolve).
 
 ## V1 — DONE ✅ (all 5 acceptance criteria met + validated on real R7 CR3)
 
@@ -13,7 +46,7 @@
 - [x] **Phase 5** export PNG/JPEG (full-res GPU) + dialog + ⌘E
 - [x] **Phase 6** release `.dmg` (ad-hoc signed) — `Darkroom_0.1.0_aarch64.dmg` (checksum VALID)
 
-Quality: `cargo test --workspace` (7 integration + unit, all green) · `cargo clippy --workspace` clean · `npm run build` clean.
+Quality: `cargo test --workspace` (31 suites, all green) · `cargo clippy --workspace --examples` clean · `npm run build` clean.
 
 ## Local Adjustment Masks (in progress) — plan: `~/.claude/plans/act-as-expert-on-lucky-journal.md`
 

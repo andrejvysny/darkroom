@@ -1,14 +1,19 @@
 # Darkroom — Current State (handoff)
 
-> Snapshot for resuming in a new session. Pairs with `TODO.md` (what's next), `README.md` (overview),
-> `SPEC_V1.md` (full spec), and the plan at `~/.claude/plans/act-as-senior-software-piped-meteor.md`.
+> Snapshot for resuming in a new session. Pairs with `TODO.md` (what's next + leftovers), `README.md`
+> (overview), `SPEC_V1.md` (full spec).
 
 ## TL;DR
 
-V1 is **functionally complete and validated**. All 5 acceptance criteria pass against the real
-240 Canon EOS R7 **CR3** files in `library/2026/2026-06-06/`. A signed (ad-hoc) `.dmg` builds.
-GPU develop pipeline works at ~2 ms/slider. 7 integration tests (over real CR3) + unit tests pass;
-clippy clean; frontend builds clean.
+V1 is **functionally complete**, plus a **post-V1 develop-fidelity pass** (review-driven): linear
+**ProPhoto** wide-gamut working space, scene-referred highlights (soft rolloff), **Kelvin white
+balance** (Planckian + Bradford CAT, GPT-5.5-reviewed), independent endpoint blacks/whites, and
+**Detail** (sharpen + luma/color NR) + **Lens vignette** wired. Plus data-safety fixes (dedup keeper,
+mask zero-coverage, histogram race). `cargo test --workspace` (31 suites) + `clippy --workspace
+--examples` + `npm run build` all clean. **Caveat:** the "240 CR3" validation is dev-machine-only —
+only 1 CR3 is committed; GPU/real-CR3 tests skip without the fixture/Metal. **Pending your visual QA**
+of the develop changes in-app (`npm run tauri dev`) — the math is verified headless but warmth/rolloff/
+sharpen/vignette _feel_ is subjective (all single-constant tunable).
 
 ## How to run / build / test
 
@@ -156,10 +161,14 @@ eviction and FS-watcher reconciliation are DONE — see `thumbs.rs::evict_to` an
 
 ## Suggested next steps (priority order)
 
-1. Wire **tone curve** + **HSL** into the WGSL shader (biggest develop-fidelity gap).
-2. Wire **before/after** toggle (render with `DEFAULT_PARAMS`) + per-module reset polish.
-3. **CSP hardening** + capabilities tightening (pre-distribution).
-4. Thumbnail **LRU eviction**; dedicated **loupe preview** (≥1536px) generation.
-5. FS **watcher** + move reconciliation by hash (spec §9).
-6. Detail (sharpen/NR) + lens corrections + crop in the export pipe.
-7. Developer-ID sign + **notarize** for distribution.
+See **TODO.md → "Leftovers / next"** for the authoritative list. In short:
+
+1. **Visual QA** the develop fidelity in-app (Temp/Tint/Highlights/Sharpen/Vignette on real CR3);
+   tune the single constants if the feel is off (mired span, rolloff shoulder, NR/sharpen strength).
+2. **Geometric develop** (still UI-only): Crop (aspect + straighten) + Lens distortion/CA — needs a
+   bilinear-remap helper + crop overlay/export-dims + visual QA.
+3. **`import_start` lock refactor** (brief-lock/unlocked-work/brief-commit; ends the import freeze).
+4. Higher-leverage review items not yet done: dedup orientation-normalize before dHash; per-mask
+   WB-as-CAT; bilateral (not box) NR; loupe ≥1536px preview; export full-res cache.
+5. Pre-distribution only (de-scoped while personal): CSP hardening, command path-scoping, ort dylib
+   bundling, codesign + notarize, core-analyze/src-tauri tests.
