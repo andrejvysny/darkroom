@@ -557,6 +557,19 @@ export async function developPreviewJpeg(imageId: number): Promise<string> {
   return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
 }
 
+/**
+ * Library loupe source: the unedited capture (camera embedded preview, near full sensor res).
+ * `maxEdge === 0` returns native size (capped backend-side); positive downscales the long edge.
+ * Returns an object URL backed by JPEG bytes. Caller must revoke when done.
+ */
+export async function loupeJpeg(
+  imageId: number,
+  maxEdge: number,
+): Promise<string> {
+  const buf = await invoke<ArrayBuffer>("loupe_jpeg", { imageId, maxEdge });
+  return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+}
+
 /** Pull the most recent render's histogram (reliable fallback for the fire-and-forget event). */
 export function developGetHistogram(): Promise<HistData | null> {
   return invoke<HistData | null>("develop_get_histogram", {});
@@ -622,6 +635,11 @@ export function analysisModelsEnsure(): Promise<void> {
 /** Run the background analysis pass. Emits `analysis:progress` `{done,total}` then `analysis:done`. */
 export function analysisRun(force = false): Promise<AnalysisRunStats> {
   return invoke<AnalysisRunStats>("analysis_run", { force });
+}
+
+/** Request the running pass to stop after the current batch (keeps work already committed). */
+export function analysisCancel(): Promise<void> {
+  return invoke<void>("analysis_cancel", {});
 }
 
 /** Per-category detected-image counts. */

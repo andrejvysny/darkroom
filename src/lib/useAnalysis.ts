@@ -4,6 +4,7 @@ import {
   analysisStatus,
   analysisModelsEnsure,
   analysisRun,
+  analysisCancel,
   analysisFacets,
   type AnalysisStatus,
   type FacetRow,
@@ -24,6 +25,7 @@ export interface AnalysisState {
 
 export interface AnalysisActions {
   triggerAnalysis: (force?: boolean) => Promise<void>;
+  cancelAnalysis: () => Promise<void>;
   reloadFacets: () => Promise<void>;
 }
 
@@ -43,6 +45,27 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
       /* non-fatal */
     }
   }, []);
+
+  // Throttled live refresh during a run: reload facet counts and bump doneVersion so consumers
+  // (sidebar counts, per-image AI panel, filtered grid) pick up incrementally-committed results.
+  const liveTimer = useRef<number | null>(null);
+  const liveLast = useRef(0);
+  const scheduleLiveRefresh = useCallback(() => {
+    const fire = () => {
+      liveLast.current = Date.now();
+      void reloadFacets();
+      setDoneVersion((v) => v + 1);
+    };
+    const since = Date.now() - liveLast.current;
+    if (since >= 800) {
+      fire();
+    } else if (liveTimer.current === null) {
+      liveTimer.current = window.setTimeout(() => {
+        liveTimer.current = null;
+        fire();
+      }, 800 - since);
+    }
+  }, [reloadFacets]);
 
   const reloadStatus = useCallback(async () => {
     try {
@@ -79,6 +102,14 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
     [reloadStatus, reloadFacets],
   );
 
+  const cancelAnalysis = useCallback(async () => {
+    try {
+      await analysisCancel();
+    } catch {
+      /* non-fatal */
+    }
+  }, []);
+
   // Mount: fetch initial status + facets, register event listeners
   useEffect(() => {
     if (bootstrappedRef.current) return;
@@ -102,12 +133,14 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
 
       const unProgress = await listen<{ done: number; total: number }>(
         "analysis:progress",
-        (ev) =>
+        (ev) => {
           setProgress({
             kind: "analyzing",
             done: ev.payload.done,
             total: ev.payload.total,
-          }),
+          });
+          scheduleLiveRefresh();
+        },
       );
       unlisteners.push(unProgress);
 
@@ -126,8 +159,9 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
 
     return () => {
       unlisteners.forEach((fn) => fn());
+      if (liveTimer.current !== null) window.clearTimeout(liveTimer.current);
     };
-  }, [reloadStatus, reloadFacets]);
+  }, [reloadStatus, reloadFacets, scheduleLiveRefresh]);
 
   return {
     status,
@@ -135,6 +169,7 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
     progress,
     doneVersion,
     triggerAnalysis,
+    cancelAnalysis,
     reloadFacets,
   };
 }

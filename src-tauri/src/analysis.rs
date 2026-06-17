@@ -25,6 +25,12 @@ pub const CAPTION_VERSION: &str = "florence2-base-ft-q4f16-v1";
 /// Longest-edge the analysis decode is downscaled to (boxes are normalized, so this is loss-only).
 const ANALYZE_EDGE: u32 = 1024;
 
+/// Images per commit. Each batch is decoded + inferred in parallel (no DB lock), then written in
+/// one short transaction — so results become visible incrementally and an interrupted run keeps
+/// everything finished so far. Small enough for prompt partial results, large enough to amortize
+/// the lock + transaction overhead.
+const ANALYSIS_BATCH: usize = 8;
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisStatus {
@@ -112,11 +118,16 @@ fn decode_srgb(path: &str) -> Option<image::RgbImage> {
     }
 }
 
-/// Resets the `analysis_running` flag on drop (so an early return / error can't wedge the guard).
-struct RunGuard<'a>(&'a AtomicBool);
+/// Resets the `analysis_running` + `analysis_cancel` flags on drop (so an early return / error /
+/// cancel can't wedge the guard or leave a stale cancel request for the next run).
+struct RunGuard<'a> {
+    running: &'a AtomicBool,
+    cancel: &'a AtomicBool,
+}
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
+        self.cancel.store(false, Ordering::SeqCst);
     }
 }
 
@@ -127,7 +138,11 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats,
     if st.analysis_running.swap(true, Ordering::SeqCst) {
         return Err("analysis already running".into());
     }
-    let _guard = RunGuard(&st.analysis_running);
+    st.analysis_cancel.store(false, Ordering::SeqCst);
+    let _guard = RunGuard {
+        running: &st.analysis_running,
+        cancel: &st.analysis_cancel,
+    };
 
     let registry = registry(&st)?;
     let analyzers = registry.analyzers();
@@ -160,60 +175,79 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats,
     let done = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
-    // Parallel decode + inference (inference serializes on each analyzer's internal mutex). No DB lock.
-    let results: Vec<(i64, Vec<AnalysisInput>)> = todo
-        .par_iter()
-        .filter_map(|t| {
-            let out = decode_srgb(&t.path).map(|img| {
-                let mut records = Vec::new();
-                for a in analyzers {
-                    let ctx = AnalysisCtx {
-                        image_id: t.id,
-                        content_hash_hex: &t.content_hash_hex,
-                        image: &img,
-                        prior: &records,
-                    };
-                    match a.analyze(&ctx) {
-                        Ok(rec) => records.push(rec),
-                        Err(e) => {
-                            eprintln!("[darkroom] analyzer {} failed on {}: {e}", a.id(), t.path)
+    // Process in batches: decode + inference for each batch in parallel (no DB lock), then commit
+    // that batch in one short transaction. Results are persisted + visible incrementally, so a
+    // partial / aborted run still keeps everything finished so far.
+    let mut analyzed = 0usize;
+    for batch in todo.chunks(ANALYSIS_BATCH) {
+        // Honor a cancel request between batches — work already committed is kept.
+        if st.analysis_cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        let batch_results: Vec<(i64, Vec<AnalysisInput>)> = batch
+            .par_iter()
+            .filter_map(|t| {
+                let out = decode_srgb(&t.path).map(|img| {
+                    let mut records = Vec::new();
+                    for a in analyzers {
+                        let ctx = AnalysisCtx {
+                            image_id: t.id,
+                            content_hash_hex: &t.content_hash_hex,
+                            image: &img,
+                            prior: &records,
+                        };
+                        match a.analyze(&ctx) {
+                            Ok(rec) => records.push(rec),
+                            Err(e) => {
+                                eprintln!(
+                                    "[darkroom] analyzer {} failed on {}: {e}",
+                                    a.id(),
+                                    t.path
+                                )
+                            }
                         }
                     }
+                    let inputs: Vec<AnalysisInput> = records
+                        .into_iter()
+                        .map(|r| AnalysisInput {
+                            analyzer_id: r.analyzer_id,
+                            model_version: r.model_version,
+                            payload: r.payload,
+                        })
+                        .collect();
+                    (t.id, inputs)
+                });
+                if out.is_none() {
+                    failed.fetch_add(1, Ordering::Relaxed);
                 }
-                let inputs: Vec<AnalysisInput> = records
-                    .into_iter()
-                    .map(|r| AnalysisInput {
-                        analyzer_id: r.analyzer_id,
-                        model_version: r.model_version,
-                        payload: r.payload,
-                    })
-                    .collect();
-                (t.id, inputs)
-            });
-            if out.is_none() {
-                failed.fetch_add(1, Ordering::Relaxed);
-            }
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n == total || n.is_multiple_of(2) {
-                let _ = app.emit(
-                    "analysis:progress",
-                    serde_json::json!({ "done": n, "total": total }),
-                );
-            }
-            out.filter(|(_, inputs)| !inputs.is_empty())
-        })
-        .collect();
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == total || n.is_multiple_of(2) {
+                    let _ = app.emit(
+                        "analysis:progress",
+                        serde_json::json!({ "done": n, "total": total }),
+                    );
+                }
+                out.filter(|(_, inputs)| !inputs.is_empty())
+            })
+            .collect();
 
-    // One brief lock: bulk-insert all results in a single transaction.
-    let analyzed = results.len();
-    {
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        let ran_at = core_library::now_epoch();
-        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-        for (id, inputs) in &results {
-            insert_analysis(&tx, *id, ran_at, inputs).map_err(|e| e.to_string())?;
+        // Commit this batch in one short transaction so results show up immediately.
+        if !batch_results.is_empty() {
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            let ran_at = core_library::now_epoch();
+            let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+            for (id, inputs) in &batch_results {
+                insert_analysis(&tx, *id, ran_at, inputs).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            analyzed += batch_results.len();
         }
-        tx.commit().map_err(|e| e.to_string())?;
+
+        // Nudge the UI now that committed data has changed (frontend throttles a facets refetch).
+        let _ = app.emit(
+            "analysis:progress",
+            serde_json::json!({ "done": done.load(Ordering::Relaxed), "total": total }),
+        );
     }
 
     let stats = RunStats {

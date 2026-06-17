@@ -87,6 +87,21 @@ export default function LibraryView() {
 
   const lib = useLibrary();
   const analysis = useAnalysis();
+  const [stoppingAnalysis, setStoppingAnalysis] = useState(false);
+
+  // While analysis runs (doneVersion bumps as batches commit), keep the filtered grid in sync so
+  // partial detection results appear without re-clicking the category.
+  useEffect(() => {
+    if (analysis.doneVersion > 0 && lib.params.detectedCategory) {
+      void lib.refresh();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [analysis.doneVersion]);
+
+  // Clear the "Stopping…" affordance once the pass actually ends.
+  useEffect(() => {
+    if (!analysis.progress) setStoppingAnalysis(false);
+  }, [analysis.progress]);
 
   // Register library action callbacks so TopBar/CommandPalette can call them
   useEffect(() => {
@@ -518,11 +533,38 @@ export default function LibraryView() {
                 fontSize: 12,
                 color: "var(--color-t2)",
                 whiteSpace: "nowrap",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
               }}
             >
-              {analysis.progress.kind === "models"
-                ? `Downloading models ${analysis.progress.done} / ${analysis.progress.total}…`
-                : `Analyzing ${analysis.progress.done} / ${analysis.progress.total}…`}
+              <span>
+                {analysis.progress.kind === "models"
+                  ? `Downloading models ${analysis.progress.done} / ${analysis.progress.total}…`
+                  : `Analyzing ${analysis.progress.done} / ${analysis.progress.total}…`}
+              </span>
+              {analysis.progress.kind === "analyzing" && (
+                <button
+                  disabled={stoppingAnalysis}
+                  onClick={() => {
+                    setStoppingAnalysis(true);
+                    void analysis.cancelAnalysis();
+                  }}
+                  title="Stop analysis (keeps results processed so far)"
+                  style={{
+                    border: "1px solid var(--color-line)",
+                    borderRadius: "var(--radius-sm)",
+                    background: "var(--color-hover)",
+                    color: "var(--color-t1)",
+                    fontSize: 11,
+                    padding: "2px 8px",
+                    cursor: stoppingAnalysis ? "default" : "pointer",
+                    opacity: stoppingAnalysis ? 0.6 : 1,
+                  }}
+                >
+                  {stoppingAnalysis ? "Stopping…" : "Stop"}
+                </button>
+              )}
             </div>
           )}
 

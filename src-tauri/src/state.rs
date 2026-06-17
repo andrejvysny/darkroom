@@ -77,6 +77,8 @@ pub struct AppState {
     pub analyzers: Mutex<Option<Arc<AnalyzerRegistry>>>,
     /// Guards against two analysis passes running at once.
     pub analysis_running: AtomicBool,
+    /// Set by `analysis_cancel` to request the running pass stop between batches.
+    pub analysis_cancel: AtomicBool,
 }
 
 impl AppState {
@@ -121,6 +123,7 @@ impl AppState {
             models_dir,
             analyzers: Mutex::new(None),
             analysis_running: AtomicBool::new(false),
+            analysis_cancel: AtomicBool::new(false),
         })
     }
 }

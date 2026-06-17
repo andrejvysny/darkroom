@@ -260,6 +260,35 @@ pub async fn develop_preview_jpeg(
     .map_err(|e| e.to_string())?
 }
 
+/// Library loupe: the unedited capture (camera embedded preview, near full sensor res on CR3) as
+/// JPEG bytes. `max_edge == 0` returns native size (capped at 8192 to bound payload/decode); any
+/// positive value downscales the long edge to that. No GPU, no develop edits — the frontend loads
+/// 2560 for fit-view, then native on zoom. Distinct from `develop_preview_jpeg` (which the Develop
+/// view owns) so the two can evolve independently.
+#[tauri::command]
+pub async fn loupe_jpeg(
+    app: AppHandle,
+    image_id: i64,
+    max_edge: u32,
+) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let path = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::image_by_id(&db.conn, image_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "image not found".to_string())?
+                .path
+        };
+        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+        let edge = if max_edge == 0 { 8192 } else { max_edge };
+        let thumb = core_raw::thumbnail_jpeg(&src, edge, 90).map_err(|e| e.to_string())?;
+        Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// The histogram of the most recent successful render. A reliable pull-fallback for the
 /// fire-and-forget `develop:histogram` event (which can be missed if it fires before the listener
 /// is registered). Returns `None` if nothing has rendered yet.
@@ -934,6 +963,16 @@ pub async fn analysis_run(
     tauri::async_runtime::spawn_blocking(move || crate::analysis::run_pass(&app, force))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Request the running analysis pass to stop after the current batch commits. Results already
+/// persisted are kept; the pass then emits `analysis:done` with its partial stats. No-op if idle.
+#[tauri::command]
+pub fn analysis_cancel(app: AppHandle) {
+    let st = app.state::<AppState>();
+    if st.analysis_running.load(Ordering::SeqCst) {
+        st.analysis_cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Detected-object category counts (distinct images) for the LeftNav facet.
