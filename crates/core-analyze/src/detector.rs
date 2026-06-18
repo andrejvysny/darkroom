@@ -22,8 +22,10 @@ const INPUT: u32 = 640;
 /// Absolute candidate floor. D-FINE's focal-loss sigmoid heads have NO background class, so every one
 /// of the 300 queries always emits a best-guess; on featureless frames unmatched queries score in the
 /// ~0.45–0.60 noise band (`sigmoid(−0.2)≈0.45`). Nothing below this floor is ever considered; the
-/// per-category gate in `coco::threshold` then sets the real accept bar.
-const DEFAULT_THRESHOLD: f32 = 0.50;
+/// per-category gate in `coco::threshold` then sets the real accept bar. Lowered 0.50→0.40 (v3) so the
+/// CLIP verifier — not this floor — supplies People precision (recovers distant/back-turned people the
+/// 0.55 gate dropped, while the strict person verifier-accept rejects the texture false positives).
+const DEFAULT_THRESHOLD: f32 = 0.40;
 /// Reject ambiguous "background" queries whose class distribution is flat: a real detection's top
 /// class dominates the runner-up, whereas a noise query has `best ≈ second`. Keep only if
 /// `best_s ≥ MARGIN_RATIO × second_s`.
@@ -240,7 +242,7 @@ impl ObjectDetector {
             let passes = self
                 .verifier
                 .as_ref()
-                .is_none_or(|v| v.accepts(verifier_prob));
+                .is_none_or(|v| v.accepts(cat, verifier_prob));
             out.insert(
                 cat,
                 RawScore {

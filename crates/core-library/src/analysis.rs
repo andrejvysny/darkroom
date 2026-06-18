@@ -17,11 +17,14 @@ pub const ANIMAL_DETECTION_ID: &str = "animal_detection";
 pub const CAPTION_ID: &str = "caption";
 pub const PRESENCE_ID: &str = "presence_probe";
 
-/// Baked max-F1 decision thresholds for the MobileCLIP presence probe (from `train_presence` CV).
-/// Used to OR-fuse `image_presence` into the People/Animals facet + library filter. Update these when
-/// the probe weights (`crates/core-analyze/assets/presence_probe.json`) are regenerated.
-pub const PRESENCE_TAU_PERSON: f64 = 0.5;
-pub const PRESENCE_TAU_ANIMAL: f64 = 0.5;
+/// Facet/filter fusion threshold for the MobileCLIP presence probe. Set to 1.1 (> any probability) to
+/// **disable** OR-fusion — the probe ships **advisory-only** (RightInfo readout via `presence_for_image`),
+/// not wired into the People/Animals nav counts or library filter. Rationale: honest group-aware CV
+/// showed the probe overfits the library's ~19 distinct scenes (fusing hurts animal precision and is
+/// only marginal for person). Re-enable by setting these to the trained max-F1 `tau` once the probe is
+/// retrained on scene-diverse labels.
+pub const PRESENCE_TAU_PERSON: f64 = 1.1;
+pub const PRESENCE_TAU_ANIMAL: f64 = 1.1;
 
 /// One analyzer result to persist (mirror of the ML crate's `AnalysisRecord`, kept local so
 /// `core-library` doesn't depend on `core-analyze`/ort).

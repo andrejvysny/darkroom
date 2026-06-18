@@ -25,7 +25,9 @@ use crate::state::AppState;
 /// Model-version tags stored per result row; bump to force re-analysis of all images.
 /// v2: precision-gated decode (per-category thresholds + confidence floor + margin gate + box-sanity),
 /// Animals removed from D-FINE (now MegaDetector), MLProgram CoreML format.
-pub const DETECTOR_VERSION: &str = "dfine-m-coco-v2";
+/// v3: label-calibrated People recall — floor 0.50→0.40 + People gate 0.55→0.40 with precision moved
+/// to a strict per-category person verifier-accept (0.91); measured person F1 0.868→~0.89 on labels.
+pub const DETECTOR_VERSION: &str = "dfine-m-coco-v3";
 pub const CAPTION_VERSION: &str = "florence2-base-ft-q4f16-v1";
 /// MegaDetector version is resolution-specific, so changing the size re-analyzes.
 pub const ANIMAL_DETECTOR_VERSION_1280: &str = "mdv5a-1280-v1";

@@ -250,7 +250,7 @@ impl MegaDetector {
         let passes = self
             .verifier
             .as_ref()
-            .is_none_or(|v| v.accepts(verifier_prob));
+            .is_none_or(|v| v.accepts("Animals", verifier_prob));
         Ok(RawScore {
             best_raw,
             verifier_prob,

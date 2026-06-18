@@ -29,9 +29,14 @@ const CONTEXT_LEN: usize = 77;
 const LOGIT_SCALE: f32 = 100.0;
 /// Crop padding fraction around the detection box (context helps CLIP).
 const CROP_PAD: f32 = 0.20;
-/// Keep a detection only if the positive prompt's softmax probability is at least this. Conservative
-/// (recall-preserving): we reject only when the negatives clearly dominate.
-const VERIFY_ACCEPT: f32 = 0.40;
+/// Per-category positive-prompt softmax acceptance floor. **People** lean on the verifier for
+/// precision (the D-FINE person gate is intentionally low at 0.40 to recover distant/back-turned
+/// people, so CLIP must reject the texture false positives — fields/poppies score ~0.82–0.90, real
+/// people ~0.98), hence a strict 0.91. **Animals** keep the recall-preserving 0.40 (MegaDetector is
+/// already precise; calibrated on labels at F1 1.0). Overridable for sweeps via
+/// `DARKROOM_VERIFY_ACCEPT_PEOPLE`/`DARKROOM_VERIFY_ACCEPT_ANIMALS`.
+const VERIFY_ACCEPT_PEOPLE: f32 = 0.91;
+const VERIFY_ACCEPT_ANIMALS: f32 = 0.40;
 
 /// A category's verification prompts. Index 0 is the positive; the rest are negatives.
 struct PromptSet {
@@ -65,7 +70,8 @@ pub struct Verifier {
     vision: Mutex<Session>,
     people: PromptSet,
     animals: PromptSet,
-    accept: f32,
+    accept_people: f32,
+    accept_animals: f32,
     crop_pad: f32,
 }
 
@@ -100,7 +106,8 @@ impl Verifier {
             vision: Mutex::new(vision),
             people,
             animals,
-            accept: env_f32("DARKROOM_VERIFY_ACCEPT", VERIFY_ACCEPT),
+            accept_people: env_f32("DARKROOM_VERIFY_ACCEPT_PEOPLE", VERIFY_ACCEPT_PEOPLE),
+            accept_animals: env_f32("DARKROOM_VERIFY_ACCEPT_ANIMALS", VERIFY_ACCEPT_ANIMALS),
             crop_pad: env_f32("DARKROOM_CROP_PAD", CROP_PAD),
         })
     }
@@ -113,7 +120,17 @@ impl Verifier {
         bbox: &[f32; 4],
         category: &str,
     ) -> Result<bool, AnalyzeError> {
-        Ok(self.accepts(self.confirm_prob(img, bbox, category)?))
+        Ok(self.accepts(category, self.confirm_prob(img, bbox, category)?))
+    }
+
+    /// Per-category acceptance floor (People strict, Animals lenient; unknown categories → 0 so they
+    /// are accepted unverified, matching the `None`-prob path).
+    fn accept_for(&self, category: &str) -> f32 {
+        match category {
+            "People" => self.accept_people,
+            "Animals" => self.accept_animals,
+            _ => 0.0,
+        }
     }
 
     /// Positive-prompt softmax probability for the cropped box under `category`'s prompt set (the
@@ -142,11 +159,11 @@ impl Verifier {
         Ok(Some(probs[0]))
     }
 
-    /// Whether a [`confirm_prob`](Self::confirm_prob) result accepts the detection: a category with
-    /// no prompt set (`None`) is accepted unverified; otherwise the positive prob must clear
-    /// `VERIFY_ACCEPT`.
-    pub fn accepts(&self, prob: Option<f32>) -> bool {
-        prob.is_none_or(|p| p >= self.accept)
+    /// Whether a [`confirm_prob`](Self::confirm_prob) result accepts the detection for `category`: a
+    /// category with no prompt set (`None`) is accepted unverified; otherwise the positive prob must
+    /// clear that category's [`accept_for`](Self::accept_for) floor.
+    pub fn accepts(&self, category: &str, prob: Option<f32>) -> bool {
+        prob.is_none_or(|p| p >= self.accept_for(category))
     }
 
     /// Full-image 512-d L2-normalized MobileCLIP embedding. Reuses the verifier's already-loaded

@@ -42,7 +42,9 @@ pub fn category(label: &str) -> Option<&'static str> {
 /// `DARKROOM_TH_PEOPLE`/`DARKROOM_TH_VEHICLES` (production must NOT set these).
 pub fn threshold(category: &str) -> f32 {
     match category {
-        "People" => env_f32("DARKROOM_TH_PEOPLE", 0.55),
+        // v3: People gate lowered 0.55→0.40 — precision moved to the strict person verifier-accept
+        // (see `verify::VERIFY_ACCEPT_PEOPLE`), recovering people the high score gate dropped.
+        "People" => env_f32("DARKROOM_TH_PEOPLE", 0.40),
         "Vehicles" => env_f32("DARKROOM_TH_VEHICLES", 0.50),
         _ => 0.60,
     }

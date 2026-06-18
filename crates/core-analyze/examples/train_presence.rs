@@ -230,6 +230,16 @@ struct OofRow {
     oof_animal: Option<f32>,
 }
 
+/// One per-image raw embedding row (for offline group-aware CV experiments in Python; `EMBED_OUT`).
+#[derive(Serialize)]
+struct EmbRow<'a> {
+    image_id: i64,
+    path: &'a str,
+    person: Option<bool>,
+    animal: Option<bool>,
+    emb: &'a [f32],
+}
+
 /// Fold standardization (mean,std) back into weights so runtime scores the raw embedding.
 fn fold(w: &[f32], b: f32, mean: &[f32], std: &[f32]) -> (Vec<f32>, f32) {
     let wf: Vec<f32> = (0..w.len()).map(|j| w[j] / std[j]).collect();
@@ -240,19 +250,67 @@ fn fold(w: &[f32], b: f32, mean: &[f32], std: &[f32]) -> (Vec<f32>, f32) {
 const ITERS: usize = 1500;
 const LR: f32 = 0.5;
 const LAMBDA: f32 = 1e-2;
+/// Frame-number gap (within a filename prefix) below which images are treated as the same burst/scene
+/// — group-aware CV keeps such near-duplicates in the SAME fold so CV isn't inflated by leakage.
+const GROUP_GAP: i64 = 10;
+
+/// Parse a Canon-style filename into `(prefix, frame_number)` (e.g. `_55A6301` → (`_55A`, 6301)).
+fn frame_key(path: &str) -> Option<(String, i64)> {
+    let stem = std::path::Path::new(path).file_stem()?.to_str()?;
+    let split = stem
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let (pre, num) = stem.split_at(split);
+    Some((pre.to_string(), num.parse().ok()?))
+}
+
+/// Cluster labeled images into burst/scene groups: sorted by (prefix, frame#), a new group starts when
+/// the prefix changes or the frame gap exceeds [`GROUP_GAP`]. Unparseable names get singleton groups.
+fn compute_groups(labeled: &[LabeledImage]) -> std::collections::HashMap<i64, u32> {
+    let mut keyed: Vec<(String, i64, i64)> = labeled
+        .iter()
+        .filter_map(|li| frame_key(&li.path).map(|(p, n)| (p, n, li.id)))
+        .collect();
+    keyed.sort();
+    let mut map = std::collections::HashMap::new();
+    let mut g = 0u32;
+    let mut prev: Option<(String, i64)> = None;
+    for (p, n, id) in &keyed {
+        if let Some((pp, pn)) = &prev {
+            if pp != p || n - pn > GROUP_GAP {
+                g += 1;
+            }
+        }
+        map.insert(*id, g);
+        prev = Some((p.clone(), *n));
+    }
+    // Unparseable filenames → their own singleton groups.
+    let mut next = g + 1;
+    for li in labeled {
+        map.entry(li.id).or_insert_with(|| {
+            let x = next;
+            next += 1;
+            x
+        });
+    }
+    map
+}
 
 /// Fit one category: 5-fold OOF predictions for honest AUC/tau/F1, then a final fit on all rows with
 /// standardization folded into the returned weights. Also returns the per-row cross-validated OOF
 /// probability (aligned to `feats` order) for offline fusion measurement.
-fn train_head(name: &str, feats: &[Vec<f32>], labels: &[bool]) -> (Head, Vec<f32>) {
+fn train_head(name: &str, feats: &[Vec<f32>], labels: &[bool], groups: &[u32]) -> (Head, Vec<f32>) {
     let n_pos = labels.iter().filter(|b| **b).count();
     let n_neg = labels.len() - n_pos;
 
-    // Out-of-fold predictions, kept aligned to input index (deterministic split: index % FOLDS).
+    // Out-of-fold predictions, kept aligned to input index. Folds are assigned by GROUP (group % FOLDS)
+    // so burst/scene siblings always land in the same fold — no near-duplicate leakage across folds.
     let mut oof_idx = vec![0f32; feats.len()];
     for f in 0..FOLDS {
-        let tr: Vec<usize> = (0..feats.len()).filter(|i| i % FOLDS != f).collect();
-        let te: Vec<usize> = (0..feats.len()).filter(|i| i % FOLDS == f).collect();
+        let in_fold = |i: usize| (groups[i] as usize) % FOLDS == f;
+        let tr: Vec<usize> = (0..feats.len()).filter(|&i| !in_fold(i)).collect();
+        let te: Vec<usize> = (0..feats.len()).filter(|&i| in_fold(i)).collect();
         let tr_x: Vec<Vec<f32>> = tr.iter().map(|&i| feats[i].clone()).collect();
         let tr_y: Vec<bool> = tr.iter().map(|&i| labels[i]).collect();
         let (mean, std) = standardizer(&tr_x);
@@ -306,8 +364,13 @@ fn main() -> Result<()> {
     );
 
     // Embed every labeled image once; bucket into per-category (id, feature, label) by tri-state.
-    let (mut p_x, mut p_y, mut p_ids) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut a_x, mut a_y, mut a_ids) = (Vec::new(), Vec::new(), Vec::new());
+    // Burst/scene grouping for leakage-free group-aware CV.
+    let group_of = compute_groups(&labeled);
+
+    let (mut p_x, mut p_y, mut p_ids, mut p_g) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut a_x, mut a_y, mut a_ids, mut a_g) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    #[allow(clippy::type_complexity)]
+    let mut emb_rows: Vec<(i64, String, Option<bool>, Option<bool>, Vec<f32>)> = Vec::new();
     let (mut ok, mut failed) = (0usize, 0usize);
     for LabeledImage {
         id,
@@ -332,16 +395,20 @@ fn main() -> Result<()> {
                 continue;
             }
         };
+        let g = group_of[id];
         if let Some(y) = person {
             p_x.push(emb.clone());
             p_y.push(*y);
             p_ids.push(*id);
+            p_g.push(g);
         }
         if let Some(y) = animal {
             a_x.push(emb.clone());
             a_y.push(*y);
             a_ids.push(*id);
+            a_g.push(g);
         }
+        emb_rows.push((*id, path.clone(), *person, *animal, emb));
         ok += 1;
         if ok % 50 == 0 {
             eprintln!("  embedded {ok}…");
@@ -351,8 +418,16 @@ fn main() -> Result<()> {
     anyhow::ensure!(!p_x.is_empty() && !a_x.is_empty(), "no labeled features");
 
     let dim = p_x[0].len();
-    let (person, p_oof) = train_head("person", &p_x, &p_y);
-    let (animal, a_oof) = train_head("animal", &a_x, &a_y);
+    let n_groups = group_of
+        .values()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    eprintln!(
+        "group-aware CV: {n_groups} burst/scene groups across {} labeled images",
+        labeled.len()
+    );
+    let (person, p_oof) = train_head("person", &p_x, &p_y, &p_g);
+    let (animal, a_oof) = train_head("animal", &a_x, &a_y, &a_g);
     let probe = Probe {
         model_version: PRESENCE_VERSION.to_string(),
         dim,
@@ -382,6 +457,23 @@ fn main() -> Result<()> {
         }
         std::fs::write(&out_path, buf).with_context(|| format!("write {out_path}"))?;
         eprintln!("OOF dump → {out_path} ({} images)", m.len());
+    }
+
+    // Optional raw-embedding dump for offline group-aware CV experiments (Python).
+    if let Ok(out_path) = std::env::var("EMBED_OUT") {
+        let mut buf = String::new();
+        for (id, path, person, animal, emb) in &emb_rows {
+            buf.push_str(&serde_json::to_string(&EmbRow {
+                image_id: *id,
+                path,
+                person: *person,
+                animal: *animal,
+                emb,
+            })?);
+            buf.push('\n');
+        }
+        std::fs::write(&out_path, buf).with_context(|| format!("write {out_path}"))?;
+        eprintln!("EMBED dump → {out_path} ({} rows)", emb_rows.len());
     }
     Ok(())
 }
