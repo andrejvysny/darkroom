@@ -4,6 +4,7 @@
 //! ÷255, no mean/std) → `logits[1,300,80]` + `pred_boxes[1,300,4]` (cxcywh, normalized). DETR-style,
 //! NMS-free — we apply only a light per-label IoU dedup for occasional near-duplicate queries.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +15,7 @@ use ort::value::Tensor;
 use crate::error::AnalyzeError;
 use crate::{
     coco, models, preprocess, AnalysisCtx, AnalysisRecord, Analyzer, Detection, DetectionPayload,
-    Verifier,
+    RawScore, Verifier,
 };
 
 const INPUT: u32 = 640;
@@ -40,18 +41,22 @@ pub struct ObjectDetector {
     session: Mutex<Session>,
     model_version: &'static str,
     threshold: f32,
+    margin: f32,
     verifier: Option<Arc<Verifier>>,
 }
 
 impl ObjectDetector {
     /// Load a D-FINE ONNX model. `model_version` is a stable tag stored per result row (bump to force
-    /// re-analysis). The detector loads at the default optimization level.
+    /// re-analysis). The detector loads at the default optimization level. The confidence floor and
+    /// margin take their defaults from [`DEFAULT_THRESHOLD`]/[`MARGIN_RATIO`], overridable for offline
+    /// calibration only via `DARKROOM_DET_FLOOR`/`DARKROOM_DET_MARGIN` (production must NOT set these).
     pub fn new(model_path: &Path, model_version: &'static str) -> Result<Self, AnalyzeError> {
         let session = models::build_session(model_path, false, true)?;
         Ok(Self {
             session: Mutex::new(session),
             model_version,
-            threshold: DEFAULT_THRESHOLD,
+            threshold: env_f32("DARKROOM_DET_FLOOR", DEFAULT_THRESHOLD),
+            margin: env_f32("DARKROOM_DET_MARGIN", MARGIN_RATIO),
             verifier: None,
         })
     }
@@ -112,7 +117,7 @@ impl ObjectDetector {
                 }
             }
             // Absolute floor + flat-distribution (background) rejection.
-            if best_s < self.threshold || best_s < MARGIN_RATIO * second_s {
+            if best_s < self.threshold || best_s < self.margin * second_s {
                 continue;
             }
             let label = coco::COCO_LABELS[best_c];
@@ -149,6 +154,104 @@ impl ObjectDetector {
         }
         Ok(dedup(dets))
     }
+
+    /// Diagnostic per-category **pre-gate** scores for offline threshold sweeping (NOT production).
+    /// Mirrors [`detect`](Self::detect)'s query loop — same absolute floor + `MARGIN_RATIO` + box
+    /// sanity that define a real candidate — but skips the per-category [`coco::threshold`] accept
+    /// gate, tracking `best_raw = max(best_raw, best_s)` per category. For each category's top
+    /// candidate it then captures the verifier's positive-prompt prob and the decision production
+    /// `detect()` would make (`gated = best_raw ≥ coco::threshold && verifier accepts`).
+    pub fn score_raw(
+        &self,
+        img: &RgbImage,
+    ) -> Result<HashMap<&'static str, RawScore>, AnalyzeError> {
+        let chw = preprocess::to_chw(img, INPUT, [0.0; 3], [1.0; 3]);
+        let input = Tensor::from_array(([1usize, 3, INPUT as usize, INPUT as usize], chw))
+            .map_err(AnalyzeError::inference)?;
+
+        // Best (score, bbox) per D-FINE-owned category, collected under the session lock (the tensor
+        // views borrow `outputs` which borrows `session`, so scalars must be captured before unlock).
+        let mut top: HashMap<&'static str, (f32, [f32; 4])> = HashMap::new();
+        {
+            let mut session = self.session.lock().expect("detector mutex poisoned");
+            let outputs = session
+                .run(ort::inputs![input])
+                .map_err(AnalyzeError::inference)?;
+            let mut logits = None;
+            let mut boxes = None;
+            for i in 0..outputs.len() {
+                let arr = outputs[i]
+                    .try_extract_array::<f32>()
+                    .map_err(AnalyzeError::inference)?;
+                match arr.shape().last().copied() {
+                    Some(80) => logits = Some(arr),
+                    Some(4) => boxes = Some(arr),
+                    _ => {}
+                }
+            }
+            let logits =
+                logits.ok_or_else(|| AnalyzeError::Inference("no [.,.,80] logits".into()))?;
+            let boxes = boxes.ok_or_else(|| AnalyzeError::Inference("no [.,.,4] boxes".into()))?;
+            let nq = logits.shape()[1];
+            for q in 0..nq {
+                let (mut best_c, mut best_s, mut second_s) = (0usize, 0f32, 0f32);
+                for c in 0..80 {
+                    let s = sigmoid(logits[[0, q, c]]);
+                    if s > best_s {
+                        second_s = best_s;
+                        best_s = s;
+                        best_c = c;
+                    } else if s > second_s {
+                        second_s = s;
+                    }
+                }
+                if best_s < self.threshold || best_s < self.margin * second_s {
+                    continue;
+                }
+                let label = coco::COCO_LABELS[best_c];
+                let Some(cat) = coco::category(label) else {
+                    continue;
+                };
+                let (cx, cy, w, h) = (
+                    boxes[[0, q, 0]],
+                    boxes[[0, q, 1]],
+                    boxes[[0, q, 2]],
+                    boxes[[0, q, 3]],
+                );
+                let bbox = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
+                if !box_ok(label, &bbox) {
+                    continue;
+                }
+                let e = top.entry(cat).or_insert((best_s, bbox));
+                if best_s > e.0 {
+                    *e = (best_s, bbox);
+                }
+            }
+        }
+
+        // Verifier prob + production gate decision for each category's top candidate (session lock
+        // released; the verifier locks its own vision session).
+        let mut out = HashMap::new();
+        for (cat, (best_raw, bbox)) in top {
+            let verifier_prob = match &self.verifier {
+                Some(v) => v.confirm_prob(img, &bbox, cat)?,
+                None => None,
+            };
+            let passes = self
+                .verifier
+                .as_ref()
+                .is_none_or(|v| v.accepts(verifier_prob));
+            out.insert(
+                cat,
+                RawScore {
+                    best_raw,
+                    verifier_prob,
+                    gated: best_raw >= coco::threshold(cat) && passes,
+                },
+            );
+        }
+        Ok(out)
+    }
 }
 
 impl Analyzer for ObjectDetector {
@@ -170,6 +273,15 @@ impl Analyzer for ObjectDetector {
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// Read an `f32` tuning override from the environment, falling back to `default`. Production must NOT
+/// set these — they exist only for the offline `presence_eval`/`presence_tune` calibration sweeps.
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Geometric sanity check on a normalized xyxy box. Rejects degenerate noise boxes that survive the

@@ -3,6 +3,7 @@ import {
   thumbUrl,
   imageDetections,
   imageCaption,
+  imagePresence,
   imageUserLabels,
   setImageUserLabel,
   DETECTION_CATEGORIES,
@@ -11,6 +12,7 @@ import {
   type CollectionRow,
   type Detection,
   type ImageCaption,
+  type Presence,
   type UserLabels,
 } from "../../lib/ipc";
 
@@ -83,6 +85,8 @@ export interface RightInfoHandlers {
   onRemoveKeyword: (keywordId: number) => void;
   onAddToCollection: (collectionId: number) => void;
   onRemoveFromCollection: (collectionId: number) => void;
+  /** Called after a Contains-person/animal label toggle, so the parent can refresh facet counts. */
+  onPresenceChanged?: () => void;
 }
 
 interface RightInfoProps {
@@ -113,6 +117,7 @@ export default function RightInfo({
   const [kwInput, setKwInput] = useState("");
   const [aiCaption, setAiCaption] = useState<ImageCaption | null>(null);
   const [aiDetections, setAiDetections] = useState<Detection[]>([]);
+  const [aiPresence, setAiPresence] = useState<Presence | null>(null);
   const [labels, setLabels] = useState<UserLabels>({
     containsPerson: null,
     containsAnimal: null,
@@ -122,6 +127,7 @@ export default function RightInfo({
     if (meta === null) {
       setAiCaption(null);
       setAiDetections([]);
+      setAiPresence(null);
       setLabels({ containsPerson: null, containsAnimal: null });
       return;
     }
@@ -129,11 +135,13 @@ export default function RightInfo({
     void Promise.all([
       imageCaption(meta.id),
       imageDetections(meta.id),
+      imagePresence(meta.id),
       imageUserLabels(meta.id),
-    ]).then(([cap, dets, lab]) => {
+    ]).then(([cap, dets, pres, lab]) => {
       if (!cancelled) {
         setAiCaption(cap);
         setAiDetections(dets);
+        setAiPresence(pres);
         setLabels(lab);
       }
     });
@@ -146,9 +154,11 @@ export default function RightInfo({
     if (meta === null) return;
     const key = field === "person" ? "containsPerson" : "containsAnimal";
     setLabels((prev) => ({ ...prev, [key]: checked })); // optimistic
-    void setImageUserLabel(meta.id, field, checked).catch(() => {
-      setLabels((prev) => ({ ...prev, [key]: !checked })); // revert on error
-    });
+    void setImageUserLabel(meta.id, field, checked)
+      .then(() => handlers.onPresenceChanged?.())
+      .catch(() => {
+        setLabels((prev) => ({ ...prev, [key]: !checked })); // revert on error
+      });
   };
 
   const memberIds = new Set(imageCollections.map((c) => c.id));
@@ -188,7 +198,9 @@ export default function RightInfo({
       ]
     : [];
 
-  const previewSrc = meta ? thumbUrl(meta.contentHash, 512) : null;
+  const previewSrc = meta
+    ? thumbUrl(meta.contentHash, 512, meta.editedAt)
+    : null;
 
   const appliedNames = new Set(keywords.map((k) => k.name.toLowerCase()));
   const suggestions = keywordSuggestions.filter(
@@ -268,7 +280,7 @@ export default function RightInfo({
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           {/* Stars */}
-          <div style={{ display: "flex", gap: 1 }}>
+          <div data-testid="rating-stars" style={{ display: "flex", gap: 1 }}>
             {[1, 2, 3, 4, 5].map((n) => (
               <svg
                 key={n}
@@ -588,7 +600,9 @@ export default function RightInfo({
           <div style={{ fontSize: 12, color: "var(--color-t3)" }}>
             No image selected
           </div>
-        ) : aiCaption === null && aiDetections.length === 0 ? (
+        ) : aiCaption === null &&
+          aiDetections.length === 0 &&
+          aiPresence === null ? (
           <div style={{ fontSize: 11.5, color: "var(--color-t3)" }}>
             Not analyzed yet
           </div>
@@ -666,6 +680,19 @@ export default function RightInfo({
                 </div>
               );
             })}
+            {aiPresence !== null && (
+              <div
+                style={{
+                  fontSize: 10.5,
+                  color: "var(--color-t3)",
+                  marginTop: 4,
+                }}
+                title="MobileCLIP presence probe (advisory; manual labels below are the ground truth)"
+              >
+                probe&nbsp; person {aiPresence.pPerson.toFixed(2)} ·&nbsp;animal{" "}
+                {aiPresence.pAnimal.toFixed(2)}
+              </div>
+            )}
           </>
         )}
         {/* Ground truth — manual labels (eval dataset). Checked = image contains the subject. */}

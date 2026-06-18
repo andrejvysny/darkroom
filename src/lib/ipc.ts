@@ -81,6 +81,8 @@ export type ImageRow = {
   stars: number;
   flag: "none" | "pick" | "reject";
   colorLabel: string | null;
+  /** `edits.updated_at` if the image has a develop edit; versions edit-aware previews (null = none). */
+  editedAt: number | null;
 };
 
 export type FolderRow = {
@@ -220,8 +222,28 @@ export function setThumbCacheCap(bytes: number): Promise<number> {
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 
-export function thumbUrl(hash: string, size = 512): string {
-  return `thumb://localhost/${hash}?size=${size}`;
+export function thumbUrl(
+  hash: string,
+  size = 512,
+  editedAt?: number | null,
+): string {
+  const base = `thumb://localhost/${hash}?size=${size}`;
+  // `edit=<version>` makes the protocol serve the edited render and changes the URL on each edit
+  // (cache-busting the immutable-cached `<img>`).
+  const url = editedAt != null ? `${base}&edit=${editedAt}` : base;
+  // Dev-only: in a plain browser the `thumb://` protocol has no handler. A mock backend
+  // (src/dev/tauriMock.ts) installs `window.__darkroomThumbMock` to serve placeholder images.
+  // Tree-shaken from production builds via the DEV guard; never set inside the Tauri shell.
+  if (import.meta.env.DEV) {
+    const mock = window.__darkroomThumbMock;
+    if (mock) return mock(url);
+  }
+  return url;
+}
+
+/** Regenerate the edited thumbnail for an image (on edit-settle); emits `develop:edit-changed`. */
+export function developRegenThumb(imageId: number): Promise<number | null> {
+  return invoke<number | null>("develop_regen_thumb", { imageId });
 }
 
 // ── Cull IPC ───────────────────────────────────────────────────────────────
@@ -595,12 +617,14 @@ let renderRequestSeq = 0;
 export async function developRender(
   imageId: number,
   params: DevelopParams,
+  fullRes = false,
 ): Promise<string | null> {
   const requestId = ++renderRequestSeq;
   const buf = await invoke<ArrayBuffer>("develop_render", {
     imageId,
     params,
     requestId,
+    fullRes,
   });
   if (buf.byteLength === 0) return null; // superseded — no-op
   return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
@@ -719,6 +743,16 @@ export function imageCaption(id: number): Promise<ImageCaption | null> {
   return invoke<ImageCaption | null>("image_caption", { id });
 }
 
+/** MobileCLIP presence-probe scores in [0,1] (advisory AI readout). `null` until the probe ran. */
+export type Presence = {
+  pPerson: number;
+  pAnimal: number;
+};
+
+export function imagePresence(id: number): Promise<Presence | null> {
+  return invoke<Presence | null>("image_presence", { id });
+}
+
 /** Manual ground-truth labels (tri-state: `null` = unlabeled). Doubles as detection eval data. */
 export type UserLabels = {
   containsPerson: boolean | null;
@@ -736,6 +770,21 @@ export function setImageUserLabel(
   value: boolean | null,
 ): Promise<void> {
   return invoke<void>("set_image_user_label", { id, field, value });
+}
+
+/** Set one label field on many images at once (multi-select labeling). */
+export function setImageUserLabelMany(
+  imageIds: number[],
+  field: "person" | "animal",
+  value: boolean | null,
+  groupId?: string,
+): Promise<void> {
+  return invoke<void>("set_image_user_label_many", {
+    imageIds,
+    field,
+    value,
+    groupId: groupId ?? null,
+  });
 }
 
 /** MegaDetector (animal) input resolution: 640 (faster) or 1280 (best recall). */

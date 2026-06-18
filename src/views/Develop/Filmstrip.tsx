@@ -106,7 +106,7 @@ export default function Filmstrip() {
               }}
             >
               <img
-                src={thumbUrl(img.contentHash, 256)}
+                src={thumbUrl(img.contentHash, 256, img.editedAt)}
                 alt={img.filename}
                 loading="lazy"
                 draggable={false}

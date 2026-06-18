@@ -15,6 +15,13 @@ use crate::error::LibError;
 pub const OBJECT_DETECTION_ID: &str = "object_detection";
 pub const ANIMAL_DETECTION_ID: &str = "animal_detection";
 pub const CAPTION_ID: &str = "caption";
+pub const PRESENCE_ID: &str = "presence_probe";
+
+/// Baked max-F1 decision thresholds for the MobileCLIP presence probe (from `train_presence` CV).
+/// Used to OR-fuse `image_presence` into the People/Animals facet + library filter. Update these when
+/// the probe weights (`crates/core-analyze/assets/presence_probe.json`) are regenerated.
+pub const PRESENCE_TAU_PERSON: f64 = 0.5;
+pub const PRESENCE_TAU_ANIMAL: f64 = 0.5;
 
 /// One analyzer result to persist (mirror of the ML crate's `AnalysisRecord`, kept local so
 /// `core-library` doesn't depend on `core-analyze`/ort).
@@ -69,6 +76,7 @@ pub fn insert_analysis(
             }
             ANIMAL_DETECTION_ID => project_detections(conn, image_id, rec, &["Animals"])?,
             CAPTION_ID => project_caption(conn, image_id, ran_at, rec)?,
+            PRESENCE_ID => project_presence(conn, image_id, rec)?,
             _ => {}
         }
     }
@@ -145,6 +153,25 @@ fn project_caption(
     Ok(())
 }
 
+fn project_presence(conn: &Connection, image_id: i64, rec: &AnalysisInput) -> Result<(), LibError> {
+    let p_person = rec
+        .payload
+        .get("p_person")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let p_animal = rec
+        .payload
+        .get("p_animal")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    conn.execute(
+        "INSERT OR REPLACE INTO image_presence (image_id, p_person, p_animal, model_version)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![image_id, p_person, p_animal, rec.model_version],
+    )?;
+    Ok(())
+}
+
 /// A present image to (potentially) analyze.
 pub struct AnalyzeTarget {
     pub id: i64,
@@ -182,6 +209,36 @@ pub fn present_images(conn: &Connection) -> Result<Vec<AnalyzeTarget>, LibError>
         });
     }
     Ok(out)
+}
+
+/// One labeled image for the eval / training harnesses: catalog path + tri-state ground-truth.
+/// `person`/`animal` are `None` when that field is unlabeled (NULL) — callers MUST exclude `None`
+/// from that category's metrics; never treat unlabeled as a negative.
+#[derive(Debug, Clone)]
+pub struct LabeledImage {
+    pub id: i64,
+    pub path: String,
+    pub person: Option<bool>,
+    pub animal: Option<bool>,
+}
+
+/// All present images that carry a manual label, joined to `images.path`, in id order. Reuses the
+/// `present`-status filter from [`present_images`] and the tri-state decode from [`user_labels`].
+pub fn labeled_images(conn: &Connection) -> Result<Vec<LabeledImage>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.path, ul.contains_person, ul.contains_animal
+           FROM image_user_labels ul JOIN images i ON i.id = ul.image_id
+          WHERE i.status = 'present' ORDER BY i.id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(LabeledImage {
+            id: r.get::<_, i64>(0)?,
+            path: r.get::<_, String>(1)?,
+            person: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+            animal: r.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+        })
+    })?;
+    Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
 }
 
 // ---- read side (IPC) ----
@@ -236,6 +293,34 @@ pub fn caption_for_image(conn: &Connection, image_id: i64) -> Result<Option<Capt
     }))
 }
 
+/// MobileCLIP presence-probe scores for one image (advisory AI readout; manual labels stay truth).
+/// `None` when the probe hasn't run for this image yet.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceRow {
+    pub p_person: f64,
+    pub p_animal: f64,
+}
+
+pub fn presence_for_image(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Option<PresenceRow>, LibError> {
+    let row = conn
+        .query_row(
+            "SELECT p_person, p_animal FROM image_presence WHERE image_id = ?1",
+            [image_id],
+            |r| {
+                Ok(PresenceRow {
+                    p_person: r.get(0)?,
+                    p_animal: r.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
 /// Manual ground-truth labels (tri-state per field: `None` = unlabeled). Distinct from AI detections.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -281,6 +366,35 @@ pub fn set_user_label(
     Ok(())
 }
 
+/// Upsert one label field across many images in a single transaction (multi-select labeling).
+pub fn set_user_label_many(
+    conn: &mut Connection,
+    image_ids: &[i64],
+    field: &str,
+    value: Option<bool>,
+    now: i64,
+) -> Result<(), LibError> {
+    let col = match field {
+        "person" => "contains_person",
+        "animal" => "contains_animal",
+        _ => return Err(LibError::Other(format!("unknown label field: {field}"))),
+    };
+    let v: Option<i64> = value.map(|b| b as i64);
+    let sql = format!(
+        "INSERT INTO image_user_labels(image_id, {col}, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(image_id) DO UPDATE SET {col} = ?2, updated_at = ?3"
+    );
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(&sql)?;
+        for &id in image_ids {
+            stmt.execute(params![id, v, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FacetRow {
@@ -294,17 +408,59 @@ pub struct FacetRow {
 /// A blanket `>= 0.5` floor here was strictly higher than the Animals bar, so CLIP-confirmed animals
 /// scored in [0.35, 0.50) were silently dropped from the facet (and the matching library filter).
 pub fn analysis_facets(conn: &Connection) -> Result<Vec<FacetRow>, LibError> {
-    let mut stmt = conn.prepare(
-        "SELECT category, COUNT(DISTINCT image_id) FROM image_detections
-         GROUP BY category ORDER BY category",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(FacetRow {
-            category: r.get(0)?,
-            count: r.get(1)?,
-        })
-    })?;
-    Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
+    // Each category counts present images with a model detection in that bucket OR (for People /
+    // Animals) a matching manual ground-truth label OR a presence-probe score over its threshold, so
+    // hand-flagged and probe-detected images show up in the nav. All column names are whitelisted
+    // constants and the taus are trusted consts — never caller input — so the format! is injection-safe.
+    // FacetSpec = (category, manual-label column, (presence-probe column, threshold)).
+    type FacetSpec = (
+        &'static str,
+        Option<&'static str>,
+        Option<(&'static str, f64)>,
+    );
+    let cats: [FacetSpec; 3] = [
+        (
+            "People",
+            Some("contains_person"),
+            Some(("p_person", PRESENCE_TAU_PERSON)),
+        ),
+        (
+            "Animals",
+            Some("contains_animal"),
+            Some(("p_animal", PRESENCE_TAU_ANIMAL)),
+        ),
+        ("Vehicles", None, None),
+    ];
+    let mut out = Vec::new();
+    for (cat, label_col, probe) in cats {
+        let label_clause = match label_col {
+            Some(col) => format!(
+                " OR EXISTS (SELECT 1 FROM image_user_labels ul \
+                   WHERE ul.image_id = i.id AND ul.{col} = 1)"
+            ),
+            None => String::new(),
+        };
+        let probe_clause = match probe {
+            Some((col, tau)) => format!(
+                " OR EXISTS (SELECT 1 FROM image_presence p \
+                   WHERE p.image_id = i.id AND p.{col} >= {tau})"
+            ),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM images i WHERE i.status = 'present' AND (\
+               EXISTS (SELECT 1 FROM image_detections d \
+                       WHERE d.image_id = i.id AND d.category = ?1){label_clause}{probe_clause})"
+        );
+        let count: i64 = conn.query_row(&sql, params![cat], |r| r.get(0))?;
+        if count > 0 {
+            out.push(FacetRow {
+                category: cat.to_string(),
+                count,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Count of present images (denominator for analysis progress / status).

@@ -52,12 +52,17 @@ pub struct ImageRow {
     pub stars: i64,
     pub flag: String,
     pub color_label: Option<String>,
+    /// `edits.updated_at` if the image has a develop edit — versions edit-aware previews (NULL = none).
+    pub edited_at: Option<i64>,
 }
 
 const COLUMNS: &str = "i.id, i.content_hash, i.path, i.original_filename, i.capture_date,
     i.camera_make, i.camera_model, i.lens, i.iso, i.shutter, i.aperture, i.focal_length,
     i.width, i.height, i.orientation,
-    COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label";
+    COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label, e.updated_at";
+
+// Joined into every row-returning query so `edited_at` is populated.
+const EDIT_JOIN: &str = "LEFT JOIN edits e ON e.image_id = i.id";
 
 // All filter dimensions are bound named params; NULL no-ops each clause. Keyword/collection
 // membership use EXISTS subqueries so there is no row duplication and the static SELECT stays
@@ -75,9 +80,21 @@ const WHERE: &str = "i.status = 'present'
     AND (:collection_id IS NULL OR EXISTS
          (SELECT 1 FROM collection_images ci WHERE ci.image_id = i.id AND ci.collection_id = :collection_id))
     AND (:import_session_id IS NULL OR i.import_session_id = :import_session_id)
-    AND (:detected_category IS NULL OR EXISTS
-         (SELECT 1 FROM image_detections d
-          WHERE d.image_id = i.id AND d.category = :detected_category))
+    AND (:detected_category IS NULL
+         OR EXISTS (SELECT 1 FROM image_detections d
+                    WHERE d.image_id = i.id AND d.category = :detected_category)
+         OR (:detected_category = 'People' AND EXISTS
+              (SELECT 1 FROM image_user_labels ul
+               WHERE ul.image_id = i.id AND ul.contains_person = 1))
+         OR (:detected_category = 'Animals' AND EXISTS
+              (SELECT 1 FROM image_user_labels ul
+               WHERE ul.image_id = i.id AND ul.contains_animal = 1))
+         OR (:detected_category = 'People' AND EXISTS
+              (SELECT 1 FROM image_presence p
+               WHERE p.image_id = i.id AND p.p_person >= :tau_person))
+         OR (:detected_category = 'Animals' AND EXISTS
+              (SELECT 1 FROM image_presence p
+               WHERE p.image_id = i.id AND p.p_animal >= :tau_animal)))
     AND (:search IS NULL OR i.original_filename LIKE :search
                          OR i.camera_model LIKE :search
                          OR i.lens LIKE :search
@@ -126,6 +143,7 @@ fn map_row(r: &Row<'_>) -> core_db::rusqlite::Result<ImageRow> {
         stars: r.get(15)?,
         flag: r.get(16)?,
         color_label: r.get(17)?,
+        edited_at: r.get(18)?,
     })
 }
 
@@ -133,6 +151,7 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
     let sql = format!(
         "SELECT {COLUMNS} FROM images i
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
+         {EDIT_JOIN}
          WHERE {WHERE}
          ORDER BY {} LIMIT :limit OFFSET :offset",
         sort_sql(p.sort.as_deref())
@@ -149,6 +168,8 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
             ":detected_category": p.detected_category,
+            ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
+            ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,
             ":limit": p.limit.unwrap_or(5000),
             ":offset": p.offset.unwrap_or(0),
@@ -191,6 +212,7 @@ pub fn image_by_id(conn: &Connection, id: i64) -> Result<Option<ImageRow>, LibEr
     let sql = format!(
         "SELECT {COLUMNS} FROM images i
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
+         {EDIT_JOIN}
          WHERE i.id = ?1"
     );
     Ok(conn.query_row(&sql, [id], map_row).optional()?)
@@ -214,6 +236,8 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
             ":detected_category": p.detected_category,
+            ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
+            ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,
         },
         |r| r.get(0),

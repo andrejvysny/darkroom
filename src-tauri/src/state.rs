@@ -63,6 +63,9 @@ pub struct AppState {
     pub gpu: Option<GpuRender>,
     /// Warm GPU resources for recently-developed images.
     pub develop_cache: Mutex<DevelopLru>,
+    /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
+    /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
+    pub full_render_cache: Mutex<Option<(i64, PreparedImage)>>,
     /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
     /// newer request has already superseded it.
     pub latest_render: AtomicU64,
@@ -128,6 +131,7 @@ impl AppState {
             thumbs,
             gpu,
             develop_cache: Mutex::new(DevelopLru::default()),
+            full_render_cache: Mutex::new(None),
             latest_render: AtomicU64::new(0),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),

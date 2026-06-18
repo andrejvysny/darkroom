@@ -6,6 +6,7 @@ import {
   developGetEdit,
   developGetHistogram,
   developPreviewJpeg,
+  developRegenThumb,
   developRender,
   developSetEdit,
   MASK_CAP,
@@ -48,6 +49,9 @@ export function useDevelop() {
   const previewObjUrl = useRef<string | null>(null);
   // Tracks the last before/after value so the toggle effect ignores selection changes.
   const prevShowBefore = useRef(showBefore);
+  // Tracks the last full-res value so its toggle effect ignores selection changes.
+  const fullRes = useDevelopStore((s) => s.fullRes);
+  const prevFullRes = useRef(fullRes);
 
   function applyUrl(url: string) {
     if (currentUrl.current) URL.revokeObjectURL(currentUrl.current);
@@ -66,7 +70,12 @@ export function useDevelop() {
     const seq = ++renderSeq.current;
     setRendering(true);
     try {
-      const url = await developRender(id, p);
+      // Full-res tier when zoomed in past fit (set by the Stage); preview tier otherwise.
+      const url = await developRender(
+        id,
+        p,
+        useDevelopStore.getState().fullRes,
+      );
       if (seq !== renderSeq.current) {
         if (url) URL.revokeObjectURL(url); // a newer render superseded this one
         return false;
@@ -109,9 +118,11 @@ export function useDevelop() {
         timer = setTimeout(() => {
           const tc = touchCount.current;
           touchCount.current = 0;
-          developSetEdit(id, p, tc).catch((e) =>
-            console.error("develop_set_edit failed", e),
-          );
+          // Persist, then regenerate the edited thumbnail so the filmstrip/grid/loupe update live
+          // (the regen command emits `develop:edit-changed`).
+          developSetEdit(id, p, tc)
+            .then(() => developRegenThumb(id))
+            .catch((e) => console.error("develop_set_edit failed", e));
         }, 500);
       };
       return Object.assign(run, {
@@ -222,6 +233,18 @@ export function useDevelop() {
     render(selectedId, p);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showBefore]);
+
+  // Re-render at the new resolution tier when the stage zoom crosses the fit threshold.
+  useEffect(() => {
+    if (selectedId === null) return;
+    if (prevFullRes.current === fullRes) return;
+    prevFullRes.current = fullRes;
+    const p = useDevelopStore.getState().showBefore
+      ? freshDefaults()
+      : useDevelopStore.getState().params;
+    render(selectedId, p);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fullRes]);
 
   // Cleanup on unmount.
   useEffect(() => {
@@ -451,9 +474,9 @@ export function useDevelop() {
     const p = freshDefaults();
     render(selectedId, p);
     // force=true: Reset deliberately discards the stored edit, even if the prior blob was unreadable.
-    developSetEdit(selectedId, p, undefined, true).catch((e) =>
-      console.error("develop_set_edit failed", e),
-    );
+    developSetEdit(selectedId, p, undefined, true)
+      .then(() => developRegenThumb(selectedId))
+      .catch((e) => console.error("develop_set_edit failed", e));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, resetParams, debouncedPersist, debouncedRender]);
 

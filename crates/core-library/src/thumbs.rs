@@ -47,6 +47,49 @@ impl ThumbCache {
         std::fs::rename(&tmp, &final_path)
     }
 
+    /// Path for an *edited* thumbnail variant: `‹hash›_edit_‹version›.jpg`, where `version` is the
+    /// edit's `updated_at`. Kept separate from the base (unedited) thumbnail so toggling/resetting an
+    /// edit never destroys the original, and so the URL changes when the edit does (cache-busting).
+    pub fn edited_path_for(&self, hash_hex: &str, version: i64) -> PathBuf {
+        self.root.join(format!("{hash_hex}_edit_{version}.jpg"))
+    }
+
+    pub fn read_edited(&self, hash_hex: &str, version: i64) -> std::io::Result<Vec<u8>> {
+        std::fs::read(self.edited_path_for(hash_hex, version))
+    }
+
+    /// Write the edited thumbnail for `version`, first removing any older edited variants of this
+    /// hash (only the current version is ever requested, so stale ones are dead weight).
+    pub fn write_edited(&self, hash_hex: &str, version: i64, jpeg: &[u8]) -> std::io::Result<()> {
+        let _ = self.clear_edited(hash_hex);
+        let final_path = self.edited_path_for(hash_hex, version);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.root.join(format!(
+            "{hash_hex}_edit_{version}.{}.{seq}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, jpeg)?;
+        std::fs::rename(&tmp, &final_path)
+    }
+
+    /// Remove every edited variant (`‹hash›_edit_*.jpg`) for a hash. Returns count removed.
+    pub fn clear_edited(&self, hash_hex: &str) -> std::io::Result<usize> {
+        let prefix = format!("{hash_hex}_edit_");
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix)
+                && name.ends_with(".jpg")
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Delete every cached size variant for a content hash (`‹hash›_*.jpg`). Call when an image row
     /// is removed (dedup resolve, import move) and no other present row shares the hash. Returns the
     /// number of files deleted. Missing files are not an error.

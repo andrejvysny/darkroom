@@ -89,13 +89,18 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
         return;
       }
 
-      // Flag: p=pick, x=reject, u=none
+      // Flag: p=pick, x/r=reject, u=none
       if (
-        (e.key === "p" || e.key === "x" || e.key === "u") &&
+        (e.key === "p" || e.key === "x" || e.key === "r" || e.key === "u") &&
         !e.metaKey &&
         !e.ctrlKey
       ) {
-        const flag = e.key === "p" ? "pick" : e.key === "x" ? "reject" : "none";
+        const flag =
+          e.key === "p"
+            ? "pick"
+            : e.key === "x" || e.key === "r"
+              ? "reject"
+              : "none";
         if (multi) {
           ids.forEach((i) => patchImage(i, { flag }));
           void cullSetFlagMany(ids, flag);

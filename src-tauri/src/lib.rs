@@ -11,12 +11,30 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init());
+
+    // Tier-3 E2E: real-backend UI automation via the tauri-plugin-playwright socket bridge.
+    // Behind a feature + optional dep so it is never compiled into release builds.
+    #[cfg(feature = "e2e-testing")]
+    {
+        builder = builder.plugin(tauri_plugin_playwright::init());
+    }
+
+    builder
         .register_asynchronous_uri_scheme_protocol("thumb", |ctx, req, responder| {
             protocol::handle_thumb(ctx, req, responder)
         })
         .setup(|app| {
+            // Grant the playwright permission at runtime (debug-only `dynamic-acl`), so the
+            // capability never lives in capabilities/ and feature-off builds stay clean.
+            #[cfg(feature = "e2e-testing")]
+            {
+                app.handle()
+                    .add_capability(include_str!("../e2e-capability.json"))?;
+            }
+
             let state = AppState::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
 
@@ -58,6 +76,7 @@ pub fn run() {
             commands::develop_get_edit,
             commands::develop_set_edit,
             commands::develop_render,
+            commands::develop_regen_thumb,
             commands::develop_preview_jpeg,
             commands::loupe_jpeg,
             commands::develop_get_histogram,
@@ -97,8 +116,10 @@ pub fn run() {
             commands::analysis_facets,
             commands::image_detections,
             commands::image_caption,
+            commands::image_presence,
             commands::image_user_labels,
             commands::set_image_user_label,
+            commands::set_image_user_label_many,
             commands::analysis_detector_size,
             commands::set_analysis_detector_size,
             commands::features_backfill,

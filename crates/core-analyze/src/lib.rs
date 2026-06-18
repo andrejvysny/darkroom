@@ -12,7 +12,9 @@ pub mod coco;
 pub mod detector;
 pub mod error;
 pub mod megadetector;
+pub mod metrics;
 pub mod models;
+pub mod presence;
 mod preprocess;
 pub mod verify;
 
@@ -24,6 +26,7 @@ pub use error::AnalyzeError;
 pub use megadetector::MegaDetector;
 /// Re-export so downstream crates link the exact same `ort`.
 pub use ort;
+pub use presence::PresenceProbe;
 pub use verify::Verifier;
 
 use serde::de::DeserializeOwned;
@@ -33,6 +36,7 @@ use serde::{Deserialize, Serialize};
 pub const OBJECT_DETECTION_ID: &str = "object_detection";
 pub const ANIMAL_DETECTION_ID: &str = "animal_detection";
 pub const CAPTION_ID: &str = "caption";
+pub const PRESENCE_ID: &str = "presence_probe";
 
 /// Per-image input handed to each analyzer. sRGB pixels are already decoded (analyzers resize as
 /// needed). `prior` holds the records produced by earlier analyzers for this same image, so a later
@@ -82,10 +86,31 @@ pub struct DetectionPayload {
     pub detections: Vec<Detection>,
 }
 
+/// Diagnostic per-image scores for offline threshold / PR sweeping (NOT persisted). `best_raw` is the
+/// best candidate score for a category BEFORE the per-category accept threshold (D-FINE: sigmoid;
+/// MegaDetector: `obj×cls`), but after the absolute floor / margin / box-sanity that define a real
+/// candidate. `verifier_prob` is the CLIP positive-prompt softmax for that top candidate (`None` if
+/// there is no candidate, no verifier, or the category has no prompt set). `gated` is the decision the
+/// production `detect()` would make for this category.
+#[derive(Debug, Clone, Default)]
+pub struct RawScore {
+    pub best_raw: f32,
+    pub verifier_prob: Option<f32>,
+    pub gated: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CaptionPayload {
     pub caption: String,
     pub keywords: Vec<String>,
+}
+
+/// MobileCLIP linear-probe presence scores in `[0,1]` — `p_person`/`p_animal` are calibrated
+/// `sigmoid(w·embedding + b)` per category, fused with the detectors (OR at the baked threshold).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PresencePayload {
+    pub p_person: f32,
+    pub p_animal: f32,
 }
 
 /// An analyzer stage. Object-safe (no generics/associated types) so it can live behind `dyn`.

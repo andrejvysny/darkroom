@@ -65,6 +65,8 @@ pub struct Verifier {
     vision: Mutex<Session>,
     people: PromptSet,
     animals: PromptSet,
+    accept: f32,
+    crop_pad: f32,
 }
 
 impl Verifier {
@@ -98,6 +100,8 @@ impl Verifier {
             vision: Mutex::new(vision),
             people,
             animals,
+            accept: env_f32("DARKROOM_VERIFY_ACCEPT", VERIFY_ACCEPT),
+            crop_pad: env_f32("DARKROOM_CROP_PAD", CROP_PAD),
         })
     }
 
@@ -109,12 +113,24 @@ impl Verifier {
         bbox: &[f32; 4],
         category: &str,
     ) -> Result<bool, AnalyzeError> {
+        Ok(self.accepts(self.confirm_prob(img, bbox, category)?))
+    }
+
+    /// Positive-prompt softmax probability for the cropped box under `category`'s prompt set (the
+    /// value [`confirm`](Self::confirm) thresholds at `VERIFY_ACCEPT`). Categories without a prompt
+    /// set (e.g. Vehicles) return `None`. Exposed so the eval harness can sweep the accept threshold.
+    pub fn confirm_prob(
+        &self,
+        img: &RgbImage,
+        bbox: &[f32; 4],
+        category: &str,
+    ) -> Result<Option<f32>, AnalyzeError> {
         let prompts = match category {
             "People" => &self.people,
             "Animals" => &self.animals,
-            _ => return Ok(true),
+            _ => return Ok(None),
         };
-        let crop = crop_padded(img, bbox);
+        let crop = crop_padded(img, bbox, self.crop_pad);
         let emb = self.embed_image(&crop)?;
         // Cosine (embeds are unit-norm) → scaled logits → softmax; positive is index 0.
         let logits: Vec<f32> = prompts
@@ -123,7 +139,22 @@ impl Verifier {
             .map(|t| LOGIT_SCALE * dot(&emb, t))
             .collect();
         let probs = softmax(&logits);
-        Ok(probs[0] >= VERIFY_ACCEPT)
+        Ok(Some(probs[0]))
+    }
+
+    /// Whether a [`confirm_prob`](Self::confirm_prob) result accepts the detection: a category with
+    /// no prompt set (`None`) is accepted unverified; otherwise the positive prob must clear
+    /// `VERIFY_ACCEPT`.
+    pub fn accepts(&self, prob: Option<f32>) -> bool {
+        prob.is_none_or(|p| p >= self.accept)
+    }
+
+    /// Full-image 512-d L2-normalized MobileCLIP embedding. Reuses the verifier's already-loaded
+    /// vision session (no new model), resizing the whole frame to the CLIP input — the feature the
+    /// linear-probe presence classifier scores. Distinct from [`confirm_prob`](Self::confirm_prob),
+    /// which embeds a padded detection *crop*.
+    pub fn embed_full(&self, img: &RgbImage) -> Result<Vec<f32>, AnalyzeError> {
+        self.embed_image(img)
     }
 
     fn embed_image(&self, crop: &RgbImage) -> Result<Vec<f32>, AnalyzeError> {
@@ -173,14 +204,14 @@ fn first_f32(outputs: &ort::session::SessionOutputs<'_>) -> Result<Vec<f32>, Ana
     Ok(arr.iter().copied().collect())
 }
 
-/// Crop the normalized box from `img`, padded by `CROP_PAD` and clamped to bounds.
-fn crop_padded(img: &RgbImage, b: &[f32; 4]) -> RgbImage {
+/// Crop the normalized box from `img`, padded by `pad` (fraction of box size) and clamped to bounds.
+fn crop_padded(img: &RgbImage, b: &[f32; 4], pad: f32) -> RgbImage {
     let (iw, ih) = (img.width() as f32, img.height() as f32);
     let (bw, bh) = (b[2] - b[0], b[3] - b[1]);
-    let x0 = ((b[0] - CROP_PAD * bw).clamp(0.0, 1.0) * iw) as u32;
-    let y0 = ((b[1] - CROP_PAD * bh).clamp(0.0, 1.0) * ih) as u32;
-    let x1 = ((b[2] + CROP_PAD * bw).clamp(0.0, 1.0) * iw) as u32;
-    let y1 = ((b[3] + CROP_PAD * bh).clamp(0.0, 1.0) * ih) as u32;
+    let x0 = ((b[0] - pad * bw).clamp(0.0, 1.0) * iw) as u32;
+    let y0 = ((b[1] - pad * bh).clamp(0.0, 1.0) * ih) as u32;
+    let x1 = ((b[2] + pad * bw).clamp(0.0, 1.0) * iw) as u32;
+    let y1 = ((b[3] + pad * bh).clamp(0.0, 1.0) * ih) as u32;
     let w = x1
         .saturating_sub(x0)
         .max(1)
@@ -194,6 +225,15 @@ fn crop_padded(img: &RgbImage, b: &[f32; 4]) -> RgbImage {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Read an `f32` tuning override from the environment, falling back to `default`. Production must NOT
+/// set these — they exist only for the offline `presence_eval`/`presence_tune` calibration sweeps.
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn l2_normalize(v: &mut [f32]) {

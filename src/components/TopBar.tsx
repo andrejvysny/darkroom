@@ -1,7 +1,22 @@
 import { useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "../store/app";
 import { useDevelopStore } from "../store/develop";
 import Icon from "./Icon";
+
+// Interactive controls (and anything opted out via [data-no-drag]) must NOT start a window drag.
+const NO_DRAG =
+  "button, input, a, select, label, [role='button'], [data-no-drag]";
+
+// `data-tauri-drag-region` only drags when the moused-down element itself carries the attribute, so
+// clicks on the header's child containers (e.g. the flex spacer) don't move the window. A mousedown
+// handler that calls the window API is robust regardless of which child was hit.
+function onTitlebarMouseDown(e: React.MouseEvent) {
+  if (e.button !== 0) return; // primary button only
+  if ((e.target as HTMLElement).closest(NO_DRAG)) return;
+  if (e.detail === 2) void getCurrentWindow().toggleMaximize();
+  else void getCurrentWindow().startDragging();
+}
 
 export default function TopBar() {
   const view = useAppStore((s) => s.view);
@@ -28,48 +43,20 @@ export default function TopBar() {
 
   return (
     <header
+      onMouseDown={onTitlebarMouseDown}
       style={{
         display: "flex",
         alignItems: "center",
         gap: 16,
-        padding: "0 14px",
+        // Left pad clears the native macOS traffic lights (overlaid via titleBarStyle:"Overlay").
+        paddingLeft: 82,
+        paddingRight: 14,
         background: "var(--color-app)",
         borderBottom: "1px solid var(--color-line)",
         height: 46,
         flexShrink: 0,
       }}
     >
-      {/* Traffic lights */}
-      <div style={{ display: "flex", gap: 8, marginRight: 4 }}>
-        <i
-          style={{
-            width: 12,
-            height: 12,
-            borderRadius: "50%",
-            display: "block",
-            background: "#e0655b",
-          }}
-        />
-        <i
-          style={{
-            width: 12,
-            height: 12,
-            borderRadius: "50%",
-            display: "block",
-            background: "#dba84a",
-          }}
-        />
-        <i
-          style={{
-            width: 12,
-            height: 12,
-            borderRadius: "50%",
-            display: "block",
-            background: "#62b95a",
-          }}
-        />
-      </div>
-
       {/* Segmented control */}
       <div
         style={{
@@ -81,6 +68,7 @@ export default function TopBar() {
         }}
       >
         <button
+          data-testid="nav-library"
           onClick={() => setView("library")}
           style={{
             padding: "4px 13px",
@@ -96,6 +84,7 @@ export default function TopBar() {
           Library
         </button>
         <button
+          data-testid="nav-develop"
           onClick={() => setView("develop")}
           style={{
             padding: "4px 13px",
@@ -131,6 +120,7 @@ export default function TopBar() {
           >
             <Icon name="search" />
             <input
+              data-testid="library-search"
               placeholder="Search filename, camera, keyword…"
               value={search}
               onChange={(e) => onSearchInput(e.target.value)}

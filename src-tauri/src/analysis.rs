@@ -12,7 +12,7 @@ use core_analyze::models::{
     ModelStore, ANIMAL_DETECTOR_FILES, CAPTION_FILES, DETECTOR_FILES, VERIFIER_FILES,
 };
 use core_analyze::{
-    AnalysisCtx, AnalyzerRegistry, Captioner, MegaDetector, ObjectDetector, Verifier,
+    AnalysisCtx, AnalyzerRegistry, Captioner, MegaDetector, ObjectDetector, PresenceProbe, Verifier,
 };
 use core_library::{existing_analysis, insert_analysis, present_images, AnalysisInput};
 use image::imageops::FilterType;
@@ -30,6 +30,9 @@ pub const CAPTION_VERSION: &str = "florence2-base-ft-q4f16-v1";
 /// MegaDetector version is resolution-specific, so changing the size re-analyzes.
 pub const ANIMAL_DETECTOR_VERSION_1280: &str = "mdv5a-1280-v1";
 pub const ANIMAL_DETECTOR_VERSION_640: &str = "mdv5a-640-v1";
+/// MobileCLIP linear-probe presence classifier (full-image scene scores). Bump when the bundled
+/// `presence_probe.json` weights are regenerated.
+pub const PRESENCE_VERSION: &str = "mobileclip-s1-probe-v1";
 
 /// Longest-edge the analysis decode is downscaled to (boxes are normalized, so this is loss-only).
 const ANALYZE_EDGE: u32 = 1024;
@@ -136,6 +139,11 @@ fn registry(st: &AppState) -> Result<Arc<AnalyzerRegistry>, String> {
     reg.register(Arc::new(
         Captioner::new(&florence, &florence.join("tokenizer.json"), CAPTION_VERSION)
             .map_err(|e| e.to_string())?,
+    ));
+    // Full-image linear-probe presence classifier — reuses the already-built CLIP verifier (vision
+    // encoder), so no extra model load. Catches subjects the box detectors miss; fused at query time.
+    reg.register(Arc::new(
+        PresenceProbe::new(verifier.clone(), PRESENCE_VERSION).map_err(|e| e.to_string())?,
     ));
     let arc = Arc::new(reg);
     *st.analyzers.lock().map_err(|e| e.to_string())? = Some(arc.clone());

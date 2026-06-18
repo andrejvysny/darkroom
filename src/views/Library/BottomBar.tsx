@@ -93,6 +93,7 @@ export default function BottomBar({
       }}
     >
       <span
+        data-testid="photo-count"
         style={{
           fontFamily: "var(--font-mono)",
           fontSize: 11.5,
@@ -116,7 +117,9 @@ export default function BottomBar({
             viewBox="0 0 16 16"
             width={13}
             height={13}
-            fill={minStars != null && n <= minStars ? "var(--color-star)" : "none"}
+            fill={
+              minStars != null && n <= minStars ? "var(--color-star)" : "none"
+            }
             stroke={
               minStars != null && n <= minStars
                 ? "var(--color-star)"
@@ -186,7 +189,9 @@ export default function BottomBar({
             background: "transparent",
             border: "1px solid var(--color-t3)",
             boxShadow:
-              label === LABEL_NONE ? "0 0 0 2px var(--color-accent-line)" : "none",
+              label === LABEL_NONE
+                ? "0 0 0 2px var(--color-accent-line)"
+                : "none",
             cursor: "pointer",
             display: "block",
             flexShrink: 0,

@@ -1,0 +1,7 @@
+{
+  "identifier": "e2e-playwright",
+  "description": "Tier-3 E2E only. Added at runtime under the `e2e-testing` feature so the playwright socket bridge can drive the real webview. Never present in release builds (not in capabilities/, not compiled without the feature).",
+  "local": true,
+  "windows": ["main", "*"],
+  "permissions": ["playwright:default"]
+}

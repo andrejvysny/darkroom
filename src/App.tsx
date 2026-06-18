@@ -1,5 +1,6 @@
 import { useAppStore } from "./store/app";
 import { useKeyboard } from "./hooks/useKeyboard";
+import { useEditSync } from "./hooks/useEditSync";
 import TopBar from "./components/TopBar";
 import CommandPalette from "./components/CommandPalette";
 import Toast from "./components/Toast";
@@ -8,6 +9,7 @@ import DevelopView from "./views/Develop/DevelopView";
 
 export default function App() {
   useKeyboard();
+  useEditSync();
   const view = useAppStore((s) => s.view);
 
   return (

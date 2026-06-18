@@ -46,6 +46,7 @@ export default function Stage({
   );
   const maskOverlayVisible = useDevelopStore((s) => s.maskOverlayVisible);
   const brush = useDevelopStore((s) => s.brush);
+  const setFullRes = useDevelopStore((s) => s.setFullRes);
 
   const sectionRef = useRef<HTMLElement | null>(null);
   const [avail, setAvail] = useState({ w: 0, h: 0 });
@@ -79,10 +80,48 @@ export default function Stage({
   const dispW = Math.max(1, nat.w * fit);
   const dispH = Math.max(1, nat.h * fit);
 
-  const onWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    setZoom((z) => Math.min(8, Math.max(0.5, z * (1 - e.deltaY * 0.0015))));
-  }, []);
+  // Clamp a pan offset so the scaled image can never be dragged past the viewport edges. When the
+  // scaled image is smaller than the viewport on an axis, max travel is 0 → it stays centered (so
+  // zooming back out always recenters).
+  const clampPan = useCallback(
+    (p: { x: number; y: number }, z: number) => {
+      const maxX = Math.max(0, (dispW * z - avail.w) / 2);
+      const maxY = Math.max(0, (dispH * z - avail.h) / 2);
+      return {
+        x: Math.min(maxX, Math.max(-maxX, p.x)),
+        y: Math.min(maxY, Math.max(-maxY, p.y)),
+      };
+    },
+    [dispW, dispH, avail.w, avail.h],
+  );
+
+  const onWheel = useCallback(
+    (e: React.WheelEvent) => {
+      e.preventDefault();
+      setZoom((z) => {
+        const next = Math.min(8, Math.max(0.5, z * (1 - e.deltaY * 0.0015)));
+        // Re-clamp the pan against the new zoom (recenters on zoom-out).
+        setPan((p) => clampPan(p, next));
+        return next;
+      });
+    },
+    [clampPan],
+  );
+
+  // Keep pan valid when the viewport or image size changes (resize, new image).
+  useEffect(() => {
+    setPan((p) => clampPan(p, zoom));
+  }, [clampPan, zoom]);
+
+  // Zoomed in past fit → request the full-resolution render tier; back at/under fit → fast preview.
+  useEffect(() => {
+    setFullRes(zoom > 1.001);
+  }, [zoom, setFullRes]);
+
+  // Leaving the stage: drop back to the preview tier so the next image opens fast.
+  useEffect(() => {
+    return () => setFullRes(false);
+  }, [setFullRes]);
 
   // Background drag = pan. Mask handles stop propagation, so they never trigger a pan.
   const onPointerDown = useCallback(
@@ -91,10 +130,15 @@ export default function Stage({
       const start = { x: e.clientX, y: e.clientY };
       const startPan = pan;
       const move = (ev: PointerEvent) =>
-        setPan({
-          x: startPan.x + (ev.clientX - start.x),
-          y: startPan.y + (ev.clientY - start.y),
-        });
+        setPan(
+          clampPan(
+            {
+              x: startPan.x + (ev.clientX - start.x),
+              y: startPan.y + (ev.clientY - start.y),
+            },
+            zoom,
+          ),
+        );
       const up = () => {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
@@ -102,7 +146,7 @@ export default function Stage({
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", up);
     },
-    [pan],
+    [pan, zoom, clampPan],
   );
 
   const resetView = useCallback(() => {

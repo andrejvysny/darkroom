@@ -61,14 +61,20 @@ export default function ThumbGrid({
 }: ThumbGridProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [colCount, setColCount] = useState(4);
+  // Inner content width (clientWidth − horizontal padding). Drives the *actual* cell width below.
+  const [contentWidth, setContentWidth] = useState(0);
   const selectedSet = new Set(selectedIds);
 
-  // Recompute column count when container width or thumbSize changes
+  const PADDING = 14; // each side
+  const GAP = 12;
+
+  // Recompute column count + content width when container resizes or thumbSize changes.
   const updateCols = useCallback(() => {
     if (!containerRef.current) return;
-    const w = containerRef.current.clientWidth - 28; // 14px padding each side
-    const cols = Math.max(1, Math.floor((w + 12) / (thumbSize + 12)));
+    const w = containerRef.current.clientWidth - PADDING * 2;
+    const cols = Math.max(1, Math.floor((w + GAP) / (thumbSize + GAP)));
     setColCount(cols);
+    setContentWidth(w);
   }, [thumbSize]);
 
   useEffect(() => {
@@ -79,7 +85,14 @@ export default function ThumbGrid({
   }, [updateCols]);
 
   const rowCount = Math.ceil(images.length / colCount);
-  const rowHeight = Math.round((thumbSize / 3) * 2) + 12; // 3:2 aspect + gap
+  // Cells are `1fr`, so they stretch to fill the row — their real width is the column width, NOT
+  // thumbSize. Derive row height from that actual width so the virtualizer's row stride matches the
+  // rendered height; using thumbSize here makes rows shorter than reality and they overlap.
+  const cellWidth =
+    contentWidth > 0
+      ? (contentWidth - GAP * (colCount - 1)) / colCount
+      : thumbSize;
+  const rowHeight = Math.round((cellWidth * 2) / 3) + GAP; // 3:2 aspect + gap
 
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
@@ -87,6 +100,12 @@ export default function ThumbGrid({
     estimateSize: () => rowHeight,
     overscan: 3,
   });
+
+  // Re-measure when the computed row height changes (thumbSize / width change), otherwise the
+  // virtualizer keeps the previous stride and rows overlap or leave gaps.
+  useEffect(() => {
+    rowVirtualizer.measure();
+  }, [rowHeight, rowVirtualizer]);
 
   const virtualRows = rowVirtualizer.getVirtualItems();
 
@@ -139,6 +158,8 @@ export default function ThumbGrid({
                 return (
                   <div
                     key={img.id}
+                    data-testid="thumb-cell"
+                    data-image-id={img.id}
                     onClick={(e) =>
                       onSelect(img.id, {
                         meta: e.metaKey || e.ctrlKey,

@@ -27,6 +27,9 @@ interface DevelopState {
   setPreviewUrl: (url: string | null) => void;
   rendering: boolean;
   setRendering: (b: boolean) => void;
+  /** True when the stage is zoomed in past fit — render the full-resolution frame, not the preview. */
+  fullRes: boolean;
+  setFullRes: (b: boolean) => void;
   showBefore: boolean;
   setShowBefore: (b: boolean) => void;
   histogram: HistData | null;
@@ -75,6 +78,8 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setPreviewUrl: (url) => set({ previewUrl: url }),
   rendering: false,
   setRendering: (b) => set({ rendering: b }),
+  fullRes: false,
+  setFullRes: (b) => set({ fullRes: b }),
   showBefore: false,
   setShowBefore: (b) => set({ showBefore: b }),
   histogram: null,

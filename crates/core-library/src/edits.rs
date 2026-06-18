@@ -14,6 +14,20 @@ pub fn get_edit(conn: &Connection, image_id: i64) -> Result<Option<String>, LibE
         .optional()?)
 }
 
+/// Saved develop params JSON + its `updated_at` version, if any. The version cache-busts previews.
+pub fn get_edit_with_version(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Option<(String, i64)>, LibError> {
+    Ok(conn
+        .query_row(
+            "SELECT params, updated_at FROM edits WHERE image_id = ?1",
+            params![image_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?)
+}
+
 /// Upsert develop params JSON for an image.
 pub fn set_edit(
     conn: &Connection,

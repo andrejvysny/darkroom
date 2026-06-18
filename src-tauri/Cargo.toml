@@ -17,9 +17,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Tier-3 E2E (real-backend UI automation via tauri-plugin-playwright socket bridge).
+# Enables the optional plugin AND tauri's runtime-capability API so the playwright
+# permission is granted at runtime (debug only) — never compiled into release builds.
+e2e-testing = ["dep:tauri-plugin-playwright", "tauri/dynamic-acl"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-playwright = { version = "0.4", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 core-db = { path = "../crates/core-db" }

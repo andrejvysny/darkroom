@@ -20,7 +20,9 @@ const MIN_SCALE = 1; // 1 = fit-to-container
 export default function Loupe({ image }: LoupeProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const [src, setSrc] = useState(() => thumbUrl(image.contentHash, 512));
+  const [src, setSrc] = useState(() =>
+    thumbUrl(image.contentHash, 512, image.editedAt),
+  );
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
@@ -116,7 +118,7 @@ export default function Loupe({ image }: LoupeProps) {
   useEffect(() => {
     setScale(1);
     setOffset({ x: 0, y: 0 });
-    setSrc(thumbUrl(image.contentHash, 512));
+    setSrc(thumbUrl(image.contentHash, 512, image.editedAt));
     setNatural({ w: image.width ?? 0, h: image.height ?? 0 });
     fullRequested.current = false;
 
@@ -137,7 +139,14 @@ export default function Loupe({ image }: LoupeProps) {
       for (const u of urls.current) URL.revokeObjectURL(u);
       urls.current = [];
     };
-  }, [image.id, image.contentHash, image.width, image.height, swapSrc]);
+  }, [
+    image.id,
+    image.contentHash,
+    image.width,
+    image.height,
+    image.editedAt,
+    swapSrc,
+  ]);
 
   // ── Container measurement ─────────────────────────────────────────────────
   useLayoutEffect(() => {
@@ -245,6 +254,7 @@ export default function Loupe({ image }: LoupeProps) {
   return (
     <div
       ref={containerRef}
+      data-testid="loupe"
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}

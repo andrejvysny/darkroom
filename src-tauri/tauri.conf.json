@@ -10,13 +10,17 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Darkroom",
         "width": 1320,
         "height": 860,
         "minWidth": 1040,
-        "minHeight": 680
+        "minHeight": 680,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 14, "y": 17 }
       }
     ],
     "security": {

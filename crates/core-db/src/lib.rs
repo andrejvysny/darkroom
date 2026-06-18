@@ -23,6 +23,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../migrations/005_analysis.sql")),
         M::up(include_str!("../migrations/006_labels.sql")),
         M::up(include_str!("../migrations/007_user_events.sql")),
+        M::up(include_str!("../migrations/008_presence.sql")),
     ])
 });
 
@@ -110,7 +111,7 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         names.sort();
-        // Exact catalog table set across migrations 001–007 (rusqlite_migration tracks its version
+        // Exact catalog table set across migrations 001–008 (rusqlite_migration tracks its version
         // via PRAGMA user_version, adding no table). Asserting the explicit set — not a loose count —
         // so a dropped/renamed/forgotten table in a future migration fails the test.
         let mut expected = vec![
@@ -124,6 +125,7 @@ mod tests {
             "image_detections",
             "image_features",
             "image_keywords",
+            "image_presence",
             "image_user_labels",
             "images",
             "import_sessions",

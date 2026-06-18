@@ -23,3 +23,6 @@ sha2 = "0.10"
 [dev-dependencies]
 anyhow = "1"
 core-raw = { path = "../core-raw" }
+# Label-driven eval/tuning harnesses read the catalog directly. core-db re-exports the shared rusqlite.
+core-db = { path = "../core-db" }
+core-library = { path = "../core-library" }

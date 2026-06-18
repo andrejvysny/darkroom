@@ -9,6 +9,7 @@ import {
   keywordsList,
   collectionsList,
   clearedFilters,
+  LABEL_NONE,
   type QueryParams,
   type ImageRow,
   type FolderRow,
@@ -37,6 +38,8 @@ export interface LibraryState {
 
 export interface LibraryActions {
   refresh: (overrides?: Partial<QueryParams>) => Promise<void>;
+  /** Re-query just the image page + its count for the current filter (no folder/keyword reload). */
+  refreshImages: (overrides?: Partial<QueryParams>) => Promise<void>;
   /** Append the next page of results (infinite scroll). No-op when all rows are loaded or a page
    *  fetch is already in flight. */
   loadMore: () => void;
@@ -62,6 +65,21 @@ const DEFAULT_PARAMS: QueryParams = {
   limit: PAGE_SIZE,
   offset: 0,
 };
+
+/** Does a row still satisfy the active filter on the dimensions evaluable from the row alone
+ *  (flag / min stars / color label)? Server-only dimensions are treated as matching here. */
+function matchesRowFilter(row: ImageRow, p: QueryParams): boolean {
+  if (p.flag != null && row.flag !== p.flag) return false;
+  if (p.minStars != null && row.stars < p.minStars) return false;
+  if (p.colorLabel != null) {
+    if (p.colorLabel === LABEL_NONE) {
+      if (row.colorLabel != null) return false;
+    } else if (row.colorLabel !== p.colorLabel) {
+      return false;
+    }
+  }
+  return true;
+}
 
 export function useLibrary(): LibraryState & LibraryActions {
   const [images, setImages] = useState<ImageRow[]>([]);
@@ -298,10 +316,22 @@ export function useLibrary(): LibraryState & LibraryActions {
     setParams((p) => ({ ...p, search }));
   }, []);
 
+  // Update one image's row in place. If the change makes it no longer match the active filter on a
+  // dimension we can evaluate from the row itself (flag / rating / color label), drop it from the
+  // grid and decrement the count immediately — so e.g. rejecting a photo in the Picks view removes
+  // it live without a re-query. Filters needing server data (keyword/collection/detected) are left
+  // to the caller to reconcile.
   const patchImage = useCallback((id: number, patch: Partial<ImageRow>) => {
+    const p = paramsRef.current;
+    const cur = imagesRef.current.find((i) => i.id === id);
+    const updated = cur ? { ...cur, ...patch } : null;
+    const remove = updated != null && !matchesRowFilter(updated, p);
     setImages((prev) =>
-      prev.map((img) => (img.id === id ? { ...img, ...patch } : img)),
+      remove
+        ? prev.filter((i) => i.id !== id)
+        : prev.map((img) => (img.id === id ? { ...img, ...patch } : img)),
     );
+    if (remove) setTotal((t) => Math.max(0, t - 1));
   }, []);
 
   const reloadKeywords = useCallback(async () => {
@@ -333,6 +363,7 @@ export function useLibrary(): LibraryState & LibraryActions {
     error,
     params,
     refresh,
+    refreshImages,
     loadMore,
     patchParams,
     clearFilters,

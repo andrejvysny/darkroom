@@ -16,6 +16,8 @@ interface SelectionBarProps {
   onRate: (stars: number) => void;
   onFlag: (flag: "pick" | "reject" | "none") => void;
   onLabel: (label: string | null) => void;
+  /** Manual AI ground-truth label: mark Person/Animal present (true), absent (false), or clear (null). */
+  onSetPresence: (field: "person" | "animal", value: boolean | null) => void;
   onAddKeyword: (name: string) => void;
   onAddToCollection: (collectionId: number) => void;
   onExport: () => void;
@@ -24,9 +26,7 @@ interface SelectionBarProps {
 
 function Divider() {
   return (
-    <span
-      style={{ width: 1, height: 18, background: "var(--color-line)" }}
-    />
+    <span style={{ width: 1, height: 18, background: "var(--color-line)" }} />
   );
 }
 
@@ -46,12 +46,30 @@ function btn(): React.CSSProperties {
   };
 }
 
+function presenceBtn(): React.CSSProperties {
+  return {
+    width: 20,
+    height: 20,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 5,
+    border: "1px solid var(--color-line)",
+    background: "transparent",
+    color: "var(--color-t2)",
+    fontSize: 11,
+    cursor: "pointer",
+    padding: 0,
+  };
+}
+
 export default function SelectionBar({
   count,
   collections,
   onRate,
   onFlag,
   onLabel,
+  onSetPresence,
   onAddKeyword,
   onAddToCollection,
   onExport,
@@ -73,11 +91,17 @@ export default function SelectionBar({
         alignItems: "center",
         gap: 10,
         padding: "0 14px",
-        height: 42,
+        height: 46,
         flexShrink: 0,
-        background: "var(--color-accent-dim)",
-        borderBottom: "1px solid var(--color-accent-line)",
+        // Floating island: elevated surface, pill corners, shadow. `pointerEvents: auto` re-enables
+        // interaction inside the bar (the wrapper sets it to none so the rest stays click-through).
+        background: "var(--color-elev)",
+        border: "1px solid var(--color-line)",
+        borderRadius: 14,
+        boxShadow: "0 8px 28px rgba(0,0,0,.45)",
+        maxWidth: "calc(100% - 28px)",
         overflowX: "auto",
+        pointerEvents: "auto",
       }}
     >
       <span
@@ -161,6 +185,42 @@ export default function SelectionBar({
             display: "block",
           }}
         />
+      </div>
+
+      <Divider />
+
+      {/* Manual AI presence labels (ground truth) */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        {(["person", "animal"] as const).map((field) => (
+          <div
+            key={field}
+            style={{ display: "flex", alignItems: "center", gap: 3 }}
+          >
+            <span
+              style={{
+                fontSize: 11,
+                color: "var(--color-t3)",
+                textTransform: "capitalize",
+              }}
+            >
+              {field}
+            </span>
+            <button
+              style={presenceBtn()}
+              title={`Mark ${field} present on selection`}
+              onClick={() => onSetPresence(field, true)}
+            >
+              ✓
+            </button>
+            <button
+              style={presenceBtn()}
+              title={`Mark ${field} absent on selection`}
+              onClick={() => onSetPresence(field, false)}
+            >
+              ✕
+            </button>
+          </div>
+        ))}
       </div>
 
       <Divider />

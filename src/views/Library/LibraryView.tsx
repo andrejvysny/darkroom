@@ -9,6 +9,7 @@ import {
   cullSetRatingMany,
   cullSetFlagMany,
   cullSetLabelMany,
+  setImageUserLabelMany,
   keywordsForImage,
   keywordAddToImage,
   keywordAddToImages,
@@ -55,7 +56,7 @@ function toGridImage(r: ImageRow): GridImage {
   return {
     id: r.id,
     filename: r.filename,
-    thumbUrl: thumbUrl(r.contentHash),
+    thumbUrl: thumbUrl(r.contentHash, 512, r.editedAt),
     stars: r.stars,
     flag: r.flag === "none" ? null : r.flag,
     label: r.colorLabel
@@ -206,31 +207,49 @@ export default function LibraryView() {
     [selectedId, lib.reloadKeywords, lib.refresh, lib.params.keywordId],
   );
 
+  // RightInfo panel actions. When more than one image is selected they apply to the whole
+  // selection (matching the keyboard shortcuts + SelectionBar); otherwise single-image path keeps
+  // the behavioral-log signal (latency) and culling auto-advance.
   const handleSetRating = useCallback(
     (stars: number) => {
+      if (selectedIds.length > 1) {
+        selectedIds.forEach((id) => lib.patchImage(id, { stars }));
+        void cullSetRatingMany(selectedIds, stars);
+        return;
+      }
       if (selectedId === null) return;
       lib.patchImage(selectedId, { stars });
       void cullSetRating(selectedId, stars);
     },
-    [selectedId, lib.patchImage],
+    [selectedId, selectedIds, lib.patchImage],
   );
 
   const handleSetFlag = useCallback(
     (flag: "none" | "pick" | "reject") => {
+      if (selectedIds.length > 1) {
+        selectedIds.forEach((id) => lib.patchImage(id, { flag }));
+        void cullSetFlagMany(selectedIds, flag);
+        return;
+      }
       if (selectedId === null) return;
       lib.patchImage(selectedId, { flag });
       void cullSetFlag(selectedId, flag);
     },
-    [selectedId, lib.patchImage],
+    [selectedId, selectedIds, lib.patchImage],
   );
 
   const handleSetLabel = useCallback(
     (label: string | null) => {
+      if (selectedIds.length > 1) {
+        selectedIds.forEach((id) => lib.patchImage(id, { colorLabel: label }));
+        void cullSetLabelMany(selectedIds, label);
+        return;
+      }
       if (selectedId === null) return;
       lib.patchImage(selectedId, { colorLabel: label });
       void cullSetLabel(selectedId, label);
     },
-    [selectedId, lib.patchImage],
+    [selectedId, selectedIds, lib.patchImage],
   );
 
   const handleAddToCollection = useCallback(
@@ -390,6 +409,23 @@ export default function LibraryView() {
     [selectedIds, lib.patchImage],
   );
 
+  // Presence labels feed the Detected (People/Animals) facets and can change membership of a
+  // detected-category filter — refresh facet counts and, when such a filter is active, re-query.
+  const afterPresenceChange = useCallback(() => {
+    void analysis.reloadFacets();
+    if (lib.params.detectedCategory) void lib.refreshImages();
+  }, [analysis, lib.params.detectedCategory, lib.refreshImages]);
+
+  const batchSetPresence = useCallback(
+    (field: "person" | "animal", value: boolean | null) => {
+      if (selectedIds.length === 0) return;
+      void setImageUserLabelMany(selectedIds, field, value).then(
+        afterPresenceChange,
+      );
+    },
+    [selectedIds, afterPresenceChange],
+  );
+
   const batchAddKeyword = useCallback(
     async (name: string) => {
       if (selectedIds.length === 0) return;
@@ -439,6 +475,7 @@ export default function LibraryView() {
     onRemoveKeyword: handleRemoveKeyword,
     onAddToCollection: handleAddToCollection,
     onRemoveFromCollection: handleRemoveFromCollection,
+    onPresenceChanged: afterPresenceChange,
   };
 
   const gridImages = lib.images.map(toGridImage);
@@ -483,20 +520,36 @@ export default function LibraryView() {
           flexDirection: "column",
         }}
       >
-        {selectedIds.length > 1 && (
-          <SelectionBar
-            count={selectedIds.length}
-            collections={lib.collections}
-            onRate={batchRate}
-            onFlag={batchFlag}
-            onLabel={batchLabel}
-            onAddKeyword={batchAddKeyword}
-            onAddToCollection={batchAddToCollection}
-            onExport={batchExport}
-            onClear={collapseSelection}
-          />
-        )}
         <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
+          {/* Floating "island" toolbar (Figma-style): centered overlay that never reflows the grid.
+              The wrapper ignores pointer events so the empty area stays click-through to the grid. */}
+          {selectedIds.length > 1 && (
+            <div
+              style={{
+                position: "absolute",
+                top: 12,
+                left: 0,
+                right: 0,
+                zIndex: 20,
+                display: "flex",
+                justifyContent: "center",
+                pointerEvents: "none",
+              }}
+            >
+              <SelectionBar
+                count={selectedIds.length}
+                collections={lib.collections}
+                onRate={batchRate}
+                onFlag={batchFlag}
+                onLabel={batchLabel}
+                onSetPresence={batchSetPresence}
+                onAddKeyword={batchAddKeyword}
+                onAddToCollection={batchAddToCollection}
+                onExport={batchExport}
+                onClear={collapseSelection}
+              />
+            </div>
+          )}
           {lib.indexing && (
             <div
               style={{
@@ -568,37 +621,45 @@ export default function LibraryView() {
             </div>
           )}
 
-          {gridMode === "loupe" && selectedImage !== null ? (
-            <Loupe image={selectedImage} />
-          ) : (
-            <>
-              {!lib.loading && !lib.indexing && gridImages.length === 0 && (
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    height: "100%",
-                    color: "var(--color-t3)",
-                    fontSize: 13,
-                  }}
-                >
-                  No photos found
-                </div>
-              )}
-              <ThumbGrid
-                images={gridImages}
-                thumbSize={thumbSize}
-                selectedId={selectedId}
-                selectedIds={selectedIds}
-                onSelect={handleSelect}
-                onActivate={(id) => {
-                  setSelectedId(id);
-                  setGridMode("loupe");
-                }}
-                onLoadMore={lib.loadMore}
-              />
-            </>
+          {/* The grid stays mounted while the loupe is open, so its scroll position (and the
+              virtualizer's window) survive. The loupe renders as an opaque overlay on top. */}
+          {!lib.loading && !lib.indexing && gridImages.length === 0 && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                height: "100%",
+                color: "var(--color-t3)",
+                fontSize: 13,
+              }}
+            >
+              No photos found
+            </div>
+          )}
+          <ThumbGrid
+            images={gridImages}
+            thumbSize={thumbSize}
+            selectedId={selectedId}
+            selectedIds={selectedIds}
+            onSelect={handleSelect}
+            onActivate={(id) => {
+              setSelectedId(id);
+              setGridMode("loupe");
+            }}
+            onLoadMore={lib.loadMore}
+          />
+          {gridMode === "loupe" && selectedImage !== null && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                zIndex: 30,
+                background: "var(--color-stage)",
+              }}
+            >
+              <Loupe image={selectedImage} />
+            </div>
           )}
         </div>
       </div>

@@ -16,15 +16,16 @@ pub mod thumbs;
 
 pub use analysis::{
     analysis_facets, caption_for_image, detections_for_image, existing_analysis, insert_analysis,
-    present_image_count, present_images, set_user_label, user_labels, AnalysisInput, AnalyzeTarget,
-    CaptionRow, DetectionRow, FacetRow, UserLabels,
+    labeled_images, presence_for_image, present_image_count, present_images, set_user_label,
+    set_user_label_many, user_labels, AnalysisInput, AnalyzeTarget, CaptionRow, DetectionRow,
+    FacetRow, LabeledImage, PresenceRow, UserLabels,
 };
 pub use collections::{
     add_images_to_collection, collections_for_image, create_collection, delete_collection,
     list_collections, remove_images_from_collection, rename_collection, CollectionRow,
 };
 pub use cull::{set_flag, set_flag_many, set_label, set_label_many, set_rating, set_rating_many};
-pub use edits::{get_edit, set_edit};
+pub use edits::{get_edit, get_edit_with_version, set_edit};
 pub use error::LibError;
 pub use events::{append_event, event_count, ids_json, Event};
 pub use features::{

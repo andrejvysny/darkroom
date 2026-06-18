@@ -8,6 +8,8 @@ interface AppState {
    *  even while the LibraryView is unmounted. */
   libraryImages: ImageRow[];
   setLibraryImages: (rows: ImageRow[]) => void;
+  /** Update one image's edit version (drives live edit-aware previews in the filmstrip/chrome). */
+  setImageEdited: (id: number, editedAt: number | null) => void;
   /** Primary/active selection (drives metadata panel + develop). */
   selectedId: number | null;
   setSelectedId: (id: number | null) => void;
@@ -41,6 +43,12 @@ export const useAppStore = create<AppState>((set) => ({
   setView: (v) => set({ view: v }),
   libraryImages: [],
   setLibraryImages: (rows) => set({ libraryImages: rows }),
+  setImageEdited: (id, editedAt) =>
+    set((s) => ({
+      libraryImages: s.libraryImages.map((r) =>
+        r.id === id ? { ...r, editedAt } : r,
+      ),
+    })),
   selectedId: 6,
   setSelectedId: (id) =>
     set({ selectedId: id, selectedIds: id == null ? [] : [id] }),
