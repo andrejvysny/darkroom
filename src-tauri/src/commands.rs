@@ -187,30 +187,17 @@ fn index_root_blocking(
     Ok(stats)
 }
 
-/// Wipe the catalog (index/metadata/settings) and rebuild it from disk. Files on disk are never
-/// touched: it deletes DB rows, clears the thumbnail + warm GPU caches, then re-scans the
-/// previously-watched folders (regenerating thumbnails with correct orientation). Returns the
-/// aggregate re-index stats.
+/// Wipe the catalog to a fully empty state. Deletes every DB row (images, folders/watched roots,
+/// edits, collections, keywords, analysis, behavioral events…) and clears the thumbnail + warm GPU
+/// caches. Files on disk are never touched — only the index/metadata is removed. Nothing is
+/// re-scanned: the app is left empty until the user imports again. Returns zeroed stats.
 #[tauri::command]
 pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let st = app2.state::<AppState>();
 
-        // Snapshot the watched roots before wiping so we can rebuild from them.
-        let roots: Vec<String> = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let mut stmt = db
-                .conn
-                .prepare("SELECT path FROM folders ORDER BY id")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(|e| e.to_string())?;
-            rows.filter_map(Result::ok).collect()
-        };
-
-        // Wipe catalog rows.
+        // Wipe all catalog rows (folders included → no watched roots remain).
         {
             let mut db = st.db.lock().map_err(|e| e.to_string())?;
             db.wipe().map_err(|e| e.to_string())?;
@@ -224,20 +211,7 @@ pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
             *h = None;
         }
 
-        // Rebuild from disk. Skip auto-analyze (the rebuild is already heavy; analysis is explicit).
-        let mut agg = IndexStats::default();
-        for r in &roots {
-            let root = PathBuf::from(r);
-            if !root.exists() {
-                continue;
-            }
-            let s = index_root_blocking(&app2, &st, &root, false)?;
-            agg.scanned += s.scanned;
-            agg.added += s.added;
-            agg.skipped += s.skipped;
-            agg.failed += s.failed;
-        }
-        Ok::<_, String>(agg)
+        Ok::<_, String>(IndexStats::default())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1341,26 +1315,38 @@ pub async fn import_start(
             "reference" => core_import::ImportMode::Reference,
             _ => core_import::ImportMode::Copy,
         };
+        // Gate the FS watcher for the duration of the import so it can't race the now-unlocked
+        // per-file copy/process phase (double-decode / duplicate insert). Dropped when this closure
+        // returns (success or error), which runs one deferred watcher sync if one was suppressed.
+        let _import_guard = crate::watch::ImportGuard::new(app2.clone());
         let progress_app = app2.clone();
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        // Buffer freshly-imported rows and flush them with the progress event so the frontend can
+        // append photos to the grid live (single-threaded blocking import → RefCell is sufficient).
+        let pending = std::cell::RefCell::new(Vec::<core_library::ImageRow>::new());
         let stats = core_import::import(
-            &mut db.conn,
+            &st.db,
             &st.thumbs,
             Path::new(&source),
             import_mode,
             Path::new(&dest),
             recursive.unwrap_or(true),
-            |done, total| {
-                if done == total || done.is_multiple_of(4) {
+            |done, total, added| {
+                if let Some(row) = added {
+                    pending.borrow_mut().push(row.clone());
+                }
+                // Flush on completion, a full batch, or every 4th file (keeps the counter live even
+                // through runs of skipped files that add no rows).
+                if done == total || pending.borrow().len() >= 8 || done.is_multiple_of(4) {
+                    let images: Vec<core_library::ImageRow> =
+                        pending.borrow_mut().drain(..).collect();
                     let _ = progress_app.emit(
                         "import:progress",
-                        serde_json::json!({"done": done, "total": total}),
+                        serde_json::json!({"done": done, "total": total, "images": images}),
                     );
                 }
             },
         )
         .map_err(|e| e.to_string())?;
-        drop(db);
         enforce_thumb_cap(&st);
         let _ = app2.emit("import:done", &stats);
         Ok::<_, String>(stats)

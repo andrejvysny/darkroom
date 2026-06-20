@@ -623,20 +623,23 @@ export default function LibraryView() {
 
           {/* The grid stays mounted while the loupe is open, so its scroll position (and the
               virtualizer's window) survive. The loupe renders as an opaque overlay on top. */}
-          {!lib.loading && !lib.indexing && gridImages.length === 0 && (
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                height: "100%",
-                color: "var(--color-t3)",
-                fontSize: 13,
-              }}
-            >
-              No photos found
-            </div>
-          )}
+          {!lib.loading &&
+            !lib.indexing &&
+            !lib.importing &&
+            gridImages.length === 0 && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  height: "100%",
+                  color: "var(--color-t3)",
+                  fontSize: 13,
+                }}
+              >
+                No photos found
+              </div>
+            )}
           <ThumbGrid
             images={gridImages}
             thumbSize={thumbSize}

@@ -140,6 +140,8 @@ export type ImportStats = {
   added: number;
   skipped: number;
   failed: number;
+  /** Move-mode files catalogued but whose original could not be sent to Trash (source kept). */
+  sourceRetained: number;
 };
 
 export type DupImage = {

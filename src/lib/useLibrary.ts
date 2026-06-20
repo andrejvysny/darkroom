@@ -9,6 +9,7 @@ import {
   keywordsList,
   collectionsList,
   clearedFilters,
+  hasActiveFilters,
   LABEL_NONE,
   type QueryParams,
   type ImageRow,
@@ -32,6 +33,8 @@ export interface LibraryState {
   /** True while a `loadMore` page fetch is in flight (initial load uses `loading`). */
   loadingMore: boolean;
   indexing: IndexingState | null;
+  /** True while an import (Import button) is in flight — suppresses the empty-state during it. */
+  importing: boolean;
   error: string | null;
   params: QueryParams;
 }
@@ -91,6 +94,7 @@ export function useLibrary(): LibraryState & LibraryActions {
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [indexing, setIndexing] = useState<IndexingState | null>(null);
+  const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [params, setParams] = useState<QueryParams>(DEFAULT_PARAMS);
 
@@ -240,6 +244,11 @@ export function useLibrary(): LibraryState & LibraryActions {
 
     async function bootstrap() {
       setLoading(true);
+      // Auto-import the bundled validation library only on the very first launch ever. Once the
+      // user has opened the app (or explicitly reset to empty), they own their library — never
+      // silently re-import on an empty catalog. This keeps "Reset catalog" leaving a truly empty
+      // app that stays empty across reloads/restarts.
+      const firstLaunch = localStorage.getItem("darkroom.bootstrapped") !== "1";
       try {
         const [flds, cnt, kws, cols] = await Promise.all([
           libraryFolders(),
@@ -249,8 +258,9 @@ export function useLibrary(): LibraryState & LibraryActions {
         ]);
         setKeywords(kws);
         setCollections(cols);
+        localStorage.setItem("darkroom.bootstrapped", "1");
 
-        if (flds.length === 0 || cnt === 0) {
+        if (firstLaunch && (flds.length === 0 || cnt === 0)) {
           const defaultPath = await appDefaultLibrary();
           if (defaultPath) {
             unlisteners = await startIndexing(defaultPath);
@@ -289,6 +299,45 @@ export function useLibrary(): LibraryState & LibraryActions {
     });
     return () => un?.();
   }, [refresh]);
+
+  // Live-append photos as they're imported. The backend streams each freshly-catalogued row in the
+  // `import:progress` event; we append them to the grid immediately so the user sees photos land as
+  // they import. The counter/toast is owned by the import flow / `startIndexing` listeners, and the
+  // `import:done` refresh wired there reconciles ordering & counts afterward. Only append on the
+  // unfiltered "All photos" view — a filtered/sorted/searched view would mis-place fresh rows, so it
+  // waits for that reconcile instead.
+  useEffect(() => {
+    let unProgress: UnlistenFn | undefined;
+    let unDone: UnlistenFn | undefined;
+    void listen<{ done: number; total: number; images?: ImageRow[] }>(
+      "import:progress",
+      (ev) => {
+        // Active while files remain. The final event (done === total) always fires after the import
+        // loop — even if a post-loop DB step then errors — so this self-clears without depending on
+        // `import:done` (which is skipped on a wholesale import failure).
+        setImporting(ev.payload.done < ev.payload.total);
+        const incoming = ev.payload.images;
+        if (!incoming || incoming.length === 0) return;
+        const p = paramsRef.current;
+        if (hasActiveFilters(p) || p.search) return;
+        const have = new Set(imagesRef.current.map((i) => i.id));
+        const fresh = incoming.filter((r) => !have.has(r.id));
+        if (fresh.length === 0) return;
+        setImages((prev) => [...prev, ...fresh]);
+        setTotal((t) => t + fresh.length);
+        setGrandTotal((g) => g + fresh.length);
+      },
+    ).then((f) => {
+      unProgress = f;
+    });
+    void listen("import:done", () => setImporting(false)).then((f) => {
+      unDone = f;
+    });
+    return () => {
+      unProgress?.();
+      unDone?.();
+    };
+  }, []);
 
   // Re-fetch when params change (skip the initial render)
   const isFirstParamsRun = useRef(true);
@@ -360,6 +409,7 @@ export function useLibrary(): LibraryState & LibraryActions {
     loading,
     loadingMore,
     indexing,
+    importing,
     error,
     params,
     refresh,

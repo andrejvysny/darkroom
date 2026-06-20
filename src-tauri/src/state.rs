@@ -5,7 +5,7 @@ use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -73,6 +73,13 @@ pub struct AppState {
     pub last_histogram: Mutex<Option<Histogram>>,
     /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Number of imports currently in flight. While > 0 the FS watcher defers its reconcile/index
+    /// pass so it can't race an import's unlocked copy/process phase (double-decode / duplicate
+    /// insert). A counter, not a bool, so overlapping imports compose. See `watch::ImportGuard`.
+    pub import_active: AtomicUsize,
+    /// Set by the watcher when it skipped a sync because an import was in flight; the import's
+    /// completion guard then runs exactly one deferred sync to catch any real external change.
+    pub watch_pending: AtomicBool,
     /// Directory holding downloaded ML model files (`<app-data>/models`).
     pub models_dir: PathBuf,
     /// AI analyzer registry, lazily built on first analysis run (loading ~300 MB of ONNX is deferred
@@ -135,6 +142,8 @@ impl AppState {
             latest_render: AtomicU64::new(0),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
+            import_active: AtomicUsize::new(0),
+            watch_pending: AtomicBool::new(false),
             models_dir,
             analyzers: Mutex::new(None),
             analysis_running: AtomicBool::new(false),

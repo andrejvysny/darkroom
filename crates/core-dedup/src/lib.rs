@@ -10,6 +10,22 @@ pub use error::DedupError;
 use core_db::rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+/// A trash context that deletes silently and without involving Finder. On macOS the `trash` crate's
+/// default `DeleteMethod::Finder` shells out to `osascript`/Finder per call — playing the Trash
+/// sound, spawning a subprocess, and pulling Finder forward (a white WKWebView repaint). Resolving
+/// a duplicate group of N files would otherwise fire that N times. `NsFileManager` trashes silently
+/// and directly; files remain recoverable from the Trash (sans one-click "Put Back").
+fn make_trash_ctx() -> trash::TrashContext {
+    #[allow(unused_mut)]
+    let mut ctx = trash::TrashContext::default();
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    ctx
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DupImage {
@@ -244,11 +260,14 @@ pub fn resolve(
     }
 
     // Trash files; collect only those whose file is gone (so the row can be safely removed).
+    // Per-file (not batched) so a single failure only skips that one row — a batch `delete_all`
+    // stops at the first error and would hide which files actually made it to the Trash.
+    let trash_ctx = make_trash_ctx();
     let mut to_delete: Vec<i64> = Vec::new();
     let mut hashes: Vec<String> = Vec::new();
     for (id, path, hash) in &victims {
         let p = std::path::Path::new(path);
-        if p.exists() && trash::delete(p).is_err() {
+        if p.exists() && trash_ctx.delete(p).is_err() {
             continue; // leave the row intact; skip this one
         }
         to_delete.push(*id);

@@ -98,7 +98,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     setStatus(null);
     try {
       await databaseReset();
-      // Rebuilt the catalog from disk; reload to re-bootstrap the UI with fresh data.
+      // Catalog wiped to empty; reload to re-bootstrap the UI with the now-empty state.
       window.location.reload();
     } catch {
       setStatus("Reset failed");
@@ -286,9 +286,10 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
           <div
             style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
           >
-            Wipes the database (index, metadata, ratings, keywords, settings)
-            and the thumbnail cache, then re-scans from disk. Your photo files
-            are never touched.
+            Wipes the database (index, metadata, ratings, keywords, settings,
+            imported folders) and the thumbnail cache, leaving the app empty.
+            Your photo files on disk are never touched — re-import to
+            repopulate.
           </div>
           <button
             onClick={() => void handleReset()}

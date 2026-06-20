@@ -49,8 +49,12 @@ export async function runImport(
   const unDone = await listen<ImportStats>("import:done", (ev) => {
     unProgress();
     unDone();
-    const { added, skipped } = ev.payload;
-    setToast(`Imported: added ${added}, skipped ${skipped}`);
+    const { added, skipped, sourceRetained } = ev.payload;
+    const retained =
+      sourceRetained > 0
+        ? `, ${sourceRetained} original(s) kept (trash failed)`
+        : "";
+    setToast(`Imported: added ${added}, skipped ${skipped}${retained}`);
     onComplete?.();
   });
 

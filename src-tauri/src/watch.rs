@@ -11,6 +11,7 @@ use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -85,24 +86,41 @@ fn watched_roots(app: &AppHandle) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Reconcile status + index new files under each root, then emit `library:changed`.
-fn sync(app: &AppHandle) {
+/// Reconcile status + index new files under each root, then emit `library:changed` — but only when
+/// something actually changed, so a no-op stat sweep doesn't trigger a full UI refresh.
+///
+/// Deferred while an import is in flight: the import catalogs its own files and drives its own UI
+/// update (live-append + `import:done`), so running reconcile/index here would only race its
+/// unlocked copy/process phase. The import's completion guard runs one sync afterward to catch any
+/// real external change that landed during the import window (see `ImportGuard`).
+pub(crate) fn sync(app: &AppHandle) {
     let st = app.state::<AppState>();
+    if st.import_active.load(Ordering::SeqCst) > 0 {
+        st.watch_pending.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    let mut changed = false;
     if let Ok(db) = st.db.lock() {
-        let _ = core_library::reconcile(&db.conn);
+        if let Ok(rs) = core_library::reconcile(&db.conn) {
+            changed |= rs.now_missing > 0 || rs.restored > 0;
+        }
     }
     for root in watched_roots(app) {
-        index_new(&st, &root);
+        changed |= index_new(&st, &root);
     }
-    let _ = app.emit("library:changed", ());
+    if changed {
+        let _ = app.emit("library:changed", ());
+    }
 }
 
 /// Index RAW files under `root` that aren't already in the catalog (idempotent). No progress events.
-fn index_new(st: &AppState, root: &Path) {
+/// Returns `true` if at least one new row was inserted.
+fn index_new(st: &AppState, root: &Path) -> bool {
     let (folder_id, known) = {
-        let Ok(db) = st.db.lock() else { return };
+        let Ok(db) = st.db.lock() else { return false };
         let Ok(fid) = core_library::add_root(&db.conn, root) else {
-            return;
+            return false;
         };
         (
             fid,
@@ -115,7 +133,7 @@ fn index_new(st: &AppState, root: &Path) {
         .filter(|p| !known.contains(&p.display().to_string()))
         .collect();
     if todo.is_empty() {
-        return;
+        return false;
     }
 
     let results: Vec<_> = todo
@@ -124,12 +142,46 @@ fn index_new(st: &AppState, root: &Path) {
         .collect();
 
     let imported_at = core_library::now_epoch();
+    let mut inserted_any = false;
     if let Ok(mut db) = st.db.lock() {
         if let Ok(tx) = db.conn.transaction() {
             for r in results.iter().flatten() {
-                let _ = core_library::insert_image(&tx, folder_id, imported_at, r);
+                if let Ok(Some(_)) = core_library::insert_image(&tx, folder_id, imported_at, r) {
+                    inserted_any = true;
+                }
             }
             let _ = tx.commit();
+        }
+    }
+    inserted_any
+}
+
+/// RAII marker that an import is running, so the FS watcher defers its sync pass for the duration
+/// (preventing a double-index race once the import releases the DB lock between files). On drop —
+/// the last in-flight import finishing — if the watcher tried to sync while gated, one sync is run
+/// to reconcile any real on-disk change that happened during the import window.
+pub struct ImportGuard {
+    app: AppHandle,
+}
+
+impl ImportGuard {
+    pub fn new(app: AppHandle) -> Self {
+        app.state::<AppState>()
+            .import_active
+            .fetch_add(1, Ordering::SeqCst);
+        Self { app }
+    }
+}
+
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        let st = self.app.state::<AppState>();
+        // `fetch_sub` returns the prior value; `== 1` means this was the last active import.
+        if st.import_active.fetch_sub(1, Ordering::SeqCst) == 1
+            && st.watch_pending.swap(false, Ordering::SeqCst)
+        {
+            let app = self.app.clone();
+            std::thread::spawn(move || sync(&app));
         }
     }
 }
