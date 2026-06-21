@@ -113,11 +113,12 @@ fn develop_params_have_correct_effects() {
     );
 }
 
-/// Scene-referred highlight headroom: linear values >1.0 must NOT hard-clip to pure white. The soft
-/// rolloff keeps them below 255 and keeps brighter inputs brighter (so a Highlights pull can recover
-/// detail). Regression guard for removing the old `clamp(lin,0,1)` pre-OETF.
+/// Scene-referred base tone operator (ACR-matched, full Amount default): maps scene-linear ProPhoto
+/// gray through the display transition to the expected ACR-default 8-bit tonality. Locks the curve
+/// shape (mid-grey anchor + smooth highlight compression + toe), replacing the old fixed `exp()`
+/// shoulder. Vectors from the Codex curve review of the analytic `p=1.35` seed.
 #[test]
-fn highlights_above_one_roll_off_not_clip() {
+fn base_curve_tone_response() {
     let ctx = match GpuContext::new() {
         Ok(c) => c,
         Err(_) => {
@@ -131,26 +132,145 @@ fn highlights_above_one_roll_off_not_clip() {
         let img = solid(8, 8, [v, v, v]);
         let prep = pipe.prepare(&ctx, &img).unwrap();
         let out = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+        // Solid input ⇒ every pixel identical ⇒ mean == the exact 8-bit output value.
         mean_channel(&out, 0)
     };
 
-    let at_one = render_val(1.0);
-    let at_onefive = render_val(1.5);
-    let at_two = render_val(2.0);
+    // (scene-linear input, inclusive 8-bit output bounds). Mid-grey 0.18 must anchor near 118.
+    let cases = [
+        (0.0_f32, 0.0_f64, 1.0_f64),
+        (0.01, 11.0, 17.0),
+        (0.05, 51.0, 58.0),
+        (0.18, 116.0, 120.0),
+        (0.5, 178.0, 185.0),
+        (1.0, 213.0, 220.0),
+        (2.0, 234.0, 241.0),
+        (4.0, 245.0, 251.0),
+    ];
+    let mut prev = -1.0;
+    for (x, lo, hi) in cases {
+        let got = render_val(x);
+        assert!(
+            got >= lo && got <= hi,
+            "base curve f({x}) → 8-bit {got}, expected [{lo},{hi}]"
+        );
+        assert!(
+            got > prev,
+            "tone response must be monotonic ({prev} -> {got} at x={x})"
+        );
+        prev = got;
+    }
+}
 
-    // A linear 1.0 must roll off below pure white (the old hard clamp would make it exactly 255).
+/// The per-channel base curve desaturates highlights, but the hue-protection blend must keep a
+/// saturated highlight the SAME hue (no neon twist, no flip to white). A bright saturated red stays
+/// distinctly red (R ≫ B) in the output.
+#[test]
+fn base_curve_preserves_saturated_hue() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+
+    // Bright, saturated red with headroom (>1.0) — the regime where per-channel curves twist hue.
+    let red = solid(16, 16, [3.0, 0.3, 0.3]);
+    let prep = pipe.prepare(&ctx, &red).unwrap();
+    let out = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let (r, b) = (mean_channel(&out, 0), mean_channel(&out, 2));
     assert!(
-        at_one < 252.0,
-        "linear 1.0 must roll off below 255 (got {at_one})"
+        r > b + 30.0,
+        "saturated red must stay red after tone mapping (r {r}, b {b})"
     );
-    // Headroom above 1.0 is preserved as distinguishable brightness (detail to recover), not all-255.
+}
+
+/// Crop selects the right region (UV-remap). The `edge` image is dark-left | bright-right; cropping
+/// to the right half makes the output center sample the bright side, the left half the dark side.
+#[test]
+fn crop_selects_region() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = edge(64, 16);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+
+    let center = |crop: core_pipeline::Crop| {
+        let out = pipe
+            .render(
+                &ctx,
+                &prep,
+                &DevelopParams {
+                    crop,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        out[(8 * 64 + 32) * 4] as i32 // center pixel, R channel
+    };
+
+    let right = center(core_pipeline::Crop {
+        cx: 0.75,
+        cy: 0.5,
+        hw: 0.25,
+        hh: 0.5,
+        angle: 0.0,
+    });
+    let left = center(core_pipeline::Crop {
+        cx: 0.25,
+        cy: 0.5,
+        hw: 0.25,
+        hh: 0.5,
+        angle: 0.0,
+    });
     assert!(
-        at_onefive > at_one + 3.0,
-        "linear 1.5 must read brighter than 1.0 ({at_one} -> {at_onefive})"
+        right > left + 20,
+        "crop must select the sampled region (right-center {right} vs left-center {left})"
     );
+}
+
+/// Straighten (rotation + autozoom) on a solid image must keep the center a clean, artifact-free
+/// copy of the un-rotated render (rotating a uniform field is a no-op; autozoom must not bleed the
+/// letterbox edge into the center).
+#[test]
+fn straighten_solid_has_no_center_artifacts() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = solid(48, 32, [0.35, 0.35, 0.35]);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let flat = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let tilted = pipe
+        .render(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                crop: core_pipeline::Crop {
+                    angle: 8.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let at = |buf: &[u8]| buf[(16 * 48 + 24) * 4] as i32; // center pixel
     assert!(
-        at_two >= at_onefive - 1.0,
-        "monotonic into the shoulder ({at_onefive} -> {at_two})"
+        (at(&tilted) - at(&flat)).abs() <= 2,
+        "straighten of a solid must leave the center unchanged ({} vs {})",
+        at(&flat),
+        at(&tilted)
     );
 }
 

@@ -6,9 +6,10 @@ import {
   useState,
 } from "react";
 import MaskOverlay from "./MaskOverlay";
+import CropOverlay from "./CropOverlay";
 import { useDevelopStore } from "../../store/develop";
 import { useAppStore } from "../../store/app";
-import type { BrushStroke, ComponentKind, Mask } from "../../lib/ipc";
+import type { BrushStroke, ComponentKind, Crop, Mask } from "../../lib/ipc";
 
 const PLACEHOLDER_SRC =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNTAwIDEwMDAiPgo8ZGVmcz4KPGxpbmVhckdyYWRpZW50IGlkPSJzIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMSI+CjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzViN2I5NiIvPjxzdG9wIG9mZnNldD0iLjM4IiBzdG9wLWNvbG9yPSIjODY5NTlhIi8+CjxzdG9wIG9mZnNldD0iLjUyIiBzdG9wLWNvbG9yPSIjOWE4YTZlIi8+PHN0b3Agb2Zmc2V0PSIuNjYiIHN0b3AtY29sb3I9IiM1YzUzNDAiLz4KPHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjMzMyYzIyIi8+PC9saW5lYXJHcmFkaWVudD4KPHJhZGlhbEdyYWRpZW50IGlkPSJ1IiBjeD0iLjUiIGN5PSIuMSIgcj0iLjU1Ij4KPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZTZiZDdkIi8+PHN0b3Agb2Zmc2V0PSIuNDUiIHN0b3AtY29sb3I9IiNiODg5NWEiIHN0b3Atb3BhY2l0eT0iLjUiLz4KPHN0b3Agb2Zmc2V0PSIuOCIgc3RvcC1jb2xvcj0iI2I4ODk1YSIgc3RvcC1vcGFjaXR5PSIwIi8+PC9yYWRpYWxHcmFkaWVudD4KPHJhZGlhbEdyYWRpZW50IGlkPSJ2IiBjeD0iLjUiIGN5PSIuNSIgcj0iLjc1Ij4KPHN0b3Agb2Zmc2V0PSIuNTgiIHN0b3AtY29sb3I9IiMwMDAiIHN0b3Atb3BhY2l0eT0iMCIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzAwMCIgc3RvcC1vcGFjaXR5PSIuNCIvPjwvcmFkaWFsR3JhZGllbnQ+CjwvZGVmcz4KPHJlY3Qgd2lkdGg9IjE1MDAiIGhlaWdodD0iMTAwMCIgZmlsbD0idXJsKCNzKSIvPgo8cmVjdCB3aWR0aD0iMTUwMCIgaGVpZ2h0PSIxMDAwIiBmaWxsPSJ1cmwoI3UpIi8+CjxyZWN0IHdpZHRoPSIxNTAwIiBoZWlnaHQ9IjEwMDAiIGZpbGw9InVybCgjdikiLz4KPC9zdmc+Cg==";
@@ -23,6 +24,8 @@ interface StageProps {
   previewUrl: string | null;
   rendering: boolean;
   masks: Mask[];
+  crop: Crop;
+  onCropChange: (patch: Partial<Crop>) => void;
   onChangeMaskKind: (
     index: number,
     compIndex: number,
@@ -37,6 +40,8 @@ export default function Stage({
   previewUrl,
   rendering,
   masks,
+  crop,
+  onCropChange,
   onChangeMaskKind,
   onCommitStroke,
 }: StageProps) {
@@ -46,6 +51,7 @@ export default function Stage({
     (s) => s.selectedComponentIndex,
   );
   const maskOverlayVisible = useDevelopStore((s) => s.maskOverlayVisible);
+  const cropMode = useDevelopStore((s) => s.cropMode);
   const brush = useDevelopStore((s) => s.brush);
   const setFullRes = useDevelopStore((s) => s.setFullRes);
   // Reset zoom/pan only when the IMAGE changes — keyed on selectedId, not imageUrl (which gets a new
@@ -202,8 +208,12 @@ export default function Stage({
           alt="RAW preview"
           onLoad={(e) => {
             const im = e.currentTarget;
-            if (im.naturalWidth > 0)
+            if (im.naturalWidth > 0) {
               setNat({ w: im.naturalWidth, h: im.naturalHeight });
+              useDevelopStore
+                .getState()
+                .setImageAspect(im.naturalWidth / im.naturalHeight);
+            }
           }}
           style={{
             display: "block",
@@ -239,6 +249,14 @@ export default function Stage({
               onCommitStroke(selectedMaskIndex!, stroke)
             }
             imageUrl={imageUrl}
+          />
+        )}
+        {cropMode && !showBefore && (
+          <CropOverlay
+            width={dispW}
+            height={dispH}
+            crop={crop}
+            onChange={onCropChange}
           />
         )}
       </div>

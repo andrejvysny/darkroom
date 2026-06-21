@@ -19,6 +19,7 @@ export default function DevelopView() {
     onParamChange,
     onCurveChange,
     onHslChange,
+    onCropChange,
     resetKeys,
     reset,
     addMask,
@@ -91,6 +92,8 @@ export default function DevelopView() {
           previewUrl={previewUrl}
           rendering={rendering}
           masks={params.masks}
+          crop={params.crop}
+          onCropChange={onCropChange}
           onChangeMaskKind={updateMaskComponentKind}
           onCommitStroke={appendStroke}
         />
@@ -99,6 +102,7 @@ export default function DevelopView() {
           onParamChange={onParamChange}
           onCurveChange={onCurveChange}
           onHslChange={onHslChange}
+          onCropChange={onCropChange}
           resetKeys={resetKeys}
           onReset={reset}
           onAddMask={addMask}

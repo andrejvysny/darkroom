@@ -542,6 +542,24 @@ export type Mask = {
 /** Maximum masks per image (must match Rust `MASK_CAP`). */
 export const MASK_CAP = 16;
 
+/** Crop + straighten geometry. Mirrors Rust `Crop`. Center (cx,cy) + half-extents (hw,hh) in
+ * normalized image coords; `angle` is the straighten correction in degrees. Full frame = identity. */
+export type Crop = {
+  cx: number;
+  cy: number;
+  hw: number;
+  hh: number;
+  angle: number;
+};
+
+export const DEFAULT_CROP: Crop = {
+  cx: 0.5,
+  cy: 0.5,
+  hw: 0.5,
+  hh: 0.5,
+  angle: 0,
+};
+
 export type DevelopParams = {
   exposure: number;
   temp: number;
@@ -556,13 +574,19 @@ export type DevelopParams = {
   nrLuma: number;
   nrColor: number;
   vignette: number;
+  /** Scene-referred base tone operator strength, 0..100 (0 = flat, 100 = full ACR look). */
+  toneAmount: number;
   toneCurve: ToneCurve;
   hsl: HslBand[];
+  crop: Crop;
   masks: Mask[];
 };
 
-/** The numeric (scalar) develop params — everything except the structured curve/hsl fields. */
-export type ScalarParamKey = Exclude<keyof DevelopParams, "toneCurve" | "hsl">;
+/** The numeric (scalar) develop params — everything except the structured fields. */
+export type ScalarParamKey = Exclude<
+  keyof DevelopParams,
+  "toneCurve" | "hsl" | "crop" | "masks"
+>;
 
 export const EMPTY_TONE_CURVE: ToneCurve = { rgb: [], r: [], g: [], b: [] };
 
@@ -580,8 +604,10 @@ export const DEFAULT_PARAMS: DevelopParams = {
   nrLuma: 0,
   nrColor: 0,
   vignette: 0,
+  toneAmount: 100,
   toneCurve: { rgb: [], r: [], g: [], b: [] },
   hsl: Array.from({ length: HSL_BANDS }, () => ({ h: 0, s: 0, l: 0 })),
+  crop: { ...DEFAULT_CROP },
   masks: [],
 };
 

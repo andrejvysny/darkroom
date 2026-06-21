@@ -63,6 +63,30 @@ fn write_lut(ctx: &GpuContext, tex: &wgpu::Texture, lut: &[u8]) {
     );
 }
 
+/// Upload the base tone-operator LUT (`BASE_LUT_SIZE` f32 entries) to `tex` (R32Float, Nx1).
+fn write_base_lut(ctx: &GpuContext, tex: &wgpu::Texture, lut: &[f32]) {
+    let w = crate::params::BASE_LUT_SIZE as u32;
+    ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(lut),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 /// Per-image GPU resources, reused across many `render()` calls (one per slider change).
 pub struct PreparedImage {
     pub width: u32,
@@ -79,6 +103,11 @@ pub struct PreparedImage {
     readback: wgpu::Buffer,
     // Tone-curve LUT, rewritten per render() from the current params.
     lut: wgpu::Texture,
+    // Scene-referred base tone operator: log-exposure LUT + its uniform, rewritten per render().
+    base_lut: wgpu::Texture,
+    tone_op_uniform: wgpu::Buffer,
+    // Crop + straighten geometry uniform, rewritten per render().
+    geom_uniform: wgpu::Buffer,
     // Per-mask scalar deltas, rewritten per render() from the current params.
     mask_buffer: wgpu::Buffer,
     // Pre-pass uniform (one mask's components), rewritten per mask per render().
@@ -218,6 +247,39 @@ impl DevelopPipeline {
                 // Detail (sharpen/NR) + vignette + texel size (uniform).
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Base tone operator uniform (log-exposure domain + hue-protect).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Base tone-operator LUT (R32Float Nx1), read via textureLoad (no sampler needed).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Crop + straighten geometry (uniform).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -383,6 +445,16 @@ impl DevelopPipeline {
             contents: bytemuck::bytes_of(&crate::params::ExtraUniform::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let tone_op_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("develop-tone-op-uniform"),
+            contents: bytemuck::bytes_of(&crate::params::ToneOpUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let geom_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("develop-geom-uniform"),
+            contents: bytemuck::bytes_of(&crate::params::GeomUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         // Tone-curve LUT: 256x1 RGBA8, seeded with identity (overwritten each render()).
         let lut_size = wgpu::Extent3d {
@@ -401,6 +473,24 @@ impl DevelopPipeline {
             view_formats: &[],
         });
         write_lut(ctx, &lut, &crate::curve::identity_lut());
+
+        // Base tone-operator LUT: R32Float Nx1 over the log-exposure domain (overwritten each
+        // render()). Seeded with the default (full-amount ACR) curve.
+        let base_lut = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("develop-base-lut"),
+            size: wgpu::Extent3d {
+                width: crate::params::BASE_LUT_SIZE as u32,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        write_base_lut(ctx, &base_lut, &DevelopParams::default().base_curve_lut());
 
         // Mask alpha layers: R16Float, MASK_CAP layers, same size as the image. Zero-initialised by
         // wgpu; the mask pre-pass (later phase) writes real coverage via RENDER_ATTACHMENT
@@ -520,6 +610,7 @@ impl DevelopPipeline {
         });
 
         let lut_view = lut.create_view(&wgpu::TextureViewDescriptor::default());
+        let base_lut_view = base_lut.create_view(&wgpu::TextureViewDescriptor::default());
         let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor {
             label: Some("develop-mask-view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -569,6 +660,18 @@ impl DevelopPipeline {
                     binding: 9,
                     resource: extra_uniform.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: tone_op_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&base_lut_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: geom_uniform.as_entire_binding(),
+                },
             ],
         });
 
@@ -597,6 +700,9 @@ impl DevelopPipeline {
             output,
             readback,
             lut,
+            base_lut,
+            tone_op_uniform,
+            geom_uniform,
             mask_buffer,
             prepass_uniform,
             prepass_bind,
@@ -652,6 +758,24 @@ impl DevelopPipeline {
             crate::curve::build_lut(&params.tone_curve)
         };
         write_lut(ctx, &prepared.lut, &lut);
+
+        // Refresh the scene-referred base tone operator (uniform + log-exposure LUT). Always on
+        // (mandatory base render transform); cheap to rebuild (BASE_LUT_SIZE f32 entries).
+        ctx.queue.write_buffer(
+            &prepared.tone_op_uniform,
+            0,
+            bytemuck::bytes_of(&params.to_tone_op()),
+        );
+        write_base_lut(ctx, &prepared.base_lut, &params.base_curve_lut());
+
+        // Crop + straighten geometry. Preview renders into the input-sized output (out == src
+        // aspect), so the crop is letterbox-fit; true-dims export uses a crop-sized output instead.
+        let aspect = w.max(1) as f32 / h.max(1) as f32;
+        ctx.queue.write_buffer(
+            &prepared.geom_uniform,
+            0,
+            bytemuck::bytes_of(&params.to_geom(aspect, aspect)),
+        );
 
         // Mask pre-pass: compute each enabled mask's composited alpha into its alpha layer. Same
         // order as `to_mask_buffer` (enabled masks, dense 0..count). One submit per mask so the

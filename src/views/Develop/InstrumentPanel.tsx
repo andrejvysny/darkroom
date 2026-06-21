@@ -5,15 +5,18 @@ import ToneCurve from "./ToneCurve";
 import ColorMixer from "./ColorMixer";
 import MaskPanel from "./MaskPanel";
 import Icon from "../../components/Icon";
-import type {
-  DevelopParams,
-  LocalAdjust,
-  Mask,
-  MaskComponent,
-  ScalarParamKey,
-  ToneCurveChannel,
-  CurvePoint,
-  HslBand,
+import { useDevelopStore } from "../../store/develop";
+import {
+  DEFAULT_CROP,
+  type DevelopParams,
+  type LocalAdjust,
+  type Mask,
+  type MaskComponent,
+  type ScalarParamKey,
+  type ToneCurveChannel,
+  type CurvePoint,
+  type HslBand,
+  type Crop,
 } from "../../lib/ipc";
 
 interface InstrumentPanelProps {
@@ -21,6 +24,7 @@ interface InstrumentPanelProps {
   onParamChange: (key: ScalarParamKey, value: number) => void;
   onCurveChange: (channel: ToneCurveChannel, points: CurvePoint[]) => void;
   onHslChange: (index: number, patch: Partial<HslBand>) => void;
+  onCropChange: (patch: Partial<Crop>) => void;
   resetKeys: (keys: ScalarParamKey[]) => void;
   onReset: () => void;
   onAddMask: (mask: Mask) => void;
@@ -41,6 +45,7 @@ export default function InstrumentPanel({
   onParamChange,
   onCurveChange,
   onHslChange,
+  onCropChange,
   resetKeys,
   onReset,
   onAddMask,
@@ -51,6 +56,25 @@ export default function InstrumentPanel({
   onUpdateComponent,
   onDeleteComponent,
 }: InstrumentPanelProps) {
+  const cropMode = useDevelopStore((s) => s.cropMode);
+  const setCropMode = useDevelopStore((s) => s.setCropMode);
+  const imageAspect = useDevelopStore((s) => s.imageAspect);
+
+  // Centered crop rect of a target pixel aspect ratio that fills the frame. `target<=0` ⇒ full frame.
+  // imageAspect is 0 until the Stage measures the loaded image; in that brief window a ratio preset
+  // only opens the tool (no wrong-aspect crop) — the user can re-click once the image is measured.
+  const setAspect = (target: number) => {
+    if (target <= 0) {
+      onCropChange({ cx: 0.5, cy: 0.5, hw: 0.5, hh: 0.5 });
+    } else if (imageAspect > 0) {
+      const k = target / imageAspect; // hw/hh
+      const hw = k >= 1 ? 0.5 : 0.5 * k;
+      const hh = k >= 1 ? 0.5 / k : 0.5;
+      onCropChange({ cx: 0.5, cy: 0.5, hw, hh });
+    }
+    setCropMode(true);
+  };
+
   return (
     <aside
       style={{
@@ -210,12 +234,21 @@ export default function InstrumentPanel({
       <Module
         title="Tone curve"
         onReset={() => {
+          onParamChange("toneAmount", 100);
           onCurveChange("rgb", []);
           onCurveChange("r", []);
           onCurveChange("g", []);
           onCurveChange("b", []);
         }}
       >
+        <Slider
+          label="Base curve"
+          min={0}
+          max={100}
+          defaultValue={100}
+          value={params.toneAmount}
+          onChange={(v) => onParamChange("toneAmount", v)}
+        />
         <ToneCurve curve={params.toneCurve} onChange={onCurveChange} />
       </Module>
 
@@ -284,18 +317,78 @@ export default function InstrumentPanel({
         />
       </Module>
 
-      {/* Crop & geometry — not yet wired to the GPU pipeline; shown as upcoming, not a dead control. */}
-      <Module title="Crop & geometry" defaultCollapsed>
-        <div
+      {/* Crop & straighten */}
+      <Module
+        title="Crop & straighten"
+        defaultCollapsed
+        onReset={() => {
+          onCropChange({ ...DEFAULT_CROP });
+          setCropMode(false);
+        }}
+      >
+        <button
+          onClick={() => setCropMode(!cropMode)}
           style={{
-            fontSize: 11.5,
-            color: "var(--color-t3)",
-            lineHeight: 1.5,
-            padding: "2px 0",
+            width: "100%",
+            padding: "7px 0",
+            marginBottom: 10,
+            border: "1px solid var(--color-line)",
+            borderRadius: "var(--radius-sm)",
+            fontSize: 12,
+            background: cropMode ? "var(--color-accent)" : "transparent",
+            color: cropMode ? "#fff" : "var(--color-t2)",
+            cursor: "pointer",
           }}
         >
-          Crop, straighten, and lens correction are coming soon.
+          {cropMode ? "Done cropping" : "Adjust crop"}
+        </button>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(4, 1fr)",
+            gap: 6,
+            marginBottom: 12,
+          }}
+        >
+          {(
+            [
+              ["Full", 0],
+              ["1:1", 1],
+              ["4:5", 4 / 5],
+              ["5:4", 5 / 4],
+              ["3:2", 3 / 2],
+              ["2:3", 2 / 3],
+              ["4:3", 4 / 3],
+              ["16:9", 16 / 9],
+            ] as [string, number][]
+          ).map(([label, ar]) => (
+            <button
+              key={label}
+              onClick={() => setAspect(ar)}
+              style={{
+                padding: "5px 0",
+                border: "1px solid var(--color-line)",
+                borderRadius: "var(--radius-sm)",
+                fontSize: 11,
+                color: "var(--color-t2)",
+                background: "transparent",
+                cursor: "pointer",
+              }}
+            >
+              {label}
+            </button>
+          ))}
         </div>
+        <Slider
+          label="Straighten"
+          min={-45}
+          max={45}
+          defaultValue={0}
+          bipolar
+          decimals={1}
+          value={params.crop.angle}
+          onChange={(v) => onCropChange({ angle: v })}
+        />
       </Module>
 
       {/* Global reset at panel bottom */}
