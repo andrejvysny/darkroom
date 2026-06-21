@@ -1,4 +1,3 @@
-import { useState } from "react";
 import Histogram from "./Histogram";
 import Module from "./Module";
 import Slider from "./Slider";
@@ -16,9 +15,6 @@ import type {
   CurvePoint,
   HslBand,
 } from "../../lib/ipc";
-
-type AspectRatio = "3:2" | "16:9" | "1:1" | "4:5" | "Free";
-const ASPECTS: AspectRatio[] = ["3:2", "16:9", "1:1", "4:5", "Free"];
 
 interface InstrumentPanelProps {
   params: DevelopParams;
@@ -55,8 +51,6 @@ export default function InstrumentPanel({
   onUpdateComponent,
   onDeleteComponent,
 }: InstrumentPanelProps) {
-  const [aspect, setAspect] = useState<AspectRatio>("3:2");
-
   return (
     <aside
       style={{
@@ -290,41 +284,18 @@ export default function InstrumentPanel({
         />
       </Module>
 
-      {/* Crop & Geometry */}
+      {/* Crop & geometry — not yet wired to the GPU pipeline; shown as upcoming, not a dead control. */}
       <Module title="Crop & geometry" defaultCollapsed>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {ASPECTS.map((a) => (
-            <button
-              key={a}
-              onClick={() => setAspect(a)}
-              style={{
-                padding: "4px 10px",
-                border: "1px solid",
-                borderRadius: "var(--radius-sm)",
-                fontSize: 11.5,
-                fontFamily: "var(--font-mono)",
-                cursor: "pointer",
-                color: aspect === a ? "var(--color-t1)" : "var(--color-t2)",
-                borderColor:
-                  aspect === a
-                    ? "var(--color-accent-line)"
-                    : "var(--color-line)",
-                background:
-                  aspect === a ? "var(--color-accent-dim)" : "transparent",
-              }}
-            >
-              {a}
-            </button>
-          ))}
+        <div
+          style={{
+            fontSize: 11.5,
+            color: "var(--color-t3)",
+            lineHeight: 1.5,
+            padding: "2px 0",
+          }}
+        >
+          Crop, straighten, and lens correction are coming soon.
         </div>
-        <Slider
-          label="Angle"
-          min={-45}
-          max={45}
-          defaultValue={0}
-          bipolar
-          suffix="°"
-        />
       </Module>
 
       {/* Global reset at panel bottom */}

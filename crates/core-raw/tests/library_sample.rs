@@ -27,6 +27,12 @@ fn sample_cr3() -> Option<PathBuf> {
 #[test]
 fn metadata_thumbnail_hash_fingerprint() {
     let Some(path) = sample_cr3() else {
+        // In CI (DARKROOM_REQUIRE_FIXTURES set) a missing committed fixture is a hard failure, not a
+        // silent pass — that's how the committed CR3 disappearing gets caught.
+        assert!(
+            std::env::var_os("DARKROOM_REQUIRE_FIXTURES").is_none(),
+            "CR3 fixture (library/2026) missing but DARKROOM_REQUIRE_FIXTURES is set"
+        );
         eprintln!("library/2026 not present — skipping");
         return;
     };

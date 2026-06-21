@@ -293,6 +293,7 @@ pub async fn develop_set_edit(
             core_library::now_epoch(),
         )
         .map_err(|e| e.to_string())?;
+        sync_sidecar(&db.conn, image_id);
         let _ = core_library::append_event(
             &db.conn,
             &crate::events::stamp(
@@ -739,6 +740,20 @@ where
     .map_err(|e| e.to_string())?
 }
 
+/// Best-effort: (re)write the per-image sidecar after a catalog mutation so disk stays the durable
+/// source of edit intent. Never fails the command — a sidecar error is logged and swallowed.
+fn sync_sidecar(conn: &core_db::rusqlite::Connection, image_id: i64) {
+    if let Err(e) = core_library::write_sidecar(conn, image_id) {
+        eprintln!("sidecar write failed for image {image_id}: {e}");
+    }
+}
+
+fn sync_sidecars(conn: &core_db::rusqlite::Connection, image_ids: &[i64]) {
+    for &id in image_ids {
+        sync_sidecar(conn, id);
+    }
+}
+
 /// `flag` value → event-type label (for the behavioral log).
 fn flag_event_type(flag: &str) -> &'static str {
     match flag {
@@ -761,6 +776,7 @@ pub async fn cull_set_rating(
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_rating(&db.conn, image_id, stars).map_err(|e| e.to_string())?;
+        sync_sidecar(&db.conn, image_id);
         let _ = core_library::append_event(
             &db.conn,
             &crate::events::stamp(
@@ -795,6 +811,7 @@ pub async fn cull_set_flag(
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_flag(&db.conn, image_id, &flag).map_err(|e| e.to_string())?;
+        sync_sidecar(&db.conn, image_id);
         let _ = core_library::append_event(
             &db.conn,
             &crate::events::stamp(
@@ -829,6 +846,7 @@ pub async fn cull_set_label(
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_label(&db.conn, image_id, label.as_deref()).map_err(|e| e.to_string())?;
+        sync_sidecar(&db.conn, image_id);
         let _ = core_library::append_event(
             &db.conn,
             &crate::events::stamp(
@@ -881,6 +899,7 @@ pub async fn cull_set_rating_many(
         let st = app.state::<AppState>();
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_rating_many(&mut db.conn, &image_ids, stars).map_err(|e| e.to_string())?;
+        sync_sidecars(&db.conn, &image_ids);
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
             core_library::Event {
                 event_type: "culling.rate".into(),
@@ -905,6 +924,7 @@ pub async fn cull_set_flag_many(
         let st = app.state::<AppState>();
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_flag_many(&mut db.conn, &image_ids, &flag).map_err(|e| e.to_string())?;
+        sync_sidecars(&db.conn, &image_ids);
         let et = flag_event_type(&flag);
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |id| {
             core_library::Event {
@@ -932,6 +952,7 @@ pub async fn cull_set_label_many(
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_label_many(&mut db.conn, &image_ids, label.as_deref())
             .map_err(|e| e.to_string())?;
+        sync_sidecars(&db.conn, &image_ids);
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
             core_library::Event {
                 event_type: "culling.label".into(),
@@ -978,7 +999,10 @@ pub async fn keyword_add_to_image(
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::add_keyword_to_image(&db.conn, image_id, &name).map_err(|e| e.to_string())
+        let row =
+            core_library::add_keyword_to_image(&db.conn, image_id, &name).map_err(|e| e.to_string())?;
+        sync_sidecar(&db.conn, image_id);
+        Ok(row)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -993,7 +1017,10 @@ pub async fn keyword_add_to_images(
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::add_keyword_to_images(&db.conn, &image_ids, &name).map_err(|e| e.to_string())
+        let row = core_library::add_keyword_to_images(&db.conn, &image_ids, &name)
+            .map_err(|e| e.to_string())?;
+        sync_sidecars(&db.conn, &image_ids);
+        Ok(row)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1005,15 +1032,40 @@ pub async fn keyword_remove_from_image(
     image_id: i64,
     keyword_id: i64,
 ) -> Result<(), String> {
-    db_write(app, move |c| {
-        core_library::remove_keyword_from_image(c, image_id, keyword_id)
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::remove_keyword_from_image(&db.conn, image_id, keyword_id)
+            .map_err(|e| e.to_string())?;
+        sync_sidecar(&db.conn, image_id);
+        Ok(())
     })
     .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), String> {
-    db_write(app, move |c| core_library::delete_keyword(c, keyword_id)).await
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        // Capture images that carry this keyword BEFORE the cascade delete, to rewrite their sidecars.
+        let affected: Vec<i64> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT image_id FROM image_keywords WHERE keyword_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([keyword_id], |r| r.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(Result::ok).collect()
+        };
+        core_library::delete_keyword(&db.conn, keyword_id).map_err(|e| e.to_string())?;
+        sync_sidecars(&db.conn, &affected);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------- Collections ----------
@@ -1493,6 +1545,54 @@ pub async fn features_backfill(app: AppHandle) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || crate::features::run_backfill(&app2))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Real per-image histogram for the Library metadata panel, computed from the cached thumbnail (no
+/// GPU render needed). `None` if the image/thumb is unavailable.
+#[tauri::command]
+pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<Histogram>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let hash = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            match core_library::image_by_id(&db.conn, image_id).map_err(|e| e.to_string())? {
+                Some(r) => r.content_hash,
+                None => return Ok(None),
+            }
+        };
+        let Ok(jpeg) = st.thumbs.read(&hash, core_library::THUMB_SIZE) else {
+            return Ok(None);
+        };
+        Ok(core_pipeline::histogram_from_jpeg(&jpeg))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Write a sidecar (`<raw>.json`: edits + rating + keywords) next to every present RAW — migrates an
+/// existing catalog onto the durable on-disk format. Returns the count written.
+#[tauri::command]
+pub async fn sidecars_write_all(app: AppHandle) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::write_all_sidecars(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Force-apply every present image's sidecar back into the catalog (recover edits/ratings/keywords
+/// after a catalog loss or when moving between machines). Returns the count hydrated.
+#[tauri::command]
+pub async fn sidecars_rebuild(app: AppHandle) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::rebuild_from_sidecars(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Manual ground-truth labels for one image (the "Contains person/animal" checkboxes).

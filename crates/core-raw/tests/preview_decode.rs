@@ -36,6 +36,10 @@ fn channel_means(img: &core_raw::LinearImage) -> [f64; 3] {
 #[test]
 fn preview_matches_full_within_tolerance() {
     let Some(path) = sample_cr3() else {
+        assert!(
+            std::env::var_os("DARKROOM_REQUIRE_FIXTURES").is_none(),
+            "CR3 fixture (library/2026) missing but DARKROOM_REQUIRE_FIXTURES is set"
+        );
         eprintln!("library/2026 not present — skipping");
         return;
     };

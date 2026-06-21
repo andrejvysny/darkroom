@@ -23,6 +23,13 @@ pub fn histogram(rgba: &[u8]) -> Histogram {
     Histogram { r, g, b }
 }
 
+/// Decode a JPEG (e.g. a cached thumbnail) and compute its histogram. `None` if it doesn't decode.
+/// Lets the Library metadata panel show a REAL per-image histogram without a GPU render.
+pub fn histogram_from_jpeg(bytes: &[u8]) -> Option<Histogram> {
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    Some(histogram(&rgba))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

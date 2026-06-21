@@ -48,8 +48,12 @@ impl LinearImage {
         let scale = max_edge as f32 / longest as f32;
         let nw = ((self.width as f32 * scale).round() as u32).max(1);
         let nh = ((self.height as f32 * scale).round() as u32).max(1);
-        let buf = Rgb32FImage::from_raw(self.width, self.height, self.data.clone())
-            .expect("linear buffer dims match data length");
+        // Defensive: a buffer whose length doesn't match its dims would panic in `from_raw`. That
+        // invariant always holds for our decoders, but never crash on it — return the source
+        // un-downscaled instead.
+        let Some(buf) = Rgb32FImage::from_raw(self.width, self.height, self.data.clone()) else {
+            return self.clone();
+        };
         let resized = image::imageops::resize(&buf, nw, nh, FilterType::Lanczos3);
         LinearImage {
             width: nw,
@@ -66,11 +70,16 @@ impl LinearImage {
         if longest <= max_edge {
             return self;
         }
+        // Defensive: never panic on a dims/length mismatch (always holds for our decoders) — skip
+        // the downscale and return the buffer unchanged.
+        if self.data.len() != self.width as usize * self.height as usize * 3 {
+            return self;
+        }
         let scale = max_edge as f32 / longest as f32;
         let nw = ((self.width as f32 * scale).round() as u32).max(1);
         let nh = ((self.height as f32 * scale).round() as u32).max(1);
-        let buf = Rgb32FImage::from_raw(self.width, self.height, self.data)
-            .expect("linear buffer dims match data length");
+        let buf =
+            Rgb32FImage::from_raw(self.width, self.height, self.data).expect("dims verified above");
         let resized = image::imageops::resize(&buf, nw, nh, FilterType::Triangle);
         LinearImage {
             width: nw,
@@ -90,8 +99,12 @@ impl LinearImage {
         if o == Orientation::NoTransforms {
             return self;
         }
-        let buf = Rgb32FImage::from_raw(self.width, self.height, self.data)
-            .expect("linear buffer dims match data length");
+        // Defensive: never panic on a dims/length mismatch (always holds for our decoders).
+        if self.data.len() != self.width as usize * self.height as usize * 3 {
+            return self;
+        }
+        let buf =
+            Rgb32FImage::from_raw(self.width, self.height, self.data).expect("dims verified above");
         let mut img = DynamicImage::ImageRgb32F(buf);
         img.apply_orientation(o);
         let buf = img.into_rgb32f();
@@ -165,8 +178,10 @@ fn wb_or_neutral(raw: &RawImage) -> [f32; 4] {
 /// Standard RGB sensors with a usable color matrix take the **headroom-preserving** path: demosaic +
 /// crop WITHOUT rawler's `Calibrate`, then our own camera→linear-ProPhoto map with `clip_negative` — so
 /// scene values >1.0 survive into the GPU buffer (the develop shader's soft highlight rolloff then
-/// uses that headroom). This shares `map_3ch_to_rgb` with the preview path, so export == preview.
-/// 4-colour / monochrome / matrix-less sensors fall back to rawler's calibrated develop.
+/// uses that headroom). This shares `map_3ch_to_rgb` with the preview path, so export matches the
+/// preview's GLOBAL tone/color; pixel-local detail differs (the preview is a ½-res superpixel
+/// demosaic, so fine colored detail is not bit-identical). 4-colour / monochrome / matrix-less
+/// sensors fall back to rawler's calibrated develop.
 fn develop_linear_from(raw: &RawImage) -> Result<LinearImage, RawError> {
     if let Some(xyz2cam) = cam_xyz2cam(raw) {
         let dev = RawDevelop {
@@ -296,8 +311,19 @@ pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> 
 
     // CropDefault: trim to the recommended crop, made relative to the active area and halved to
     // match the superpixel (½-resolution) output — mirrors rawler's `develop_intermediate`.
-    if let Some(mut crop) = raw.crop_area.or(raw.active_area) {
-        crop = crop.adapt(&raw.active_area.unwrap_or(crop));
+    if let Some(crop) = raw.crop_area.or(raw.active_area) {
+        let master = raw.active_area.unwrap_or(crop);
+        // rawler's `Rect::adapt` ASSERTS the crop is contained in the master (origin ≥, size ≤).
+        // For an unusual body whose crop_area isn't fully inside active_area that assert panics, and
+        // this path is reachable from IPC on arbitrary files — bail to the full pipeline instead.
+        let contained = crop.p.x >= master.p.x
+            && crop.p.y >= master.p.y
+            && crop.d.w <= master.d.w
+            && crop.d.h <= master.d.h;
+        if !contained {
+            return develop_linear(src);
+        }
+        let mut crop = crop.adapt(&master);
         if rgb.dim().w == roi.width() / 2 {
             crop.scale(0.5);
         }

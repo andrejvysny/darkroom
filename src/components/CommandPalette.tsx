@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../store/app";
 import { runExport } from "../lib/export";
 import Icon, { IconName } from "./Icon";
@@ -20,9 +20,11 @@ export default function CommandPalette() {
   const onOpenDedup = useAppStore((s) => s.onOpenDedup);
   const onOpenSettings = useAppStore((s) => s.onOpenSettings);
   const inputRef = useRef<HTMLInputElement>(null);
+  const [query, setQuery] = useState("");
 
   useEffect(() => {
     if (open) {
+      setQuery(""); // fresh search each time the palette opens
       setTimeout(() => inputRef.current?.focus(), 20);
     }
   }, [open]);
@@ -78,7 +80,11 @@ export default function CommandPalette() {
     },
   ];
 
-  const rows = view === "library" ? libraryRows : developRows;
+  const q = query.trim().toLowerCase();
+  const allRows = view === "library" ? libraryRows : developRows;
+  const rows = q
+    ? allRows.filter((r) => r.label.toLowerCase().includes(q))
+    : allRows;
 
   return (
     <div
@@ -125,6 +131,8 @@ export default function CommandPalette() {
           />
           <input
             ref={inputRef}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
             placeholder="Type a command…"
             style={{
               flex: 1,

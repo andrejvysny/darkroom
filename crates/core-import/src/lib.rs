@@ -218,15 +218,14 @@ where
     for (i, src_path) in files.iter().enumerate() {
         // Unlocked: hash, dedup-check, copy, verify, thumbnail/metadata. A per-file error here is
         // recorded and the import continues (a single bad file must not abort the whole run).
-        let outcome =
-            match process_one_unlocked(thumbs, &trash_ctx, src_path, mode, library_root, &seen) {
-                Ok(o) => o,
-                Err(_) => {
-                    stats.failed += 1;
-                    progress(i + 1, total, None);
-                    continue;
-                }
-            };
+        let outcome = match process_one_unlocked(thumbs, src_path, mode, library_root, &seen) {
+            Ok(o) => o,
+            Err(_) => {
+                stats.failed += 1;
+                progress(i + 1, total, None);
+                continue;
+            }
+        };
 
         let row = match outcome {
             Outcome::Skip => {
@@ -259,6 +258,10 @@ where
                                 "UPDATE images SET import_session_id=?1 WHERE id=?2",
                                 params![session_id, id],
                             )?;
+                            // Restore edits/rating/keywords from a sidecar that travelled with the
+                            // RAW (copied in `process_one_unlocked`, or in place for reference mode).
+                            let _ =
+                                core_library::sidecar::hydrate_if_blank(conn, id, &processed.path);
                             // Read-back is best-effort: a failure only costs the live update.
                             Ok(Some((id, image_by_id(conn, id).ok().flatten())))
                         }
@@ -305,7 +308,6 @@ where
 /// only the filesystem + CPU; never the DB. Returns what the caller should catalog (or skip).
 fn process_one_unlocked(
     thumbs: &ThumbCache,
-    trash_ctx: &trash::TrashContext,
     src_path: &Path,
     mode: ImportMode,
     library_root: &Path,
@@ -342,14 +344,29 @@ fn process_one_unlocked(
             }
             let dest = unique_dest(&dest_dir, filename);
 
-            std::fs::copy(src_path, &dest)?;
-            let (vh, _) = hash_file(&dest)?;
+            // Copy to a temp sibling, hash-verify, then ATOMIC rename into place. A crash mid-copy
+            // leaves an inert `*.part` file (not a supported RAW ext, so never enumerated/catalogued)
+            // rather than a truncated file sitting at the real destination name.
+            let tmp = {
+                let mut t = dest.clone().into_os_string();
+                t.push(".part");
+                PathBuf::from(t)
+            };
+            std::fs::copy(src_path, &tmp)?;
+            let (vh, _) = hash_file(&tmp)?;
             if vh != src_hash {
-                // Verification failed — remove the bad copy (silently), preserve the source, fail.
-                let _ = trash_ctx.delete(&dest);
+                // Verification failed — remove the bad temp copy, preserve the source, fail.
+                let _ = std::fs::remove_file(&tmp);
                 return Err(ImportError::Io(std::io::Error::other(
                     "destination hash mismatch after copy",
                 )));
+            }
+            std::fs::rename(&tmp, &dest)?;
+            // Bring along the source's sidecar (edit intent), if any, so the copy keeps its edits.
+            let src_sidecar = core_library::sidecar::sidecar_path(&src_path.display().to_string());
+            if src_sidecar.exists() {
+                let dest_sidecar = core_library::sidecar::sidecar_path(&dest.display().to_string());
+                let _ = std::fs::copy(&src_sidecar, &dest_sidecar);
             }
             let to_trash = if matches!(mode, ImportMode::Move) {
                 Some(src_path.to_path_buf())

@@ -126,6 +126,80 @@ pub fn hamming(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
 
+/// BK-tree over u64 dHashes (Hamming metric) for sub-quadratic near-duplicate queries. Identical
+/// hashes collapse into one node carrying multiple payloads, so a large all-identical cluster (e.g.
+/// many shots of a flat wall) stays cheap instead of degenerating to O(n²). `payload` is the caller's
+/// row index, used to union matches.
+#[derive(Default)]
+struct BkTree {
+    nodes: Vec<BkNode>,
+}
+
+struct BkNode {
+    hash: u64,
+    payloads: Vec<usize>,
+    /// distance-to-this-node → child node index.
+    children: std::collections::HashMap<u32, usize>,
+}
+
+impl BkTree {
+    fn insert(&mut self, hash: u64, payload: usize) {
+        if self.nodes.is_empty() {
+            self.nodes.push(BkNode {
+                hash,
+                payloads: vec![payload],
+                children: std::collections::HashMap::new(),
+            });
+            return;
+        }
+        let mut cur = 0usize;
+        loop {
+            let d = hamming(self.nodes[cur].hash, hash);
+            if d == 0 {
+                self.nodes[cur].payloads.push(payload); // identical dHash → same node
+                return;
+            }
+            match self.nodes[cur].children.get(&d).copied() {
+                Some(next) => cur = next,
+                None => {
+                    let new_idx = self.nodes.len();
+                    self.nodes.push(BkNode {
+                        hash,
+                        payloads: vec![payload],
+                        children: std::collections::HashMap::new(),
+                    });
+                    self.nodes[cur].children.insert(d, new_idx);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Append the payloads of every node within `max_dist` of `target` to `out`. Prunes children by
+    /// the triangle inequality: only branches with key in `[d - max_dist, d + max_dist]` can contain
+    /// a match.
+    fn query(&self, target: u64, max_dist: u32, out: &mut Vec<usize>) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let mut stack = vec![0usize];
+        while let Some(cur) = stack.pop() {
+            let node = &self.nodes[cur];
+            let d = hamming(node.hash, target);
+            if d <= max_dist {
+                out.extend_from_slice(&node.payloads);
+            }
+            let lo = d.saturating_sub(max_dist);
+            let hi = d + max_dist;
+            for (&k, &child) in &node.children {
+                if k >= lo && k <= hi {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
 /// Near-duplicate groups: images whose dHashes are within `threshold` bits of each other, linked
 /// transitively (a burst forms one group via union-find). Reads the precomputed `phash` column —
 /// rows with a NULL `phash` are ignored (the caller fills them lazily before scanning).
@@ -165,15 +239,21 @@ pub fn find_perceptual(conn: &Connection, threshold: u32) -> Result<Vec<DupGroup
         }
         x
     }
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if hamming(rows[i].1, rows[j].1) <= threshold {
-                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
-                if ri != rj {
-                    parent[ri] = rj;
-                }
+    // Sub-quadratic linkage: query the BK-tree for every earlier hash within `threshold` of row i,
+    // then insert row i. Unioning i with each earlier match yields the same connected components as
+    // the all-pairs comparison (union is symmetric/transitive), at ~O(n log n) instead of O(n²).
+    let mut tree = BkTree::default();
+    let mut matches: Vec<usize> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        matches.clear();
+        tree.query(row.1, threshold, &mut matches);
+        for &j in &matches {
+            let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+            if ri != rj {
+                parent[ri] = rj;
             }
         }
+        tree.insert(row.1, i);
     }
 
     let mut by_root: std::collections::HashMap<usize, Vec<usize>> =
@@ -194,6 +274,53 @@ pub fn find_perceptual(conn: &Connection, threshold: u32) -> Result<Vec<DupGroup
     // Stable order: by the smallest image id in each group.
     out.sort_by_key(|g| g.images.iter().map(|i| i.id).min().unwrap_or(0));
     Ok(out)
+}
+
+#[cfg(test)]
+mod bk_tests {
+    use super::*;
+
+    #[test]
+    fn bktree_query_matches_brute_force() {
+        // Deterministic pseudo-random 64-bit hashes (no rng dependency).
+        let hashes: Vec<u64> = (0..600u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 7))
+            .collect();
+        let mut tree = BkTree::default();
+        for (idx, &h) in hashes.iter().enumerate() {
+            tree.insert(h, idx);
+        }
+        for &q in &hashes {
+            for &thr in &[0u32, 3, 8, 20] {
+                let mut got = Vec::new();
+                tree.query(q, thr, &mut got);
+                got.sort_unstable();
+                let mut want: Vec<usize> = hashes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &h)| hamming(h, q) <= thr)
+                    .map(|(i, _)| i)
+                    .collect();
+                want.sort_unstable();
+                assert_eq!(
+                    got, want,
+                    "BK-tree query diverged from brute force (thr={thr})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bktree_collapses_identical_hashes() {
+        let mut tree = BkTree::default();
+        for idx in 0..5 {
+            tree.insert(42u64, idx);
+        }
+        let mut got = Vec::new();
+        tree.query(42, 0, &mut got);
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+    }
 }
 
 /// Byte-identical duplicates (same whole-file `content_hash`).

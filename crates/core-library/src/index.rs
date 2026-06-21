@@ -108,6 +108,8 @@ pub fn process_file(
     let thumb = core_raw::thumbnail_jpeg(&src, thumb_size, 82)?;
     thumbs.write(&hex_digest, thumb_size, &thumb.jpeg)?;
 
+    // Fingerprint keys off NATIVE (pre-orientation) dims for stability; the catalog stores the
+    // ORIENTED display dims so portrait shots aren't recorded as landscape (correct aspect/UI).
     let fp = capture_fingerprint(&meta, thumb.src_width, thumb.src_height);
 
     Ok(ProcessedImage {
@@ -120,8 +122,8 @@ pub fn process_file(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
         meta,
-        width: thumb.src_width as i64,
-        height: thumb.src_height as i64,
+        width: thumb.disp_width as i64,
+        height: thumb.disp_height as i64,
         capture_fingerprint: fp,
     })
 }
@@ -250,7 +252,12 @@ where
     for r in &results {
         match r {
             Ok(p) => match insert_image(&tx, folder_id, imported_at, p)? {
-                Some(_) => stats.added += 1,
+                Some(id) => {
+                    stats.added += 1;
+                    // Recover edits/rating/keywords from a sidecar next to the RAW (e.g. after a
+                    // "delete catalog.db, rescan" rebuild). Only blank rows hydrate; best-effort.
+                    let _ = crate::sidecar::hydrate_if_blank(&tx, id, &p.path);
+                }
                 None => stats.skipped += 1,
             },
             Err(_) => stats.failed += 1,

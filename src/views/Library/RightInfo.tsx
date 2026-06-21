@@ -6,7 +6,9 @@ import {
   imagePresence,
   imageUserLabels,
   setImageUserLabel,
+  imageHistogram,
   DETECTION_CATEGORIES,
+  type HistData,
   type ImageRow,
   type KeywordRow,
   type CollectionRow,
@@ -24,31 +26,38 @@ const LABEL_COLORS: { key: string; bg: string }[] = [
   { key: "purple", bg: "var(--color-lab-purple)" },
 ];
 
-function HistogramSvg() {
-  const W = 232;
+// Real per-channel histogram drawn from `HistData` (256 bins/channel). Log-scaled so shadow detail
+// is visible; `null` while loading renders an empty axis (never synthetic data).
+function HistogramSvg({ data }: { data: HistData | null }) {
+  const W = 256;
   const H = 64;
-
-  function buildPath(seed: number, scale: number): string {
+  if (!data) {
+    return (
+      <svg
+        width="100%"
+        height="100%"
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+      />
+    );
+  }
+  const maxv = Math.max(1, ...data.r, ...data.g, ...data.b);
+  const norm = Math.log1p(maxv);
+  const path = (bins: number[]): string => {
     let d = `M0 ${H} `;
-    for (let x = 0; x <= W; x += 4) {
-      const v = Math.sin(x * 0.05 + seed) * Math.cos(x * 0.013 + seed * 2);
-      const y =
-        H -
-        (0.5 + 0.5 * v) *
-          H *
-          scale *
-          (0.4 + 0.6 * Math.exp(-Math.pow((x - W * 0.45) / 110, 2)));
-      d += `L${x} ${y.toFixed(1)} `;
+    const n = bins.length;
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * W;
+      const y = H - (Math.log1p(bins[i]) / norm) * H;
+      d += `L${x.toFixed(1)} ${y.toFixed(1)} `;
     }
     return d + `L${W} ${H} Z`;
-  }
-
-  const channels: [string, number, number][] = [
-    ["#c56d6d", 1.5, 0],
-    ["#6db074", 2, 2.1],
-    ["#5b93cf", 1.7, 4.2],
+  };
+  const channels: [string, number[]][] = [
+    ["#c56d6d", data.r],
+    ["#6db074", data.g],
+    ["#5b93cf", data.b],
   ];
-
   return (
     <svg
       width="100%"
@@ -56,10 +65,10 @@ function HistogramSvg() {
       viewBox={`0 0 ${W} ${H}`}
       preserveAspectRatio="none"
     >
-      {channels.map(([color, scale, seed]) => (
+      {channels.map(([color, bins]) => (
         <path
           key={color}
-          d={buildPath(seed, scale)}
+          d={path(bins)}
           fill={color}
           opacity={0.5}
           style={{ mixBlendMode: "screen" }}
@@ -122,6 +131,7 @@ export default function RightInfo({
     containsPerson: null,
     containsAnimal: null,
   });
+  const [hist, setHist] = useState<HistData | null>(null);
 
   useEffect(() => {
     if (meta === null) {
@@ -129,9 +139,14 @@ export default function RightInfo({
       setAiDetections([]);
       setAiPresence(null);
       setLabels({ containsPerson: null, containsAnimal: null });
+      setHist(null);
       return;
     }
     let cancelled = false;
+    setHist(null);
+    void imageHistogram(meta.id).then((h) => {
+      if (!cancelled) setHist(h);
+    });
     void Promise.all([
       imageCaption(meta.id),
       imageDetections(meta.id),
@@ -418,7 +433,7 @@ export default function RightInfo({
             overflow: "hidden",
           }}
         >
-          <HistogramSvg />
+          <HistogramSvg data={hist} />
         </div>
       </div>
 

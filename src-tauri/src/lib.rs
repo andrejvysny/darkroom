@@ -38,6 +38,16 @@ pub fn run() {
             let state = AppState::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
 
+            // Crash recovery: stamp `finished_at` on any import sessions a previous run left open
+            // (killed/crashed mid-import). Best-effort; the per-file copies are already catalogued.
+            {
+                let st = app.state::<AppState>();
+                let lock = st.db.lock();
+                if let Ok(db) = lock {
+                    let _ = core_library::reap_dangling_import_sessions(&db.conn);
+                }
+            }
+
             // Mark the start of a usage session in the behavioral-signal log (best-effort).
             {
                 let st = app.state::<AppState>();
@@ -123,7 +133,21 @@ pub fn run() {
             commands::analysis_detector_size,
             commands::set_analysis_detector_size,
             commands::features_backfill,
+            commands::sidecars_write_all,
+            commands::sidecars_rebuild,
+            commands::image_histogram,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Flush the WAL into the main catalog file on quit so recent rows aren't stranded in
+            // `catalog.db-wal` (and a later corrupt-check sees a consistent file). Best-effort.
+            if let tauri::RunEvent::Exit = event {
+                let st = app_handle.state::<AppState>();
+                let lock = st.db.lock();
+                if let Ok(db) = lock {
+                    let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                }
+            }
+        });
 }

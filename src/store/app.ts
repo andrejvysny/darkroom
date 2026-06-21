@@ -49,10 +49,10 @@ export const useAppStore = create<AppState>((set) => ({
         r.id === id ? { ...r, editedAt } : r,
       ),
     })),
-  selectedId: 6,
+  selectedId: null,
   setSelectedId: (id) =>
     set({ selectedId: id, selectedIds: id == null ? [] : [id] }),
-  selectedIds: [6],
+  selectedIds: [],
   setSelection: (ids, primary) =>
     set({ selectedIds: ids, selectedId: primary }),
   thumbSize: 150,
