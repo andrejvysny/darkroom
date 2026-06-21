@@ -659,6 +659,11 @@ export function developGetHistogram(): Promise<HistData | null> {
   return invoke<HistData | null>("develop_get_histogram", {});
 }
 
+/** Real per-image histogram (from the cached thumbnail) for the Library metadata panel. */
+export function imageHistogram(imageId: number): Promise<HistData | null> {
+  return invoke<HistData | null>("image_histogram", { imageId });
+}
+
 export function exportImage(
   imageId: number,
   params: DevelopParams,
@@ -730,6 +735,18 @@ export function analysisCancel(): Promise<void> {
  *  them. Emits `features:progress` `{done,total}` then `features:done`. Resolves to count computed. */
 export function featuresBackfill(): Promise<number> {
   return invoke<number>("features_backfill", {});
+}
+
+/** Write a `<raw>.json` sidecar (edits + rating + keywords) next to every present RAW. Migrates an
+ *  existing catalog onto the durable on-disk format. Resolves to the count written. */
+export function sidecarsWriteAll(): Promise<number> {
+  return invoke<number>("sidecars_write_all", {});
+}
+
+/** Force-apply every present image's sidecar back into the catalog (recover edits/ratings/keywords
+ *  after a catalog loss / across machines). Resolves to the count hydrated. */
+export function sidecarsRebuild(): Promise<number> {
+  return invoke<number>("sidecars_rebuild", {});
 }
 
 /** Per-category detected-image counts. */

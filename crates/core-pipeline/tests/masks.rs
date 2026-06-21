@@ -1,9 +1,10 @@
-//! Phase 1 mask guards:
+//! Mask packing + GPU guards:
 //! - CPU: `to_mask_buffer` packs ENABLED masks densely (layers 0..count), skips disabled, caps at
 //!   MASK_CAP, and normalizes scalar deltas like the global uniform.
-//! - GPU: with no mask pre-pass yet (mask alpha is zero-initialised), a render with masks present is
-//!   byte-identical to one without — masks are inert until Phase 2 wires the pre-pass. This is the
-//!   "no behavior change" guard for the develop.wgsl refactor + new bindings.
+//! - GPU: a render with ZERO-coverage mask alpha is byte-identical to one with no masks (the no-op
+//!   guard for the develop.wgsl refactor + new bindings). NOTE: masks are fully wired now — the
+//!   parametric/radial/brush/range pre-pass writes the alpha layers (`mask.rs`/`mask_prepass.wgsl`);
+//!   other tests here exercise that real coverage changing pixels.
 
 use core_pipeline::params::MaskBufferUniform;
 use core_pipeline::{

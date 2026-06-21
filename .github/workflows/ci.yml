@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # macOS so the wgpu/Metal develop pipeline + the committed CR3 fixture run for real (the GPU and
+    # decode tests are no-ops on a GPU-less / fixture-less host). Linux would need webkit2gtk for the
+    # Tauri crate and has no Metal, so it can't exercise the develop pipeline.
+    runs-on: macos-latest
+    env:
+      # Turn a missing committed fixture into a hard failure instead of a silently-skipped test.
+      DARKROOM_REQUIRE_FIXTURES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91 (+ clippy)
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Frontend type-check + build
+        run: npm run build
+
+      - name: Clippy (warnings = errors)
+        run: cargo clippy --workspace --examples -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace

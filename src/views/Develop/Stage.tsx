@@ -7,6 +7,7 @@ import {
 } from "react";
 import MaskOverlay from "./MaskOverlay";
 import { useDevelopStore } from "../../store/develop";
+import { useAppStore } from "../../store/app";
 import type { BrushStroke, ComponentKind, Mask } from "../../lib/ipc";
 
 const PLACEHOLDER_SRC =
@@ -47,6 +48,9 @@ export default function Stage({
   const maskOverlayVisible = useDevelopStore((s) => s.maskOverlayVisible);
   const brush = useDevelopStore((s) => s.brush);
   const setFullRes = useDevelopStore((s) => s.setFullRes);
+  // Reset zoom/pan only when the IMAGE changes — keyed on selectedId, not imageUrl (which gets a new
+  // object URL on every render, which would reset the view on every slider move).
+  const selectedId = useAppStore((s) => s.selectedId);
 
   const sectionRef = useRef<HTMLElement | null>(null);
   const [avail, setAvail] = useState({ w: 0, h: 0 });
@@ -69,11 +73,11 @@ export default function Stage({
     return () => ro.disconnect();
   }, []);
 
-  // Reset zoom/pan when the image changes.
+  // Reset zoom/pan when the selected image changes (NOT on every imageUrl swap during editing).
   useEffect(() => {
     setZoom(1);
     setPan({ x: 0, y: 0 });
-  }, [imageUrl]);
+  }, [selectedId]);
 
   // Fit-to-area displayed size (before zoom).
   const fit = Math.min(avail.w / nat.w, avail.h / nat.h) || 0;
@@ -297,7 +301,7 @@ export default function Stage({
           {nat.w} × {nat.h}
         </span>
         <Dot />
-        <span>Display P3</span>
+        <span>sRGB</span>
       </div>
     </section>
   );

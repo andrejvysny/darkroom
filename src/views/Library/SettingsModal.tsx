@@ -7,6 +7,8 @@ import {
   setAnalysisDetectorSize,
   featuresBackfill,
   databaseReset,
+  sidecarsWriteAll,
+  sidecarsRebuild,
 } from "../../lib/ipc";
 
 const GB = 1024 * 1024 * 1024;
@@ -31,6 +33,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
+  const [sidecarBusy, setSidecarBusy] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -65,6 +68,24 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       .then((n) => setStatus(`Computed features for ${n} image(s)`))
       .catch(() => setStatus("Failed to compute features"))
       .finally(() => setBackfilling(false));
+  };
+
+  const handleWriteSidecars = () => {
+    setSidecarBusy(true);
+    setStatus(null);
+    void sidecarsWriteAll()
+      .then((n) => setStatus(`Wrote ${n} sidecar file(s) next to your RAWs`))
+      .catch(() => setStatus("Failed to write sidecars"))
+      .finally(() => setSidecarBusy(false));
+  };
+
+  const handleRebuildSidecars = () => {
+    setSidecarBusy(true);
+    setStatus(null);
+    void sidecarsRebuild()
+      .then((n) => setStatus(`Restored ${n} image(s) from sidecars`))
+      .catch(() => setStatus("Failed to rebuild from sidecars"))
+      .finally(() => setSidecarBusy(false));
   };
 
   if (!open) return null;
@@ -275,6 +296,56 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
           >
             {backfilling ? "Computing…" : "Compute features"}
           </button>
+        </div>
+
+        <div style={{ padding: "0 18px 18px" }}>
+          <div
+            style={{ fontSize: 13, color: "var(--color-t1)", marginBottom: 4 }}
+          >
+            Edit backups (sidecars)
+          </div>
+          <div
+            style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
+          >
+            Edits, ratings, and keywords are written to a small{" "}
+            <code>.json</code> file next to each RAW, so the catalog can be
+            rebuilt if lost. Write them for your whole library, or restore the
+            catalog from them.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={handleWriteSidecars}
+              disabled={sidecarBusy}
+              style={{
+                background: "var(--color-elev)",
+                color: "var(--color-t1)",
+                border: "1px solid var(--color-line-2)",
+                borderRadius: "var(--radius-sm)",
+                padding: "6px 14px",
+                fontSize: 12,
+                cursor: sidecarBusy ? "default" : "pointer",
+                opacity: sidecarBusy ? 0.6 : 1,
+              }}
+            >
+              {sidecarBusy ? "Working…" : "Write all sidecars"}
+            </button>
+            <button
+              onClick={handleRebuildSidecars}
+              disabled={sidecarBusy}
+              style={{
+                background: "var(--color-elev)",
+                color: "var(--color-t1)",
+                border: "1px solid var(--color-line-2)",
+                borderRadius: "var(--radius-sm)",
+                padding: "6px 14px",
+                fontSize: 12,
+                cursor: sidecarBusy ? "default" : "pointer",
+                opacity: sidecarBusy ? 0.6 : 1,
+              }}
+            >
+              {sidecarBusy ? "Working…" : "Rebuild from sidecars"}
+            </button>
+          </div>
         </div>
 
         <div style={{ padding: "0 18px 18px" }}>

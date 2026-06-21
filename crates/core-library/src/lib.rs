@@ -9,9 +9,11 @@ pub mod events;
 pub mod features;
 pub mod index;
 pub mod keywords;
+pub mod maintenance;
 pub mod query;
 pub mod reconcile;
 pub mod settings;
+pub mod sidecar;
 pub mod thumbs;
 
 pub use analysis::{
@@ -39,6 +41,7 @@ pub use keywords::{
     add_keyword_to_image, add_keyword_to_images, create_or_get_keyword, delete_keyword,
     keywords_for_image, list_keywords, remove_keyword_from_image, KeywordRow,
 };
+pub use maintenance::reap_dangling_import_sessions;
 pub use query::{
     count_images, image_by_id, list_folders, query_images, FolderRow, ImageRow, QueryParams,
 };
@@ -46,5 +49,8 @@ pub use reconcile::{reconcile, ReconcileStats};
 pub use settings::{
     animal_detector_size, get_meta, set_animal_detector_size, set_meta, set_thumb_cache_cap,
     thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP,
+};
+pub use sidecar::{
+    hydrate_if_blank, rebuild_from_sidecars, write_all_sidecars, write_sidecar, Sidecar,
 };
 pub use thumbs::ThumbCache;

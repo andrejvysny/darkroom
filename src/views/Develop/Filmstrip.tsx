@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import Icon from "../../components/Icon";
+import { useEffect, useRef } from "react";
 import { useAppStore } from "../../store/app";
 import { thumbUrl } from "../../lib/ipc";
 
@@ -28,7 +27,6 @@ export default function Filmstrip() {
   const images = useAppStore((s) => s.libraryImages);
   const selectedId = useAppStore((s) => s.selectedId);
   const setSelectedId = useAppStore((s) => s.setSelectedId);
-  const [zoom, setZoom] = useState(38);
 
   const selRef = useRef<HTMLButtonElement>(null);
   const current = images.find((i) => i.id === selectedId) ?? null;
@@ -121,50 +119,6 @@ export default function Filmstrip() {
             </button>
           );
         })}
-      </div>
-
-      {/* Right: zoom + 1:1 */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            fontFamily: "var(--font-mono)",
-            fontSize: 11.5,
-            color: "var(--color-t2)",
-          }}
-        >
-          <Icon
-            name="zoom"
-            size={13}
-            style={{ color: "var(--color-t3)" } as React.CSSProperties}
-          />
-          <input
-            type="range"
-            min={10}
-            max={200}
-            value={zoom}
-            onChange={(e) => setZoom(Number(e.target.value))}
-            style={{ width: 90 }}
-          />
-          <span>Fit</span>
-        </div>
-        <button
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            padding: "5px 10px",
-            border: "1px solid var(--color-line)",
-            borderRadius: "var(--radius-sm)",
-            fontSize: 12,
-            color: "var(--color-t2)",
-          }}
-        >
-          <Icon name="split" size={13} />
-          1:1
-        </button>
       </div>
     </footer>
   );

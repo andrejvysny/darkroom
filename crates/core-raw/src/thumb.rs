@@ -13,8 +13,14 @@ use rawler::rawsource::RawSource;
 /// A generated thumbnail plus the source (full-image) dimensions.
 pub struct Thumb {
     pub jpeg: Vec<u8>,
+    /// NATIVE (pre-orientation, sensor-native) full-image dims. Kept stable for the capture
+    /// fingerprint, which must not shift when orientation handling changes.
     pub src_width: u32,
     pub src_height: u32,
+    /// ORIENTED (display) full-image dims — width/height after applying EXIF orientation, so a
+    /// portrait shot reads as portrait. This is what the catalog stores for aspect/UI logic.
+    pub disp_width: u32,
+    pub disp_height: u32,
 }
 
 fn de(e: impl std::fmt::Display) -> RawError {
@@ -84,5 +90,7 @@ pub fn thumbnail_jpeg(src: &RawSource, max_edge: u32, quality: u8) -> Result<Thu
         jpeg: buf,
         src_width: w,
         src_height: h,
+        disp_width: ow,
+        disp_height: oh,
     })
 }

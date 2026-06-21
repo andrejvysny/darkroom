@@ -14,18 +14,26 @@ use rusqlite_migration::{Migrations, M};
 use std::path::Path;
 use std::sync::LazyLock;
 
-static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
-    Migrations::new(vec![
-        M::up(include_str!("../migrations/001_init.sql")),
-        M::up(include_str!("../migrations/002_keyword_unique.sql")),
-        M::up(include_str!("../migrations/003_scale.sql")),
-        M::up(include_str!("../migrations/004_phash.sql")),
-        M::up(include_str!("../migrations/005_analysis.sql")),
-        M::up(include_str!("../migrations/006_labels.sql")),
-        M::up(include_str!("../migrations/007_user_events.sql")),
-        M::up(include_str!("../migrations/008_presence.sql")),
-    ])
-});
+/// Ordered migration SQL. `to_latest` sets `PRAGMA user_version` to the count applied, so the slice
+/// length is also the latest schema version (see [`LATEST_SCHEMA_VERSION`]). Append new files here.
+const MIGRATION_SQL: &[&str] = &[
+    include_str!("../migrations/001_init.sql"),
+    include_str!("../migrations/002_keyword_unique.sql"),
+    include_str!("../migrations/003_scale.sql"),
+    include_str!("../migrations/004_phash.sql"),
+    include_str!("../migrations/005_analysis.sql"),
+    include_str!("../migrations/006_labels.sql"),
+    include_str!("../migrations/007_user_events.sql"),
+    include_str!("../migrations/008_presence.sql"),
+    include_str!("../migrations/009_integrity.sql"),
+];
+
+/// Highest schema version this build understands (= number of migrations). A catalog whose
+/// `user_version` exceeds this was written by a newer build and is refused (downgrade guard).
+const LATEST_SCHEMA_VERSION: i64 = MIGRATION_SQL.len() as i64;
+
+static MIGRATIONS: LazyLock<Migrations<'static>> =
+    LazyLock::new(|| Migrations::new(MIGRATION_SQL.iter().map(|s| M::up(s)).collect()));
 
 /// Owns a single SQLite connection to the catalog.
 pub struct Db {
@@ -43,6 +51,22 @@ impl Db {
              PRAGMA busy_timeout = 5000;
              PRAGMA cache_size = -32000;",
         )?;
+        // Integrity gate: fail loudly on a corrupt catalog (so the app can offer to rebuild from
+        // sidecars) instead of silently operating on damaged data. `quick_check` is the fast
+        // structural pass; a healthy (or empty/new) DB returns the single row "ok".
+        let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if check != "ok" {
+            return Err(DbError::Corrupt(check));
+        }
+        // Downgrade guard: refuse a catalog written by a newer build — running newer schema on older
+        // code (or "migrating down") would corrupt it.
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if user_version > LATEST_SCHEMA_VERSION {
+            return Err(DbError::SchemaTooNew {
+                found: user_version,
+                supported: LATEST_SCHEMA_VERSION,
+            });
+        }
         MIGRATIONS.to_latest(&mut conn)?;
         Ok(Self { conn })
     }
@@ -135,6 +159,31 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(names, expected, "catalog table set drifted from migrations");
+    }
+
+    #[test]
+    fn refuses_newer_schema() {
+        let path =
+            std::env::temp_dir().join(format!("darkroom_schema_guard_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Create + migrate to latest normally.
+        Db::open(&path).unwrap();
+        // Simulate a catalog written by a newer build (user_version beyond what we support).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                LATEST_SCHEMA_VERSION + 1
+            ))
+            .unwrap();
+        }
+        assert!(
+            matches!(Db::open(&path), Err(DbError::SchemaTooNew { .. })),
+            "must refuse a catalog from a newer build"
+        );
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(path.with_extension(ext));
+        }
     }
 
     #[test]

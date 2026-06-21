@@ -16,7 +16,7 @@ pub use backend::{DevelopPipeline, GpuContext};
 pub use curve::build_lut;
 pub use encode::{rgba8_to_jpeg, rgba8_to_png};
 pub use error::PipelineError;
-pub use histogram::{histogram, Histogram};
+pub use histogram::{histogram, histogram_from_jpeg, Histogram};
 pub use params::{
     BrushStroke, ComponentKind, CurvePoint, DevelopParams, HslBand, LocalAdjust, Mask,
     MaskComponent, MaskOp, ToneCurve, MASK_CAP,
