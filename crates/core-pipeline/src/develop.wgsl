@@ -1,6 +1,7 @@
 // Develop fragment pipeline: cached linear **ProPhoto** RGB → display-referred sRGB RGBA8.
 // Scene-linear edits (WB/exposure/highlights/shadows/saturation + masks) run in wide-gamut ProPhoto;
-// the display transition converts ProPhoto→sRGB, rolls off highlights, then applies the sRGB OETF.
+// the scene-referred base tone operator (ACR-matched) maps scene-linear→display-linear in ProPhoto,
+// then the display transition converts ProPhoto→sRGB and applies the sRGB OETF.
 
 struct Params {
   wb_gain: vec3<f32>,
@@ -75,6 +76,24 @@ struct Extra {
 };
 @group(0) @binding(9) var<uniform> EX: Extra;
 
+// Scene-referred base tone operator. `params` = (u_min, u_max, hue_protect, _pad): the log-exposure
+// domain the LUT spans + the hue-protection strength. The curve itself rides `base_lut` (R32Float
+// Nx1), mapping scene-linear ProPhoto [0,∞) → display-linear [0,1) — applied BEFORE pp_to_srgb.
+struct ToneOp {
+  params: vec4<f32>,
+};
+@group(0) @binding(10) var<uniform> TO: ToneOp;
+@group(0) @binding(11) var base_lut: texture_2d<f32>;
+
+// Crop + straighten geometry. crop=(cx,cy,hw,hh); rot=(cos θ, sin θ, autozoom, active);
+// aspect=(src W/H, out W/H, _, _). Inverse-maps output uv → source uv; mirrors params.rs geom_src_uv.
+struct Geom {
+  crop: vec4<f32>,
+  rot: vec4<f32>,
+  aspect: vec4<f32>,
+};
+@group(0) @binding(12) var<uniform> GEO: Geom;
+
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
@@ -115,15 +134,38 @@ fn pp_to_srgb(c: vec3<f32>) -> vec3<f32> {
   );
 }
 
-// Soft highlight shoulder: identity below `a`, asymptotes toward 1.0 above it (C1-continuous at `a`).
-// Scene-linear values >1.0 (preserved by the decoder's clip_negative) roll into the top of the
-// display range instead of hard-clipping to white — recovering highlight detail the old clamp lost.
-fn highlight_rolloff(c: vec3<f32>) -> vec3<f32> {
-  let a = 0.75;
-  let x = max(c, vec3<f32>(0.0));
-  let over = max(x - vec3<f32>(a), vec3<f32>(0.0));
-  let rolled = vec3<f32>(a) + (1.0 - a) * (1.0 - exp(-over / (1.0 - a)));
-  return select(x, rolled, x > vec3<f32>(a));
+// Base tone-operator LUT length (matches `BASE_LUT_SIZE` in params.rs).
+const BASE_LUT_N: i32 = 512;
+
+// Sample the base tone operator f(x) for one scalar channel via the log-exposure LUT.
+// x in scene-linear ProPhoto; returns display-linear in [0,1). f(0)=0; out-of-domain extremes clamp
+// to the LUT ends (deep shadows ≈ 0, far highlights ≈ the asymptote).
+fn base_curve_lookup(x: f32) -> f32 {
+  if (x <= 0.0) { return 0.0; }
+  let u = log2(x / 0.18);
+  let t = clamp((u - TO.params.x) / (TO.params.y - TO.params.x), 0.0, 1.0) * f32(BASE_LUT_N - 1);
+  let i0 = i32(floor(t));
+  let i1 = min(i0 + 1, BASE_LUT_N - 1);
+  let f = t - floor(t);
+  let v0 = textureLoad(base_lut, vec2<i32>(i0, 0), 0).r;
+  let v1 = textureLoad(base_lut, vec2<i32>(i1, 0), 0).r;
+  return mix(v0, v1, f);
+}
+
+// Apply the scene-referred base tone operator in ProPhoto (Codex: per-channel on Rec.709 is unsafe).
+// Default is the per-channel curve (photographic highlight desaturation); for SATURATED HIGHLIGHTS it
+// blends toward a hue-preserving luminance-ratio variant (weight rises with chroma × highlight
+// excursion, gated by TO.params.z) to tame neon hue twists. Midtones/low-sat stay per-channel.
+fn apply_base_tone(c: vec3<f32>) -> vec3<f32> {
+  let rgb = max(c, vec3<f32>(0.0));
+  let pc = vec3<f32>(base_curve_lookup(rgb.r), base_curve_lookup(rgb.g), base_curve_lookup(rgb.b));
+  let y = dot(rgb, LUMA);
+  let ratio = select(vec3<f32>(0.0), rgb * (base_curve_lookup(y) / max(y, 1e-6)), y > 1e-6);
+  let mx = max(rgb.r, max(rgb.g, rgb.b));
+  let mn = min(rgb.r, min(rgb.g, rgb.b));
+  let chroma = (mx - mn) / max(mx, 1e-6);
+  let w = clamp(TO.params.z * chroma * smoothstep(0.5, 2.0, mx), 0.0, 1.0);
+  return mix(pc, ratio, w);
 }
 
 fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
@@ -269,12 +311,87 @@ fn apply_local_display(d_in: vec3<f32>, contrast: f32, blacks: f32, whites: f32)
   return d;
 }
 
+// Letterbox surround for preview pixels outside the cropped frame (export never letterboxes).
+const LETTERBOX = vec3<f32>(0.0, 0.0, 0.0);
+
+// 4-tap bilinear fetch of the linear input at an arbitrary uv (texel-center convention). Needed by
+// the geometry remap since the input texture is non-filterable (textureLoad only). The `-0.5` is
+// essential — without it the identity render shifts half a texel.
+fn sample_bilinear(uv: vec2<f32>) -> vec3<f32> {
+  let dims = vec2<f32>(textureDimensions(input_tex));
+  let p = uv * dims - vec2<f32>(0.5);
+  let i0 = floor(p);
+  let f = p - i0;
+  let lo = vec2<i32>(0, 0);
+  let hi = vec2<i32>(dims) - vec2<i32>(1, 1);
+  let c0 = clamp(vec2<i32>(i0), lo, hi);
+  let c1 = clamp(vec2<i32>(i0) + vec2<i32>(1, 1), lo, hi);
+  let t00 = textureLoad(input_tex, vec2<i32>(c0.x, c0.y), 0).rgb;
+  let t10 = textureLoad(input_tex, vec2<i32>(c1.x, c0.y), 0).rgb;
+  let t01 = textureLoad(input_tex, vec2<i32>(c0.x, c1.y), 0).rgb;
+  let t11 = textureLoad(input_tex, vec2<i32>(c1.x, c1.y), 0).rgb;
+  return mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);
+}
+
+struct GeomResult {
+  u: vec2<f32>,       // crop-local output uv [0,1] (vignette/letterbox space)
+  src_uv: vec2<f32>,  // source sampling uv
+  inside: bool,       // false ⇒ this output pixel is letterbox (outside the cropped frame)
+};
+
+// Map a fullscreen output uv → (crop-local u, source uv). Letterbox-fits the crop into the output
+// frame (preserve aspect) for preview; for export out_aspect == crop aspect so it fills. Rotation is
+// in pixel space (rotating normalized uv would shear a non-square image).
+fn geom_resolve(out_uv: vec2<f32>) -> GeomResult {
+  var r: GeomResult;
+  if (GEO.rot.w < 0.5) {           // identity fast-path: no crop, no rotation
+    r.u = out_uv;
+    r.src_uv = out_uv;
+    r.inside = true;
+    return r;
+  }
+  let src_aspect = GEO.aspect.x;
+  let out_aspect = GEO.aspect.y;
+  let hw = GEO.crop.z;
+  let hh = GEO.crop.w;
+  let ac = (hw / hh) * src_aspect; // crop pixel aspect
+  var content = vec2<f32>(1.0, 1.0);
+  if (out_aspect > ac) {
+    content = vec2<f32>(ac / out_aspect, 1.0);
+  } else {
+    content = vec2<f32>(1.0, out_aspect / ac);
+  }
+  let cmin = (vec2<f32>(1.0) - content) * 0.5;
+  let u = (out_uv - cmin) / content;
+  r.u = u;
+  if (u.x < 0.0 || u.x > 1.0 || u.y < 0.0 || u.y > 1.0) {
+    r.src_uv = vec2<f32>(0.0);
+    r.inside = false;
+    return r;
+  }
+  let ct = GEO.rot.x;
+  let st = GEO.rot.y;
+  let z = GEO.rot.z;
+  let d = vec2<f32>((2.0 * u.x - 1.0) * hw, (2.0 * u.y - 1.0) * hh);
+  let dpx = vec2<f32>(d.x * src_aspect, d.y);
+  let rot = vec2<f32>(ct * dpx.x + st * dpx.y, -st * dpx.x + ct * dpx.y); // inverse rotation R(-θ)
+  let disp = vec2<f32>(rot.x / src_aspect / z, rot.y / z);
+  r.src_uv = vec2<f32>(GEO.crop.x, GEO.crop.y) + disp;
+  r.inside = true;
+  return r;
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  // Detail stage (sharpen + NR) on the linear input, then global white balance (chromatic
-  // adaptation), once, in linear ProPhoto before everything else. P.wb_gain is held at identity now
+  let geo = geom_resolve(in.uv);
+  if (!geo.inside) {
+    return vec4<f32>(LETTERBOX, 1.0);
+  }
+  let suv = geo.src_uv;
+  // Detail stage (sharpen + NR) on the linear input at the geometry-remapped source uv, then global
+  // white balance (chromatic adaptation), once, in linear ProPhoto. P.wb_gain is held at identity now
   // that global WB rides this matrix; masks keep their gain delta.
-  let base_rgb = apply_detail(in.uv, textureSampleLevel(input_tex, input_smp, in.uv, 0.0).rgb);
+  let base_rgb = apply_detail(suv, sample_bilinear(suv));
   let base_wb = wb_apply(base_rgb);
 
   // --- SCENE-LINEAR STAGE: base develop, then composite each mask's linear deltas ---
@@ -282,7 +399,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     base_wb, vec3<f32>(1.0), P.exposure, P.highlights, P.shadows, P.saturation);
   for (var i = 0u; i < M.count; i = i + 1u) {
     let mp = M.masks[i];
-    let a = textureSampleLevel(mask_tex, mask_smp, in.uv, i32(i), 0.0).r * mp.opacity;
+    let a = textureSampleLevel(mask_tex, mask_smp, suv, i32(i), 0.0).r * mp.opacity;
     if (a < 1e-4) { continue; }
     let li = apply_local_linear(
       base_wb,
@@ -295,8 +412,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     lin = mix(lin, li, a);
   }
 
-  // --- DISPLAY TRANSITION (shared, once): ProPhoto→sRGB, highlight rolloff, OETF, HSL, tone curve ---
-  var d = srgb_encode(highlight_rolloff(pp_to_srgb(lin)));
+  // --- DISPLAY TRANSITION (shared, once): base tone operator (ProPhoto) → ProPhoto→sRGB → OETF → HSL → tone curve ---
+  // The base operator maps scene-linear→display-linear in ProPhoto (covering >1.0 headroom), then the
+  // matrix + OETF take it to display-encoded sRGB. Out-of-sRGB-gamut colors clamp at the final step.
+  var d = srgb_encode(pp_to_srgb(apply_base_tone(lin)));
   d = apply_hsl(d);
   d = vec3<f32>(
     curve_ch(d.r, vec3<f32>(1.0, 0.0, 0.0)),
@@ -308,17 +427,18 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   var out = apply_local_display(d, P.contrast, P.blacks, P.whites);
   for (var i = 0u; i < M.count; i = i + 1u) {
     let mp = M.masks[i];
-    let a = textureSampleLevel(mask_tex, mask_smp, in.uv, i32(i), 0.0).r * mp.opacity;
+    let a = textureSampleLevel(mask_tex, mask_smp, suv, i32(i), 0.0).r * mp.opacity;
     if (a < 1e-4) { continue; }
     let di = apply_local_display(
       d, P.contrast + mp.contrast, P.blacks + mp.blacks, P.whites + mp.whites);
     out = mix(out, di, a);
   }
 
-  // Lens vignette: radial darken(−) / brighten(+) toward the corners (display space, after masks).
+  // Lens vignette: radial darken(−) / brighten(+) toward the corners of the CROPPED frame (uses the
+  // crop-local uv so the vignette follows the crop, like Lightroom).
   let vig = EX.detail.w;
   if (abs(vig) > 1e-4) {
-    let rad = distance(in.uv, vec2<f32>(0.5)) / 0.70710678; // 0 center .. 1 corner
+    let rad = distance(geo.u, vec2<f32>(0.5)) / 0.70710678; // 0 center .. 1 corner
     out = out * (1.0 + vig * 0.6 * smoothstep(0.3, 1.0, rad));
   }
 

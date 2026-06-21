@@ -21,6 +21,8 @@ import {
   type ToneCurveChannel,
   type CurvePoint,
   type HslBand,
+  type Crop,
+  DEFAULT_CROP,
 } from "../../lib/ipc";
 
 // Warm-cache renders are single-digit ms; a short debounce keeps sliders feeling real-time while
@@ -70,12 +72,12 @@ export function useDevelop() {
     const seq = ++renderSeq.current;
     setRendering(true);
     try {
+      // While the crop tool is active, render the FULL un-cropped/un-rotated image so the crop
+      // overlay maps 1:1 to image coordinates; the applied crop renders when the tool is closed.
+      const st = useDevelopStore.getState();
+      const rp = st.cropMode ? { ...p, crop: { ...DEFAULT_CROP } } : p;
       // Full-res tier when zoomed in past fit (set by the Stage); preview tier otherwise.
-      const url = await developRender(
-        id,
-        p,
-        useDevelopStore.getState().fullRes,
-      );
+      const url = await developRender(id, rp, st.fullRes);
       if (seq !== renderSeq.current) {
         if (url) URL.revokeObjectURL(url); // a newer render superseded this one
         return false;
@@ -173,8 +175,15 @@ export function useDevelop() {
 
     const id = selectedId;
     let cancelled = false;
-    // New image: drop any mask selection / armed eyedropper from the previous image.
-    useDevelopStore.setState({ selectedMaskIndex: null, pickingColor: false });
+    // New image: drop any mask selection / armed eyedropper / crop tool from the previous image, and
+    // invalidate the cached image aspect (the Stage re-sets it on load) so crop presets never use a
+    // stale (different-image) aspect. Leaving cropMode on would render the new image uncropped.
+    useDevelopStore.setState({
+      selectedMaskIndex: null,
+      pickingColor: false,
+      cropMode: false,
+      imageAspect: 0,
+    });
 
     // 1. Instant first paint — embedded camera JPEG (demosaic-free), in parallel with the render.
     developPreviewJpeg(id)
@@ -289,6 +298,26 @@ export function useDevelop() {
       commit(selectedId, { ...cur, hsl });
     },
     [selectedId, commit],
+  );
+
+  const onCropChange = useCallback(
+    (patch: Partial<Crop>) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      const next = { ...cur, crop: { ...cur.crop, ...patch } };
+      // While the crop tool is active the preview shows the full (identity-crop) image, so a crop
+      // change does NOT alter the rendered pixels — update the store + persist, but skip the
+      // redundant GPU re-render (the overlay is pure DOM). The applied crop renders on tool close
+      // via the cropMode effect below.
+      if (useDevelopStore.getState().cropMode) {
+        touchCount.current += 1;
+        useDevelopStore.setState({ params: next });
+        debouncedPersist(selectedId, next);
+      } else {
+        commit(selectedId, next);
+      }
+    },
+    [selectedId, commit, debouncedPersist],
   );
 
   // ── Mask operations ───────────────────────────────────────────────────────
@@ -480,6 +509,16 @@ export function useDevelop() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, resetParams, debouncedPersist, debouncedRender]);
 
+  // Re-render when the crop tool opens/closes (full image while editing → applied crop on close).
+  const cropMode = useDevelopStore((s) => s.cropMode);
+  useEffect(() => {
+    const id = useAppStore.getState().selectedId;
+    if (id !== null && !useDevelopStore.getState().showBefore) {
+      debouncedRender(id, useDevelopStore.getState().params);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cropMode]);
+
   return {
     params,
     imageUrl,
@@ -487,6 +526,7 @@ export function useDevelop() {
     onParamChange,
     onCurveChange,
     onHslChange,
+    onCropChange,
     resetKeys,
     reset,
     addMask,

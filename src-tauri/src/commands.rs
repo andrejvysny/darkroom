@@ -14,7 +14,9 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 
 // v2 adds local adjustment masks (DevelopParams.masks). v1 rows deserialize with masks: [].
-const PROCESS_VERSION: i64 = 2;
+// v3 adds the scene-referred base tone operator (DevelopParams.tone_amount, default 100 = full ACR);
+// it replaces the fixed highlight shoulder, so v1/v2 rows re-render with the new tonality.
+const PROCESS_VERSION: i64 = 3;
 
 /// Delete cached thumbnails for content hashes no longer referenced by any present row. A byte-
 /// identical keeper still shares its hash, so presence is re-checked before deleting (lowercase-hex
@@ -697,9 +699,18 @@ pub async fn export_image(
             .render_once(&gpu.ctx, &lin, &params)
             .map_err(|e| e.to_string())?;
 
+        // Crop to true dimensions: the render letterbox-fits the crop centered into the full frame,
+        // so a plain pixel copy of that rect is the exact cropped export (no extra resample).
+        let (cx, cy, cw, ch) = params.crop.export_rect(lin.width, lin.height);
+        let rgba = if (cw, ch) == (lin.width, lin.height) {
+            rgba
+        } else {
+            core_pipeline::crop_rgba8(&rgba, lin.width, cx, cy, cw, ch)
+        };
+
         let bytes = match format.to_lowercase().as_str() {
-            "png" => core_pipeline::rgba8_to_png(&rgba, lin.width, lin.height),
-            "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, lin.width, lin.height, 92),
+            "png" => core_pipeline::rgba8_to_png(&rgba, cw, ch),
+            "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, cw, ch, 92),
             other => return Err(format!("unsupported export format: {other}")),
         }
         .map_err(|e| e.to_string())?;

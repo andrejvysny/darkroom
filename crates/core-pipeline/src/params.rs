@@ -172,6 +172,59 @@ impl Default for Mask {
     }
 }
 
+/// Crop + straighten geometry. Crop rect is center (`cx`,`cy`) + half-extents (`hw`,`hh`) in
+/// normalized image coords; `angle` is the straighten correction in degrees (CCW+). Default is the
+/// full frame, no rotation (identity). Applied as a UV-remap in the develop shader (see `to_geom`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Crop {
+    pub cx: f32,
+    pub cy: f32,
+    pub hw: f32,
+    pub hh: f32,
+    pub angle: f32,
+}
+
+impl Default for Crop {
+    fn default() -> Self {
+        Self {
+            cx: 0.5,
+            cy: 0.5,
+            hw: 0.5,
+            hh: 0.5,
+            angle: 0.0,
+        }
+    }
+}
+
+impl Crop {
+    /// True when the crop is the full frame with no rotation (shader takes the identity fast-path).
+    pub fn is_identity(&self) -> bool {
+        self.cx == 0.5 && self.cy == 0.5 && self.hw >= 0.5 && self.hh >= 0.5 && self.angle == 0.0
+    }
+
+    /// The cropped content's pixel rect `(x, y, w, h)` within an input-sized (`w`×`h`) render. The
+    /// develop shader letterbox-fits the crop centered into the input-sized output at exactly the
+    /// crop's pixel dimensions, so cropping this rect (a plain pixel copy, no resize) yields the
+    /// true-dimension export at full quality. Mirrors the letterbox math in `geom_resolve` for
+    /// `out_aspect == src_aspect`.
+    pub fn export_rect(&self, w: u32, h: u32) -> (u32, u32, u32, u32) {
+        if self.is_identity() {
+            return (0, 0, w, h);
+        }
+        let src_aspect = w as f32 / h as f32;
+        let ac = (self.hw / self.hh) * src_aspect;
+        let (cwf, chf) = if src_aspect > ac {
+            (ac / src_aspect, 1.0)
+        } else {
+            (1.0, src_aspect / ac)
+        };
+        let cw = (cwf * w as f32).round().clamp(1.0, w as f32) as u32;
+        let ch = (chf * h as f32).round().clamp(1.0, h as f32) as u32;
+        ((w - cw) / 2, (h - ch) / 2, cw, ch)
+    }
+}
+
 /// Editable adjustments applied to the cached linear buffer. All default to a no-op.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -202,10 +255,16 @@ pub struct DevelopParams {
     pub nr_color: f32,
     /// Lens vignette, -100..100 (negative darkens corners, positive brightens).
     pub vignette: f32,
+    /// Scene-referred base tone operator strength, 0..100. 0 = neutral soft-clip (flat), 100 = full
+    /// ACR-matched contrast curve. Defaults to 100 so unedited images render with the ACR look.
+    pub tone_amount: f32,
     /// Tone curve (display-space LUT). Identity by default.
     pub tone_curve: ToneCurve,
     /// Per-hue HSL mixer (8 bands). All-zero by default.
     pub hsl: [HslBand; HSL_BANDS],
+    /// Crop + straighten geometry. Full-frame/no-rotation by default.
+    #[serde(default)]
+    pub crop: Crop,
     /// Local adjustment masks, in stacking order. Empty by default (v1 edits deserialize here).
     #[serde(default)]
     pub masks: Vec<Mask>,
@@ -227,8 +286,10 @@ impl Default for DevelopParams {
             nr_luma: 0.0,
             nr_color: 0.0,
             vignette: 0.0,
+            tone_amount: 100.0,
             tone_curve: ToneCurve::default(),
             hsl: [HslBand::default(); HSL_BANDS],
+            crop: Crop::default(),
             masks: Vec::new(),
         }
     }
@@ -401,6 +462,88 @@ pub(crate) fn wb_matrix(temp: f32, tint: f32) -> [[f32; 3]; 3] {
     out
 }
 
+// --- Scene-referred base tone operator (ACR-matched) ---------------------------------------------
+// Replaces the old fixed `exp()` highlight shoulder. A monotone curve maps scene-linear ProPhoto
+// [0,∞) → display-linear [0,1), applied per-channel before the ProPhoto→sRGB matrix (Codex review:
+// per-channel on Rec.709 is unsafe for wide-gamut colors). Sampled into a LUT over the log-exposure
+// domain (so headroom is covered) and uploaded to the GPU. `tone_amount` interpolates a neutral
+// soft-clip (flat) → the ACR-seed curve; both anchor mid-grey 0.18 → 0.18 exactly. The ACR-seed
+// shape is the analytic `x^p/(x^p+c)`; once reference ACR renders are fit, only the seed is replaced.
+
+/// Base-curve LUT length (entries over the log-exposure domain). Matches `BASE_LUT_N` in develop.wgsl.
+pub const BASE_LUT_SIZE: usize = 512;
+/// Log-exposure domain (stops relative to mid-grey) the LUT spans. ~21 stops covers deep shadows to
+/// far highlight headroom; all golden test inputs (x ≤ 8) map inside it.
+const BASE_U_MIN: f32 = -13.0;
+const BASE_U_MAX: f32 = 8.0;
+/// Scene-linear mid-grey anchor (held fixed through the curve).
+const MID_GREY: f32 = 0.18;
+/// ACR-seed contrast exponent (Codex-recommended starting shape, pre-fit).
+const ACR_P: f32 = 1.35;
+/// Hue-protection strength: how strongly saturated highlights are pulled toward the (hue-preserving)
+/// luminance-ratio variant vs the per-channel curve. Auto (not user-controlled) for now.
+const BASE_HUE_PROTECT: f32 = 0.6;
+
+/// The base tone operator value `f(x)` for one scalar channel, `amount` in [0,1].
+/// Monotone, `f(0)=0`, `f(0.18)=0.18` for all amounts, asymptotes below 1.
+pub fn base_curve_value(x: f32, amount: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    // Neutral soft-clip (Reinhard anchored at 0.18): f0(0.18) = 0.18/(0.18+0.82) = 0.18.
+    let f0 = x / (x + (1.0 - MID_GREY) / MID_GREY * MID_GREY); // = x / (x + 0.82)
+                                                               // ACR-seed: x^p / (x^p + c), with c chosen so f1(0.18) = 0.18 exactly.
+    let xp = x.powf(ACR_P);
+    let c = MID_GREY.powf(ACR_P - 1.0) * (1.0 - MID_GREY);
+    let f1 = xp / (xp + c);
+    let y = f0 + (f1 - f0) * amount.clamp(0.0, 1.0);
+    y.max(0.0)
+}
+
+/// Sample the base tone operator into a LUT over the log-exposure domain (`BASE_U_MIN..BASE_U_MAX`).
+pub fn build_base_curve_lut(amount: f32) -> Vec<f32> {
+    let n = BASE_LUT_SIZE;
+    let mut lut = vec![0f32; n];
+    for (i, v) in lut.iter_mut().enumerate() {
+        let u = BASE_U_MIN + (i as f32 / (n - 1) as f32) * (BASE_U_MAX - BASE_U_MIN);
+        let x = MID_GREY * 2f32.powf(u);
+        *v = base_curve_value(x, amount);
+    }
+    lut
+}
+
+// --- Crop + straighten geometry remap ------------------------------------------------------------
+// The develop shader maps each output fragment's crop-local UV `u` ∈ [0,1] back to a source UV, so
+// crop/straighten is one inverse-mapped sampling stage (Codex review). Rotation happens in
+// PIXEL/aspect-correct space (rotating normalized UV would shear a non-square image). `src_aspect` =
+// W/H of the source. These helpers mirror the WGSL exactly so the math is unit-testable on the CPU.
+
+/// Auto-zoom factor (≥1) that keeps the rotated crop rectangle fully inside the source [0,1]², so a
+/// straighten never samples past the image edge. Closed form from the Codex review.
+pub fn geom_autozoom(c: &Crop, src_aspect: f32) -> f32 {
+    let theta = c.angle.to_radians();
+    let (ct, st) = (theta.cos().abs(), theta.sin().abs());
+    // Max normalized displacement of the rotated footprint (hh·H/W = hh/aspect; hw·W/H = hw·aspect).
+    let ax = ct * c.hw + st * c.hh / src_aspect;
+    let ay = st * c.hw * src_aspect + ct * c.hh;
+    let mx = c.cx.min(1.0 - c.cx).max(1e-6);
+    let my = c.cy.min(1.0 - c.cy).max(1e-6);
+    1.0_f32.max(ax / mx).max(ay / my)
+}
+
+/// Map a crop-local output UV `u` ∈ [0,1]² to a source UV (inverse rotation about the crop center,
+/// pixel-space, then auto-zoom). Mirrors `geom_resolve` in develop.wgsl. `z` = `geom_autozoom`.
+pub fn geom_src_uv(c: &Crop, src_aspect: f32, z: f32, u: [f32; 2]) -> [f32; 2] {
+    let theta = c.angle.to_radians();
+    let (ct, st) = (theta.cos(), theta.sin());
+    let d = [(2.0 * u[0] - 1.0) * c.hw, (2.0 * u[1] - 1.0) * c.hh];
+    let dpx = [d[0] * src_aspect, d[1]];
+    // Inverse rotation R(-θ) in pixel space.
+    let r = [ct * dpx[0] + st * dpx[1], -st * dpx[0] + ct * dpx[1]];
+    let disp = [r[0] / src_aspect / z, r[1] / z];
+    [c.cx + disp[0], c.cy + disp[1]]
+}
+
 impl DevelopParams {
     pub fn to_uniform(&self) -> ParamsUniform {
         ParamsUniform {
@@ -499,6 +642,37 @@ impl DevelopParams {
             masks,
         }
     }
+
+    /// Pack the base tone operator's GPU uniform: the LUT log-exposure domain + hue-protect strength.
+    /// `tone_amount` itself is baked into the LUT (CPU-side via `base_curve_lut`), not passed here.
+    pub fn to_tone_op(&self) -> ToneOpUniform {
+        ToneOpUniform {
+            params: [BASE_U_MIN, BASE_U_MAX, BASE_HUE_PROTECT, 0.0],
+        }
+    }
+
+    /// Build this image's base-curve LUT (`tone_amount` normalized to [0,1]).
+    pub fn base_curve_lut(&self) -> Vec<f32> {
+        build_base_curve_lut((self.tone_amount / 100.0).clamp(0.0, 1.0))
+    }
+
+    /// Pack the crop + straighten geometry for the GPU. `src_aspect` = source W/H; `out_aspect` =
+    /// render-target W/H (== src_aspect for preview; == crop pixel aspect for true-dims export, so
+    /// the cropped content fills the target with no letterbox).
+    pub fn to_geom(&self, src_aspect: f32, out_aspect: f32) -> GeomUniform {
+        let c = &self.crop;
+        let theta = c.angle.to_radians();
+        GeomUniform {
+            crop: [c.cx, c.cy, c.hw, c.hh],
+            rot: [
+                theta.cos(),
+                theta.sin(),
+                geom_autozoom(c, src_aspect),
+                if c.is_identity() { 0.0 } else { 1.0 },
+            ],
+            aspect: [src_aspect, out_aspect, 0.0, 0.0],
+        }
+    }
 }
 
 /// One mask's scalar deltas, packed for the develop storage buffer. std430-clean: 48 bytes
@@ -582,6 +756,38 @@ impl Default for ExtraUniform {
     }
 }
 
+/// Scene-referred base tone operator uniform (`@binding(10)`). std140-clean: one `vec4` (16 bytes).
+/// `params` = (u_min, u_max, hue_protect, _pad). The curve itself rides the base-curve LUT texture
+/// (`@binding(11)`); see `build_base_curve_lut`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ToneOpUniform {
+    pub params: [f32; 4],
+}
+
+impl Default for ToneOpUniform {
+    fn default() -> Self {
+        DevelopParams::default().to_tone_op()
+    }
+}
+
+/// Crop + straighten geometry uniform (`@binding(12)`). std140-clean: three `vec4` (48 bytes).
+/// `crop` = (cx, cy, hw, hh); `rot` = (cos θ, sin θ, autozoom, active); `aspect` = (src W/H, out W/H,
+/// _, _). See `to_geom` / `geom_src_uv` and `geom_resolve` in develop.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GeomUniform {
+    pub crop: [f32; 4],
+    pub rot: [f32; 4],
+    pub aspect: [f32; 4],
+}
+
+impl Default for GeomUniform {
+    fn default() -> Self {
+        DevelopParams::default().to_geom(1.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod wb_tests {
     use super::*;
@@ -633,5 +839,153 @@ mod wb_tests {
         for v in warm.iter().chain(cool.iter()).chain(magenta.iter()) {
             assert!(v.is_finite(), "WB response must be finite");
         }
+    }
+}
+
+#[cfg(test)]
+mod base_curve_tests {
+    use super::*;
+
+    #[test]
+    fn anchors_zero_and_mid_grey_for_all_amounts() {
+        for amount in [0.0, 0.5, 1.0] {
+            assert_eq!(base_curve_value(0.0, amount), 0.0, "f(0) must be 0");
+            let m = base_curve_value(MID_GREY, amount);
+            assert!(
+                (m - MID_GREY).abs() < 1e-5,
+                "mid-grey must anchor at {MID_GREY} for amount {amount} (got {m})"
+            );
+        }
+    }
+
+    #[test]
+    fn monotone_bounded_and_compresses_highlights() {
+        let xs = [0.001, 0.01, 0.05, 0.18, 0.5, 1.0, 2.0, 4.0, 8.0, 32.0];
+        let mut prev = -1.0;
+        for x in xs {
+            let y = base_curve_value(x, 1.0);
+            assert!((0.0..1.0).contains(&y), "f({x})={y} out of [0,1)");
+            assert!(y > prev, "f must increase ({prev} -> {y} at x={x})");
+            prev = y;
+        }
+        assert!(base_curve_value(4.0, 1.0) < base_curve_value(8.0, 1.0));
+        assert!(base_curve_value(8.0, 1.0) < 1.0);
+    }
+
+    #[test]
+    fn full_amount_is_more_contrasty_than_neutral() {
+        assert!(base_curve_value(1.0, 1.0) > base_curve_value(1.0, 0.0));
+    }
+
+    #[test]
+    fn lut_matches_curve_at_sample_points() {
+        let lut = build_base_curve_lut(1.0);
+        assert_eq!(lut.len(), BASE_LUT_SIZE);
+        let u_at = |i: usize| {
+            BASE_U_MIN + (i as f32 / (BASE_LUT_SIZE - 1) as f32) * (BASE_U_MAX - BASE_U_MIN)
+        };
+        for i in [0usize, BASE_LUT_SIZE / 2, BASE_LUT_SIZE - 1] {
+            let x = MID_GREY * 2f32.powf(u_at(i));
+            assert!((lut[i] - base_curve_value(x, 1.0)).abs() < 1e-6);
+        }
+    }
+}
+
+#[cfg(test)]
+mod geom_tests {
+    use super::*;
+
+    fn close(a: [f32; 2], b: [f32; 2], eps: f32) -> bool {
+        (a[0] - b[0]).abs() < eps && (a[1] - b[1]).abs() < eps
+    }
+
+    #[test]
+    fn identity_crop_maps_to_self() {
+        let c = Crop::default();
+        assert!(c.is_identity());
+        for u in [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0], [0.25, 0.8]] {
+            let src = geom_src_uv(&c, 1.5, geom_autozoom(&c, 1.5), u);
+            assert!(
+                close(src, u, 1e-6),
+                "identity must map {u:?} -> self, got {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crop_corners_map_to_rect() {
+        let c = Crop {
+            cx: 0.6,
+            cy: 0.4,
+            hw: 0.25,
+            hh: 0.2,
+            angle: 0.0,
+        };
+        let a = 2.0;
+        let z = 1.0;
+        assert!(close(geom_src_uv(&c, a, z, [0.0, 0.0]), [0.35, 0.2], 1e-6));
+        assert!(close(geom_src_uv(&c, a, z, [1.0, 1.0]), [0.85, 0.6], 1e-6));
+        assert!(close(geom_src_uv(&c, a, z, [0.5, 0.5]), [0.6, 0.4], 1e-6));
+    }
+
+    #[test]
+    fn rotation_is_pixel_space_on_nonsquare() {
+        let c = Crop {
+            angle: 90.0,
+            ..Default::default()
+        };
+        let src = geom_src_uv(&c, 2.0, 1.0, [0.6, 0.5]);
+        assert!(
+            close(src, [0.5, 0.3], 1e-5),
+            "90° non-square map wrong: {src:?}"
+        );
+    }
+
+    #[test]
+    fn export_rect_is_full_for_identity_and_tight_for_aspect() {
+        assert_eq!(Crop::default().export_rect(3000, 2000), (0, 0, 3000, 2000));
+        let c = Crop {
+            cx: 0.5,
+            cy: 0.5,
+            hw: 0.5,
+            hh: 0.5 / ((16.0 / 9.0) / 1.5),
+            angle: 0.0,
+        };
+        let (_x, y, w, h) = c.export_rect(3000, 2000);
+        assert_eq!(w, 3000, "16:9 of 3:2 keeps full width");
+        assert!(
+            (w as f32 / h as f32 - 16.0 / 9.0).abs() < 0.01,
+            "rect must be 16:9"
+        );
+        assert_eq!(y, (2000 - h) / 2, "crop must be vertically centered");
+    }
+
+    #[test]
+    fn autozoom_keeps_corners_in_bounds() {
+        let c = Crop {
+            angle: 45.0,
+            ..Default::default()
+        };
+        let a = 1.0;
+        let z = geom_autozoom(&c, a);
+        assert!(
+            (z - 2.0_f32.sqrt()).abs() < 1e-3,
+            "45° square autozoom ≈ √2, got {z}"
+        );
+        let mut touches = false;
+        for u in [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] {
+            let s = geom_src_uv(&c, a, z, u);
+            assert!(
+                s[0] >= -1e-4 && s[0] <= 1.0 + 1e-4 && s[1] >= -1e-4 && s[1] <= 1.0 + 1e-4,
+                "corner {u:?} -> {s:?} out of source bounds"
+            );
+            if s[0].min(1.0 - s[0]).min(s[1]).min(1.0 - s[1]) < 1e-3 {
+                touches = true;
+            }
+        }
+        assert!(
+            touches,
+            "at z_min at least one corner must touch the source edge"
+        );
     }
 }

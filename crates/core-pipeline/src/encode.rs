@@ -22,3 +22,17 @@ pub fn rgba8_to_jpeg(rgba: &[u8], w: u32, h: u32, quality: u8) -> Result<Vec<u8>
     enc.encode(&rgb, w, h, ExtendedColorType::Rgb8)?;
     Ok(buf)
 }
+
+/// Copy a sub-rectangle out of a tightly-packed RGBA8 buffer — a plain pixel copy, no resampling.
+/// Used to extract the true-dimension crop from a full, letterbox-fit export render. Bounds are
+/// assumed valid (`x + cw <= w`, `y + ch <= h`); callers use `Crop::export_rect` which guarantees it.
+pub fn crop_rgba8(rgba: &[u8], w: u32, x: u32, y: u32, cw: u32, ch: u32) -> Vec<u8> {
+    let row = (w * 4) as usize;
+    let cwb = (cw * 4) as usize;
+    let mut out = Vec::with_capacity(cwb * ch as usize);
+    for ry in 0..ch as usize {
+        let start = (y as usize + ry) * row + x as usize * 4;
+        out.extend_from_slice(&rgba[start..start + cwb]);
+    }
+    out
+}

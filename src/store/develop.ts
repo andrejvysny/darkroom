@@ -12,6 +12,7 @@ export function freshDefaults(): DevelopParams {
     ...DEFAULT_PARAMS,
     toneCurve: { rgb: [], r: [], g: [], b: [] },
     hsl: DEFAULT_PARAMS.hsl.map((b) => ({ ...b })),
+    crop: { ...DEFAULT_PARAMS.crop },
     masks: [],
   };
 }
@@ -49,6 +50,12 @@ interface DevelopState {
   /** Eyedropper armed for the color-range mask (next image click samples a target color). */
   pickingColor: boolean;
   setPickingColor: (b: boolean) => void;
+  /** Crop tool active: the stage shows the full (uncropped) image + a draggable crop rectangle. */
+  cropMode: boolean;
+  setCropMode: (b: boolean) => void;
+  /** Source image aspect (W/H), set by the Stage on load — used by the crop aspect presets. */
+  imageAspect: number;
+  setImageAspect: (a: number) => void;
 }
 
 export interface BrushSettings {
@@ -95,4 +102,8 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setBrush: (patch) => set((s) => ({ brush: { ...s.brush, ...patch } })),
   pickingColor: false,
   setPickingColor: (b) => set({ pickingColor: b }),
+  cropMode: false,
+  setCropMode: (b) => set({ cropMode: b }),
+  imageAspect: 1.5,
+  setImageAspect: (a) => set({ imageAspect: a }),
 }));
