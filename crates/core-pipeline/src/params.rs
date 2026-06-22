@@ -788,6 +788,79 @@ impl Default for GeomUniform {
     }
 }
 
+/// Viewport + mask-overlay uniform (`@binding(13)`). std140-clean: three `vec4` (48 bytes).
+/// `rect`  = (origin.x, origin.y, size.x, size.y) — the visible window in **crop-local uv** [0,1]
+///           (zoom/pan); `flags` = (active 0/1, overlay_layer as f32 (-1 = off), overlay_strength,
+///           _pad); `color` = (overlay r, g, b, _pad) in display sRGB.
+///
+/// `active = 0` (the `ViewParams::full` identity) makes the shader take the legacy `geom_resolve`
+/// path and leaves the overlay branch dead, so a full-frame render is **byte-identical** to one
+/// produced before this binding existed. The golden suites + export rely on that.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ViewUniform {
+    pub rect: [f32; 4],
+    pub flags: [f32; 4],
+    pub color: [f32; 4],
+}
+
+impl Default for ViewUniform {
+    fn default() -> Self {
+        ViewParams::full(1, 1).to_uniform()
+    }
+}
+
+/// CPU-side viewport descriptor consumed by `DevelopPipeline::render_view`. Renders only the
+/// crop-local window `[origin, origin + size]` into an `out_w × out_h` target. `overlay_layer` is
+/// the **packed enabled-mask layer** (not the frontend mask index; -1 = no overlay) whose coverage
+/// is red-tinted over the result.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewParams {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub out_w: u32,
+    pub out_h: u32,
+    pub active: bool,
+    pub overlay_layer: i32,
+    pub overlay_color: [f32; 3],
+    pub overlay_strength: f32,
+}
+
+impl ViewParams {
+    /// Identity view: whole crop, output == source size, no overlay → byte-identical to the legacy
+    /// (pre-viewport) render. The 3-arg `render()` wrapper uses this.
+    pub fn full(w: u32, h: u32) -> Self {
+        Self {
+            origin: [0.0, 0.0],
+            size: [1.0, 1.0],
+            out_w: w.max(1),
+            out_h: h.max(1),
+            active: false,
+            overlay_layer: -1,
+            overlay_color: [0.85, 0.10, 0.10],
+            overlay_strength: 0.5,
+        }
+    }
+
+    pub fn to_uniform(&self) -> ViewUniform {
+        ViewUniform {
+            rect: [self.origin[0], self.origin[1], self.size[0], self.size[1]],
+            flags: [
+                if self.active { 1.0 } else { 0.0 },
+                self.overlay_layer as f32,
+                self.overlay_strength,
+                0.0,
+            ],
+            color: [
+                self.overlay_color[0],
+                self.overlay_color[1],
+                self.overlay_color[2],
+                0.0,
+            ],
+        }
+    }
+}
+
 #[cfg(test)]
 mod wb_tests {
     use super::*;

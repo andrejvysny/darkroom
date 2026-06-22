@@ -2,6 +2,39 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## DONE: Viewport render — full-res zoom + near-instant edits + mask overlay
+
+> Branch `feat/viewport-render` (merged). Plan: `~/.claude/plans/snoopy-floating-island.md`. Render
+> only the visible viewport at display res (RapidRAW pattern); canvas + server view-rect replaces
+> `<img>`+CSS scale (kills WKWebView zoom blur/glitch); mask-layer cache + raw-RGBA transport →
+> ~260 ms → ~5 ms per masked edit. 41 core-pipeline tests green, goldens byte-identical, build clean,
+> Tier-1 mock QA passed.
+
+- [x] `ViewUniform` `@binding(13)` + `ViewParams`; `render_view` (display-sized viewport);
+      `render()` = byte-identical identity wrapper.
+- [x] Geometry split `crop_to_source` (crop+zoom+straighten compose); 5 `tests/viewport.rs` vectors.
+- [x] Mask-layer cache (`PreparedImage.mask_layer_hash`, `mask::mask_geometry_hash`) — skip pre-pass
+      on pan/zoom/scalar edits; cache-correctness test.
+- [x] Red overlay shader tint on the packed mask layer; `packed_overlay_layer` index resolution.
+- [x] `develop_render` → raw RGBA `[outW][outH][rgba]`; output dims capped 8192; preview-tier LRU
+      removed (full-res source cached).
+- [x] `lib/viewport.ts` math; canvas `Stage` + `Loupe`; overlays via view-rect; single-flight rAF
+      coalescing; double-buffer; crop-aspect-correct natural; `renderTick` → live slider edits.
+- [x] `bench_render` example + Codex review (architecture + methodology). 2 code-reviewer passes.
+
+### NEXT (this feature, prioritized)
+
+- [ ] **Real-app visual QA** (`npm run tauri dev`): crisp full-res zoom, red overlay color over a
+      real mask, edit snappiness on real photos. (Tier-1 mock is synthetic — can't confirm fidelity.)
+- [ ] **B0 native-GPU-surface spike** (go/no-go): CAMetalLayer under a transparent webview, zero
+      readback. If go → **Workstream B** (render thread owns Device/Queue/Surface, `run_on_main_thread`
+      present, `develop:preview-rendered` event, surface lifecycle). Plan: snoopy-floating-island.md.
+- [ ] Whole-crop histogram pass (current histogram is viewport-biased; TODO marked in `commands.rs`).
+- [ ] Tiered source: preview-res for fit, full-res on zoom (faster first-open + fixes fit-view
+      minification aliasing, Codex #3).
+- [ ] Extract a shared viewport hook — `Stage.tsx` and `Loupe.tsx` duplicate the canvas logic.
+- [ ] Deferred review nits: derived-key float accumulation; eyedropper-while-cropping guard.
+
 ## DONE: Behavioral-signal capture (Phase 0 — labeled data for future AI)
 
 > Plan: `~/.claude/plans/act-as-senior-ai-linked-peacock.md`. Captures decision/label signals so the

@@ -19,7 +19,7 @@ pub use error::PipelineError;
 pub use histogram::{histogram, histogram_from_jpeg, Histogram};
 pub use params::{
     BrushStroke, ComponentKind, Crop, CurvePoint, DevelopParams, HslBand, LocalAdjust, Mask,
-    MaskComponent, MaskOp, ToneCurve, MASK_CAP,
+    MaskComponent, MaskOp, ToneCurve, ViewParams, MASK_CAP,
 };
 
 // Re-export the linear buffer type for convenience.

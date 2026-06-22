@@ -206,8 +206,8 @@ pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
         }
         // Clear derived caches (thumbnails on disk + warm GPU resources + last histogram).
         let _ = st.thumbs.evict_to(0);
-        if let Ok(mut lru) = st.develop_cache.lock() {
-            *lru = Default::default();
+        if let Ok(mut slot) = st.full_render_cache.lock() {
+            *slot = None;
         }
         if let Ok(mut h) = st.last_histogram.lock() {
             *h = None;
@@ -318,10 +318,6 @@ pub async fn develop_set_edit(
 }
 
 const PREVIEW_MAX_EDGE: u32 = 1600;
-const PREVIEW_JPEG_QUALITY: u8 = 82;
-/// Quality for the full-resolution (zoomed 1:1) render. Higher than the preview since this is what
-/// the user inspects pixel-for-pixel.
-const FULL_JPEG_QUALITY: u8 = 92;
 /// Hard cap on the full-res texture's long edge — keeps it within the GPU max texture dimension
 /// (8192 on the wgpu defaults). A no-op for the validated EOS R7 (6960 px).
 const FULL_MAX_EDGE: u32 = 8192;
@@ -492,19 +488,58 @@ pub async fn develop_get_histogram(app: AppHandle) -> Result<Option<Histogram>, 
     Ok(hist)
 }
 
-/// Render the develop preview for `image_id` with `params`, returning JPEG bytes.
+/// A crop-local uv viewport window: origin `(ox, oy)` + size `(sx, sy)`, all in [0,1] crop space.
+#[derive(serde::Deserialize)]
+pub struct ViewRect {
+    ox: f32,
+    oy: f32,
+    sx: f32,
+    sy: f32,
+}
+
+/// Resolve a frontend mask *index* (its position in `params.masks`) to the dense GPU overlay
+/// *layer* the mask pre-pass packs into. The pre-pass only uploads enabled masks, so disabled
+/// masks before `idx` shift every later mask down a layer. Returns -1 (no overlay) when `idx` is
+/// negative, out of range, the targeted mask is disabled, or its packed layer would exceed the GPU
+/// mask cap.
+fn packed_overlay_layer(params: &DevelopParams, idx: i32) -> i32 {
+    if idx < 0 {
+        return -1;
+    }
+    let i = idx as usize;
+    match params.masks.get(i) {
+        Some(m) if m.enabled => {
+            let packed = params.masks[..i].iter().filter(|m| m.enabled).count();
+            if packed >= core_pipeline::MASK_CAP {
+                -1
+            } else {
+                packed as i32
+            }
+        }
+        _ => -1,
+    }
+}
+
+/// Render a crop-local viewport window of `image_id` at the requested output size, returning raw
+/// RGBA8 framed by its dimensions: `[out_w u32 LE][out_h u32 LE][rgba8 (out_w*out_h*4)]`.
 ///
-/// First open of an image decodes (half-resolution superpixel) + uploads — slow once, then cached
-/// in a small LRU so back/forward and A/B compare reuse the GPU resources (single-digit ms). The
-/// expensive decode runs WITHOUT holding the cache lock. `request_id` is a monotonic token: if a
-/// newer request has superseded this one, the decode is skipped and an empty response is returned.
+/// The prepared SOURCE is always full-resolution (decoded once and cached in `full_render_cache`,
+/// keyed by `image_id`) so any zoom stays crisp; only the small `out_w × out_h` viewport target is
+/// re-rendered per edit (the RapidRAW pattern). The expensive decode runs WITHOUT holding the
+/// cache lock. `request_id` is a monotonic supersede token: if a newer request has overtaken this
+/// one, the decode is skipped and an empty response is returned. (Instant first-paint is served
+/// separately by `develop_preview_jpeg`.)
+#[allow(clippy::too_many_arguments)] // fixed by the viewport-render IPC contract
 #[tauri::command]
 pub async fn develop_render(
     app: AppHandle,
     image_id: i64,
     params: DevelopParams,
+    view: ViewRect,
+    out_w: u32,
+    out_h: u32,
+    overlay_mask_index: i32,
     request_id: u64,
-    full_res: bool,
 ) -> Result<tauri::ipc::Response, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let prof = profiling();
@@ -525,122 +560,68 @@ pub async fn develop_render(
             }
         }
 
-        // Produce the rendered RGBA8 buffer + its dimensions, from either the preview tier (fast,
-        // ≤1600 px, slider editing) or the full-resolution tier (zoomed 1:1 inspection).
-        let (rgba, w, h) = if full_res {
-            // --- Full-res tier: decode the whole frame at full demosaic, cached in a single slot. ---
-            let present = {
-                let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-                slot.as_ref().is_some_and(|(id, _)| *id == image_id)
-            };
-            if !present {
-                if superseded() {
-                    return Ok(tauri::ipc::Response::new(Vec::new()));
-                }
-                let path = {
-                    let db = st.db.lock().map_err(|e| e.to_string())?;
-                    core_library::image_by_id(&db.conn, image_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| "image not found".to_string())?
-                        .path
-                };
-                let src =
-                    core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-                let t = Instant::now();
-                let lin = core_raw::develop_linear(&src)
-                    .map_err(|e| e.to_string())?
-                    .downscale_into(FULL_MAX_EDGE);
-                if prof {
-                    eprintln!("[profile] decode(full): {:?}", t.elapsed());
-                }
-                let prepared = gpu
-                    .pipeline
-                    .prepare(&gpu.ctx, &lin)
-                    .map_err(|e| e.to_string())?;
-                *st.full_render_cache.lock().map_err(|e| e.to_string())? =
-                    Some((image_id, prepared));
-            }
-            // Lock held across render+readback so the slot can't be swapped mid-render.
+        // --- Full-res source: decode the whole frame at full demosaic, cached in a single slot. ---
+        let present = {
             let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-            let (_, prepared) = slot
-                .as_ref()
-                .ok_or_else(|| "full-res image evicted before render".to_string())?;
-            let (w, h) = (prepared.width, prepared.height);
-            let t = Instant::now();
-            let rgba = gpu
-                .pipeline
-                .render(&gpu.ctx, prepared, &params)
-                .map_err(|e| e.to_string())?;
-            if prof {
-                eprintln!("[profile] gpu render+readback(full): {:?}", t.elapsed());
-            }
-            (rgba, w, h)
-        } else {
-            // --- Preview tier: half-res superpixel decode downscaled to ≤1600 px, LRU-cached. ---
-            let present = {
-                let cache = st.develop_cache.lock().map_err(|e| e.to_string())?;
-                cache.contains(image_id)
-            };
-            if !present {
-                // Skip the expensive decode if a newer request already arrived.
-                if superseded() {
-                    return Ok(tauri::ipc::Response::new(Vec::new()));
-                }
-                let path = {
-                    let db = st.db.lock().map_err(|e| e.to_string())?;
-                    core_library::image_by_id(&db.conn, image_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| "image not found".to_string())?
-                        .path
-                };
-                let src =
-                    core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-
-                let t = Instant::now();
-                let lin = core_raw::develop_linear_preview(&src).map_err(|e| e.to_string())?;
-                if prof {
-                    eprintln!("[profile] decode(superpixel): {:?}", t.elapsed());
-                }
-
-                let t = Instant::now();
-                let preview = lin.downscale_into(PREVIEW_MAX_EDGE);
-                if prof {
-                    eprintln!("[profile] downscale_into: {:?}", t.elapsed());
-                }
-
-                let t = Instant::now();
-                let prepared = gpu
-                    .pipeline
-                    .prepare(&gpu.ctx, &preview)
-                    .map_err(|e| e.to_string())?;
-                if prof {
-                    eprintln!("[profile] gpu prepare: {:?}", t.elapsed());
-                }
-
-                let mut cache = st.develop_cache.lock().map_err(|e| e.to_string())?;
-                cache.put(image_id, prepared);
-            }
-
-            // Lock held only across the GPU render + readback.
-            let mut cache = st.develop_cache.lock().map_err(|e| e.to_string())?;
-            let prepared = cache
-                .get(image_id)
-                .ok_or_else(|| "prepared image evicted before render".to_string())?;
-            let (w, h) = (prepared.width, prepared.height);
-            let t = Instant::now();
-            let rgba = gpu
-                .pipeline
-                .render(&gpu.ctx, prepared, &params)
-                .map_err(|e| e.to_string())?;
-            if prof {
-                eprintln!("[profile] gpu render+readback: {:?}", t.elapsed());
-            }
-            (rgba, w, h)
+            slot.as_ref().is_some_and(|(id, _)| *id == image_id)
         };
+        if !present {
+            // Skip the expensive decode if a newer request already arrived.
+            if superseded() {
+                return Ok(tauri::ipc::Response::new(Vec::new()));
+            }
+            let path = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::image_by_id(&db.conn, image_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "image not found".to_string())?
+                    .path
+            };
+            let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+            let t = Instant::now();
+            let lin = core_raw::develop_linear(&src)
+                .map_err(|e| e.to_string())?
+                .downscale_into(FULL_MAX_EDGE);
+            if prof {
+                eprintln!("[profile] decode(full): {:?}", t.elapsed());
+            }
+            let prepared = gpu
+                .pipeline
+                .prepare(&gpu.ctx, &lin)
+                .map_err(|e| e.to_string())?;
+            *st.full_render_cache.lock().map_err(|e| e.to_string())? = Some((image_id, prepared));
+        }
+
+        // Build the viewport descriptor and render the crop-local window into an out_w × out_h
+        // target. Lock held across render+readback so the slot can't be swapped mid-render.
+        let view = core_pipeline::ViewParams {
+            origin: [view.ox, view.oy],
+            size: [view.sx, view.sy],
+            out_w,
+            out_h,
+            active: true,
+            overlay_layer: packed_overlay_layer(&params, overlay_mask_index),
+            overlay_color: [0.85, 0.10, 0.10],
+            overlay_strength: 0.5,
+        };
+        let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
+        let (_, prepared) = slot
+            .as_ref()
+            .ok_or_else(|| "full-res image evicted before render".to_string())?;
+        let t = Instant::now();
+        let rgba = gpu
+            .pipeline
+            .render_view(&gpu.ctx, prepared, &params, &view)
+            .map_err(|e| e.to_string())?;
+        if prof {
+            eprintln!("[profile] gpu render_view+readback: {:?}", t.elapsed());
+        }
+        drop(slot);
 
         // Histogram from the rendered buffer: store for pull + emit for push. Skip if a newer render
         // has superseded this one — otherwise a slower earlier render (e.g. a cache hit racing a
         // just-started newer request) could clobber the live histogram with a stale buffer's stats.
+        // TODO: whole-crop histogram pass (this is now the visible-viewport histogram).
         if !superseded() {
             let hist = core_pipeline::histogram(&rgba);
             if let Ok(mut last) = st.last_histogram.lock() {
@@ -649,17 +630,12 @@ pub async fn develop_render(
             let _ = app.emit("develop:histogram", hist);
         }
 
-        let quality = if full_res {
-            FULL_JPEG_QUALITY
-        } else {
-            PREVIEW_JPEG_QUALITY
-        };
-        let t = Instant::now();
-        let jpeg = core_pipeline::rgba8_to_jpeg(&rgba, w, h, quality).map_err(|e| e.to_string())?;
-        if prof {
-            eprintln!("[profile] jpeg encode: {:?}", t.elapsed());
-        }
-        Ok::<_, String>(tauri::ipc::Response::new(jpeg))
+        // Frame the raw RGBA8 with its dimensions: [out_w LE][out_h LE][rgba8].
+        let mut buf = Vec::with_capacity(8 + rgba.len());
+        buf.extend_from_slice(&out_w.to_le_bytes());
+        buf.extend_from_slice(&out_h.to_le_bytes());
+        buf.extend_from_slice(&rgba);
+        Ok::<_, String>(tauri::ipc::Response::new(buf))
     })
     .await
     .map_err(|e| e.to_string())?

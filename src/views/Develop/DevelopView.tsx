@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import Stage from "./Stage";
 import InstrumentPanel from "./InstrumentPanel";
 import Filmstrip from "./Filmstrip";
@@ -8,14 +8,17 @@ import { useDevelopStore } from "../../store/develop";
 
 export default function DevelopView() {
   const selectedId = useAppStore((s) => s.selectedId);
+  const libraryImages = useAppStore((s) => s.libraryImages);
   const setOnDevelopReset = useAppStore((s) => s.setOnDevelopReset);
   const rendering = useDevelopStore((s) => s.rendering);
   const showBefore = useDevelopStore((s) => s.showBefore);
   const setShowBefore = useDevelopStore((s) => s.setShowBefore);
+
   const {
     params,
-    imageUrl,
     previewUrl,
+    renderFrame,
+    renderTick,
     onParamChange,
     onCurveChange,
     onHslChange,
@@ -33,13 +36,35 @@ export default function DevelopView() {
     deleteMask,
   } = useDevelop();
 
+  // Natural sensor dims from the selected ImageRow (drives viewport math + readout).
+  const selectedRow = libraryImages.find((r) => r.id === selectedId) ?? null;
+  const natural = {
+    w: selectedRow?.width ?? 3,
+    h: selectedRow?.height ?? 2,
+  };
+
+  // Embedded preview <img> for instant first paint on the canvas.
+  const [previewImg, setPreviewImg] = useState<HTMLImageElement | null>(null);
+  const previewUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (previewUrl === previewUrlRef.current) return;
+    previewUrlRef.current = previewUrl;
+    if (!previewUrl) {
+      setPreviewImg(null);
+      return;
+    }
+    const img = new Image();
+    img.onload = () => setPreviewImg(img);
+    img.src = previewUrl;
+  }, [previewUrl]);
+
   // Expose develop reset to the TopBar / command palette.
   useEffect(() => {
     setOnDevelopReset(reset);
     return () => setOnDevelopReset(null);
   }, [reset, setOnDevelopReset]);
 
-  // `\` toggles a real before/after (renders DEFAULT_PARAMS). Ignored while typing in a field.
+  // `\` toggles before/after. Ignored while typing in a field.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "\\") return;
@@ -88,14 +113,16 @@ export default function DevelopView() {
       >
         <Stage
           showBefore={showBefore}
-          imageUrl={imageUrl}
-          previewUrl={previewUrl}
           rendering={rendering}
           masks={params.masks}
           crop={params.crop}
+          natural={natural}
           onCropChange={onCropChange}
           onChangeMaskKind={updateMaskComponentKind}
           onCommitStroke={appendStroke}
+          renderFn={renderFrame}
+          renderTick={renderTick}
+          previewImg={previewImg}
         />
         <InstrumentPanel
           params={params}

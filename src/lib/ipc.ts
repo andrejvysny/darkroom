@@ -638,24 +638,45 @@ export type HistData = { r: number[]; g: number[]; b: number[] };
 // and skip superseded render requests.
 let renderRequestSeq = 0;
 
+export type ViewRect = { ox: number; oy: number; sx: number; sy: number };
+
+/** Rendered frame pixel data, or null when the request was superseded. */
+export type RenderedFrame = { data: Uint8ClampedArray; w: number; h: number };
+
 /**
- * Render the develop preview. Returns an object URL backed by JPEG bytes (caller must revoke), or
- * `null` if the backend skipped this request because a newer one superseded it.
+ * Render the develop viewport at display resolution.
+ *
+ * The backend returns raw bytes: [outW u32 LE][outH u32 LE][rgba8 outW*outH*4].
+ * An empty ArrayBuffer means the request was superseded — returns null.
+ *
+ * @param view      Visible window in crop-local uv [0,1] (ox,oy = top-left, sx,sy = size)
+ * @param outW/outH Canvas backing store size in device px (= visCssSize * clamped-DPR)
+ * @param overlayMaskIndex  Selected mask index (or -1 = no overlay)
  */
 export async function developRender(
   imageId: number,
   params: DevelopParams,
-  fullRes = false,
-): Promise<string | null> {
+  view: ViewRect,
+  outW: number,
+  outH: number,
+  overlayMaskIndex: number,
+): Promise<RenderedFrame | null> {
   const requestId = ++renderRequestSeq;
   const buf = await invoke<ArrayBuffer>("develop_render", {
     imageId,
     params,
+    view,
+    outW,
+    outH,
+    overlayMaskIndex,
     requestId,
-    fullRes,
   });
-  if (buf.byteLength === 0) return null; // superseded — no-op
-  return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+  if (buf.byteLength < 8) return null; // superseded or error
+  const header = new DataView(buf, 0, 8);
+  const w = header.getUint32(0, true); // little-endian
+  const h = header.getUint32(4, true);
+  const pixels = new Uint8ClampedArray(buf, 8);
+  return { data: pixels, w, h };
 }
 
 /**

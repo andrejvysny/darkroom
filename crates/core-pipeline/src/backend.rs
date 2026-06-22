@@ -108,6 +108,8 @@ pub struct PreparedImage {
     tone_op_uniform: wgpu::Buffer,
     // Crop + straighten geometry uniform, rewritten per render().
     geom_uniform: wgpu::Buffer,
+    // Viewport + mask-overlay uniform (@binding(13)), rewritten per render_view().
+    view_uniform: wgpu::Buffer,
     // Per-mask scalar deltas, rewritten per render() from the current params.
     mask_buffer: wgpu::Buffer,
     // Pre-pass uniform (one mask's components), rewritten per mask per render().
@@ -128,6 +130,10 @@ pub struct PreparedImage {
     // Mask alpha layers (R16Float, MASK_CAP layers). The pre-pass writes per-mask coverage here;
     // the develop pass samples it. Kept alive for the bind group's array view + per-layer targets.
     mask_tex: wgpu::Texture,
+    // Geometry hash of the mask baked into each `mask_tex` layer (None = stale). Lets `render_to`
+    // skip the pre-pass when a mask's coverage is unchanged. `Mutex` (not `RefCell`) keeps
+    // `PreparedImage: Sync` so it can live in the shared develop caches.
+    mask_layer_hash: std::sync::Mutex<Vec<Option<u64>>>,
 }
 
 /// The reusable develop render pipeline (created once per `GpuContext`).
@@ -280,6 +286,17 @@ impl DevelopPipeline {
                 // Crop + straighten geometry (uniform).
                 wgpu::BindGroupLayoutEntry {
                     binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Viewport + mask-overlay (uniform).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -453,6 +470,11 @@ impl DevelopPipeline {
         let geom_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("develop-geom-uniform"),
             contents: bytemuck::bytes_of(&crate::params::GeomUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let view_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("develop-view-uniform"),
+            contents: bytemuck::bytes_of(&crate::params::ViewUniform::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -672,6 +694,10 @@ impl DevelopPipeline {
                     binding: 12,
                     resource: geom_uniform.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: view_uniform.as_entire_binding(),
+                },
             ],
         });
 
@@ -703,6 +729,7 @@ impl DevelopPipeline {
             base_lut,
             tone_op_uniform,
             geom_uniform,
+            view_uniform,
             mask_buffer,
             prepass_uniform,
             prepass_bind,
@@ -714,15 +741,26 @@ impl DevelopPipeline {
             refine_uniform,
             _input: input,
             mask_tex,
+            mask_layer_hash: std::sync::Mutex::new(vec![None; crate::params::MASK_CAP]),
         })
     }
 
-    /// Render `prepared` with `params`; returns tightly-packed RGBA8 (`w*h*4`).
-    pub fn render(
+    /// Core render: write uniforms, run the mask pre-pass, draw into `out_tex`, read back
+    /// tightly-packed RGBA8 (`ow*oh*4`). Source dims (`w`,`h` from `prepared`) drive sampling /
+    /// detail / mask generation; output dims (`ow`,`oh`) drive the render target + readback. `view`
+    /// selects the viewport window + mask overlay (identity `ViewParams::full` ⇒ legacy full frame).
+    #[allow(clippy::too_many_arguments)]
+    fn render_to(
         &self,
         ctx: &GpuContext,
         prepared: &PreparedImage,
         params: &DevelopParams,
+        view: &crate::params::ViewParams,
+        out_tex: &wgpu::Texture,
+        readback: &wgpu::Buffer,
+        out_bpr: u32,
+        ow: u32,
+        oh: u32,
     ) -> Result<Vec<u8>, PipelineError> {
         let device = &ctx.device;
         let (w, h) = (prepared.width, prepared.height);
@@ -750,6 +788,11 @@ impl DevelopPipeline {
             0,
             bytemuck::bytes_of(&params.to_mask_buffer()),
         );
+        ctx.queue.write_buffer(
+            &prepared.view_uniform,
+            0,
+            bytemuck::bytes_of(&view.to_uniform()),
+        );
 
         // Refresh the tone-curve LUT (identity is cheap; skips spline work when no curve set).
         let lut = if params.tone_curve.is_identity() {
@@ -768,18 +811,25 @@ impl DevelopPipeline {
         );
         write_base_lut(ctx, &prepared.base_lut, &params.base_curve_lut());
 
-        // Crop + straighten geometry. Preview renders into the input-sized output (out == src
-        // aspect), so the crop is letterbox-fit; true-dims export uses a crop-sized output instead.
-        let aspect = w.max(1) as f32 / h.max(1) as f32;
+        // Crop + straighten geometry. `src_aspect` from the source; `out_aspect` from the render
+        // target. For the legacy/identity path (out == source dims) these are equal, so the geom is
+        // unchanged. In the active viewport path `crop_to_source` ignores `out_aspect` anyway.
+        let src_aspect = w.max(1) as f32 / h.max(1) as f32;
+        let out_aspect = ow.max(1) as f32 / oh.max(1) as f32;
         ctx.queue.write_buffer(
             &prepared.geom_uniform,
             0,
-            bytemuck::bytes_of(&params.to_geom(aspect, aspect)),
+            bytemuck::bytes_of(&params.to_geom(src_aspect, out_aspect)),
         );
 
         // Mask pre-pass: compute each enabled mask's composited alpha into its alpha layer. Same
         // order as `to_mask_buffer` (enabled masks, dense 0..count). One submit per mask so the
         // per-mask uniform write is ordered before its draw (the uniform buffer is reused).
+        // Cache: a mask layer is recomputed only when its coverage geometry changes. Pan/zoom and
+        // global/local SCALAR edits leave geometry untouched, so they reuse the persistent mask_tex
+        // layer and skip the (full-res) pre-pass entirely.
+        let mut layer_hashes = prepared.mask_layer_hash.lock().unwrap();
+        let mut enabled_count = 0usize;
         for (layer, mask) in params
             .masks
             .iter()
@@ -787,6 +837,13 @@ impl DevelopPipeline {
             .take(crate::params::MASK_CAP)
             .enumerate()
         {
+            enabled_count = layer + 1;
+            let geom_hash = crate::mask::mask_geometry_hash(mask);
+            if layer_hashes[layer] == Some(geom_hash) {
+                continue; // coverage unchanged ⇒ this mask_tex layer is already valid
+            }
+            layer_hashes[layer] = Some(geom_hash);
+
             // Bake this mask's brush strokes (if any) into the brush scratch before its pre-pass.
             if crate::mask::mask_has_brush(mask) {
                 self.bake_brush(ctx, prepared, mask);
@@ -876,10 +933,14 @@ impl DevelopPipeline {
                 );
             }
         }
+        // Invalidate layers no longer in use so a later render with more masks recomputes them
+        // instead of reusing stale coverage.
+        for slot in layer_hashes.iter_mut().skip(enabled_count) {
+            *slot = None;
+        }
+        drop(layer_hashes);
 
-        let output_view = prepared
-            .output
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let output_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("develop-enc"),
         });
@@ -906,50 +967,129 @@ impl DevelopPipeline {
         }
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &prepared.output,
+                texture: out_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &prepared.readback,
+                buffer: readback,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(prepared.bpr),
-                    rows_per_image: Some(h),
+                    bytes_per_row: Some(out_bpr),
+                    rows_per_image: Some(oh),
                 },
             },
             wgpu::Extent3d {
-                width: w,
-                height: h,
+                width: ow,
+                height: oh,
                 depth_or_array_layers: 1,
             },
         );
         ctx.queue.submit(Some(enc.finish()));
 
         let (tx, rx) = std::sync::mpsc::channel();
-        prepared
-            .readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|e| PipelineError::Map(e.to_string()))?
             .map_err(|e| PipelineError::Map(e.to_string()))?;
 
-        let data = prepared.readback.slice(..).get_mapped_range();
-        let mut out = vec![0u8; (w * h * 4) as usize];
-        let row = (w * 4) as usize;
-        for y in 0..h as usize {
-            let src = y * prepared.bpr as usize;
+        let data = readback.slice(..).get_mapped_range();
+        let mut out = vec![0u8; (ow * oh * 4) as usize];
+        let row = (ow * 4) as usize;
+        for y in 0..oh as usize {
+            let src = y * out_bpr as usize;
             let dst = y * row;
             out[dst..dst + row].copy_from_slice(&data[src..src + row]);
         }
         drop(data);
-        prepared.readback.unmap();
+        readback.unmap();
         Ok(out)
+    }
+
+    /// Render `prepared` with `params` at full source resolution; returns tightly-packed RGBA8
+    /// (`w*h*4`). Thin identity wrapper over [`Self::render_to`] — byte-identical to the pre-viewport
+    /// pipeline, so every existing caller / golden / export is unaffected.
+    pub fn render(
+        &self,
+        ctx: &GpuContext,
+        prepared: &PreparedImage,
+        params: &DevelopParams,
+    ) -> Result<Vec<u8>, PipelineError> {
+        let view = crate::params::ViewParams::full(prepared.width, prepared.height);
+        self.render_to(
+            ctx,
+            prepared,
+            params,
+            &view,
+            &prepared.output,
+            &prepared.readback,
+            prepared.bpr,
+            prepared.width,
+            prepared.height,
+        )
+    }
+
+    /// Render only the crop-local viewport window `view` into a `view.out_w × view.out_h` target
+    /// (the RapidRAW pattern: full-res source cached once, small viewport-sized output per edit).
+    /// Returns tightly-packed RGBA8 (`out_w*out_h*4`). An identity, source-sized, overlay-off view
+    /// reuses the prepared (source-sized) target and is byte-identical to [`Self::render`]; any other
+    /// view renders into a transient display-sized target (the render thread owns a reusable one —
+    /// Workstream B).
+    pub fn render_view(
+        &self,
+        ctx: &GpuContext,
+        prepared: &PreparedImage,
+        params: &DevelopParams,
+        view: &crate::params::ViewParams,
+    ) -> Result<Vec<u8>, PipelineError> {
+        // Clamp the output to the GPU max texture edge. This also bounds `ow * oh * 4` well within
+        // u32 (8192² × 4 ≈ 256 MB), so the readback allocation can't silently overflow on a bad
+        // request from the IPC layer.
+        const MAX_VIEW_EDGE: u32 = 8192;
+        let ow = view.out_w.clamp(1, MAX_VIEW_EDGE);
+        let oh = view.out_h.clamp(1, MAX_VIEW_EDGE);
+        if !view.active && view.overlay_layer < 0 && ow == prepared.width && oh == prepared.height {
+            return self.render_to(
+                ctx,
+                prepared,
+                params,
+                view,
+                &prepared.output,
+                &prepared.readback,
+                prepared.bpr,
+                ow,
+                oh,
+            );
+        }
+        let device = &ctx.device;
+        let out_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("develop-view-output"),
+            size: wgpu::Extent3d {
+                width: ow,
+                height: oh,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let out_bpr = padded_bpr(ow);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("develop-view-readback"),
+            size: (out_bpr * oh) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.render_to(
+            ctx, prepared, params, view, &out_tex, &readback, out_bpr, ow, oh,
+        )
     }
 
     /// Bake a mask's brush strokes into the per-image brush scratch texture. Clears first, then
