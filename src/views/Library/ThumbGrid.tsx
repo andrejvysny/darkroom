@@ -9,6 +9,8 @@ export interface GridImage {
   stars: number;
   flag: "pick" | "reject" | null;
   label?: string;
+  width?: number | null;
+  height?: number | null;
 }
 
 export interface SelectMods {
@@ -85,14 +87,12 @@ export default function ThumbGrid({
   }, [updateCols]);
 
   const rowCount = Math.ceil(images.length / colCount);
-  // Cells are `1fr`, so they stretch to fill the row — their real width is the column width, NOT
-  // thumbSize. Derive row height from that actual width so the virtualizer's row stride matches the
-  // rendered height; using thumbSize here makes rows shorter than reality and they overlap.
+  // Cells are square (1:1) so row height = cell width (the actual 1fr column width, not thumbSize).
   const cellWidth =
     contentWidth > 0
       ? (contentWidth - GAP * (colCount - 1)) / colCount
       : thumbSize;
-  const rowHeight = Math.round((cellWidth * 2) / 3) + GAP; // 3:2 aspect + gap
+  const rowHeight = Math.round(cellWidth) + GAP;
 
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
@@ -101,8 +101,7 @@ export default function ThumbGrid({
     overscan: 3,
   });
 
-  // Re-measure when the computed row height changes (thumbSize / width change), otherwise the
-  // virtualizer keeps the previous stride and rows overlap or leave gaps.
+  // Re-measure when row height changes (thumbSize / width change).
   useEffect(() => {
     rowVirtualizer.measure();
   }, [rowHeight, rowVirtualizer]);
@@ -125,7 +124,7 @@ export default function ThumbGrid({
         height: "100%",
         overflowY: "auto",
         overflowX: "hidden",
-        background: "var(--color-stage)",
+        background: "#000",
       }}
     >
       <div
@@ -169,13 +168,13 @@ export default function ThumbGrid({
                     onDoubleClick={() => onActivate?.(img.id)}
                     style={{
                       position: "relative",
-                      aspectRatio: "3/2",
+                      aspectRatio: "1/1",
                       borderRadius: "var(--radius-sm)",
                       overflow: "hidden",
                       cursor: "pointer",
                       outline: sel
                         ? `2px solid ${primary ? "var(--color-accent)" : "var(--color-accent-line)"}`
-                        : "1px solid var(--color-line)",
+                        : "none",
                       outlineOffset: 0,
                       background: "#000",
                     }}
@@ -186,7 +185,7 @@ export default function ThumbGrid({
                         position: "absolute",
                         inset: 0,
                         background: img.thumbUrl
-                          ? `url(${img.thumbUrl}) center/cover`
+                          ? `url(${img.thumbUrl}) center/contain no-repeat`
                           : (img.gradient ?? "#1a1a1a"),
                       }}
                     />

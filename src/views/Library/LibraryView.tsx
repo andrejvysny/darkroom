@@ -62,6 +62,8 @@ function toGridImage(r: ImageRow): GridImage {
     label: r.colorLabel
       ? (LABEL_COLOR_MAP[r.colorLabel] ?? r.colorLabel)
       : undefined,
+    width: r.width,
+    height: r.height,
   };
 }
 

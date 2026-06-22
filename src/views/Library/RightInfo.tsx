@@ -242,36 +242,32 @@ export default function RightInfo({
       {/* Preview */}
       <div
         style={{
-          aspectRatio: "3/2",
           margin: 14,
           borderRadius: "var(--radius-md)",
           overflow: "hidden",
           outline: "1px solid var(--color-line)",
           position: "relative",
           background: "var(--color-stage)",
+          lineHeight: 0,
         }}
       >
         {previewSrc && (
           <img
             src={previewSrc}
             alt={meta?.filename ?? ""}
+            style={{ width: "100%", height: "auto", display: "block" }}
+          />
+        )}
+        {previewSrc && (
+          <div
             style={{
               position: "absolute",
               inset: 0,
-              width: "100%",
-              height: "100%",
-              objectFit: "cover",
+              boxShadow: "inset 0 0 50px rgba(0,0,0,.4)",
+              pointerEvents: "none",
             }}
           />
         )}
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            boxShadow: "inset 0 0 50px rgba(0,0,0,.4)",
-            pointerEvents: "none",
-          }}
-        />
       </div>
 
       {/* Rating */}
