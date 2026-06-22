@@ -110,6 +110,8 @@ pub struct PreparedImage {
     geom_uniform: wgpu::Buffer,
     // Viewport + mask-overlay uniform (@binding(13)), rewritten per render_view().
     view_uniform: wgpu::Buffer,
+    // Color-balance-RGB grading uniform (@binding(14)), rewritten per render().
+    cbrgb_uniform: wgpu::Buffer,
     // Per-mask scalar deltas, rewritten per render() from the current params.
     mask_buffer: wgpu::Buffer,
     // Pre-pass uniform (one mask's components), rewritten per mask per render().
@@ -305,6 +307,17 @@ impl DevelopPipeline {
                     },
                     count: None,
                 },
+                // Color-balance-RGB grading (uniform).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -475,6 +488,11 @@ impl DevelopPipeline {
         let view_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("develop-view-uniform"),
             contents: bytemuck::bytes_of(&crate::params::ViewUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let cbrgb_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("develop-cbrgb-uniform"),
+            contents: bytemuck::bytes_of(&crate::params::CbRgbUniform::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -698,6 +716,10 @@ impl DevelopPipeline {
                     binding: 13,
                     resource: view_uniform.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: cbrgb_uniform.as_entire_binding(),
+                },
             ],
         });
 
@@ -730,6 +752,7 @@ impl DevelopPipeline {
             tone_op_uniform,
             geom_uniform,
             view_uniform,
+            cbrgb_uniform,
             mask_buffer,
             prepass_uniform,
             prepass_bind,
@@ -820,6 +843,11 @@ impl DevelopPipeline {
             &prepared.geom_uniform,
             0,
             bytemuck::bytes_of(&params.to_geom(src_aspect, out_aspect)),
+        );
+        ctx.queue.write_buffer(
+            &prepared.cbrgb_uniform,
+            0,
+            bytemuck::bytes_of(&params.to_cbrgb()),
         );
 
         // Mask pre-pass: compute each enabled mask's composited alpha into its alpha layer. Same

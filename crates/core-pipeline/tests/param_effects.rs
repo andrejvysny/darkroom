@@ -3,7 +3,7 @@
 //! (`vec3 wb_gain` + scalars) — a misalignment would make exposure/saturation/etc. no-ops.
 //! Skips gracefully when no GPU adapter is available.
 
-use core_pipeline::{DevelopParams, DevelopPipeline, GpuContext};
+use core_pipeline::{CbRgb, DevelopParams, DevelopPipeline, GpuContext};
 use core_raw::LinearImage;
 
 fn solid(w: u32, h: u32, rgb: [f32; 3]) -> LinearImage {
@@ -115,8 +115,8 @@ fn develop_params_have_correct_effects() {
 
 /// Scene-referred base tone operator (ACR-matched, full Amount default): maps scene-linear ProPhoto
 /// gray through the display transition to the expected ACR-default 8-bit tonality. Locks the curve
-/// shape (mid-grey anchor + smooth highlight compression + toe), replacing the old fixed `exp()`
-/// shoulder. Vectors from the Codex curve review of the analytic `p=1.35` seed.
+/// fit to Adobe Camera Raw's real default tone response (`base_curve_ref::ADOBE_DEFAULT_TONE_CURVE`):
+/// mid-grey 0.18 → ~167 (65% sRGB, the ACR mid-grey), smooth highlight shoulder asymptoting to white.
 #[test]
 fn base_curve_tone_response() {
     let ctx = match GpuContext::new() {
@@ -136,16 +136,17 @@ fn base_curve_tone_response() {
         mean_channel(&out, 0)
     };
 
-    // (scene-linear input, inclusive 8-bit output bounds). Mid-grey 0.18 must anchor near 118.
+    // (scene-linear input, inclusive 8-bit output bounds) — the Adobe-default tone response.
+    // Mid-grey 0.18 anchors near 167 (65% sRGB). Highlights saturate to 255 (smooth shoulder).
     let cases = [
         (0.0_f32, 0.0_f64, 1.0_f64),
-        (0.01, 11.0, 17.0),
-        (0.05, 51.0, 58.0),
-        (0.18, 116.0, 120.0),
-        (0.5, 178.0, 185.0),
-        (1.0, 213.0, 220.0),
-        (2.0, 234.0, 241.0),
-        (4.0, 245.0, 251.0),
+        (0.01, 21.0, 25.0),
+        (0.05, 76.0, 80.0),
+        (0.18, 165.0, 169.0),
+        (0.5, 230.0, 234.0),
+        (1.0, 252.0, 255.0),
+        (2.0, 254.0, 255.0),
+        (4.0, 254.0, 255.0),
     ];
     let mut prev = -1.0;
     for (x, lo, hi) in cases {
@@ -154,8 +155,9 @@ fn base_curve_tone_response() {
             got >= lo && got <= hi,
             "base curve f({x}) → 8-bit {got}, expected [{lo},{hi}]"
         );
+        // Non-decreasing (highlights saturate to 255, so equal at the very top is allowed).
         assert!(
-            got > prev,
+            got >= prev,
             "tone response must be monotonic ({prev} -> {got} at x={x})"
         );
         prev = got;
@@ -369,5 +371,72 @@ fn sharpen_overshoots_edges_keeps_flats() {
         "sharpen must overshoot the bright edge ({} -> {})",
         at(&base, 32),
         at(&sharp, 32)
+    );
+}
+
+/// Color-balance-RGB grading (binding 14): a global offset raises luminance, and full negative
+/// saturation collapses a colored pixel toward neutral. Locks the grading round-trip + masks wiring.
+#[test]
+fn color_balance_global_offset_brightens() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = solid(8, 8, [0.18, 0.18, 0.18]);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let lifted = DevelopParams {
+        cb_rgb: CbRgb {
+            global: [0.15, 0.15, 0.15],
+            ..CbRgb::default()
+        },
+        ..DevelopParams::default()
+    };
+    let out = pipe.render(&ctx, &prep, &lifted).unwrap();
+    // Green channel must brighten (a positive grading offset raises luminance).
+    assert!(
+        mean_channel(&out, 1) > mean_channel(&base, 1) + 4.0,
+        "global offset must brighten ({} -> {})",
+        mean_channel(&base, 1),
+        mean_channel(&out, 1)
+    );
+}
+
+#[test]
+fn color_balance_saturation_neutralizes() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    // A clearly reddish pixel (R ≫ B).
+    let img = solid(8, 8, [0.5, 0.12, 0.12]);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let spread_base = mean_channel(&base, 0) - mean_channel(&base, 2);
+    assert!(spread_base > 20.0, "fixture must start saturated (r-b={spread_base})");
+
+    let desat = DevelopParams {
+        cb_rgb: CbRgb {
+            saturation: -1.0,
+            ..CbRgb::default()
+        },
+        ..DevelopParams::default()
+    };
+    let out = pipe.render(&ctx, &prep, &desat).unwrap();
+    let spread = mean_channel(&out, 0) - mean_channel(&out, 2);
+    // Full negative saturation collapses chroma → channels converge (spread → near 0).
+    assert!(
+        spread < spread_base * 0.25,
+        "saturation -1 must neutralize (r-b {spread_base} -> {spread})"
     );
 }
