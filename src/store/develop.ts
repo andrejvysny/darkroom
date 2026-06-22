@@ -21,16 +21,11 @@ interface DevelopState {
   params: DevelopParams;
   setParam: (key: ScalarParamKey, value: number) => void;
   resetParams: () => void;
-  imageUrl: string | null;
-  setImageUrl: (url: string | null) => void;
-  /** Instant embedded-JPEG preview shown until the processed render lands. */
+  /** Instant embedded-JPEG preview shown until the first canvas render lands. */
   previewUrl: string | null;
   setPreviewUrl: (url: string | null) => void;
   rendering: boolean;
   setRendering: (b: boolean) => void;
-  /** True when the stage is zoomed in past fit — render the full-resolution frame, not the preview. */
-  fullRes: boolean;
-  setFullRes: (b: boolean) => void;
   showBefore: boolean;
   setShowBefore: (b: boolean) => void;
   histogram: HistData | null;
@@ -38,7 +33,7 @@ interface DevelopState {
   /** Index of the mask being edited (into params.masks), or null. */
   selectedMaskIndex: number | null;
   setSelectedMaskIndex: (i: number | null) => void;
-  /** Index of the active component within the selected mask (for overlay + param editing). */
+  /** Index of the active component within the selected mask. */
   selectedComponentIndex: number;
   setSelectedComponentIndex: (i: number) => void;
   /** Whether the mask coverage/handle overlay is shown on the stage. */
@@ -47,13 +42,13 @@ interface DevelopState {
   /** Current brush settings used when painting new strokes. */
   brush: BrushSettings;
   setBrush: (patch: Partial<BrushSettings>) => void;
-  /** Eyedropper armed for the color-range mask (next image click samples a target color). */
+  /** Eyedropper armed for the color-range mask. */
   pickingColor: boolean;
   setPickingColor: (b: boolean) => void;
-  /** Crop tool active: the stage shows the full (uncropped) image + a draggable crop rectangle. */
+  /** Crop tool active: stage shows full (uncropped) image + draggable crop rect. */
   cropMode: boolean;
   setCropMode: (b: boolean) => void;
-  /** Source image aspect (W/H), set by the Stage on load — used by the crop aspect presets. */
+  /** Source image aspect (W/H), set by DevelopView from the ImageRow — used by crop aspect presets. */
   imageAspect: number;
   setImageAspect: (a: number) => void;
 }
@@ -79,14 +74,10 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setParam: (key, value) =>
     set((s) => ({ params: { ...s.params, [key]: value } })),
   resetParams: () => set({ params: freshDefaults() }),
-  imageUrl: null,
-  setImageUrl: (url) => set({ imageUrl: url }),
   previewUrl: null,
   setPreviewUrl: (url) => set({ previewUrl: url }),
   rendering: false,
   setRendering: (b) => set({ rendering: b }),
-  fullRes: false,
-  setFullRes: (b) => set({ fullRes: b }),
   showBefore: false,
   setShowBefore: (b) => set({ showBefore: b }),
   histogram: null,

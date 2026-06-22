@@ -3,7 +3,6 @@ use core_db::Db;
 use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
@@ -15,54 +14,11 @@ pub struct GpuRender {
     pub pipeline: DevelopPipeline,
 }
 
-/// One developed image's uploaded GPU resources, keyed by image id.
-pub struct DevelopCache {
-    pub image_id: i64,
-    pub prepared: PreparedImage,
-}
-
-/// How many images' GPU resources to keep warm at once. Small (back/forward + A/B compare) so
-/// VRAM/unified-memory stays bounded; each 1600 px preview is modest.
-const DEVELOP_CACHE_CAP: usize = 3;
-
-/// LRU of prepared develop images. Front = most-recently-used.
-#[derive(Default)]
-pub struct DevelopLru {
-    entries: VecDeque<DevelopCache>,
-}
-
-impl DevelopLru {
-    pub fn contains(&self, image_id: i64) -> bool {
-        self.entries.iter().any(|c| c.image_id == image_id)
-    }
-
-    /// Fetch a prepared image, promoting it to most-recently-used.
-    pub fn get(&mut self, image_id: i64) -> Option<&PreparedImage> {
-        let pos = self.entries.iter().position(|c| c.image_id == image_id)?;
-        if pos != 0 {
-            let item = self.entries.remove(pos).expect("position is valid");
-            self.entries.push_front(item);
-        }
-        self.entries.front().map(|c| &c.prepared)
-    }
-
-    /// Insert (or replace) an image, evicting the least-recently-used over capacity.
-    pub fn put(&mut self, image_id: i64, prepared: PreparedImage) {
-        self.entries.retain(|c| c.image_id != image_id);
-        self.entries.push_front(DevelopCache { image_id, prepared });
-        while self.entries.len() > DEVELOP_CACHE_CAP {
-            self.entries.pop_back();
-        }
-    }
-}
-
 /// Managed application state.
 pub struct AppState {
     pub db: Mutex<Db>,
     pub thumbs: ThumbCache,
     pub gpu: Option<GpuRender>,
-    /// Warm GPU resources for recently-developed images.
-    pub develop_cache: Mutex<DevelopLru>,
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
     /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
     pub full_render_cache: Mutex<Option<(i64, PreparedImage)>>,
@@ -137,7 +93,6 @@ impl AppState {
             db: Mutex::new(db),
             thumbs,
             gpu,
-            develop_cache: Mutex::new(DevelopLru::default()),
             full_render_cache: Mutex::new(None),
             latest_render: AtomicU64::new(0),
             last_histogram: Mutex::new(None),

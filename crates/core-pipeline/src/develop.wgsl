@@ -94,6 +94,16 @@ struct Geom {
 };
 @group(0) @binding(12) var<uniform> GEO: Geom;
 
+// Viewport + mask overlay. rect=(origin.xy, size.xy) visible window in CROP-LOCAL uv [0,1];
+// flags=(active 0/1, overlay_layer (-1=off), overlay_strength, _); color=(rgb, _) overlay tint.
+// active=0 ⇒ legacy geom_resolve path + dead overlay ⇒ byte-identical to a pre-binding render.
+struct View {
+  rect: vec4<f32>,
+  flags: vec4<f32>,
+  color: vec4<f32>,
+};
+@group(0) @binding(13) var<uniform> VIEW: View;
+
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
@@ -381,9 +391,47 @@ fn geom_resolve(out_uv: vec2<f32>) -> GeomResult {
   return r;
 }
 
+// Viewport path: map a CROP-LOCAL uv ([0,1] = the whole cropped frame) directly to source uv. The
+// view rect already supplies the visible window + aspect, so the letterbox-fit of `geom_resolve` is
+// skipped (it would double-apply aspect — Codex). `out_aspect` plays no role here.
+fn crop_to_source(cuv: vec2<f32>) -> GeomResult {
+  var r: GeomResult;
+  r.u = cuv;
+  if (cuv.x < 0.0 || cuv.x > 1.0 || cuv.y < 0.0 || cuv.y > 1.0) {
+    r.src_uv = vec2<f32>(0.0);
+    r.inside = false;
+    return r;
+  }
+  if (GEO.rot.w < 0.5) {            // no crop / rotation ⇒ crop-local uv IS source uv
+    r.src_uv = cuv;
+    r.inside = true;
+    return r;
+  }
+  let src_aspect = GEO.aspect.x;
+  let hw = GEO.crop.z;
+  let hh = GEO.crop.w;
+  let ct = GEO.rot.x;
+  let st = GEO.rot.y;
+  let z = GEO.rot.z;
+  let d = vec2<f32>((2.0 * cuv.x - 1.0) * hw, (2.0 * cuv.y - 1.0) * hh);
+  let dpx = vec2<f32>(d.x * src_aspect, d.y);
+  let rot = vec2<f32>(ct * dpx.x + st * dpx.y, -st * dpx.x + ct * dpx.y); // inverse rotation R(-θ)
+  let disp = vec2<f32>(rot.x / src_aspect / z, rot.y / z);
+  r.src_uv = vec2<f32>(GEO.crop.x, GEO.crop.y) + disp;
+  r.inside = true;
+  return r;
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let geo = geom_resolve(in.uv);
+  // Viewport path (active) maps a crop-local sub-rect; legacy path (inactive) letterbox-fits the
+  // whole crop — byte-identical to before this binding.
+  var geo: GeomResult;
+  if (VIEW.flags.x > 0.5) {
+    geo = crop_to_source(VIEW.rect.xy + in.uv * VIEW.rect.zw);
+  } else {
+    geo = geom_resolve(in.uv);
+  }
   if (!geo.inside) {
     return vec4<f32>(LETTERBOX, 1.0);
   }
@@ -432,6 +480,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let di = apply_local_display(
       d, P.contrast + mp.contrast, P.blacks + mp.blacks, P.whites + mp.whites);
     out = mix(out, di, a);
+  }
+
+  // Mask coverage overlay (Lightroom-style red tint). flags.y = packed layer index (-1 = off).
+  // Sits on the developed pixels but BEFORE the vignette so the overlay itself isn't vignetted.
+  let ov = i32(round(VIEW.flags.y));
+  if (ov >= 0) {
+    let cov = clamp(textureSampleLevel(mask_tex, mask_smp, suv, ov, 0.0).r, 0.0, 1.0);
+    out = mix(out, VIEW.color.xyz, cov * VIEW.flags.z);
   }
 
   // Lens vignette: radial darken(−) / brighten(+) toward the corners of the CROPPED frame (uses the

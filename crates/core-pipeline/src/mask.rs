@@ -469,3 +469,31 @@ pub fn mask_brush_strokes(mask: &Mask) -> Vec<BrushStroke> {
     }
     out
 }
+
+/// Stable hash of everything that affects a mask's **coverage** (the pre-pass output), and nothing
+/// else: the parametric components (kind/op/invert/geometry, via `PrepassUniform`), the edge-aware
+/// refine trigger, and the baked brush strokes. Deliberately EXCLUDES scalar adjustments, opacity,
+/// the enabled flag, and the name — those are applied per-frame in the develop pass and never
+/// require re-baking a mask layer. Used to skip the full-res pre-pass when geometry is unchanged
+/// (pan / zoom / global + local scalar edits / overlay toggles).
+pub fn mask_geometry_hash(mask: &Mask) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Parametric components — the exact bytes the pre-pass consumes (all _pad fields are zeroed).
+    bytemuck::bytes_of(&PrepassUniform::from_mask(mask)).hash(&mut h);
+    // Per-component feather drives the (separable bilateral) refine pass.
+    mask_feathered(mask).hash(&mut h);
+    // Brush strokes are rasterized into coverage; hash their geometry + per-stroke settings.
+    for s in &mask_brush_strokes(mask) {
+        for p in &s.points {
+            p[0].to_bits().hash(&mut h);
+            p[1].to_bits().hash(&mut h);
+        }
+        s.size.to_bits().hash(&mut h);
+        s.hardness.to_bits().hash(&mut h);
+        s.flow.to_bits().hash(&mut h);
+        s.opacity.to_bits().hash(&mut h);
+        s.is_erase.hash(&mut h);
+    }
+    h.finish()
+}

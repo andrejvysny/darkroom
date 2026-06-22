@@ -464,3 +464,68 @@ fn brush_stroke_brightens_locally() {
         "far pixel must be ~unchanged"
     );
 }
+
+/// Mask-layer caching (A5): a cache HIT (geometry unchanged) must still apply the per-frame scalar
+/// adjustments — it only skips re-baking coverage — and a geometry change must INVALIDATE the layer.
+#[test]
+fn mask_cache_applies_scalars_and_invalidates_on_geometry() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let gray = solid(64, 32, [0.2, 0.2, 0.2]);
+    let prep = pipe.prepare(&ctx, &gray).unwrap();
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+
+    let radial = |cx: f32, exposure: f32| DevelopParams {
+        masks: vec![Mask {
+            name: "m".into(),
+            components: vec![MaskComponent {
+                kind: ComponentKind::Radial {
+                    center: [cx, 0.5],
+                    radius: [0.18, 0.6],
+                    angle: 0.0,
+                    feather: 0.0,
+                },
+                op: MaskOp::Add,
+                invert: false,
+                feather: false,
+            }],
+            adjust: LocalAdjust {
+                exposure,
+                ..Default::default()
+            },
+            opacity: 1.0,
+            enabled: true,
+        }],
+        ..Default::default()
+    };
+    let at = |buf: &[u8], col: usize| buf[(16 * 64 + col) * 4] as i32;
+
+    // 1) Left radial, +2 EV → left brightens (cold compute).
+    let bright = pipe.render(&ctx, &prep, &radial(0.2, 2.0)).unwrap();
+    assert!(at(&bright, 12) > at(&base, 12) + 10, "left must brighten");
+    // 2) SAME geometry, 0 EV (layer cache HIT) → left returns to base: the scalar is applied fresh,
+    //    not frozen by the cache.
+    let flat = pipe.render(&ctx, &prep, &radial(0.2, 0.0)).unwrap();
+    assert!(
+        (at(&flat, 12) - at(&base, 12)).abs() <= 3,
+        "cache hit must not freeze the scalar ({} vs base {})",
+        at(&flat, 12),
+        at(&base, 12)
+    );
+    // 3) Geometry change (right radial, +2 EV) → right brightens, left back to base (invalidation).
+    let right = pipe.render(&ctx, &prep, &radial(0.8, 2.0)).unwrap();
+    assert!(
+        at(&right, 52) > at(&base, 52) + 10,
+        "right must brighten after geometry change"
+    );
+    assert!(
+        (at(&right, 12) - at(&base, 12)).abs() <= 3,
+        "left must no longer be affected after the mask moved"
+    );
+}

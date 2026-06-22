@@ -202,6 +202,51 @@ function makeDevelopJpeg(
   return dataUrlToArrayBuffer(c.toDataURL("image/jpeg", 0.82));
 }
 
+/**
+ * Raw-RGBA response for `develop_render` (new viewport model).
+ * Layout: [outW u32 LE][outH u32 LE][rgba8 outW*outH*4]
+ * The gradient shifts with view.ox/oy so panning is visually confirmed.
+ */
+function makeDevelopRgba(p: Record<string, unknown>): ArrayBuffer {
+  const view = (p.view ?? {}) as {
+    ox?: number;
+    oy?: number;
+    sx?: number;
+    sy?: number;
+  };
+  const ox = num(view.ox ?? 0);
+  const oy = num(view.oy ?? 0);
+  const outW = Math.max(1, Math.min(4096, num(p.outW ?? 1200)));
+  const outH = Math.max(1, Math.min(4096, num(p.outH ?? 800)));
+  const params = (p.params ?? {}) as Record<string, unknown>;
+  const exposure = num(params.exposure);
+  const temp = num(params.temp);
+
+  // 8-byte header
+  const buf = new ArrayBuffer(8 + outW * outH * 4);
+  const header = new DataView(buf, 0, 8);
+  header.setUint32(0, outW, true);
+  header.setUint32(4, outH, true);
+
+  const pixels = new Uint8Array(buf, 8);
+  const light = Math.max(20, Math.min(235, 128 + Math.round(exposure * 30)));
+  const warmShift = Math.round(temp * 0.4);
+
+  for (let y = 0; y < outH; y++) {
+    for (let x = 0; x < outW; x++) {
+      const i = (y * outW + x) * 4;
+      // Gradient that shifts visibly with pan (ox/oy) so panning is testable
+      const fx = (x / outW + ox) % 1;
+      const fy = (y / outH + oy) % 1;
+      pixels[i + 0] = Math.round(light + warmShift + fx * 60) & 0xff; // R
+      pixels[i + 1] = Math.round(light + fy * 40) & 0xff; // G
+      pixels[i + 2] = Math.round(light - warmShift + (1 - fx) * 40) & 0xff; // B
+      pixels[i + 3] = 255; // A
+    }
+  }
+  return buf;
+}
+
 function makeHistogram(): { r: number[]; g: number[]; b: number[] } {
   const bell = (center: number): number[] =>
     Array.from({ length: 256 }, (_, i) =>
@@ -320,8 +365,8 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   // Develop
   develop_get_edit: () => structuredClone(DEFAULT_PARAMS),
   develop_set_edit: () => undefined,
-  develop_render: (p) =>
-    makeDevelopJpeg(p.params as Record<string, unknown> | undefined),
+  // New viewport model: returns [outW u32 LE][outH u32 LE][rgba8 outW*outH*4]
+  develop_render: (p) => makeDevelopRgba(p),
   develop_preview_jpeg: () => makeDevelopJpeg(undefined),
   loupe_jpeg: () => makeDevelopJpeg(undefined),
   develop_get_histogram: () => makeHistogram(),
