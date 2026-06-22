@@ -43,6 +43,32 @@ pub fn to_letterbox_chw(img: &RgbImage, size: u32) -> (Vec<f32>, f32, f32, f32) 
     (out, scale, pad_x as f32, pad_y as f32)
 }
 
+/// SCRFD preprocessing (InsightFace `scrfd.py` recipe): aspect-preserving resize to fit `size`×`size`,
+/// paste at the **top-left** of a black (0) canvas, then `(px − 127.5) / 128`, RGB, planar CHW. Returns
+/// the buffer plus the single `scale` (source→input) so detected boxes/landmarks map back to source
+/// pixels by dividing by `scale`. Differs from [`to_letterbox_chw`] (centered + gray-114 + ÷255).
+pub fn to_scrfd_chw(img: &RgbImage, size: u32) -> (Vec<f32>, f32) {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let scale = (size as f32 / w as f32).min(size as f32 / h as f32);
+    let nw = ((w as f32 * scale).round() as u32).clamp(1, size);
+    let nh = ((h as f32 * scale).round() as u32).clamp(1, size);
+    let resized = image::imageops::resize(img, nw, nh, FilterType::Triangle);
+    let plane = (size * size) as usize;
+    // Black-pad canvas → tensor value (0 − 127.5)/128 in the padded region (matches InsightFace).
+    let pad = (0.0 - 127.5) / 128.0;
+    let mut out = vec![pad; 3 * plane];
+    for y in 0..nh {
+        for x in 0..nw {
+            let px = resized.get_pixel(x, y);
+            let i = (y * size + x) as usize;
+            out[i] = (px[0] as f32 - 127.5) / 128.0;
+            out[plane + i] = (px[1] as f32 - 127.5) / 128.0;
+            out[2 * plane + i] = (px[2] as f32 - 127.5) / 128.0;
+        }
+    }
+    (out, scale)
+}
+
 /// CLIP-style preprocessing for MobileCLIP-S1: resize the shortest edge to `size` (aspect-preserving),
 /// center-crop to `size`×`size`, `÷255`, RGB, planar CHW. MobileCLIP S0–S2 use identity normalization
 /// (`do_normalize=false`), unlike OpenAI CLIP — see the `Xenova/mobileclip_s1` preprocessor config.

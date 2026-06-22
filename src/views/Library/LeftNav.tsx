@@ -1,5 +1,6 @@
 import { useState } from "react";
 import Icon, { IconName } from "../../components/Icon";
+import PeopleNav from "./PeopleNav";
 import {
   hasActiveFilters,
   clearedFilters,
@@ -249,6 +250,13 @@ export default function LeftNav({
           ))}
         </div>
       )}
+
+      {/* People section */}
+      <PeopleNav
+        params={params}
+        patchParams={patchParams}
+        clearFilters={clearFilters}
+      />
 
       {/* Detected section */}
       <div>

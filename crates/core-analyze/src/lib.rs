@@ -11,11 +11,15 @@ pub mod caption;
 pub mod coco;
 pub mod detector;
 pub mod error;
+pub mod face;
+pub mod face_aligner;
+pub mod face_detector;
+pub mod face_embedder;
 pub mod megadetector;
 pub mod metrics;
 pub mod models;
-pub mod presence;
 mod preprocess;
+pub mod presence;
 pub mod verify;
 
 use std::sync::Arc;
@@ -23,6 +27,7 @@ use std::sync::Arc;
 pub use caption::Captioner;
 pub use detector::ObjectDetector;
 pub use error::AnalyzeError;
+pub use face::{FaceAnalyzer, FaceRecord};
 pub use megadetector::MegaDetector;
 /// Re-export so downstream crates link the exact same `ort`.
 pub use ort;

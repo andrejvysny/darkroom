@@ -26,6 +26,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/007_user_events.sql"),
     include_str!("../migrations/008_presence.sql"),
     include_str!("../migrations/009_integrity.sql"),
+    include_str!("../migrations/010_faces.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -144,6 +145,9 @@ mod tests {
             "collection_images",
             "collections",
             "edits",
+            "face",
+            "face_embedding",
+            "face_rejection",
             "folders",
             "image_captions",
             "image_detections",
@@ -154,6 +158,7 @@ mod tests {
             "images",
             "import_sessions",
             "keywords",
+            "person",
             "ratings_flags",
             "user_events",
         ];

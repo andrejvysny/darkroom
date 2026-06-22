@@ -23,6 +23,8 @@ pub struct QueryParams {
     pub import_session_id: Option<i64>,
     /// Restrict to images with a detected object in this bucket ("People" | "Animals" | "Vehicles").
     pub detected_category: Option<String>,
+    /// Restrict to images containing a (confirmed or suggested) face of this person.
+    pub person_id: Option<i64>,
     pub search: Option<String>,
     /// "capture_desc" (default) | "capture_asc" | "filename" | "filename_desc"
     /// | "rating_desc" | "rating_asc" | "imported_desc" | "imported_asc".
@@ -95,6 +97,9 @@ const WHERE: &str = "i.status = 'present'
          OR (:detected_category = 'Animals' AND EXISTS
               (SELECT 1 FROM image_presence p
                WHERE p.image_id = i.id AND p.p_animal >= :tau_animal)))
+    AND (:person_id IS NULL OR EXISTS
+         (SELECT 1 FROM face fa WHERE fa.asset_id = i.id AND fa.person_id = :person_id
+            AND fa.status IN ('confirmed','unconfirmed')))
     AND (:search IS NULL OR i.original_filename LIKE :search
                          OR i.camera_model LIKE :search
                          OR i.lens LIKE :search
@@ -168,6 +173,7 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
             ":detected_category": p.detected_category,
+            ":person_id": p.person_id,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,
@@ -236,6 +242,7 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
             ":detected_category": p.detected_category,
+            ":person_id": p.person_id,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,
