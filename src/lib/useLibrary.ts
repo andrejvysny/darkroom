@@ -73,6 +73,119 @@ const DEFAULT_PARAMS: QueryParams = {
   offset: 0,
 };
 
+/** Sorts paginated by keyset/seek (stable under concurrent import inserts, O(log n) at depth). The
+ *  rest (filename/rating) stay on LIMIT/OFFSET — rarely imported into, and the sorted-merge keeps the
+ *  loaded list a true prefix so offset stays correct. */
+const SEEK_SORTS = new Set<QueryParams["sort"]>([
+  "capture_desc",
+  "capture_asc",
+  "imported_desc",
+  "imported_asc",
+]);
+function isSeekSort(sort: QueryParams["sort"] | undefined): boolean {
+  return SEEK_SORTS.has(sort ?? "capture_desc");
+}
+
+/** The keyset cursor value for `row` under `sort` (capture sorts → captureDate, import sorts →
+ *  importedAt). May be null for capture sorts (a row in the NULL capture_date block). */
+function cursorValueOf(
+  row: ImageRow,
+  sort: QueryParams["sort"] | undefined,
+): number | null {
+  return sort === "imported_desc" || sort === "imported_asc"
+    ? row.importedAt
+    : row.captureDate;
+}
+
+/** Params for a FIRST page (initial load / refresh / sort change): seek-aware, cursor cleared. */
+function firstPageParams(p: QueryParams): QueryParams {
+  return {
+    ...p,
+    limit: PAGE_SIZE,
+    offset: 0,
+    seek: isSeekSort(p.sort),
+    cursorValue: null,
+    cursorId: null,
+  };
+}
+
+/** Comparator mirroring the backend ORDER BY for `sort` — same NULL placement (DESC ⇒ NULLs last,
+ *  ASC ⇒ NULLs first) and id tie-break direction. Returns <0 when `a` sorts before `b`. */
+function makeCmp(
+  sort: QueryParams["sort"] | undefined,
+): (a: ImageRow, b: ImageRow) => number {
+  const capDesc = (a: ImageRow, b: ImageRow) => {
+    const ax = a.captureDate;
+    const bx = b.captureDate;
+    if (ax == null && bx == null) return b.id - a.id;
+    if (ax == null) return 1; // NULLs last
+    if (bx == null) return -1;
+    return ax !== bx ? bx - ax : b.id - a.id;
+  };
+  const capAsc = (a: ImageRow, b: ImageRow) => {
+    const ax = a.captureDate;
+    const bx = b.captureDate;
+    if (ax == null && bx == null) return a.id - b.id;
+    if (ax == null) return -1; // NULLs first
+    if (bx == null) return 1;
+    return ax !== bx ? ax - bx : a.id - b.id;
+  };
+  switch (sort) {
+    case "capture_asc":
+      return capAsc;
+    case "filename":
+      return (a, b) =>
+        a.filename < b.filename
+          ? -1
+          : a.filename > b.filename
+            ? 1
+            : a.id - b.id;
+    case "filename_desc":
+      return (a, b) =>
+        a.filename > b.filename
+          ? -1
+          : a.filename < b.filename
+            ? 1
+            : b.id - a.id;
+    case "rating_desc":
+      return (a, b) =>
+        b.stars !== a.stars ? b.stars - a.stars : capDesc(a, b);
+    case "rating_asc":
+      return (a, b) =>
+        a.stars !== b.stars ? a.stars - b.stars : capDesc(a, b);
+    case "imported_desc":
+      return (a, b) =>
+        a.importedAt !== b.importedAt
+          ? b.importedAt - a.importedAt
+          : b.id - a.id;
+    case "imported_asc":
+      return (a, b) =>
+        a.importedAt !== b.importedAt
+          ? a.importedAt - b.importedAt
+          : a.id - b.id;
+    default:
+      return capDesc; // capture_desc
+  }
+}
+
+/** Merge two `cmp`-sorted arrays into one. O(n+m), stable on ties (left wins). */
+function mergeSorted(
+  a: ImageRow[],
+  b: ImageRow[],
+  cmp: (x: ImageRow, y: ImageRow) => number,
+): ImageRow[] {
+  const out: ImageRow[] = new Array(a.length + b.length);
+  let i = 0;
+  let j = 0;
+  let k = 0;
+  while (i < a.length && j < b.length) {
+    out[k++] = cmp(a[i], b[j]) <= 0 ? a[i++] : b[j++];
+  }
+  while (i < a.length) out[k++] = a[i++];
+  while (j < b.length) out[k++] = b[j++];
+  return out;
+}
+
 /** Does a row still satisfy the active filter on the dimensions evaluable from the row alone
  *  (flag / min stars / color label)? Server-only dimensions are treated as matching here. */
 function matchesRowFilter(row: ImageRow, p: QueryParams): boolean {
@@ -114,6 +227,14 @@ export function useLibrary(): LibraryState & LibraryActions {
   const totalRef = useRef(0);
   totalRef.current = total;
   const loadingMoreRef = useRef(false);
+  // True once every present row for the current filter is loaded (no more pages). Lets the live merge
+  // insert ALL fresh rows (the cursor is the global last) vs. only within-window rows otherwise.
+  const endReachedRef = useRef(false);
+  // Import rows that arrived while a `loadMore` seek was in flight — re-evaluated against the advanced
+  // cursor once the page lands, so a row committed mid-seek is never dropped-and-lost (keyset race).
+  const bufferRef = useRef<ImageRow[]>([]);
+  // Trailing-throttle timer for the live sidebar (Folders tree + counts) refresh during import.
+  const sidebarTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Guard against double-run in React 19 StrictMode
   const bootstrappedRef = useRef(false);
@@ -127,7 +248,7 @@ export function useLibrary(): LibraryState & LibraryActions {
         ? { ...paramsRef.current, ...overrides }
         : paramsRef.current;
       const [imgs, cnt, flds, tree, grand, kws, cols] = await Promise.all([
-        libraryQuery(merged),
+        libraryQuery(firstPageParams(merged)),
         libraryCount(merged),
         libraryFolders(),
         libraryDateTree(),
@@ -136,6 +257,7 @@ export function useLibrary(): LibraryState & LibraryActions {
         collectionsList(),
       ]);
       setImages(imgs);
+      endReachedRef.current = imgs.length >= cnt;
       setTotal(cnt);
       setGrandTotal(grand);
       setFolders(flds);
@@ -161,10 +283,11 @@ export function useLibrary(): LibraryState & LibraryActions {
           ? { ...paramsRef.current, ...overrides }
           : paramsRef.current;
         const [imgs, cnt] = await Promise.all([
-          libraryQuery(merged),
+          libraryQuery(firstPageParams(merged)),
           libraryCount(merged),
         ]);
         setImages(imgs);
+        endReachedRef.current = imgs.length >= cnt;
         setTotal(cnt);
       } catch (e) {
         setError(String(e));
@@ -175,31 +298,75 @@ export function useLibrary(): LibraryState & LibraryActions {
     [],
   );
 
+  // Insert fresh import rows into the grid, keeping `images` an exact sorted prefix. Reads params/refs
+  // so its identity is stable. Inserts only rows that sort within the loaded window (strictly before
+  // the last loaded row) — unless the whole library is loaded, where every fresh row belongs. Rows
+  // past the cursor are dropped here and re-fetched by `loadMore`'s seek: no gap, no duplicate.
+  const mergeFreshIntoGrid = useCallback((fresh: ImageRow[]) => {
+    if (fresh.length === 0) return;
+    const cmp = makeCmp(paramsRef.current.sort);
+    setImages((prev) => {
+      const have = new Set(prev.map((i) => i.id));
+      const add = fresh.filter((r) => !have.has(r.id));
+      if (add.length === 0) return prev;
+      const cursor = prev[prev.length - 1];
+      const within =
+        endReachedRef.current || !cursor
+          ? add
+          : add.filter((r) => cmp(r, cursor) < 0);
+      if (within.length === 0) return prev;
+      within.sort(cmp);
+      return mergeSorted(prev, within, cmp);
+    });
+  }, []);
+
   // Append the next page. Reads current length/total/params from refs so its identity is stable.
+  // Time-based sorts page by keyset cursor (the last loaded row); filename/rating use OFFSET.
   const loadMore = useCallback(async () => {
     if (loadingMoreRef.current) return;
-    const offset = imagesRef.current.length;
-    if (offset >= totalRef.current) return; // everything loaded
+    const cur = imagesRef.current;
+    const last = cur[cur.length - 1];
+    if (!last) return;
+    if (cur.length >= totalRef.current) return; // everything loaded
     loadingMoreRef.current = true;
     setLoadingMore(true);
+    const sort = paramsRef.current.sort;
     try {
-      const page = await libraryQuery({
-        ...paramsRef.current,
-        limit: PAGE_SIZE,
-        offset,
-      });
+      const page = await libraryQuery(
+        isSeekSort(sort)
+          ? {
+              ...paramsRef.current,
+              limit: PAGE_SIZE,
+              seek: true,
+              cursorValue: cursorValueOf(last, sort),
+              cursorId: last.id,
+            }
+          : { ...paramsRef.current, limit: PAGE_SIZE, offset: cur.length },
+      );
       setImages((prev) => {
-        // A refresh may have reset the list while this page was in flight — drop the stale page.
-        if (prev.length !== offset) return prev;
-        return [...prev, ...page];
+        // A wholesale refresh replaced the list while this page was in flight — its tail no longer
+        // matches our cursor → drop the stale page. (Live merges are buffered during a loadMore, so
+        // the tail only changes via refresh, never mid-flight insertion.)
+        if (prev.length === 0 || prev[prev.length - 1].id !== last.id)
+          return prev;
+        const have = new Set(prev.map((i) => i.id));
+        const add = page.filter((r) => !have.has(r.id));
+        endReachedRef.current = page.length < PAGE_SIZE;
+        return add.length === 0 ? prev : [...prev, ...add];
       });
     } catch (e) {
       setError(String(e));
     } finally {
       loadingMoreRef.current = false;
       setLoadingMore(false);
+      // Cursor advanced — re-evaluate import rows buffered during this in-flight page.
+      if (bufferRef.current.length > 0) {
+        const buffered = bufferRef.current;
+        bufferRef.current = [];
+        mergeFreshIntoGrid(buffered);
+      }
     }
-  }, []);
+  }, [mergeFreshIntoGrid]);
 
   // Stable startIndexing — depends only on stable refresh
   const startIndexing = useCallback(
@@ -278,10 +445,11 @@ export function useLibrary(): LibraryState & LibraryActions {
           }
         } else {
           // Library already has data — load directly
-          const imgs = await libraryQuery(DEFAULT_PARAMS);
+          const imgs = await libraryQuery(firstPageParams(DEFAULT_PARAMS));
           setFolders(flds);
           setDateTree(tree);
           setImages(imgs);
+          endReachedRef.current = imgs.length >= cnt;
           // DEFAULT_PARAMS carries no filter dimensions, so cnt is the unfiltered total.
           setTotal(cnt);
           setGrandTotal(cnt);
@@ -309,12 +477,32 @@ export function useLibrary(): LibraryState & LibraryActions {
     return () => un?.();
   }, [refresh]);
 
-  // Live-append photos as they're imported. The backend streams each freshly-catalogued row in the
-  // `import:progress` event; we append them to the grid immediately so the user sees photos land as
-  // they import. The counter/toast is owned by the import flow / `startIndexing` listeners, and the
-  // `import:done` refresh wired there reconciles ordering & counts afterward. Only append on the
-  // unfiltered "All photos" view — a filtered/sorted/searched view would mis-place fresh rows, so it
-  // waits for that reconcile instead.
+  // Live sidebar during import: refetch the Folders date-tree + folder counts + grand total on a
+  // trailing ~500ms throttle so a burst of import events triggers at most ~2 GROUP BY queries/sec.
+  // These are global (filter-independent), so they update even on a filtered view.
+  const scheduleSidebarRefresh = useCallback(() => {
+    if (sidebarTimerRef.current != null) return; // already pending — coalesce the burst
+    sidebarTimerRef.current = setTimeout(() => {
+      sidebarTimerRef.current = null;
+      void Promise.all([libraryDateTree(), libraryFolders(), libraryCount({})])
+        .then(([tree, flds, grand]) => {
+          setDateTree(tree);
+          setFolders(flds);
+          setGrandTotal(grand);
+          const p = paramsRef.current;
+          // On the unfiltered view the filtered count == grand total; keep it exact (corrects any
+          // drift from the optimistic per-event bumps below).
+          if (!hasActiveFilters(p) && !p.search) setTotal(grand);
+        })
+        .catch(() => {});
+    }, 500);
+  }, []);
+
+  // Live grid during import: the backend streams each freshly-catalogued row in `import:progress`.
+  // We sorted-merge them into their correct position under the active sort (keeping `images` an exact
+  // sorted prefix), so photos land in capture-date order with no duplicates. Only the unfiltered "All
+  // photos" view merges into the grid; a filtered/searched view waits for the `import:done` refresh
+  // (wired in the import flow / `startIndexing`) — but its sidebar still updates live.
   useEffect(() => {
     let unProgress: UnlistenFn | undefined;
     let unDone: UnlistenFn | undefined;
@@ -325,6 +513,7 @@ export function useLibrary(): LibraryState & LibraryActions {
         // loop — even if a post-loop DB step then errors — so this self-clears without depending on
         // `import:done` (which is skipped on a wholesale import failure).
         setImporting(ev.payload.done < ev.payload.total);
+        scheduleSidebarRefresh();
         const incoming = ev.payload.images;
         if (!incoming || incoming.length === 0) return;
         const p = paramsRef.current;
@@ -332,21 +521,39 @@ export function useLibrary(): LibraryState & LibraryActions {
         const have = new Set(imagesRef.current.map((i) => i.id));
         const fresh = incoming.filter((r) => !have.has(r.id));
         if (fresh.length === 0) return;
-        setImages((prev) => [...prev, ...fresh]);
+        // Optimistic count bump for immediate feedback; the throttled sidebar refresh reconciles it.
         setTotal((t) => t + fresh.length);
         setGrandTotal((g) => g + fresh.length);
+        // Serialize with an in-flight loadMore (keyset race): buffer now, re-evaluate against the
+        // advanced cursor once the page lands so a row committed mid-seek is never dropped-and-lost.
+        if (loadingMoreRef.current) {
+          bufferRef.current.push(...fresh);
+          return;
+        }
+        mergeFreshIntoGrid(fresh);
       },
     ).then((f) => {
       unProgress = f;
     });
-    void listen("import:done", () => setImporting(false)).then((f) => {
+    void listen("import:done", () => {
+      setImporting(false);
+      bufferRef.current = [];
+      if (sidebarTimerRef.current != null) {
+        clearTimeout(sidebarTimerRef.current);
+        sidebarTimerRef.current = null;
+      }
+    }).then((f) => {
       unDone = f;
     });
     return () => {
       unProgress?.();
       unDone?.();
+      if (sidebarTimerRef.current != null) {
+        clearTimeout(sidebarTimerRef.current);
+        sidebarTimerRef.current = null;
+      }
     };
-  }, []);
+  }, [mergeFreshIntoGrid, scheduleSidebarRefresh]);
 
   // Re-fetch when params change (skip the initial render)
   const isFirstParamsRun = useRef(true);

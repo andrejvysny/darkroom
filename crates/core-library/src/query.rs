@@ -2,7 +2,7 @@
 //! all filters are bound named params; `sort` is chosen from a fixed whitelist.
 
 use crate::error::LibError;
-use core_db::rusqlite::{named_params, Connection, Row};
+use core_db::rusqlite::{named_params, Connection, Row, ToSql};
 use core_raw::hex;
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,14 @@ pub struct QueryParams {
     pub sort: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// Keyset (seek) pagination cursor: the sort value (`capture_date` or `imported_at`) of the last
+    /// loaded row. `None` with `cursor_id = None` = first page; `None` with `cursor_id = Some` = a
+    /// cursor sitting in the NULL `capture_date` block.
+    pub cursor_value: Option<i64>,
+    /// Keyset cursor: `id` of the last loaded row (tie-break). Presence marks "has cursor".
+    pub cursor_id: Option<i64>,
+    /// Use keyset/seek pagination instead of LIMIT/OFFSET (time-based sorts only). Defaults to offset.
+    pub seek: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,12 +68,15 @@ pub struct ImageRow {
     pub color_label: Option<String>,
     /// `edits.updated_at` if the image has a develop edit — versions edit-aware previews (NULL = none).
     pub edited_at: Option<i64>,
+    /// When the image was catalogued (epoch seconds). The keyset cursor for imported-date sorts and a
+    /// comparator key for the frontend live sorted-merge.
+    pub imported_at: i64,
 }
 
 const COLUMNS: &str = "i.id, i.content_hash, i.path, i.original_filename, i.capture_date,
     i.camera_make, i.camera_model, i.lens, i.iso, i.shutter, i.aperture, i.focal_length,
     i.width, i.height, i.orientation,
-    COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label, e.updated_at";
+    COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label, e.updated_at, i.imported_at";
 
 // Joined into every row-returning query so `edited_at` is populated.
 const EDIT_JOIN: &str = "LEFT JOIN edits e ON e.image_id = i.id";
@@ -155,10 +166,18 @@ fn map_row(r: &Row<'_>) -> core_db::rusqlite::Result<ImageRow> {
         flag: r.get(16)?,
         color_label: r.get(17)?,
         edited_at: r.get(18)?,
+        imported_at: r.get(19)?,
     })
 }
 
 pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>, LibError> {
+    // Keyset/seek pagination (time-based sorts) — stable under concurrent inserts and O(log n) at
+    // depth, unlike OFFSET. filename/rating fall through to the offset path below.
+    if p.seek == Some(true) {
+        if let Some(kind) = seek_kind(p.sort.as_deref()) {
+            return query_images_seek(conn, p, kind, p.limit.unwrap_or(5000));
+        }
+    }
     let sql = format!(
         "SELECT {COLUMNS} FROM images i
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
@@ -191,6 +210,215 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
         map_row,
     )?;
     Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The seek-paginated sorts. `None` ⇒ this sort uses OFFSET (filename / rating).
+#[derive(Clone, Copy)]
+enum SeekKind {
+    CaptureDesc,
+    CaptureAsc,
+    ImportedDesc,
+    ImportedAsc,
+}
+
+fn seek_kind(sort: Option<&str>) -> Option<SeekKind> {
+    match sort {
+        Some("capture_asc") => Some(SeekKind::CaptureAsc),
+        Some("imported_desc") => Some(SeekKind::ImportedDesc),
+        Some("imported_asc") => Some(SeekKind::ImportedAsc),
+        Some("filename") | Some("filename_desc") | Some("rating_desc") | Some("rating_asc") => None,
+        // default + "capture_desc"
+        _ => Some(SeekKind::CaptureDesc),
+    }
+}
+
+/// Run ONE seek phase: `WHERE <filters> AND (<extra_where>) ORDER BY <order> LIMIT <limit>`, appending
+/// rows to `out`. Cursor params `:cv`/`:ci` are bound only when the phase references them (`use_cv` /
+/// `use_ci`), so the same filter-bind set serves every phase shape. Index-safe: each phase's
+/// `extra_where` reduces to a range/equality the `(status, capture_date, id)` /
+/// `(status, imported_at, id)` index can seek (verified via EXPLAIN QUERY PLAN).
+#[allow(clippy::too_many_arguments)]
+fn run_seek_phase(
+    conn: &Connection,
+    p: &QueryParams,
+    search: &Option<String>,
+    extra_where: &str,
+    order: &str,
+    limit: i64,
+    use_cv: bool,
+    use_ci: bool,
+    out: &mut Vec<ImageRow>,
+) -> Result<(), LibError> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM images i
+         LEFT JOIN ratings_flags rf ON rf.image_id = i.id
+         {EDIT_JOIN}
+         WHERE {WHERE} AND ({extra_where})
+         ORDER BY {order} LIMIT :limit"
+    );
+    let lim = limit;
+    let cv_v = p.cursor_value.unwrap_or(0);
+    let ci_v = p.cursor_id.unwrap_or(0);
+    let mut binds: Vec<(&str, &dyn ToSql)> = vec![
+        (":folder_id", &p.folder_id),
+        (":min_stars", &p.min_stars),
+        (":flag", &p.flag),
+        (":color_label", &p.color_label),
+        (":keyword_id", &p.keyword_id),
+        (":collection_id", &p.collection_id),
+        (":import_session_id", &p.import_session_id),
+        (":capture_year", &p.capture_year),
+        (":capture_date", &p.capture_date),
+        (":detected_category", &p.detected_category),
+        (":person_id", &p.person_id),
+        (":tau_person", &crate::analysis::PRESENCE_TAU_PERSON),
+        (":tau_animal", &crate::analysis::PRESENCE_TAU_ANIMAL),
+        (":search", search),
+        (":limit", &lim),
+    ];
+    if use_cv {
+        binds.push((":cv", &cv_v));
+    }
+    if use_ci {
+        binds.push((":ci", &ci_v));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(binds.as_slice(), map_row)?;
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(())
+}
+
+/// Keyset pagination. Cursor = `(cursor_value, cursor_id)` of the last loaded row. `cursor_id = None`
+/// ⇒ first page. For capture sorts the cursor may sit in the NULL block (`cursor_value = None` while
+/// `cursor_id = Some`); a two-phase walk (non-NULL block, then NULL block — order swapped for ASC)
+/// keeps every phase index-seekable rather than scanning the whole `present` partition (Codex-flagged
+/// `OR capture_date IS NULL` regression). `imported_at` is NOT NULL ⇒ single phase.
+fn query_images_seek(
+    conn: &Connection,
+    p: &QueryParams,
+    kind: SeekKind,
+    limit: i64,
+) -> Result<Vec<ImageRow>, LibError> {
+    let search = p.search.as_ref().map(|s| format!("%{s}%"));
+    let has_cursor = p.cursor_id.is_some();
+    let has_cv = p.cursor_value.is_some();
+    let mut out: Vec<ImageRow> = Vec::new();
+
+    match kind {
+        SeekKind::CaptureDesc => {
+            // NULLs sort last: phase 1 = non-NULL block (index range seek), phase 2 = NULL block.
+            let in_null_block = has_cursor && !has_cv;
+            if !in_null_block {
+                let extra = if has_cv {
+                    "i.capture_date IS NOT NULL AND (i.capture_date < :cv OR (i.capture_date = :cv AND i.id < :ci))"
+                } else {
+                    "i.capture_date IS NOT NULL"
+                };
+                run_seek_phase(
+                    conn,
+                    p,
+                    &search,
+                    extra,
+                    "i.capture_date DESC, i.id DESC",
+                    limit,
+                    has_cv,
+                    has_cv,
+                    &mut out,
+                )?;
+            }
+            let remaining = limit - out.len() as i64;
+            if remaining > 0 {
+                let extra = if in_null_block {
+                    "i.capture_date IS NULL AND i.id < :ci"
+                } else {
+                    "i.capture_date IS NULL"
+                };
+                run_seek_phase(
+                    conn,
+                    p,
+                    &search,
+                    extra,
+                    "i.id DESC",
+                    remaining,
+                    false,
+                    in_null_block,
+                    &mut out,
+                )?;
+            }
+        }
+        SeekKind::CaptureAsc => {
+            // NULLs sort first: phase 1 = NULL block, phase 2 = non-NULL block.
+            let past_null_block = has_cv; // a non-NULL cursor means we've left the NULL block
+            if !past_null_block {
+                let extra = if has_cursor {
+                    "i.capture_date IS NULL AND i.id > :ci"
+                } else {
+                    "i.capture_date IS NULL"
+                };
+                run_seek_phase(
+                    conn, p, &search, extra, "i.id ASC", limit, false, has_cursor, &mut out,
+                )?;
+            }
+            let remaining = limit - out.len() as i64;
+            if remaining > 0 {
+                let extra = if has_cv {
+                    "i.capture_date IS NOT NULL AND (i.capture_date > :cv OR (i.capture_date = :cv AND i.id > :ci))"
+                } else {
+                    "i.capture_date IS NOT NULL"
+                };
+                run_seek_phase(
+                    conn,
+                    p,
+                    &search,
+                    extra,
+                    "i.capture_date ASC, i.id ASC",
+                    remaining,
+                    has_cv,
+                    has_cv,
+                    &mut out,
+                )?;
+            }
+        }
+        SeekKind::ImportedDesc => {
+            let extra = if has_cursor {
+                "(i.imported_at < :cv OR (i.imported_at = :cv AND i.id < :ci))"
+            } else {
+                "1=1"
+            };
+            run_seek_phase(
+                conn,
+                p,
+                &search,
+                extra,
+                "i.imported_at DESC, i.id DESC",
+                limit,
+                has_cursor,
+                has_cursor,
+                &mut out,
+            )?;
+        }
+        SeekKind::ImportedAsc => {
+            let extra = if has_cursor {
+                "(i.imported_at > :cv OR (i.imported_at = :cv AND i.id > :ci))"
+            } else {
+                "1=1"
+            };
+            run_seek_phase(
+                conn,
+                p,
+                &search,
+                extra,
+                "i.imported_at ASC, i.id ASC",
+                limit,
+                has_cursor,
+                has_cursor,
+                &mut out,
+            )?;
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Serialize)]
