@@ -14,6 +14,14 @@ export function freshDefaults(): DevelopParams {
     hsl: DEFAULT_PARAMS.hsl.map((b) => ({ ...b })),
     crop: { ...DEFAULT_PARAMS.crop },
     masks: [],
+    cbRgb: {
+      global: [...DEFAULT_PARAMS.cbRgb.global],
+      shadows: [...DEFAULT_PARAMS.cbRgb.shadows],
+      midtones: [...DEFAULT_PARAMS.cbRgb.midtones],
+      highlights: [...DEFAULT_PARAMS.cbRgb.highlights],
+      contrast: DEFAULT_PARAMS.cbRgb.contrast,
+      saturation: DEFAULT_PARAMS.cbRgb.saturation,
+    },
   };
 }
 

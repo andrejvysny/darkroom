@@ -268,6 +268,9 @@ pub struct DevelopParams {
     /// Local adjustment masks, in stacking order. Empty by default (v1 edits deserialize here).
     #[serde(default)]
     pub masks: Vec<Mask>,
+    /// Color-balance-RGB grading (4-way + scene-linear contrast/saturation). No-op by default.
+    #[serde(default)]
+    pub cb_rgb: CbRgb,
 }
 
 impl Default for DevelopParams {
@@ -291,7 +294,57 @@ impl Default for DevelopParams {
             hsl: [HslBand::default(); HSL_BANDS],
             crop: Crop::default(),
             masks: Vec::new(),
+            cb_rgb: CbRgb::default(),
         }
+    }
+}
+
+/// Color-balance-RGB grading (a faithful subset of darktable `colorbalancergb`). Each "way" is a
+/// per-channel grading-RGB vector applied only over its tonal range (darktable's `opacity_masks`):
+/// `global` = offset (all tones), `shadows` = lift, `highlights` = gain, `midtones` = per-channel
+/// power. Plus a scene-linear `contrast` (fulcrum 0.18) and global `saturation` (chroma). All fields
+/// are 0 by default ⇒ the whole stage is skipped (byte-identical render). Values are normalized to
+/// ±1 in the UI; see `to_cbrgb`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CbRgb {
+    /// Global offset (lift applied to every tone), per grading channel, ≈ ±0.5.
+    pub global: [f32; 3],
+    /// Shadows lift (shadow-masked additive), per grading channel.
+    pub shadows: [f32; 3],
+    /// Midtones power (midtone-masked per-channel exponent offset).
+    pub midtones: [f32; 3],
+    /// Highlights gain (highlight-masked multiplicative), per grading channel.
+    pub highlights: [f32; 3],
+    /// Scene-linear contrast, -1..1 (power about grading-luminance fulcrum 0.18).
+    pub contrast: f32,
+    /// Global chroma / saturation, -1..1.
+    pub saturation: f32,
+}
+
+impl Default for CbRgb {
+    fn default() -> Self {
+        Self {
+            global: [0.0; 3],
+            shadows: [0.0; 3],
+            midtones: [0.0; 3],
+            highlights: [0.0; 3],
+            contrast: 0.0,
+            saturation: 0.0,
+        }
+    }
+}
+
+impl CbRgb {
+    /// True when every control is at its no-op default (lets the shader skip the grading-space round
+    /// trip entirely → the default render stays byte-identical to a pre-`cb_rgb` build).
+    pub fn is_identity(&self) -> bool {
+        self.global == [0.0; 3]
+            && self.shadows == [0.0; 3]
+            && self.midtones == [0.0; 3]
+            && self.highlights == [0.0; 3]
+            && self.contrast == 0.0
+            && self.saturation == 0.0
     }
 }
 
@@ -462,13 +515,128 @@ pub(crate) fn wb_matrix(temp: f32, tint: f32) -> [[f32; 3]; 3] {
     out
 }
 
+// --- Color-balance-RGB grading color space (Filmlight/Kirk grading RGB, D65) ----------------------
+// Darktable's `colorbalancergb` runs the 4-way + chroma in a D65 grading RGB built on the CIE 2006
+// LMS. We collapse the round trip ProPhoto(D50) ⇄ grading RGB to two premultiplied mat3, reusing the
+// existing toolkit (`XYZ_TO_PROPHOTO_D50`, `mat3_inv/mul`, `bradford_cat`). Matrices verbatim from
+// darktable `colorspaces_inline_conversions.h`. The chain + numbers are GPT-5.5-verified (round-trip
+// identity to 1e-9; cond≈3.9); see `workspace/logs/codex-curve-review.out`.
+
+/// CIE D50 / D65 reference whites (XYZ, Y=1).
+const WHITE_D50_XYZ: [f64; 3] = [0.96422, 1.0, 0.82521];
+const WHITE_D65_XYZ: [f64; 3] = [0.95047, 1.0, 1.08883];
+/// XYZ(D65) → CIE 2006 LMS (darktable `XYZ_D65_to_LMS_2006_D65`).
+const XYZ_D65_TO_LMS: M3 = [
+    [0.257085, 0.859943, -0.031061],
+    [-0.394427, 1.175800, 0.106423],
+    [0.064856, -0.076250, 0.559067],
+];
+/// CIE 2006 LMS → grading RGB (darktable `gradingRGB_to_LMS` inverse).
+const LMS_TO_GRADING: M3 = [
+    [1.0877193, -0.0877193, 0.0],
+    [-0.66666667, 1.66666667, 0.0],
+    [0.02061856, -0.05154639, 1.03092784],
+];
+
+/// Premultiplied (ProPhoto-D50 → grading-RGB-D65, grading-RGB-D65 → ProPhoto-D50) mat3 pair, row-major.
+/// Forward = LMS→grading · XYZ_D65→LMS · CAT(D50→D65) · ProPhoto→XYZ_D50.
+fn grading_matrices() -> (M3, M3) {
+    let pp_to_xyz = mat3_inv(&XYZ_TO_PROPHOTO_D50);
+    let cat_d50_d65 = bradford_cat(WHITE_D50_XYZ, WHITE_D65_XYZ);
+    let fwd = mat3_mul(
+        &mat3_mul(&LMS_TO_GRADING, &XYZ_D65_TO_LMS),
+        &mat3_mul(&cat_d50_d65, &pp_to_xyz),
+    );
+    (fwd, mat3_inv(&fwd))
+}
+
+#[cfg(test)]
+mod grading_space_tests {
+    use super::*;
+
+    fn mul(a: &M3, b: &M3) -> M3 {
+        mat3_mul(a, b)
+    }
+    fn mv(m: &M3, v: [f64; 3]) -> [f64; 3] {
+        mat3_vec(m, v)
+    }
+
+    #[test]
+    fn prophoto_grading_round_trip_is_identity() {
+        let (fwd, inv) = grading_matrices();
+        let id = mul(&inv, &fwd);
+        let mut max_err = 0.0f64;
+        for i in 0..3 {
+            for j in 0..3 {
+                let expect = if i == j { 1.0 } else { 0.0 };
+                max_err = max_err.max((id[i][j] - expect).abs());
+            }
+        }
+        assert!(max_err < 1e-4, "ProPhoto⇄grading round trip err {max_err}");
+    }
+
+    #[test]
+    fn matches_codex_verified_numbers() {
+        // GPT-5.5-verified forward matrix (M) — locks the chain order + CAT direction.
+        let (fwd, _) = grading_matrices();
+        let expect: M3 = [
+            [0.4605891, 0.6311525, -0.0077856],
+            [-0.2534295, 0.8953998, 0.1723560],
+            [0.0395190, -0.0838124, 0.6316055],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (fwd[i][j] - expect[i][j]).abs() < 1e-5,
+                    "fwd[{i}][{j}] = {} (want {})",
+                    fwd[i][j],
+                    expect[i][j]
+                );
+            }
+        }
+        // Neutral ProPhoto grey is NOT neutral in grading RGB (expected): [.195,.147,.106].
+        let g = mv(&fwd, [0.18, 0.18, 0.18]);
+        assert!(
+            (g[0] - 0.1951).abs() < 1e-3
+                && (g[1] - 0.1466).abs() < 1e-3
+                && (g[2] - 0.1057).abs() < 1e-3
+        );
+    }
+
+    #[test]
+    fn cbrgb_active_flag_and_identity() {
+        // Default is a no-op ⇒ inactive (shader skips the round trip → byte-identical render).
+        let d = DevelopParams::default();
+        assert!(d.cb_rgb.is_identity());
+        assert_eq!(d.to_cbrgb().params[2], 0.0, "default cb must be inactive");
+        // Any nonzero control flips the active flag, and the verified matrices ship in the uniform.
+        let mut p = DevelopParams::default();
+        p.cb_rgb.shadows = [0.1, 0.0, 0.0];
+        assert!(!p.cb_rgb.is_identity());
+        let u = p.to_cbrgb();
+        assert_eq!(u.params[2], 1.0, "nonzero cb must be active");
+        // std140 column packing: u.fwd[col][row]; fwd[0][0] = M[0][0] (GPT-5.5-verified).
+        assert!((u.fwd[0][0] - 0.4605891).abs() < 1e-5);
+    }
+}
+
 // --- Scene-referred base tone operator (ACR-matched) ---------------------------------------------
 // Replaces the old fixed `exp()` highlight shoulder. A monotone curve maps scene-linear ProPhoto
 // [0,∞) → display-linear [0,1), applied per-channel before the ProPhoto→sRGB matrix (Codex review:
 // per-channel on Rec.709 is unsafe for wide-gamut colors). Sampled into a LUT over the log-exposure
-// domain (so headroom is covered) and uploaded to the GPU. `tone_amount` interpolates a neutral
-// soft-clip (flat) → the ACR-seed curve; both anchor mid-grey 0.18 → 0.18 exactly. The ACR-seed
-// shape is the analytic `x^p/(x^p+c)`; once reference ACR renders are fit, only the seed is replaced.
+// domain (so headroom is covered) and uploaded to the GPU.
+//
+// The `amount=1` shape (default) is now FIT to Adobe Camera Raw's real default tone response
+// (`base_curve_ref::ADOBE_DEFAULT_TONE_CURVE`, the universal Adobe-default curve the R7's
+// Adobe-Standard profile renders through — it carries no embedded ProfileToneCurve). It maps
+// mid-grey 0.18 → ~0.388 display-linear (≈65% sRGB), the canonical ACR mid-grey, so unedited imports
+// match the Lightroom default look (paired with the scene-linear `baseline_gain`, see DevelopParams).
+// `tone_amount` interpolates a flat low-contrast neutral (amount=0, mid-grey→0.18) → this ACR fit.
+//
+// Above the reference domain (scene-linear x > X_JOIN) we keep highlight headroom with a
+// tangent-continuous asymptotic shoulder (Codex: `1−k/(x+k)` cannot pass through (1,1); anchor the
+// asymptote-to-1 tail at a point where y<1 instead). The shoulder is C¹ at the joint and rolls off
+// smoothly to 1.0 instead of hard-clipping at x=1 (avoids a slope-corner → highlight banding).
 
 /// Base-curve LUT length (entries over the log-exposure domain). Matches `BASE_LUT_N` in develop.wgsl.
 pub const BASE_LUT_SIZE: usize = 512;
@@ -476,26 +644,51 @@ pub const BASE_LUT_SIZE: usize = 512;
 /// far highlight headroom; all golden test inputs (x ≤ 8) map inside it.
 const BASE_U_MIN: f32 = -13.0;
 const BASE_U_MAX: f32 = 8.0;
-/// Scene-linear mid-grey anchor (held fixed through the curve).
+/// Scene-linear mid-grey anchor.
 const MID_GREY: f32 = 0.18;
-/// ACR-seed contrast exponent (Codex-recommended starting shape, pre-fit).
-const ACR_P: f32 = 1.35;
 /// Hue-protection strength: how strongly saturated highlights are pulled toward the (hue-preserving)
 /// luminance-ratio variant vs the per-channel curve. Auto (not user-controlled) for now.
 const BASE_HUE_PROTECT: f32 = 0.6;
 
+/// Scene-linear exposure-normalization gain applied once (before color-balance / develop / the base
+/// tone curve) so a correctly-exposed mid-grey reaches the ACR curve's 0.18 input → renders at ACR
+/// brightness. Our `develop_linear` buffer is already white-normalized (white≈1.0, like ACR), so the
+/// 0.18→0.388 curve carries the brightness match and this defaults to a no-op **1.0**. It is the
+/// single visual-QA knob to make unedited imports brighter/darker to taste vs Lightroom. Rides the
+/// otherwise-unused `ExtraUniform.texel.z` (no new GPU binding).
+pub const BASELINE_GAIN: f32 = 1.0;
+
+// Highlight-shoulder joint: above this scene-linear input we leave the reference table and follow an
+// asymptotic shoulder. (X0,Y0) is the Adobe reference value there; A makes the shoulder C¹ (its slope
+// at X0 equals the reference's central-difference slope 0.2406, so A = 0.2406/(1−Y0)).
+const TONE_X_JOIN: f32 = 0.875;
+const TONE_Y_JOIN: f32 = 0.97702;
+const TONE_SHOULDER_A: f32 = 0.2406 / (1.0 - TONE_Y_JOIN); // ≈ 10.47
+
+/// The ACR-default tone curve `f_acr(x)` for one scalar channel (scene-linear → display-linear).
+/// Reference table on `[0, X_JOIN]`, asymptotic headroom shoulder above. Monotone; f(0)=0;
+/// f(0.18)≈0.388; asymptotes to 1.0 as x→∞ (never hard-clips).
+fn acr_curve(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x <= TONE_X_JOIN {
+        crate::base_curve_ref::adobe_default_curve(x)
+    } else {
+        1.0 - (1.0 - TONE_Y_JOIN) / (1.0 + TONE_SHOULDER_A * (x - TONE_X_JOIN))
+    }
+}
+
 /// The base tone operator value `f(x)` for one scalar channel, `amount` in [0,1].
-/// Monotone, `f(0)=0`, `f(0.18)=0.18` for all amounts, asymptotes below 1.
+/// `amount=0` is a flat low-contrast neutral (Reinhard, mid-grey→0.18); `amount=1` is the ACR fit
+/// (`acr_curve`, mid-grey→0.388). Monotone, `f(0)=0`, asymptotes to 1.
 pub fn base_curve_value(x: f32, amount: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;
     }
     // Neutral soft-clip (Reinhard anchored at 0.18): f0(0.18) = 0.18/(0.18+0.82) = 0.18.
-    let f0 = x / (x + (1.0 - MID_GREY) / MID_GREY * MID_GREY); // = x / (x + 0.82)
-                                                               // ACR-seed: x^p / (x^p + c), with c chosen so f1(0.18) = 0.18 exactly.
-    let xp = x.powf(ACR_P);
-    let c = MID_GREY.powf(ACR_P - 1.0) * (1.0 - MID_GREY);
-    let f1 = xp / (xp + c);
+    let f0 = x / (x + (1.0 - MID_GREY)); // = x / (x + 0.82)
+    let f1 = acr_curve(x);
     let y = f0 + (f1 - f0) * amount.clamp(0.0, 1.0);
     y.max(0.0)
 }
@@ -510,6 +703,118 @@ pub fn build_base_curve_lut(amount: f32) -> Vec<f32> {
         *v = base_curve_value(x, amount);
     }
     lut
+}
+
+#[cfg(test)]
+mod acr_fit_tests {
+    use super::*;
+    use crate::base_curve_ref::ADOBE_DEFAULT_TONE_CURVE;
+
+    // Mirror develop.wgsl::base_curve_lookup so the test exercises the FULL path that the GPU does:
+    // build the LUT → resample it over the log-exposure domain. Catches LUT-resolution / log-domain
+    // / build bugs, not just the analytic `base_curve_value`.
+    fn lut_lookup(lut: &[f32], x: f32) -> f32 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let u = (x / MID_GREY).log2();
+        let t = ((u - BASE_U_MIN) / (BASE_U_MAX - BASE_U_MIN)).clamp(0.0, 1.0)
+            * (BASE_LUT_SIZE - 1) as f32;
+        let i0 = t.floor() as usize;
+        let i1 = (i0 + 1).min(BASE_LUT_SIZE - 1);
+        let f = t - i0 as f32;
+        lut[i0] * (1.0 - f) + lut[i1] * f
+    }
+
+    // CIE L* from display-linear Y (Y already in [0,1]).
+    fn lstar(y: f32) -> f32 {
+        let y = y.max(0.0);
+        if y > 0.008856 {
+            116.0 * y.cbrt() - 16.0
+        } else {
+            903.3 * y
+        }
+    }
+
+    /// The default (amount=1) base curve, resampled through the real LUT path, must reproduce the
+    /// Adobe Camera Raw default tone response within RMS L* < 2.0 ("matches ACR"). The 16 control
+    /// points are the verified Adobe-default samples (RawTherapee `adobe_camera_raw_default_curve`).
+    #[test]
+    fn default_curve_matches_acr_reference() {
+        let lut = build_base_curve_lut(1.0);
+        // (scene-linear input, expected display-linear output) — Adobe default curve.
+        let refpts: [(f32, f32); 16] = [
+            (0.0, 0.0),
+            (0.000977, 0.000780),
+            (0.003906, 0.003140),
+            (0.007812, 0.006230),
+            (0.015625, 0.014850),
+            (0.031250, 0.040020),
+            (0.0625, 0.104330),
+            (0.125, 0.259610),
+            (0.18, 0.388086),
+            (0.25, 0.520690),
+            (0.375, 0.690350),
+            (0.5, 0.804860),
+            (0.625, 0.884530),
+            (0.75, 0.939860),
+            (0.875, 0.977020),
+            (1.0, 1.0),
+        ];
+        let mut sum_sq = 0.0f32;
+        let mut max_d = 0.0f32;
+        for (x, y_ref) in refpts {
+            let got = lut_lookup(&lut, x);
+            let d = (lstar(got) - lstar(y_ref)).abs();
+            max_d = max_d.max(d);
+            sum_sq += d * d;
+        }
+        let rms = (sum_sq / refpts.len() as f32).sqrt();
+        assert!(rms < 2.0, "RMS L* = {rms} (want < 2.0)");
+        // The only intentional deviation is the headroom shoulder near white (x≥0.875), which
+        // asymptotes to 1 instead of hitting it — a fraction of an L* unit.
+        assert!(max_d < 2.5, "max L* deviation = {max_d}");
+
+        // Mid-grey anchor: 0.18 → ~0.388 (the ACR brightness), NOT the old 0.18→0.18.
+        let mg = lut_lookup(&lut, 0.18);
+        assert!((mg - 0.388).abs() < 0.01, "f(0.18) = {mg} (want ≈0.388)");
+    }
+
+    /// Headroom shoulder: scene-linear values above 1.0 stay monotone and asymptote to (not exceed)
+    /// 1.0 — no hard clip corner.
+    #[test]
+    fn headroom_shoulder_is_monotone_below_one() {
+        let lut = build_base_curve_lut(1.0);
+        let mut prev = lut_lookup(&lut, 1.0);
+        for k in 1..=64 {
+            let x = 1.0 + k as f32 * 0.5; // 1.5 .. 33
+            let y = lut_lookup(&lut, x);
+            assert!(y >= prev - 1e-4, "non-monotone at x={x}: {y} < {prev}");
+            assert!(y <= 1.0 + 1e-4, "exceeds 1.0 at x={x}: {y}");
+            prev = y;
+        }
+    }
+
+    /// The amount slider interpolates flat-neutral (0.18→0.18) → ACR fit (0.18→0.388) monotonically.
+    #[test]
+    fn amount_blends_flat_to_acr() {
+        let flat = build_base_curve_lut(0.0);
+        let acr = build_base_curve_lut(1.0);
+        assert!(
+            (lut_lookup(&flat, 0.18) - 0.18).abs() < 0.01,
+            "flat mid-grey ≠ 0.18"
+        );
+        assert!(
+            lut_lookup(&acr, 0.18) > lut_lookup(&flat, 0.18),
+            "ACR must brighten mid-grey"
+        );
+        // Sanity: the embedded reference is monotone.
+        let mut prev = -1.0;
+        for &v in ADOBE_DEFAULT_TONE_CURVE.iter() {
+            assert!(v >= prev - 1e-6);
+            prev = v;
+        }
+    }
 }
 
 // --- Crop + straighten geometry remap ------------------------------------------------------------
@@ -573,7 +878,8 @@ impl DevelopParams {
                 (self.nr_color / 100.0).clamp(0.0, 1.0),
                 (self.vignette / 100.0).clamp(-1.0, 1.0),
             ],
-            texel: [texel[0], texel[1], 0.0, 0.0],
+            // texel.z carries the scene-linear baseline gain (ACR-brightness calibration); .w spare.
+            texel: [texel[0], texel[1], BASELINE_GAIN, 0.0],
         }
     }
 
@@ -671,6 +977,38 @@ impl DevelopParams {
                 if c.is_identity() { 0.0 } else { 1.0 },
             ],
             aspect: [src_aspect, out_aspect, 0.0, 0.0],
+        }
+    }
+
+    /// Pack the Color-balance-RGB grading for the GPU (`@binding(14)`). Ships the verified ProPhoto⇄
+    /// grading-RGB matrices (so the shader has no magic constants) + the user controls. `params.z` is
+    /// the active flag so the shader skips the whole stage at defaults (keeping the render
+    /// byte-identical to a pre-binding-14 build).
+    pub fn to_cbrgb(&self) -> CbRgbUniform {
+        let c = &self.cb_rgb;
+        let (fwd, inv) = grading_matrices(); // row-major f64
+                                             // Pack row-major M3 → std140 mat3 columns (matching `mat3x3 * v` in WGSL), as `to_wb_uniform`.
+        let cols = |m: &M3| {
+            [
+                [m[0][0] as f32, m[1][0] as f32, m[2][0] as f32, 0.0],
+                [m[0][1] as f32, m[1][1] as f32, m[2][1] as f32, 0.0],
+                [m[0][2] as f32, m[1][2] as f32, m[2][2] as f32, 0.0],
+            ]
+        };
+        let v3 = |a: [f32; 3]| [a[0], a[1], a[2], 0.0];
+        CbRgbUniform {
+            fwd: cols(&fwd),
+            inv: cols(&inv),
+            global: v3(c.global),
+            shadows: v3(c.shadows),
+            midtones: v3(c.midtones),
+            highlights: v3(c.highlights),
+            params: [
+                c.contrast.clamp(-1.0, 1.0),
+                c.saturation.clamp(-1.0, 1.0),
+                if c.is_identity() { 0.0 } else { 1.0 },
+                0.0,
+            ],
         }
     }
 }
@@ -810,6 +1148,31 @@ impl Default for ViewUniform {
     }
 }
 
+/// Color-balance-RGB grading uniform (`@binding(14)`). std140-clean: five `vec4` (80 bytes). Each of
+/// `global/shadows/midtones/highlights` is a grading-RGB vector in `.xyz` (`.w` spare); `params` =
+/// (contrast, saturation, active 0/1, _pad). `active = 0` ⇒ the shader skips the grading-space round
+/// trip, so a default render is **byte-identical** to a pre-binding-14 build (golden + export rely on
+/// it). The ProPhoto⇄grading matrices live in `develop.wgsl` as constants (see `grading_matrices`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CbRgbUniform {
+    /// ProPhoto(D50) → grading-RGB(D65), std140 mat3 (3 × `vec4` columns).
+    pub fwd: [[f32; 4]; 3],
+    /// grading-RGB(D65) → ProPhoto(D50).
+    pub inv: [[f32; 4]; 3],
+    pub global: [f32; 4],
+    pub shadows: [f32; 4],
+    pub midtones: [f32; 4],
+    pub highlights: [f32; 4],
+    pub params: [f32; 4],
+}
+
+impl Default for CbRgbUniform {
+    fn default() -> Self {
+        DevelopParams::default().to_cbrgb()
+    }
+}
+
 /// CPU-side viewport descriptor consumed by `DevelopPipeline::render_view`. Renders only the
 /// crop-local window `[origin, origin + size]` into an `out_w × out_h` target. `overlay_layer` is
 /// the **packed enabled-mask layer** (not the frontend mask index; -1 = no overlay) whose coverage
@@ -920,15 +1283,24 @@ mod base_curve_tests {
     use super::*;
 
     #[test]
-    fn anchors_zero_and_mid_grey_for_all_amounts() {
+    fn anchors_zero_and_mid_grey_brightens_with_amount() {
+        // f(0)=0 for all amounts; mid-grey rises monotonically from the flat-neutral 0.18 (amount=0)
+        // to the ACR brightness ~0.388 (amount=1) as the Base-curve slider engages the ACR fit.
+        let mut prev_mg = -1.0;
         for amount in [0.0, 0.5, 1.0] {
             assert_eq!(base_curve_value(0.0, amount), 0.0, "f(0) must be 0");
             let m = base_curve_value(MID_GREY, amount);
-            assert!(
-                (m - MID_GREY).abs() < 1e-5,
-                "mid-grey must anchor at {MID_GREY} for amount {amount} (got {m})"
-            );
+            assert!(m >= prev_mg, "mid-grey must not darken as amount rises");
+            prev_mg = m;
         }
+        assert!(
+            (base_curve_value(MID_GREY, 0.0) - 0.18).abs() < 1e-3,
+            "flat (amount=0) mid-grey must be 0.18"
+        );
+        assert!(
+            (base_curve_value(MID_GREY, 1.0) - 0.388).abs() < 0.01,
+            "ACR (amount=1) mid-grey must be ≈0.388"
+        );
     }
 
     #[test]

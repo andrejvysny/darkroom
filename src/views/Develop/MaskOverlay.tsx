@@ -66,7 +66,9 @@ export default function MaskOverlay({
   onCommitStroke,
 }: MaskOverlayProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const picking = useDevelopStore((s) => s.pickingColor);
+  // Disarm the eyedropper while the crop tool is active — the stage shows the uncropped frame then,
+  // so a pick would sample the wrong pixels (the develop preview is crop-relative).
+  const picking = useDevelopStore((s) => s.pickingColor && !s.cropMode);
   const setPicking = useDevelopStore((s) => s.setPickingColor);
   const kind = mask.components[compIndex]?.kind;
 

@@ -104,6 +104,21 @@ struct View {
 };
 @group(0) @binding(13) var<uniform> VIEW: View;
 
+// Color-balance-RGB grading (@binding(14)). fwd/inv = ProPhoto(D50)⇄grading-RGB(D65) mat3 (3 vec4
+// columns each, packed CPU-side from the verified chain). global/shadows/midtones/highlights = per-
+// channel grading-RGB vectors in .xyz. params = (contrast, saturation, active 0/1, _). active=0 ⇒
+// the whole stage is skipped (byte-identical to a pre-binding-14 render).
+struct CbRgb {
+  fwd0: vec4<f32>, fwd1: vec4<f32>, fwd2: vec4<f32>,
+  inv0: vec4<f32>, inv1: vec4<f32>, inv2: vec4<f32>,
+  global: vec4<f32>,
+  shadows: vec4<f32>,
+  midtones: vec4<f32>,
+  highlights: vec4<f32>,
+  params: vec4<f32>,
+};
+@group(0) @binding(14) var<uniform> CB: CbRgb;
+
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
@@ -422,6 +437,62 @@ fn crop_to_source(cuv: vec2<f32>) -> GeomResult {
   return r;
 }
 
+// --- Color-balance-RGB grading (faithful subset of darktable colorbalancergb) --------------------
+// Runs in the scene-linear stage (after develop + masks, before the base tone operator). All work is
+// in the D65 grading RGB; the verified ProPhoto⇄grading matrices ride the uniform.
+const CB_YW = vec3<f32>(0.78777, 0.250455, 0.0); // grading-RGB luminance weights (= [.6899,.3483,0]·Q)
+const CB_MASK_FULCRUM = 0.5;   // pow(neutral grading-Y ≈0.19, 0.41012) ≈ 0.5 (mid-grey → 0.5)
+const CB_GREY = 0.1845;        // grading-luminance fulcrum for scene-linear contrast
+const CB_SW = 4.0;             // shadows / highlights / midtones opacity weights (darktable defaults)
+const CB_HW = 4.0;
+const CB_MW = 8.0;
+
+fn cb_fwd(v: vec3<f32>) -> vec3<f32> {
+  return mat3x3<f32>(CB.fwd0.xyz, CB.fwd1.xyz, CB.fwd2.xyz) * v;
+}
+fn cb_inv(v: vec3<f32>) -> vec3<f32> {
+  return mat3x3<f32>(CB.inv0.xyz, CB.inv1.xyz, CB.inv2.xyz) * v;
+}
+
+fn apply_color_balance(lin: vec3<f32>) -> vec3<f32> {
+  if (CB.params.z < 0.5) { return lin; }  // inactive ⇒ identity (skips the round trip; byte-exact)
+  var g = cb_fwd(lin);
+
+  // Tonal opacity masks (darktable `opacity_masks`): center mid-grey at the fulcrum in a perceptual x.
+  let yv = max(dot(g, CB_YW), 0.0);
+  let x = pow(yv, 0.4101205819200422);
+  let xo = (x - CB_MASK_FULCRUM) / CB_MASK_FULCRUM;
+  let alpha = 1.0 / (1.0 + exp(xo * CB_SW));        // shadows opacity
+  let beta = 1.0 / (1.0 + exp(-xo * CB_HW));        // highlights opacity
+  let ac = 1.0 - alpha;
+  let bc = 1.0 - beta;
+  let dx = x - CB_MASK_FULCRUM;
+  let gm = clamp(exp(-dx * dx * CB_MW / 4.0) * ac * ac * bc * bc * 8.0, 0.0, 1.0); // midtones opacity
+
+  // 4-way grade.
+  g = g + CB.global.xyz;                                  // global offset (all tones)
+  g = g + CB.shadows.xyz * alpha;                         // shadows lift
+  g = g * (vec3<f32>(1.0) + CB.highlights.xyz * beta);    // highlights gain
+  let expo = vec3<f32>(1.0) - CB.midtones.xyz * gm;       // midtones per-channel power (sign-aware)
+  g = sign(g) * pow(abs(g) + 1e-6, expo);
+
+  // Scene-linear contrast about the grading-luminance fulcrum.
+  let con = CB.params.x;
+  if (abs(con) > 1e-4) {
+    let y2 = max(dot(g, CB_YW), 1e-6);
+    let yc = CB_GREY * pow(y2 / CB_GREY, 1.0 + con);
+    g = g * (yc / y2);
+  }
+  // Global chroma / saturation about luminance.
+  let sat = CB.params.y;
+  if (abs(sat) > 1e-4) {
+    let y3 = dot(g, CB_YW);
+    g = mix(vec3<f32>(y3), g, 1.0 + sat);
+  }
+
+  return max(cb_inv(g), vec3<f32>(0.0));
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   // Viewport path (active) maps a crop-local sub-rect; legacy path (inactive) letterbox-fits the
@@ -440,7 +511,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   // white balance (chromatic adaptation), once, in linear ProPhoto. P.wb_gain is held at identity now
   // that global WB rides this matrix; masks keep their gain delta.
   let base_rgb = apply_detail(suv, sample_bilinear(suv));
-  let base_wb = wb_apply(base_rgb);
+  // Scene-linear baseline gain (EX.texel.z, default 1.0) normalizes exposure so a correctly-exposed
+  // mid-grey reaches the ACR base curve's 0.18 input. Applied once, before develop + the tone curve.
+  let base_wb = wb_apply(base_rgb) * EX.texel.z;
 
   // --- SCENE-LINEAR STAGE: base develop, then composite each mask's linear deltas ---
   var lin = apply_local_linear(
@@ -459,6 +532,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     );
     lin = mix(lin, li, a);
   }
+
+  // Color-balance-RGB grading (scene-linear, after develop+masks, before the base tone operator).
+  lin = apply_color_balance(lin);
 
   // --- DISPLAY TRANSITION (shared, once): base tone operator (ProPhoto) → ProPhoto→sRGB → OETF → HSL → tone curve ---
   // The base operator maps scene-linear→display-linear in ProPhoto (covering >1.0 headroom), then the

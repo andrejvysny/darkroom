@@ -3,6 +3,7 @@ import Module from "./Module";
 import Slider from "./Slider";
 import ToneCurve from "./ToneCurve";
 import ColorMixer from "./ColorMixer";
+import ColorBalance from "./ColorBalance";
 import MaskPanel from "./MaskPanel";
 import Icon from "../../components/Icon";
 import { useDevelopStore } from "../../store/develop";
@@ -17,6 +18,8 @@ import {
   type CurvePoint,
   type HslBand,
   type Crop,
+  type CbRgb,
+  DEFAULT_CB_RGB,
 } from "../../lib/ipc";
 
 interface InstrumentPanelProps {
@@ -25,6 +28,7 @@ interface InstrumentPanelProps {
   onCurveChange: (channel: ToneCurveChannel, points: CurvePoint[]) => void;
   onHslChange: (index: number, patch: Partial<HslBand>) => void;
   onCropChange: (patch: Partial<Crop>) => void;
+  onColorBalanceChange: (patch: Partial<CbRgb>) => void;
   resetKeys: (keys: ScalarParamKey[]) => void;
   onReset: () => void;
   onAddMask: (mask: Mask) => void;
@@ -46,6 +50,7 @@ export default function InstrumentPanel({
   onCurveChange,
   onHslChange,
   onCropChange,
+  onColorBalanceChange,
   resetKeys,
   onReset,
   onAddMask,
@@ -266,6 +271,15 @@ export default function InstrumentPanel({
           bands={params.hsl}
           onBandChange={onHslChange}
         />
+      </Module>
+
+      {/* Color Balance (4-way grading) */}
+      <Module
+        title="Color balance"
+        defaultCollapsed
+        onReset={() => onColorBalanceChange({ ...DEFAULT_CB_RGB })}
+      >
+        <ColorBalance value={params.cbRgb} onChange={onColorBalanceChange} />
       </Module>
 
       {/* Detail */}

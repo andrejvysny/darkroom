@@ -16,7 +16,9 @@ use tauri::{AppHandle, Emitter, Manager};
 // v2 adds local adjustment masks (DevelopParams.masks). v1 rows deserialize with masks: [].
 // v3 adds the scene-referred base tone operator (DevelopParams.tone_amount, default 100 = full ACR);
 // it replaces the fixed highlight shoulder, so v1/v2 rows re-render with the new tonality.
-const PROCESS_VERSION: i64 = 3;
+// v4 fits the base tone curve to the real ACR default (mid-grey 0.18→0.388 ≈65% sRGB, ~+1.3 EV
+// brighter) + adds Color-balance-RGB; all prior rows re-render with the matched ACR brightness.
+const PROCESS_VERSION: i64 = 4;
 
 /// Delete cached thumbnails for content hashes no longer referenced by any present row. A byte-
 /// identical keeper still shares its hash, so presence is re-checked before deleting (lowercase-hex

@@ -2,6 +2,27 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## DONE: ACR tone-curve fit + Color-balance-RGB (develop-fidelity pass)
+
+> Branch `feat/acr-curve-colorbalance`. Plan: `~/.claude/plans/act-as-senior-software-moonlit-zephyr.md`.
+
+- [x] **Base tone curve fit to real ACR** (`base_curve_ref.rs` = Adobe universal default curve, 1025
+      pts from RawTherapee `dcp.cc`; the R7 Adobe-Standard DCP has no embedded ProfileToneCurve). Maps
+      mid-grey 0.18→0.388 (≈65% sRGB) so unedited imports match the Lightroom default brightness
+      (~+1.3 EV vs before). Codex-reviewed asymptotic highlight shoulder (no hard clip). Golden
+      `param_effects::base_curve_tone_response` + `acr_fit_tests` (RMS L\* < 2.0). `BASELINE_GAIN`
+      (`EX.texel.z`, default 1.0) is the visual-QA knob. `PROCESS_VERSION` 3→4.
+- [x] **Color-balance-RGB** (`@binding(14)` `CbRgbUniform`) — faithful subset of darktable
+      `colorbalancergb`: 4-way (global/shadows/midtones/highlights) + scene-linear contrast +
+      saturation, in the GPT-5.5-verified Filmlight grading RGB (`grading_matrices`), tonal opacity
+      masks. Identity at defaults (byte-identical render). `ColorBalance.tsx` panel. Tests:
+      `grading_space_tests`, `color_balance_*` (GPU).
+- [x] Quick win: eyedropper disarmed during crop mode (`MaskOverlay.tsx`).
+- [ ] **Visual QA in-app** (`npm run tauri dev`): confirm the brighter ACR default on varied photos +
+      tune `BASELINE_GAIN` if needed; exercise the Color balance panel.
+- [ ] **Codex follow-up** (optional): the prose summary didn't flush; the numeric review stands
+      (`workspace/logs/codex-curve-review.out`). Re-run if extending the curve/grading math.
+
 ## DONE: Viewport render — full-res zoom + near-instant edits + mask overlay
 
 > Branch `feat/viewport-render` (merged). Plan: `~/.claude/plans/snoopy-floating-island.md`. Render
@@ -60,8 +81,14 @@
 - [ ] FOLLOW-UP MODELS (deferred, consume the log): dedup keeper-ranking → best-shot → lighting
       normalization → auto-edit style. Training-time grouping for best-shot via `capture_fingerprint`.
 
-## ACTIVE: AI People/Animal detection accuracy overhaul
+## DONE: AI People/Animal detection accuracy overhaul (F1 0.905, 50fb0fc)
 
+> WS1–5 complete & production-wired (D-FINE-M People/Vehicles + MegaDetector-v5a Animals + MobileCLIP-S1
+> verifier + Florence-2 caption); label-calibrated person gating → F1 0.905 (v3). Remaining tail is
+> deferred polish: ort dylib bundling for a built `.app` (HIGH iff distributing), Florence-2 KV-cache
+> (O(n²) decode, acceptable for background), in-app e2e re-analyze QA. Original plan +
+> per-WS checklist below kept for reference.
+>
 > Plan: `~/.claude/plans/act-as-senior-ai-linked-peacock.md`. Root cause: D-FINE no-background sigmoid
 > heads + 0.45 gate + no precision filters → false positives on empty frames. One integrated release.
 > Architecture: D-FINE-M → People+Vehicles · MegaDetector-v5a → Animals · MobileCLIP-S1 → verify gate.
@@ -126,15 +153,13 @@
       NR, Vignette on real CR3. Math verified headless; _feel_ is subjective. Single-constant tunables:
       mired span `params.rs::white_xy` (±range), rolloff shoulder `develop.wgsl::highlight_rolloff`
       (`a=0.75`), highlight-mask threshold (`0.25`), NR/sharpen response, vignette `0.6` gain.
-- [ ] **Geometric develop modules** (still UI-only) — Crop (aspect + straighten angle) + Lens
-      manual distortion / chromatic-aberration. Need: a `sample_bilinear` 4-tap helper (input is
-      non-filterable `Rgba32Float`), straighten = rotate+autozoom UV in-shader, crop = overlay rect
-      in `Stage.tsx` + apply at export (avoid preview output-dims churn), distortion = radial UV /
-      per-channel scale. All need **visual QA**. Crop UI = aspect buttons + Angle slider (unwired).
-- [ ] **`import_start` lock refactor** — restructure `core_import::import` to brief-lock-snapshot →
-      unlocked parallel copy/move/hash/thumbnail → brief-lock single-tx insert (mirror
-      `library_index_root`/`run_pass`); + startup sweep for dangling sessions; + dedup seen-set
-      `status='present'` filter & relink path. Ends the whole-import IPC freeze.
+- [x] **Crop / straighten — DONE** (`feat/tone-operator-crop`): GeomUniform `@binding(12)` +
+      `crop_to_source`/`sample_bilinear` 4-tap (the helper already exists), interactive `CropOverlay.tsx`,
+      aspect presets + Angle slider, export at true dims via `Crop::export_rect`. Visual-QA pending.
+- [ ] **Lens distortion / chromatic-aberration** (the only still-UI-only geometric module; greenfield)
+      — reuse `sample_bilinear` for a radial UV / per-channel scale, then **visual QA**.
+- [x] **`import_start` lock refactor — DONE** (ea0d66a): brief-lock-snapshot → unlocked copy/hash/
+      thumbnail → brief-lock insert; `ImportGuard` RAII gates the FS watcher. Import no longer freezes IPC.
 - [ ] **Higher-leverage review items:** dedup `dhash_from_jpeg` — normalize orientation before
       hashing (rotation-sensitive); per-mask WB as a CAT (currently per-channel gain delta);
       bilateral/edge-aware NR (currently a plain 3×3 box → softens edges); dedicated loupe preview
@@ -324,7 +349,8 @@ Quality: `cargo test --workspace` (31 suites, all green) · `cargo clippy --work
   ProPhoto→sRGB at the display transition (`PP_TO_SRGB`, derived in
   `core-raw/examples/print_color_matrices.rs`). Global WB is a **CAT mat3 on `@binding(8)`**
   (`params.rs::wb_matrix`, Planckian+Bradford, identity at temp=0); `ParamsUniform.wb_gain` stays
-  identity. Detail/vignette = `ExtraUniform` on `@binding(9)`. Next free GPU binding = 10.
+  identity. Detail/vignette = `ExtraUniform` on `@binding(9)`. Bindings 0–13 are now all wired
+  (10 ToneOp, 11 base_lut, 12 Geom crop/straighten, 13 View viewport/overlay); **next free = 14**.
 - Keep ALL rawler calls in `core-raw` (pinned `=0.7.2`, non-SemVer).
 - `rusqlite 0.39` / `rusqlite_migration =2.5.0` pinned for rustc 1.91 — don't bump without checking MSRV.
 - wgpu is `=29`; its API differs a lot from older majors (see CURRENT_STATE.md).

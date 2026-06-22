@@ -560,6 +560,30 @@ export const DEFAULT_CROP: Crop = {
   angle: 0,
 };
 
+/** A grading-RGB color offset (per-channel). Mirrors Rust `[f32; 3]`. */
+export type Rgb3 = [number, number, number];
+
+/** Color-balance-RGB grading (4-way + scene-linear contrast/saturation). Mirrors Rust `CbRgb`.
+ * `global` = offset (all tones), `shadows` = lift, `highlights` = gain, `midtones` = per-channel
+ * power; each a grading-RGB vector ≈ ±0.5. `contrast`/`saturation` are -1..1. All 0 = no-op. */
+export type CbRgb = {
+  global: Rgb3;
+  shadows: Rgb3;
+  midtones: Rgb3;
+  highlights: Rgb3;
+  contrast: number;
+  saturation: number;
+};
+
+export const DEFAULT_CB_RGB: CbRgb = {
+  global: [0, 0, 0],
+  shadows: [0, 0, 0],
+  midtones: [0, 0, 0],
+  highlights: [0, 0, 0],
+  contrast: 0,
+  saturation: 0,
+};
+
 export type DevelopParams = {
   exposure: number;
   temp: number;
@@ -580,12 +604,13 @@ export type DevelopParams = {
   hsl: HslBand[];
   crop: Crop;
   masks: Mask[];
+  cbRgb: CbRgb;
 };
 
 /** The numeric (scalar) develop params — everything except the structured fields. */
 export type ScalarParamKey = Exclude<
   keyof DevelopParams,
-  "toneCurve" | "hsl" | "crop" | "masks"
+  "toneCurve" | "hsl" | "crop" | "masks" | "cbRgb"
 >;
 
 export const EMPTY_TONE_CURVE: ToneCurve = { rgb: [], r: [], g: [], b: [] };
@@ -609,6 +634,7 @@ export const DEFAULT_PARAMS: DevelopParams = {
   hsl: Array.from({ length: HSL_BANDS }, () => ({ h: 0, s: 0, l: 0 })),
   crop: { ...DEFAULT_CROP },
   masks: [],
+  cbRgb: { ...DEFAULT_CB_RGB },
 };
 
 export function developGetEdit(imageId: number): Promise<DevelopParams> {

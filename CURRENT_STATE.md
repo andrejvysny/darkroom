@@ -188,8 +188,12 @@ rolloff (no hard pre-OETF clamp). **Kelvin white balance** via Planckian locus (
 CAT on `@binding(8)` (GPT-5.5-reviewed; `wb_matrix(0,0)` is exact identity). Independent endpoint
 blacks/whites. **Detail** (3×3 unsharp sharpen + luma/color NR) + **Lens vignette** on `@binding(9)`.
 
-**Partial / UI-only (NOT wired — geometric, need bilinear remap + visual QA):** Crop/geometry
-(aspect + straighten angle), Lens distortion / chromatic-aberration. Sliders render but have no effect.
+**Crop/straighten — DONE (visual-QA pending), as of `feat/tone-operator-crop`:** GeomUniform
+`@binding(12)` + `crop_to_source`/`sample_bilinear` (the bilinear-remap "helper" the old note asked
+for already exists, `develop.wgsl`), interactive `CropOverlay.tsx`, aspect presets + straighten slider,
+export at true dims via `Crop::export_rect`. Scene-referred **ACR base tone operator** (`@binding(10/11)`)
+and **viewport render** (`@binding(13)`) also landed. **Still UI-only / NOT wired:** Lens distortion /
+chromatic-aberration only (greenfield — no shader math; controls were removed from the UI).
 
 **Not done (deferred from spec):** keyword hierarchy UI, "recent import" as a true session filter,
 per-display ICC, RCD/AMaZE demosaic, Windows/Linux, notarization, CSP hardening. (Thumbnail LRU
@@ -197,10 +201,11 @@ eviction and FS-watcher reconciliation are DONE — see `thumbs.rs::evict_to` an
 
 ## Known issues / caveats
 
-- `import_start` holds the `db` lock across the entire multi-file import (copy/move/hash/thumbnail),
-  freezing all DB-backed IPC for the duration — annoying-not-dangerous for single-user; refactor
-  deferred. (NOTE: `develop_render` does **not** hold the cache lock during decode — it decodes +
-  GPU-prepares unlocked, locking only the brief render+readback. An earlier doc claim was stale.)
+- `import_start` lock freeze is **RESOLVED** (ea0d66a): `core_import::import` takes `&Mutex<Db>` and
+  brief-locks only the initial snapshot, per-file relink/insert, and session finish — copy/hash/
+  thumbnail run unlocked between locks, so IPC stays responsive; the FS watcher is gated via an
+  `ImportGuard` RAII (`src-tauri/src/watch.rs`). (`develop_render` likewise decodes + GPU-prepares
+  unlocked, locking only the brief render+readback.)
 - Loupe uses the 512px cached thumb upscaled (no dedicated larger preview yet).
 - Export re-decodes full-res (≈1.6s) each time; not cached.
 - Unsigned dmg blocked by Gatekeeper on other Macs (`xattr -dr com.apple.quarantine`).
@@ -211,9 +216,9 @@ See **TODO.md → "Leftovers / next"** for the authoritative list. In short:
 
 1. **Visual QA** the develop fidelity in-app (Temp/Tint/Highlights/Sharpen/Vignette on real CR3);
    tune the single constants if the feel is off (mired span, rolloff shoulder, NR/sharpen strength).
-2. **Geometric develop** (still UI-only): Crop (aspect + straighten) + Lens distortion/CA — needs a
-   bilinear-remap helper + crop overlay/export-dims + visual QA.
-3. **`import_start` lock refactor** (brief-lock/unlocked-work/brief-commit; ends the import freeze).
+2. **Lens distortion / chromatic-aberration** (the only still-UI-only geometric module; greenfield —
+   reuse `sample_bilinear` for a radial UV / per-channel scale). Crop/straighten is DONE.
+3. **Develop fidelity push** (in progress): ACR base tone-curve fit + Color-balance-RGB (`@binding(14)`).
 4. Higher-leverage review items not yet done: dedup orientation-normalize before dHash; per-mask
    WB-as-CAT; bilateral (not box) NR; loupe ≥1536px preview; export full-res cache.
 5. Pre-distribution only (de-scoped while personal): CSP hardening, command path-scoping, ort dylib

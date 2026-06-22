@@ -96,8 +96,9 @@ The input path is LR-grade but everything after exposure is ad-hoc. Do in order 
    format can grow an XMP-`crs:` bridge here. Do **after** 1–2 so remapped tone/grading match ACR.
 4. **Local-contrast family** (clarity/texture, then dehaze) — needs a multi-radius blur beyond the
    current 3×3. **Grain**, **channel mixer** (3×3 linear), **HaldCLUT/.cube** (3D texture, trilinear)
-   are smaller independent wins. Fix saturation/HSL to be chroma-preserving in unclamped linear
-   (currently clamps away the ProPhoto headroom).
+   are smaller independent wins. (NOTE: the earlier "saturation/HSL clamps away ProPhoto headroom"
+   claim was **inaccurate** — global saturation already runs unclamped in scene-linear ProPhoto
+   (`develop.wgsl::apply_local_linear`); the HSL clamp is correct display-space sRGB, post-OETF.)
 
 ### B. Geometry & crop (Marek's "most-missed in LR")
 
@@ -139,5 +140,6 @@ multi-format (ARW/NEF/DNG/Fuji) validation. All deferred while personal/macOS-on
   recreate — skipped as risky/low-value for single-connection use); de-`#[ignore]` the real-Trash
   import test (needs an injectable trash backend).
 - **Hard constraints unchanged** — do NOT touch `ParamsUniform`/`wb_gain` packing; new GPU data on new
-  bindings (next free = **10**); rawler `=0.7.2`, wgpu `=29`, rusqlite `0.39`/`_migration =2.5.0`
-  pinned for rustc 1.91. See `CLAUDE.md`.
+  bindings. Bindings 0–14 are now all wired (10 ToneOp, 11 base_lut, 12 Geom, 13 View, 14 CbRgb);
+  **next free = 15**. rawler `=0.7.2`, wgpu `=29`, rusqlite `0.39`/`_migration =2.5.0` pinned for rustc
+  1.91. See `CLAUDE.md`.

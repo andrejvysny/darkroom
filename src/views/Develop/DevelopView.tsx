@@ -23,6 +23,7 @@ export default function DevelopView() {
     onCurveChange,
     onHslChange,
     onCropChange,
+    onColorBalanceChange,
     resetKeys,
     reset,
     addMask,
@@ -130,6 +131,7 @@ export default function DevelopView() {
           onCurveChange={onCurveChange}
           onHslChange={onHslChange}
           onCropChange={onCropChange}
+          onColorBalanceChange={onColorBalanceChange}
           resetKeys={resetKeys}
           onReset={reset}
           onAddMask={addMask}

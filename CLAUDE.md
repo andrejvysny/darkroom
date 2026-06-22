@@ -65,7 +65,7 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 ## Hard constraints (do not violate — see CURRENT_STATE.md for detail)
 
 - **Do NOT add padding to the `vec3 wb_gain` uniform** (`params.rs` ↔ `develop.wgsl`). A scalar packs into the vec3 tail per std140/WGSL; it is correct. A past review false-flagged it. Guarded by golden test `param_effects.rs`.
-- **All new GPU data must use new bindings**, never alter `ParamsUniform`. Tone curve = `@binding(3)`, HSL `FxUniform` = `@binding(4)`, masks = `@binding(5-7)`, **white-balance CAT mat3 = `@binding(8)`**, **Detail+vignette `ExtraUniform` = `@binding(9)`**. (Global WB now rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
+- **All new GPU data must use new bindings**, never alter `ParamsUniform`. Bindings 0–14 are all in use; **next free = `@binding(15)`**. Map: 0 `input_tex`, 1 `input_smp`, 2 `ParamsUniform` (guarded), 3 tone-curve LUT, 4 HSL `FxUniform`, 5–7 masks (array + sampler + storage), 8 white-balance CAT mat3, 9 Detail+vignette `ExtraUniform`, **10 `ToneOpUniform` (scene-referred base tone operator), 11 `base_lut` (base-curve texture), 12 `GeomUniform` (crop/straighten), 13 `ViewUniform` (viewport + mask overlay), 14 `CbRgbUniform` (Color-balance-RGB grading)**. (Global WB rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
 - **rawler `=0.7.2`** pinned (non-SemVer; CR3/EOS R7 validated, no LibRaw). Keep every rawler call inside `core-raw`.
 - **wgpu `=29`** — API differs substantially from older majors (Instance/device/pipeline-descriptor changes catalogued in CURRENT_STATE.md).
 - **rusqlite `0.39` + rusqlite_migration `=2.5.0`** pinned for rustc 1.91 (newer needs ≥1.95). Don't bump without checking MSRV.
@@ -76,7 +76,11 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 
 V1 complete (validated on 240 real Canon R7 CR3 **on the dev machine** — only 1 CR3 is committed;
 GPU/real-CR3 tests skip without the fixture/Metal). Post-V1 develop fidelity landed: linear-ProPhoto
-working space, scene-referred highlights, Kelvin WB (CAT), Detail (sharpen/NR), Lens vignette.
-**Still UI-only / not wired (geometric, need visual QA):** Crop/geometry (aspect + straighten),
-Lens distortion / chromatic-aberration — sliders render but have no effect. Check `TODO.md` before
-assuming a develop module is functional.
+working space, scene-referred **ACR base tone operator** (`@binding(10/11)`), Kelvin WB (CAT), Detail
+(sharpen/NR), Lens vignette, **crop/straighten** (`@binding(12)`, UV-remap via `crop_to_source` +
+`sample_bilinear`), and **viewport render** (`@binding(13)` — full-res zoom + mask overlay). The import
+freeze (whole-import DB lock) is **resolved** (ea0d66a); the AI scan pipeline (D-FINE-M + MegaDetector
+
+- MobileCLIP verifier + Florence-2) is production-wired (F1 0.905). **Still UI-only / not wired:** Lens
+  distortion / chromatic-aberration only (greenfield — no shader effect). Crop is wired (visual-QA
+  pending). Check `TODO.md` before assuming a develop module is functional.

@@ -5,6 +5,7 @@
 //! shadows, saturation, display transform) and outputs RGBA8 for the webview canvas / export.
 
 pub mod backend;
+pub mod base_curve_ref;
 pub mod curve;
 pub mod encode;
 pub mod error;
@@ -18,7 +19,7 @@ pub use encode::{crop_rgba8, rgba8_to_jpeg, rgba8_to_png};
 pub use error::PipelineError;
 pub use histogram::{histogram, histogram_from_jpeg, Histogram};
 pub use params::{
-    BrushStroke, ComponentKind, Crop, CurvePoint, DevelopParams, HslBand, LocalAdjust, Mask,
+    BrushStroke, CbRgb, ComponentKind, Crop, CurvePoint, DevelopParams, HslBand, LocalAdjust, Mask,
     MaskComponent, MaskOp, ToneCurve, ViewParams, MASK_CAP,
 };
 
