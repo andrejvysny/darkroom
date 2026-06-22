@@ -47,6 +47,7 @@ library/2026/2026-06-06/*
 /2024/
 /2026/
 /Darktable_SORT/
+/DATA/
 
 # UI-testing (playwright-cli) session artifacts.
 .playwright-cli/
