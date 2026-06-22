@@ -2,12 +2,26 @@
 
 > Read order when resuming: this file → `CURRENT_STATE.md` (architecture, gotchas, IPC surface) →
 > `TODO.md` (granular leftovers) → `SPEC_V1.md` (full spec) → `CLAUDE.md` (hard constraints).
-> Memory index: `~/.claude/.../memory/MEMORY.md` (latest: **darkroom-acr-curve-colorbalance**,
-> **darkroom-tone-crop**, **darkroom-trust-and-ship**).
+> Memory index: `~/.claude/.../memory/MEMORY.md` (latest: **darkroom-unified-ai-pipeline**,
+> **darkroom-acr-curve-colorbalance**, **darkroom-tone-crop**, **darkroom-trust-and-ship**).
 
 ## TL;DR
 
-**Latest (merged → `main`, commit `d3e1d3e`): `feat/acr-curve-colorbalance` — base tone curve fit to
+**Newest — branch `feat/unified-ai-pipeline` (UNMERGED / uncommitted):** the two separate on-device AI
+passes (object detection auto-after-import + face recognition manual "Find People") are merged into ONE
+**manual** scan for **10k–100k libraries** — single shared decode (`core_raw::preview_with_orientation`),
+per-stage dirty-DAG keyset pagination (`stale_targets`), deferred Phase-B captions (Florence built
+lazily), and a **data-safe `reconcile_faces`** (a re-scan never drops a person-assigned face; inference
+errors retry instead of recording "0 faces"). Codex-reviewed reframe: **no upstream person-gate** —
+SCRFD self-gates ArcFace/clustering. Built phases 0–5 + a 3-aspect review (R1 correctness/data-safety,
+R2 perf/scale, R3 clean-code); `cargo test --workspace` + `clippy` + `npx tsc --noEmit` all clean.
+Migrations `012` (`images(status,id)`) + `013` (`json_extract` marker cleanup); new `face_stage_enabled`
+IPC + Settings toggle; scan is fully manual (auto-trigger removed); People ride the unified `analysis:*`
+event stream. **NOT committed; in-app GUI QA + an independent Codex cross-check (usage-limited, resets
+~Jun 23 00:44) are pending.** Design + rationale: memory `darkroom-unified-ai-pipeline`; fix plan
+`~/.claude/plans/act-as-senior-ai-linear-tome.md`. Supersedes the prior separate AI passes.
+
+**Latest MERGED (→ `main`, commit `d3e1d3e`): `feat/acr-curve-colorbalance` — base tone curve fit to
 the REAL Adobe Camera Raw default + Color-balance-RGB.** Started from a 9-agent state audit that found
 the docs lagged reality by two merged branches (crop/straighten, tone operator, import-lock fix, AI
 F1 0.905 were all already done despite docs calling them open). Two features shipped:
@@ -98,6 +112,19 @@ New tests this pass: import-session reaper, schema downgrade guard, sidecar roun
 (write→wipe→rebuild→restored + blank-only hydrate), BK-tree brute-force equivalence + identical-hash.
 
 ## Suggested next steps
+
+### 0. Finish the unified AI pipeline branch (`feat/unified-ai-pipeline`) — UNMERGED, do first
+
+1. **In-app GUI QA** (`npm run tauri dev`): one scan does detection+faces+captions; ONE progress bar;
+   People populate before captions; a confirmed/assigned face survives a re-scan; cancel works;
+   `faces_delete_all` during a scan is refused. (First run downloads ≈900 MB object + 190 MB face models.)
+2. **Codex cross-check** — re-run the 3 Codex agents (correctness / perf / clean-code) once the OpenAI
+   usage limit resets (~Jun 23 00:44); this is the independent non-Claude review the user asked for.
+   Fold in findings — esp. the query-plan/index second opinion and the Florence lazy-load trade-off.
+3. **Commit** the branch (changes are uncommitted working-tree edits).
+4. Deferred (optional, post-merge): full Phase-A/B `run_pass` fn-split (cosmetic); ANN clustering
+   (instant-distance HNSW) for >~200 k faces; drop the now-dead `analyze: bool` param in
+   `index_root_blocking`. Full granular list: `TODO.md` top section.
 
 ### A. Feature push — Develop fidelity (highest collaborator value; tone target = LR/ACR)
 

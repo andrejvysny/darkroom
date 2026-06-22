@@ -40,25 +40,37 @@ pub fn preview_image(src: &RawSource) -> Result<DynamicImage, RawError> {
     Err(RawError::NoPreview)
 }
 
-/// Embedded preview **uprighted to its EXIF orientation** — i.e. display space, matching what
-/// [`thumbnail_jpeg`] serves (unlike [`preview_image`], which is sensor-native). Use this when boxes
-/// derived from the pixels must line up with the displayed thumbnail (face detection / overlays).
-pub fn oriented_preview(src: &RawSource) -> Result<DynamicImage, RawError> {
+/// Decode the embedded preview **once** and return the sensor-native pixels plus the EXIF
+/// orientation (if any). A unified scan derives the native view (object detectors, which are
+/// calibrated on sensor-native pixels) directly and the display view (faces) by applying the
+/// orientation — so the JPEG is decoded a single time instead of twice. Mirrors [`preview_image`]'s
+/// preview→full fallback chain so the native pixels are byte-identical to it.
+pub fn preview_with_orientation(
+    src: &RawSource,
+) -> Result<(DynamicImage, Option<Orientation>), RawError> {
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let params = RawDecodeParams::default();
-    let mut img = match decoder.preview_image(src, &params).map_err(de)? {
+    let img = match decoder.preview_image(src, &params).map_err(de)? {
         Some(img) => img,
         None => decoder
             .full_image(src, &params)
             .map_err(de)?
             .ok_or(RawError::NoPreview)?,
     };
-    if let Some(o) = decoder
+    let orientation = decoder
         .raw_metadata(src, &params)
         .ok()
         .and_then(|md| md.exif.orientation)
-        .and_then(|v| Orientation::from_exif(v as u8))
-    {
+        .and_then(|v| Orientation::from_exif(v as u8));
+    Ok((img, orientation))
+}
+
+/// Embedded preview **uprighted to its EXIF orientation** — i.e. display space, matching what
+/// [`thumbnail_jpeg`] serves (unlike [`preview_image`], which is sensor-native). Use this when boxes
+/// derived from the pixels must line up with the displayed thumbnail (face detection / overlays).
+pub fn oriented_preview(src: &RawSource) -> Result<DynamicImage, RawError> {
+    let (mut img, orientation) = preview_with_orientation(src)?;
+    if let Some(o) = orientation {
         img.apply_orientation(o);
     }
     Ok(img)

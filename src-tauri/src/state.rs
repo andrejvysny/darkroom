@@ -49,12 +49,9 @@ pub struct AppState {
     pub analysis_running: AtomicBool,
     /// Set by `analysis_cancel` to request the running pass stop between batches.
     pub analysis_cancel: AtomicBool,
-    /// Face detector + embedder (SCRFD + ArcFace, ~190 MB ONNX), lazily built on first "Find People".
+    /// Face detector + embedder (SCRFD + ArcFace, ~190 MB ONNX), lazily built on first scan with faces
+    /// enabled. The face stage runs inside the unified scan, guarded by `analysis_running`.
     pub face_analyzer: Mutex<Option<Arc<FaceAnalyzer>>>,
-    /// Guards against two face passes running at once.
-    pub faces_running: AtomicBool,
-    /// Set by `faces_cancel` to request the running face pass stop between batches.
-    pub faces_cancel: AtomicBool,
     /// Per-launch id stamped on every captured user-event (groups a usage session).
     pub session_id: String,
     /// App version stamped on events (label provenance / pipeline isolation).
@@ -115,8 +112,6 @@ impl AppState {
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),
             face_analyzer: Mutex::new(None),
-            faces_running: AtomicBool::new(false),
-            faces_cancel: AtomicBool::new(false),
             session_id,
             app_version: env!("CARGO_PKG_VERSION"),
         })

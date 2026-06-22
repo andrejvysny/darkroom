@@ -2,6 +2,51 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## DONE (UNMERGED / uncommitted): Unified AI pipeline + post-review fixes — branch `feat/unified-ai-pipeline`
+
+> Merges object detection + faces + captions into ONE manual scan for **10k–100k libraries**. Fix plan:
+> `~/.claude/plans/act-as-senior-ai-linear-tome.md`; design + decisions: memory
+> `darkroom-unified-ai-pipeline`. `cargo test --workspace` + `clippy` + `npx tsc --noEmit` all clean.
+> **NOT committed** (working-tree changes on the branch). Supersedes the two separate AI passes recorded
+> further down ("AI People/Animal detection accuracy overhaul" + the face pass).
+
+- [x] **Phase 0** decode-once: `core_raw::preview_with_orientation` (one JPEG decode → native ≤1024 +
+      oriented ≤1536); pixel-equivalence test `core-raw/tests/decode_once.rs` (justifies "no model
+      re-validation").
+- [x] **Phase 1** per-stage dirty-DAG + keyset pagination: `stale_targets`/`stale_count`/
+      `present_targets_after` (status='ok' gate, never OFFSET); migration `012` `images(status,id)`.
+- [x] **Phase 2** face data-safety: `reconcile_faces` (IoU-match, preserves id/person/confirmed/rejected/
+      cover; never drops a person-assigned face); error→retry (no "0 faces" marker on inference error);
+      migration `013` invalidates suspect markers via `json_extract`; `faces_delete_all` guarded vs an
+      in-flight scan.
+- [x] **Phase 3** scalable clustering: `has_dirty_faces` skip + chunked cancel + EXACT pairwise (dropped
+      the ~410 MB n×dim matrix); dim-mismatch guard. ANN (instant-distance HNSW) documented for >200 k.
+- [x] **Phase 4** coordinator `run_pass` (Phase A detect+faces → `run_clustering` → Phase B deferred
+      captions); single `analysis_running` guard + cancel; auto-import trigger REMOVED; `faces.rs` →
+      shims; Settings `face_stage_enabled` (default on); Florence built lazily in Phase B.
+- [x] **Phase 5** frontend: `faceStageEnabled` IPC + Settings "Detect people" toggle; unified
+      `analysis:*` events (`useFaces` rewired off `faces:*`; `faces:models` kept).
+- [x] **Review R1–R3** (3 parallel Claude review agents — Codex was usage-limited): fixed
+      person-assigned-face deletion, embedding zero-pad, matrix memory, migration brittleness, emit
+      spam (÷32), Florence residency, event duplication. +3 regression tests (reconcile / dim-guard /
+      json_extract).
+
+### NEXT (this branch — before merge)
+
+- [ ] **In-app GUI QA** (`npm run tauri dev`): one scan runs detection+faces+captions; ONE progress
+      bar; People populate before captions; a confirmed/assigned face survives a re-scan; cancel stops
+      it; `faces_delete_all` during a scan is refused. (Models ≈ 900 MB object + 190 MB faces on first
+      run.)
+- [ ] **Codex cross-check** (independent non-Claude review the user asked for): re-run the 3 Codex
+      agents (correctness / perf / clean-code) after the OpenAI usage limit resets (~Jun 23 00:44);
+      fold findings in. Specifically second-opinion the query-plan/index call (Claude judged the
+      `analysis_results` PK + new `images(status,id)` sufficient — no extra index) and the Florence
+      lazy-load trade-off.
+- [ ] **Commit** the branch (currently uncommitted working-tree changes; `git commit` not yet run).
+- [ ] Deferred (optional, post-merge): full Phase-A/B `run_pass` fn-split (cosmetic — `run_clustering`
+      already extracted); ANN clustering (instant-distance) for >~200 k faces; remove the now-dead
+      `analyze: bool` param from `commands.rs::index_root_blocking`.
+
 ## DONE: ACR tone-curve fit + Color-balance-RGB (develop-fidelity pass) — MERGED `d3e1d3e`
 
 > Branch `feat/acr-curve-colorbalance`, **merged to `main`** (`d3e1d3e`). Plan:

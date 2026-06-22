@@ -22,6 +22,12 @@ const KEY_ANIMAL_DETECTOR_SIZE: &str = "animal_detector_size";
 /// User-configured library root: where copy/move imports file photos (under `YYYY/YYYY-MM-DD/`).
 const KEY_LIBRARY_ROOT: &str = "library_root";
 
+/// Whether the face stage (SCRFD + ArcFace) participates in the unified AI scan. Defaults ON, so once
+/// the (non-commercial, ~190 MB) face models are downloaded faces are found automatically as part of
+/// the scan; a user can turn it off here. The models themselves are NEVER fetched implicitly — that
+/// stays an explicit action.
+const KEY_FACE_STAGE_ENABLED: &str = "face_stage_enabled";
+
 /// Read a raw `app_meta` value.
 pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, LibError> {
     Ok(conn
@@ -80,6 +86,22 @@ pub fn animal_detector_size(conn: &Connection) -> Result<u32, LibError> {
 pub fn set_animal_detector_size(conn: &Connection, size: u32) -> Result<(), LibError> {
     let size = if size <= 640 { 640 } else { 1280 };
     set_meta(conn, KEY_ANIMAL_DETECTOR_SIZE, &size.to_string())
+}
+
+/// Whether the face stage runs in the unified scan (defaults ON — see [`KEY_FACE_STAGE_ENABLED`]).
+pub fn face_stage_enabled(conn: &Connection) -> Result<bool, LibError> {
+    Ok(get_meta(conn, KEY_FACE_STAGE_ENABLED)?
+        .map(|v| v != "0")
+        .unwrap_or(true))
+}
+
+/// Enable/disable the face stage in the unified scan.
+pub fn set_face_stage_enabled(conn: &Connection, enabled: bool) -> Result<(), LibError> {
+    set_meta(
+        conn,
+        KEY_FACE_STAGE_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
 }
 
 /// User-configured library root (the copy/move import destination), if one has been set.

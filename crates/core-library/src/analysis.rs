@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use core_db::rusqlite::{params, Connection, OptionalExtension};
+use core_db::rusqlite::{params, Connection, OptionalExtension, ToSql};
 use serde::Serialize;
 
 use crate::error::LibError;
@@ -214,6 +214,173 @@ pub fn present_images(conn: &Connection) -> Result<Vec<AnalyzeTarget>, LibError>
     Ok(out)
 }
 
+/// One AI-scan stage to test for staleness: its analyzer id + the current model version.
+#[derive(Debug, Clone, Copy)]
+pub struct StageSpec {
+    pub analyzer_id: &'static str,
+    pub model_version: &'static str,
+}
+
+/// A present image with a per-stage staleness mask (aligned to the `stages` slice passed to
+/// [`stale_targets`]). `stale[i] == true` means stage `i` has no `status='ok'` marker at its current
+/// version for this image — i.e. it must run. A missing OR `status='error'` marker both count as
+/// stale, so failed stages retry instead of being treated as done.
+pub struct StaleTarget {
+    pub id: i64,
+    pub path: String,
+    pub content_hash_hex: String,
+    pub stale: Vec<bool>,
+}
+
+/// Keyset-paginated dirty-stage scan for the unified AI pass. Returns present images with
+/// `id > cursor` in ascending id order where AT LEAST ONE stage is stale, at most `limit` rows, each
+/// tagged with which stages are stale. One `LEFT JOIN` per stage onto `analysis_results`, keyed on
+/// `(analyzer_id, model_version, status='ok')`. Never materializes the whole library — the caller
+/// loops, advancing `cursor` to the last returned id, until a page comes back empty.
+///
+/// Per-stage (not all-or-nothing): bumping one stage's version re-runs only that stage, so a caption
+/// change never re-runs the ~950 ms/image animal detector across the library. Aliases (`j{k}`) and
+/// the column count derive from `stages.len()` (internal, trusted); all analyzer ids / versions are
+/// bound parameters, so the dynamic SQL is injection-safe.
+pub fn stale_targets(
+    conn: &Connection,
+    stages: &[StageSpec],
+    cursor: i64,
+    limit: i64,
+) -> Result<Vec<StaleTarget>, LibError> {
+    if stages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = stages.len();
+    let mut sql = String::from("SELECT i.id, i.path, i.content_hash");
+    for k in 0..n {
+        sql.push_str(&format!(", (j{k}.image_id IS NULL)"));
+    }
+    sql.push_str(" FROM images i");
+    for k in 0..n {
+        sql.push_str(&format!(
+            " LEFT JOIN analysis_results j{k} ON j{k}.image_id = i.id \
+             AND j{k}.analyzer_id = ? AND j{k}.model_version = ? AND j{k}.status = 'ok'"
+        ));
+    }
+    sql.push_str(" WHERE i.status = 'present' AND i.id > ? AND (");
+    for k in 0..n {
+        if k > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str(&format!("j{k}.image_id IS NULL"));
+    }
+    sql.push_str(") ORDER BY i.id LIMIT ?");
+
+    // Params appear in SQL order: per-stage (analyzer_id, model_version) inside the JOINs, then the
+    // cursor, then the limit.
+    let mut binds: Vec<&dyn ToSql> = Vec::with_capacity(n * 2 + 2);
+    for s in stages {
+        binds.push(&s.analyzer_id);
+        binds.push(&s.model_version);
+    }
+    binds.push(&cursor);
+    binds.push(&limit);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(binds.as_slice(), |r| {
+        let id = r.get::<_, i64>(0)?;
+        let path = r.get::<_, String>(1)?;
+        let hb = r.get::<_, Vec<u8>>(2)?;
+        let mut stale = Vec::with_capacity(n);
+        for k in 0..n {
+            stale.push(r.get::<_, bool>(3 + k)?);
+        }
+        Ok((id, path, hb, stale))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, path, hb, stale) = row?;
+        let content_hash_hex = if hb.len() == 32 {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&hb);
+            core_raw::hex(&a)
+        } else {
+            String::new()
+        };
+        out.push(StaleTarget {
+            id,
+            path,
+            content_hash_hex,
+            stale,
+        });
+    }
+    Ok(out)
+}
+
+/// COUNT of present images with ≥1 stale stage — the denominator for scan progress. Same join shape
+/// as [`stale_targets`], without pagination.
+pub fn stale_count(conn: &Connection, stages: &[StageSpec]) -> Result<i64, LibError> {
+    if stages.is_empty() {
+        return Ok(0);
+    }
+    let n = stages.len();
+    let mut sql = String::from("SELECT COUNT(*) FROM images i");
+    for k in 0..n {
+        sql.push_str(&format!(
+            " LEFT JOIN analysis_results j{k} ON j{k}.image_id = i.id \
+             AND j{k}.analyzer_id = ? AND j{k}.model_version = ? AND j{k}.status = 'ok'"
+        ));
+    }
+    sql.push_str(" WHERE i.status = 'present' AND (");
+    for k in 0..n {
+        if k > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str(&format!("j{k}.image_id IS NULL"));
+    }
+    sql.push(')');
+    let mut binds: Vec<&dyn ToSql> = Vec::with_capacity(n * 2);
+    for s in stages {
+        binds.push(&s.analyzer_id);
+        binds.push(&s.model_version);
+    }
+    Ok(conn.query_row(&sql, binds.as_slice(), |r| r.get(0))?)
+}
+
+/// Keyset page of present images (`id > cursor`, ascending) for a FORCED full re-scan that ignores
+/// staleness. Mirrors [`stale_targets`] pagination but returns every present image — the caller treats
+/// all stages as stale. Walks `idx_images_status_id` directly.
+pub fn present_targets_after(
+    conn: &Connection,
+    cursor: i64,
+    limit: i64,
+) -> Result<Vec<AnalyzeTarget>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, content_hash FROM images
+          WHERE status = 'present' AND id > ?1 ORDER BY id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![cursor, limit], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, path, hb) = row?;
+        let content_hash_hex = if hb.len() == 32 {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&hb);
+            core_raw::hex(&a)
+        } else {
+            String::new()
+        };
+        out.push(AnalyzeTarget {
+            id,
+            path,
+            content_hash_hex,
+        });
+    }
+    Ok(out)
+}
+
 /// One labeled image for the eval / training harnesses: catalog path + tri-state ground-truth.
 /// `person`/`animal` are `None` when that field is unlabeled (NULL) — callers MUST exclude `None`
 /// from that category's metrics; never treat unlabeled as a negative.
@@ -290,10 +457,20 @@ pub fn caption_for_image(conn: &Connection, image_id: i64) -> Result<Option<Capt
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .optional()?;
-    Ok(row.map(|(caption, kw)| CaptionRow {
-        caption,
-        keywords: serde_json::from_str(&kw).unwrap_or_default(),
-    }))
+    let Some((caption, kw)) = row else {
+        return Ok(None);
+    };
+    // Stored keywords hold only the caption-derived nouns (the captioner runs in the deferred Phase B
+    // with no detection context). Union the CURRENT detection labels at read time so a detector re-run
+    // is reflected without re-running the expensive captioner. Dedup case-insensitively, stored first.
+    let mut keywords: Vec<String> = serde_json::from_str(&kw).unwrap_or_default();
+    let mut seen: HashSet<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+    for d in detections_for_image(conn, image_id)? {
+        if seen.insert(d.label.to_lowercase()) {
+            keywords.push(d.label);
+        }
+    }
+    Ok(Some(CaptionRow { caption, keywords }))
 }
 
 /// MobileCLIP presence-probe scores for one image (advisory AI readout; manual labels stay truth).

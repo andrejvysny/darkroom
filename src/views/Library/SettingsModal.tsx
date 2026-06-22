@@ -5,6 +5,8 @@ import {
   setThumbCacheCap,
   analysisDetectorSize,
   setAnalysisDetectorSize,
+  faceStageEnabled,
+  setFaceStageEnabled,
   previewEdge,
   updatePreviewEdge,
   appLibraryRoot,
@@ -85,6 +87,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [pickingRoot, setPickingRoot] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [mdSize, setMdSize] = useState(1280);
+  const [faceStage, setFaceStage] = useState(true);
   const [pEdge, setPEdge] = useState(0);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -116,13 +119,15 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       analysisDetectorSize(),
       appLibraryRoot(),
       previewEdge(),
+      faceStageEnabled(),
     ])
-      .then(([cap, used, size, root, pe]) => {
+      .then(([cap, used, size, root, pe, fse]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
         setMdSize(size);
         setLibRoot(root);
         setPEdge(pe);
+        setFaceStage(fse);
         initializedRef.current = true;
       })
       .catch(() => showStatus("Failed to load settings"));
@@ -178,6 +183,17 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     void setAnalysisDetectorSize(size)
       .then(() => showStatus(`Animal detection set to ${size}px`))
       .catch(() => showStatus("Failed to save resolution"));
+  };
+
+  const handleFaceStage = (enabled: boolean) => {
+    setFaceStage(enabled);
+    void setFaceStageEnabled(enabled)
+      .then(() =>
+        showStatus(
+          enabled ? "Face detection enabled" : "Face detection disabled",
+        ),
+      )
+      .catch(() => showStatus("Failed to save face setting"));
   };
 
   const handleBackfill = () => {
@@ -402,6 +418,32 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
                   key={size}
                   onClick={() => handleMdSize(size)}
                   style={segmentBtn(mdSize === size)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Face detection during scan */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>Detect people (faces)</div>
+            <div style={descStyle}>
+              Find and group faces as part of the AI scan. Uses on-device,
+              non-commercial models (~190 MB, downloaded on first use). Turn off
+              to skip the face stage entirely.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {(
+                [
+                  [true, "On"],
+                  [false, "Off"],
+                ] as [boolean, string][]
+              ).map(([on, label]) => (
+                <button
+                  key={label}
+                  onClick={() => handleFaceStage(on)}
+                  style={segmentBtn(faceStage === on)}
                 >
                   {label}
                 </button>

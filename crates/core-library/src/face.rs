@@ -1,7 +1,7 @@
 //! Persistence + read/label queries for faces & people.
 //!
 //! Mirrors the `analysis.rs` discipline (bound params, free of any ml/ort dependency). Faces are
-//! written by the `src-tauri` face pass via [`insert_faces`]; clustering ([`crate::face_cluster`])
+//! written by the `src-tauri` face pass via [`reconcile_faces`]; clustering ([`crate::face_cluster`])
 //! and the People IPC read/mutate through here. Embeddings are stored as little-endian f32 BLOBs.
 
 use core_db::rusqlite::{named_params, params, Connection, OptionalExtension};
@@ -39,9 +39,82 @@ fn blob_to_f32s(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Replace this image's faces with a fresh set (re-run safe; cascades embeddings + rejections). MUST
-/// be called inside a transaction. Returns the number of faces written.
-pub fn insert_faces(
+/// Min IoU for a fresh detection to be considered the SAME physical face as a stored row.
+const FACE_MATCH_IOU: f64 = 0.5;
+
+/// Intersection-over-union of two normalized `[x1,y1,x2,y2]` boxes.
+fn bbox_iou(a: &[f64; 4], b: &[f64; 4]) -> f64 {
+    let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let ih = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    let inter = iw * ih;
+    let area_a = ((a[2] - a[0]) * (a[3] - a[1])).max(0.0);
+    let area_b = ((b[2] - b[0]) * (b[3] - b[1])).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+struct ExistingFace {
+    id: i64,
+    bbox: [f64; 4],
+    status: String,
+    source: String,
+    person_id: Option<i64>,
+}
+
+/// Insert one fresh detected face (+ its embedding) as a new unconfirmed `ml` row.
+fn insert_one_face(
+    conn: &Connection,
+    image_id: i64,
+    model_version: &str,
+    model_tag: &str,
+    now: i64,
+    f: &FaceInput,
+) -> Result<(), LibError> {
+    conn.execute(
+        "INSERT INTO face
+           (asset_id, person_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2, kps, quality_score,
+            det_score, source, status, deferred, model_version, created_at)
+         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ml', 'unconfirmed', 1, ?9, ?10)",
+        params![
+            image_id,
+            f.bbox[0] as f64,
+            f.bbox[1] as f64,
+            f.bbox[2] as f64,
+            f.bbox[3] as f64,
+            f32s_to_blob(&f.kps),
+            f.quality as f64,
+            f.det_score as f64,
+            model_version,
+            now,
+        ],
+    )?;
+    let face_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO face_embedding (face_id, dim, vector, model_tag) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            face_id,
+            f.embedding.len() as i64,
+            f32s_to_blob(&f.embedding),
+            model_tag,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Reconcile this image's detected faces with what's already stored — **re-run safe without losing
+/// user decisions**. New detections are matched to existing faces by bounding-box IoU
+/// (≥ [`FACE_MATCH_IOU`], greedily, 1:1). A match KEEPS the existing face id, `person_id`, `status`
+/// (confirmed/rejected), and any cover reference while refreshing geometry + replacing the embedding
+/// (so a `model_tag` change re-embeds in place). Unmatched detections are inserted as fresh
+/// unconfirmed faces. Existing faces with no match are dropped ONLY if they were unconfirmed
+/// auto-detections — `confirmed`/`rejected`/`manual` faces are preserved, so a transient detector
+/// miss never wipes a named person, its embeddings, or its rejection history. MUST run inside a
+/// transaction. Returns the number of faces detected this run.
+pub fn reconcile_faces(
     conn: &Connection,
     image_id: i64,
     model_version: &str,
@@ -49,36 +122,100 @@ pub fn insert_faces(
     now: i64,
     faces: &[FaceInput],
 ) -> Result<usize, LibError> {
-    conn.execute("DELETE FROM face WHERE asset_id = ?1", params![image_id])?;
-    for f in faces {
-        conn.execute(
-            "INSERT INTO face
-               (asset_id, person_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2, kps, quality_score,
-                det_score, source, status, deferred, model_version, created_at)
-             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ml', 'unconfirmed', 1, ?9, ?10)",
-            params![
-                image_id,
-                f.bbox[0] as f64,
-                f.bbox[1] as f64,
-                f.bbox[2] as f64,
-                f.bbox[3] as f64,
-                f32s_to_blob(&f.kps),
-                f.quality as f64,
-                f.det_score as f64,
-                model_version,
-                now,
-            ],
+    let existing: Vec<ExistingFace> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, bbox_x1, bbox_y1, bbox_x2, bbox_y2, status, source, person_id
+               FROM face WHERE asset_id = ?1",
         )?;
-        let face_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO face_embedding (face_id, dim, vector, model_tag) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                face_id,
-                f.embedding.len() as i64,
-                f32s_to_blob(&f.embedding),
-                model_tag,
-            ],
-        )?;
+        let rows = stmt.query_map(params![image_id], |r| {
+            Ok(ExistingFace {
+                id: r.get(0)?,
+                bbox: [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?],
+                status: r.get(5)?,
+                source: r.get(6)?,
+                person_id: r.get(7)?,
+            })
+        })?;
+        rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Greedy IoU matching (highest overlap first, 1:1) of new detection → existing face.
+    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+    for (ni, f) in faces.iter().enumerate() {
+        let nb = [
+            f.bbox[0] as f64,
+            f.bbox[1] as f64,
+            f.bbox[2] as f64,
+            f.bbox[3] as f64,
+        ];
+        for (ei, e) in existing.iter().enumerate() {
+            let iou = bbox_iou(&nb, &e.bbox);
+            if iou >= FACE_MATCH_IOU {
+                pairs.push((iou, ni, ei));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut new_to_existing: Vec<Option<i64>> = vec![None; faces.len()];
+    let mut new_matched = vec![false; faces.len()];
+    let mut existing_matched = vec![false; existing.len()];
+    for (_, ni, ei) in pairs {
+        if !new_matched[ni] && !existing_matched[ei] {
+            new_matched[ni] = true;
+            existing_matched[ei] = true;
+            new_to_existing[ni] = Some(existing[ei].id);
+        }
+    }
+
+    for (ni, f) in faces.iter().enumerate() {
+        match new_to_existing[ni] {
+            // Matched: refresh geometry + scores + version, keep id/person/status/cover; re-embed.
+            Some(fid) => {
+                conn.execute(
+                    "UPDATE face SET bbox_x1=?2, bbox_y1=?3, bbox_x2=?4, bbox_y2=?5, kps=?6,
+                       quality_score=?7, det_score=?8, model_version=?9 WHERE id=?1",
+                    params![
+                        fid,
+                        f.bbox[0] as f64,
+                        f.bbox[1] as f64,
+                        f.bbox[2] as f64,
+                        f.bbox[3] as f64,
+                        f32s_to_blob(&f.kps),
+                        f.quality as f64,
+                        f.det_score as f64,
+                        model_version,
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO face_embedding (face_id, dim, vector, model_tag)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        fid,
+                        f.embedding.len() as i64,
+                        f32s_to_blob(&f.embedding),
+                        model_tag,
+                    ],
+                )?;
+            }
+            None => insert_one_face(conn, image_id, model_version, model_tag, now, f)?,
+        }
+    }
+
+    // Drop stale auto-detections that no longer match a detection — but ONLY truly unattached ones.
+    // A face clustering assigned to a person keeps `person_id` while `status` stays 'unconfirmed';
+    // deleting it would orphan the person and lose the embedding, so `person_id.is_some()` is
+    // preserved alongside confirmed/rejected/manual faces.
+    for (ei, e) in existing.iter().enumerate() {
+        if existing_matched[ei] {
+            continue;
+        }
+        let keep = e.status == "confirmed"
+            || e.status == "rejected"
+            || e.source == "manual"
+            || e.person_id.is_some();
+        if !keep {
+            conn.execute("DELETE FROM face WHERE id = ?1", params![e.id])?;
+        }
     }
     Ok(faces.len())
 }
@@ -433,4 +570,144 @@ pub fn delete_all_face_data(conn: &Connection) -> Result<(), LibError> {
         [],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_db::Db;
+
+    fn seed_image(db: &Db, id: i64) {
+        db.conn
+            .execute(
+                "INSERT INTO images(id, content_hash, file_size, path, original_filename, status, imported_at)
+                 VALUES (?1, X'00', 1, ?2, 'f', 'present', 0)",
+                params![id, format!("/img{id}")],
+            )
+            .unwrap();
+    }
+
+    fn face_at(bbox: [f32; 4]) -> FaceInput {
+        FaceInput {
+            bbox,
+            kps: [0.0; 10],
+            det_score: 0.9,
+            quality: 1.0,
+            embedding: vec![1.0, 0.0, 0.0],
+        }
+    }
+
+    fn faces_of(db: &Db, asset: i64) -> Vec<(i64, Option<i64>, String)> {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT id, person_id, status FROM face WHERE asset_id = ?1 ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![asset], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.collect::<core_db::rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    /// A moved-but-same face keeps its id/person/confirmed status; an unconfirmed face that vanishes
+    /// from detection is dropped.
+    #[test]
+    fn reconcile_preserves_identity_and_drops_stale_unconfirmed() {
+        let db = Db::open_in_memory().unwrap();
+        seed_image(&db, 1);
+        reconcile_faces(
+            &db.conn,
+            1,
+            "mv",
+            "tag",
+            0,
+            &[face_at([0.1, 0.1, 0.3, 0.3]), face_at([0.6, 0.6, 0.8, 0.8])],
+        )
+        .unwrap();
+        let before = faces_of(&db, 1);
+        assert_eq!(before.len(), 2);
+        let a_id = before[0].0;
+        let person = create_person(&db.conn, 0).unwrap();
+        assign_face_person(&db.conn, a_id, Some(person)).unwrap();
+
+        // Re-scan: A moved slightly (same physical face, high IoU), B gone.
+        reconcile_faces(
+            &db.conn,
+            1,
+            "mv2",
+            "tag",
+            1,
+            &[face_at([0.11, 0.11, 0.31, 0.31])],
+        )
+        .unwrap();
+        let after = faces_of(&db, 1);
+        assert_eq!(after.len(), 1, "stale unconfirmed B dropped, A kept");
+        assert_eq!(after[0].0, a_id, "A keeps its stable id");
+        assert_eq!(after[0].1, Some(person), "A keeps its person");
+        assert_eq!(after[0].2, "confirmed", "A stays confirmed");
+    }
+
+    /// A confirmed face the detector no longer finds (occluded/turned this run) must NOT be wiped.
+    #[test]
+    fn reconcile_keeps_confirmed_face_with_no_detection() {
+        let db = Db::open_in_memory().unwrap();
+        seed_image(&db, 1);
+        reconcile_faces(
+            &db.conn,
+            1,
+            "mv",
+            "tag",
+            0,
+            &[face_at([0.1, 0.1, 0.3, 0.3])],
+        )
+        .unwrap();
+        let id = faces_of(&db, 1)[0].0;
+        let person = create_person(&db.conn, 0).unwrap();
+        assign_face_person(&db.conn, id, Some(person)).unwrap();
+
+        reconcile_faces(&db.conn, 1, "mv", "tag", 1, &[]).unwrap();
+        let after = faces_of(&db, 1);
+        assert_eq!(
+            after.len(),
+            1,
+            "confirmed face survives a zero-detection re-scan"
+        );
+        assert_eq!(after[0].2, "confirmed");
+    }
+
+    /// A face clustering auto-assigned to a person (person_id set, status still 'unconfirmed') must
+    /// NOT be dropped on a re-scan that fails to re-detect it — else the person is orphaned + the
+    /// embedding lost. (Regression guard for the reconcile drop predicate.)
+    #[test]
+    fn reconcile_keeps_person_assigned_unconfirmed_face() {
+        let db = Db::open_in_memory().unwrap();
+        seed_image(&db, 1);
+        reconcile_faces(
+            &db.conn,
+            1,
+            "mv",
+            "tag",
+            0,
+            &[face_at([0.1, 0.1, 0.3, 0.3])],
+        )
+        .unwrap();
+        let id = faces_of(&db, 1)[0].0;
+        // Mimic clustering: set person_id but leave status 'unconfirmed' (auto, not user-confirmed).
+        let person = create_person(&db.conn, 0).unwrap();
+        db.conn
+            .execute(
+                "UPDATE face SET person_id = ?2 WHERE id = ?1",
+                params![id, person],
+            )
+            .unwrap();
+
+        reconcile_faces(&db.conn, 1, "mv", "tag", 1, &[]).unwrap();
+        let after = faces_of(&db, 1);
+        assert_eq!(
+            after.len(),
+            1,
+            "person-assigned face survives a zero-detection re-scan"
+        );
+        assert_eq!(after[0].1, Some(person), "stays linked to its person");
+        assert_eq!(after[0].2, "unconfirmed");
+    }
 }

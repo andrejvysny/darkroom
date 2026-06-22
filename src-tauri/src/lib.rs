@@ -152,6 +152,8 @@ pub fn run() {
             commands::faces_models_ensure,
             commands::faces_run,
             commands::faces_cancel,
+            commands::face_stage_enabled,
+            commands::set_face_stage_enabled,
             commands::people_list,
             commands::person_faces,
             commands::image_faces,

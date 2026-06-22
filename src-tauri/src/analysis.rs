@@ -12,14 +12,23 @@ use core_analyze::models::{
     ModelStore, ANIMAL_DETECTOR_FILES, CAPTION_FILES, DETECTOR_FILES, VERIFIER_FILES,
 };
 use core_analyze::{
-    AnalysisCtx, AnalyzerRegistry, Captioner, MegaDetector, ObjectDetector, PresenceProbe, Verifier,
+    AnalysisCtx, Analyzer, AnalyzerRegistry, Captioner, MegaDetector, ObjectDetector,
+    PresenceProbe, Verifier, CAPTION_ID,
 };
-use core_library::{existing_analysis, insert_analysis, present_images, AnalysisInput};
+use core_library::{
+    cluster_assign, existing_analysis, face_stage_enabled, has_dirty_faces, insert_analysis,
+    present_image_count, present_images, present_targets_after, reconcile_faces, stale_count,
+    stale_targets, AnalysisInput, ClusterParams, FaceInput, StageSpec, StaleTarget,
+};
 use image::imageops::FilterType;
 use rayon::prelude::*;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
+use crate::faces::{
+    analyzer as build_face_analyzer, faces_models_ready, to_input, FACE_ANALYZER_ID,
+    FACE_DECODE_EDGE, FACE_MODEL_TAG, FACE_MODEL_VERSION,
+};
 use crate::state::AppState;
 
 /// Model-version tags stored per result row; bump to force re-analysis of all images.
@@ -104,7 +113,10 @@ pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
-/// Build (once) and cache the analyzer registry. Errors if models aren't downloaded yet.
+/// Build (once) and cache the **Phase-A** analyzer registry (object detection + animals + presence).
+/// The captioner (Florence-2, ~280 MB) is NOT here — it's built lazily in Phase B via
+/// [`build_captioner`] so it never sits in memory during the detection+faces phase. Errors if models
+/// aren't downloaded yet.
 fn registry(st: &AppState) -> Result<Arc<AnalyzerRegistry>, String> {
     if let Some(r) = st.analyzers.lock().map_err(|e| e.to_string())?.as_ref() {
         return Ok(r.clone());
@@ -113,7 +125,6 @@ fn registry(st: &AppState) -> Result<Arc<AnalyzerRegistry>, String> {
         return Err("models not downloaded".into());
     }
     let store = ModelStore::new(st.models_dir.clone());
-    let florence = store.florence_dir();
     // Shared CLIP verifier — crop re-check that drops confident-but-wrong detections.
     let (v_vision, v_text, v_tok) = store.verifier_paths();
     let verifier = Arc::new(Verifier::new(&v_vision, &v_text, &v_tok).map_err(|e| e.to_string())?);
@@ -138,10 +149,6 @@ fn registry(st: &AppState) -> Result<Arc<AnalyzerRegistry>, String> {
             .map_err(|e| e.to_string())?
             .with_verifier(verifier.clone()),
     ));
-    reg.register(Arc::new(
-        Captioner::new(&florence, &florence.join("tokenizer.json"), CAPTION_VERSION)
-            .map_err(|e| e.to_string())?,
-    ));
     // Full-image linear-probe presence classifier — reuses the already-built CLIP verifier (vision
     // encoder), so no extra model load. Catches subjects the box detectors miss; fused at query time.
     reg.register(Arc::new(
@@ -152,22 +159,96 @@ fn registry(st: &AppState) -> Result<Arc<AnalyzerRegistry>, String> {
     Ok(arc)
 }
 
-/// Decode an image's embedded preview to sRGB and downscale to <= ANALYZE_EDGE (longest edge).
-fn decode_srgb(path: &str) -> Option<image::RgbImage> {
-    let src = core_raw::source_from_path(Path::new(path)).ok()?;
-    let img = core_raw::preview_image(&src).ok()?.to_rgb8();
-    let (w, h) = (img.width(), img.height());
-    let m = w.max(h);
-    if m > ANALYZE_EDGE {
-        let s = ANALYZE_EDGE as f32 / m as f32;
-        Some(image::imageops::resize(
+/// Build the captioner (Florence-2, ~280 MB / 5 ONNX sessions) on demand for the deferred Phase B.
+/// Built fresh per run and dropped when the caller's `Arc` falls out of scope, so Florence is resident
+/// ONLY during captioning — never during the detection+faces phase or between scans.
+fn build_captioner(st: &AppState) -> Result<Arc<Captioner>, String> {
+    if !models_ready(st) {
+        return Err("models not downloaded".into());
+    }
+    let store = ModelStore::new(st.models_dir.clone());
+    let florence = store.florence_dir();
+    Ok(Arc::new(
+        Captioner::new(&florence, &florence.join("tokenizer.json"), CAPTION_VERSION)
+            .map_err(|e| e.to_string())?,
+    ))
+}
+
+/// Downscale so the longest edge ≤ `edge` (no-op if already within). Boxes are normalized, so this is
+/// loss-only.
+fn downscale(img: image::RgbImage, edge: u32) -> image::RgbImage {
+    let m = img.width().max(img.height());
+    if m > edge {
+        let s = edge as f32 / m as f32;
+        image::imageops::resize(
             &img,
-            (w as f32 * s) as u32,
-            (h as f32 * s) as u32,
+            (img.width() as f32 * s) as u32,
+            (img.height() as f32 * s) as u32,
             FilterType::Triangle,
-        ))
+        )
     } else {
-        Some(img)
+        img
+    }
+}
+
+/// Decode the embedded preview **once** and derive the views the unified pass needs: the sensor-native
+/// view (≤ [`ANALYZE_EDGE`]) for the object detectors, and — when `want_oriented` — the EXIF-uprighted
+/// view (≤ [`FACE_DECODE_EDGE`]) for faces. Pixel-equivalent to the former separate `preview_image` /
+/// `oriented_preview` decoders (guaranteed by core-raw's `decode_once` test), so neither model needs
+/// re-validation; we just stop decoding the JPEG twice.
+fn decode_shared(
+    path: &str,
+    want_oriented: bool,
+) -> Option<(image::RgbImage, Option<image::RgbImage>)> {
+    let src = core_raw::source_from_path(Path::new(path)).ok()?;
+    let (mut img, orientation) = core_raw::preview_with_orientation(&src).ok()?;
+    let native = downscale(img.to_rgb8(), ANALYZE_EDGE);
+    let oriented = if want_oriented {
+        if let Some(o) = orientation {
+            img.apply_orientation(o);
+        }
+        Some(downscale(img.to_rgb8(), FACE_DECODE_EDGE))
+    } else {
+        None
+    };
+    Some((native, oriented))
+}
+
+/// Emit unified scan progress on the single `analysis:progress` stream (`{phase,done,total}`). The
+/// People UI listens here too — there is no separate `faces:*` scan event (only `faces:models` for
+/// the model download).
+fn emit_progress<R: Runtime>(app: &AppHandle<R>, phase: &str, done: usize, total: i64) {
+    let _ = app.emit(
+        "analysis:progress",
+        serde_json::json!({ "phase": phase, "done": done, "total": total }),
+    );
+}
+
+/// One keyset page of work for `phase`'s stage specs. `force` re-scans every present image (all stages
+/// stale); otherwise only images with ≥1 stale stage. Never uses OFFSET — the caller advances the
+/// cursor to the last returned id, so the shrinking dirty set never skips or repeats a row.
+fn page_targets(
+    st: &AppState,
+    specs: &[StageSpec],
+    cursor: i64,
+    limit: i64,
+    force: bool,
+) -> Result<Vec<StaleTarget>, String> {
+    let db = st.db.lock().map_err(|e| e.to_string())?;
+    if force {
+        let n = specs.len();
+        Ok(present_targets_after(&db.conn, cursor, limit)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|t| StaleTarget {
+                id: t.id,
+                path: t.path,
+                content_hash_hex: t.content_hash_hex,
+                stale: vec![true; n],
+            })
+            .collect())
+    } else {
+        stale_targets(&db.conn, specs, cursor, limit).map_err(|e| e.to_string())
     }
 }
 
@@ -184,8 +265,11 @@ impl Drop for RunGuard<'_> {
     }
 }
 
-/// Run the analysis pass. `force` re-analyzes every image; otherwise only images missing any
-/// enabled analyzer@version. Emits `analysis:progress` `{done,total}` and `analysis:done`.
+/// Run the unified AI scan. **Phase A** (detection + faces) runs first for fast feedback, then
+/// clustering, then **Phase B** (captions, deferred so Florence stays off the fast path). Per-stage
+/// dirty-DAG: each image runs only its stale stages, paged by keyset so the library is never
+/// materialized. `force` re-runs every stage on every present image. One run-guard + `analysis_cancel`
+/// govern the whole job; progress + completion ride a single `analysis:*` event stream.
 pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats, String> {
     let st = app.state::<AppState>();
     if st.analysis_running.swap(true, Ordering::SeqCst) {
@@ -197,110 +281,234 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats,
         cancel: &st.analysis_cancel,
     };
 
+    // Phase-A analyzers (object detection / animals / presence). The captioner is built lazily in
+    // Phase B via `build_captioner`, so it is not part of this registry.
     let registry = registry(&st)?;
-    let analyzers = registry.analyzers();
+    let phase_a: Vec<&Arc<dyn Analyzer>> = registry.analyzers().iter().collect();
 
-    // Snapshot targets + already-analyzed triples under a brief lock.
-    let (targets, seen) = {
+    // Faces participate when enabled (default on) AND models are present — never an implicit download.
+    let face_on = {
         let db = st.db.lock().map_err(|e| e.to_string())?;
-        let targets = present_images(&db.conn).map_err(|e| e.to_string())?;
-        let seen = existing_analysis(&db.conn).map_err(|e| e.to_string())?;
-        (targets, seen)
+        face_stage_enabled(&db.conn).map_err(|e| e.to_string())?
+    } && faces_models_ready(&st);
+    let fa = if face_on {
+        Some(build_face_analyzer(&st)?)
+    } else {
+        None
     };
 
-    // An image is to-do if it's missing ANY enabled analyzer@version (then we recompute ALL of them,
-    // so the caption stage always sees fresh detection results via `prior`).
-    let todo: Vec<_> = targets
-        .into_iter()
-        .filter(|t| {
-            force
-                || analyzers.iter().any(|a| {
-                    !seen.contains(&(t.id, a.id().to_string(), a.model_version().to_string()))
-                })
+    // Phase-A dirty-DAG specs: object analyzers (in order) then the face_scan stage.
+    let mut a_specs: Vec<StageSpec> = phase_a
+        .iter()
+        .map(|a| StageSpec {
+            analyzer_id: a.id(),
+            model_version: a.model_version(),
         })
         .collect();
+    if face_on {
+        a_specs.push(StageSpec {
+            analyzer_id: FACE_ANALYZER_ID,
+            model_version: FACE_MODEL_VERSION,
+        });
+    }
+    let face_idx = face_on.then(|| a_specs.len() - 1);
 
-    let total = todo.len();
-    let _ = app.emit(
-        "analysis:progress",
-        serde_json::json!({ "done": 0, "total": total }),
-    );
-    let done = AtomicUsize::new(0);
+    let mut analyzed = 0usize;
     let failed = AtomicUsize::new(0);
 
-    // Process in batches: decode + inference for each batch in parallel (no DB lock), then commit
-    // that batch in one short transaction. Results are persisted + visible incrementally, so a
-    // partial / aborted run still keeps everything finished so far.
-    let mut analyzed = 0usize;
-    for batch in todo.chunks(ANALYSIS_BATCH) {
-        // Honor a cancel request between batches — work already committed is kept.
+    // ---- Phase A: detection + faces ----
+    let total_a = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        if force {
+            present_image_count(&db.conn).map_err(|e| e.to_string())?
+        } else {
+            stale_count(&db.conn, &a_specs).map_err(|e| e.to_string())?
+        }
+    };
+    emit_progress(app, "detect", 0, total_a);
+    let done = AtomicUsize::new(0);
+    let mut faces_added = false;
+    let mut cursor = 0i64;
+    loop {
         if st.analysis_cancel.load(Ordering::SeqCst) {
             break;
         }
-        let batch_results: Vec<(i64, Vec<AnalysisInput>)> = batch
+        let page = page_targets(&st, &a_specs, cursor, ANALYSIS_BATCH as i64, force)?;
+        let Some(last) = page.last().map(|t| t.id) else {
+            break;
+        };
+        cursor = last;
+
+        // `Err(())` = face inference errored → no marker is written, so the image retries next run
+        // (NOT a swallowed zero-face success). `None` = face stage not needed/disabled for this image.
+        type FaceOut = Option<Result<Vec<FaceInput>, ()>>;
+        let results: Vec<(i64, Vec<AnalysisInput>, FaceOut)> = page
             .par_iter()
             .filter_map(|t| {
-                let out = decode_srgb(&t.path).map(|img| {
-                    let mut records = Vec::new();
-                    for a in analyzers {
-                        let ctx = AnalysisCtx {
-                            image_id: t.id,
-                            content_hash_hex: &t.content_hash_hex,
-                            image: &img,
-                            prior: &records,
-                        };
-                        match a.analyze(&ctx) {
-                            Ok(rec) => records.push(rec),
-                            Err(e) => {
-                                eprintln!(
-                                    "[darkroom] analyzer {} failed on {}: {e}",
-                                    a.id(),
-                                    t.path
-                                )
-                            }
+                let need_face = face_idx.map(|fi| t.stale[fi]).unwrap_or(false) && fa.is_some();
+                let Some((native, oriented)) = decode_shared(&t.path, need_face) else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(32) {
+                        emit_progress(app, "detect", done.load(Ordering::Relaxed), total_a);
+                    }
+                    return None;
+                };
+                let mut records: Vec<core_analyze::AnalysisRecord> = Vec::new();
+                for (k, a) in phase_a.iter().enumerate() {
+                    if !t.stale[k] {
+                        continue;
+                    }
+                    let ctx = AnalysisCtx {
+                        image_id: t.id,
+                        content_hash_hex: &t.content_hash_hex,
+                        image: &native,
+                        prior: &records,
+                    };
+                    match a.analyze(&ctx) {
+                        Ok(r) => records.push(r),
+                        Err(e) => {
+                            eprintln!("[darkroom] analyzer {} failed on {}: {e}", a.id(), t.path)
                         }
                     }
-                    let inputs: Vec<AnalysisInput> = records
-                        .into_iter()
-                        .map(|r| AnalysisInput {
-                            analyzer_id: r.analyzer_id,
-                            model_version: r.model_version,
-                            payload: r.payload,
-                        })
-                        .collect();
-                    (t.id, inputs)
-                });
-                if out.is_none() {
-                    failed.fetch_add(1, Ordering::Relaxed);
                 }
+                let face_out: FaceOut = match (need_face, fa.as_ref(), oriented.as_ref()) {
+                    (true, Some(f), Some(img)) => Some(match f.detect_embed(img) {
+                        Ok(recs) => Ok(recs.into_iter().map(to_input).collect()),
+                        Err(e) => {
+                            eprintln!("[darkroom] face analyze failed on {}: {e}", t.path);
+                            Err(())
+                        }
+                    }),
+                    _ => None,
+                };
+                let inputs: Vec<AnalysisInput> = records
+                    .into_iter()
+                    .map(|r| AnalysisInput {
+                        analyzer_id: r.analyzer_id,
+                        model_version: r.model_version,
+                        payload: r.payload,
+                    })
+                    .collect();
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == total || n.is_multiple_of(2) {
-                    let _ = app.emit(
-                        "analysis:progress",
-                        serde_json::json!({ "done": n, "total": total }),
-                    );
+                if n.is_multiple_of(32) {
+                    emit_progress(app, "detect", done.load(Ordering::Relaxed), total_a);
                 }
-                out.filter(|(_, inputs)| !inputs.is_empty())
+                Some((t.id, inputs, face_out))
             })
             .collect();
 
-        // Commit this batch in one short transaction so results show up immediately.
-        if !batch_results.is_empty() {
+        if !results.is_empty() {
             let mut db = st.db.lock().map_err(|e| e.to_string())?;
-            let ran_at = core_library::now_epoch();
+            let now = core_library::now_epoch();
             let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-            for (id, inputs) in &batch_results {
-                insert_analysis(&tx, *id, ran_at, inputs).map_err(|e| e.to_string())?;
+            for (id, inputs, face_out) in &results {
+                if !inputs.is_empty() {
+                    insert_analysis(&tx, *id, now, inputs).map_err(|e| e.to_string())?;
+                }
+                if let Some(Ok(faces)) = face_out {
+                    reconcile_faces(&tx, *id, FACE_MODEL_VERSION, FACE_MODEL_TAG, now, faces)
+                        .map_err(|e| e.to_string())?;
+                    let marker = [AnalysisInput {
+                        analyzer_id: FACE_ANALYZER_ID.to_string(),
+                        model_version: FACE_MODEL_VERSION.to_string(),
+                        payload: serde_json::json!({ "faces": faces.len() }),
+                    }];
+                    insert_analysis(&tx, *id, now, &marker).map_err(|e| e.to_string())?;
+                    if !faces.is_empty() {
+                        faces_added = true;
+                    }
+                }
             }
             tx.commit().map_err(|e| e.to_string())?;
-            analyzed += batch_results.len();
+            analyzed += results.len();
         }
+        emit_progress(app, "detect", done.load(Ordering::Relaxed), total_a);
+    }
 
-        // Nudge the UI now that committed data has changed (frontend throttles a facets refetch).
-        let _ = app.emit(
-            "analysis:progress",
-            serde_json::json!({ "done": done.load(Ordering::Relaxed), "total": total }),
-        );
+    // Cluster faces added/dirtied this run (skipped when nothing needs placing).
+    if face_on {
+        run_clustering(&st, faces_added)?;
+    }
+
+    // ---- Phase B: captions (deferred, non-blocking) ----
+    // Build Florence ONLY when there's caption work, so a run with nothing to caption never loads
+    // ~280 MB; the captioner drops at the end of this block (out of memory between/after scans).
+    let b_specs = [StageSpec {
+        analyzer_id: CAPTION_ID,
+        model_version: CAPTION_VERSION,
+    }];
+    let total_b = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        if force {
+            present_image_count(&db.conn).map_err(|e| e.to_string())?
+        } else {
+            stale_count(&db.conn, &b_specs).map_err(|e| e.to_string())?
+        }
+    };
+    if total_b > 0 && !st.analysis_cancel.load(Ordering::SeqCst) {
+        let cap = build_captioner(&st)?;
+        emit_progress(app, "caption", 0, total_b);
+        let bdone = AtomicUsize::new(0);
+        let mut bcursor = 0i64;
+        loop {
+            if st.analysis_cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            let page = page_targets(&st, &b_specs, bcursor, ANALYSIS_BATCH as i64, force)?;
+            let Some(last) = page.last().map(|t| t.id) else {
+                break;
+            };
+            bcursor = last;
+            let results: Vec<(i64, Vec<AnalysisInput>)> = page
+                .par_iter()
+                .filter_map(|t| {
+                    let res = decode_shared(&t.path, false).and_then(|(native, _)| {
+                        let ctx = AnalysisCtx {
+                            image_id: t.id,
+                            content_hash_hex: &t.content_hash_hex,
+                            image: &native,
+                            prior: &[],
+                        };
+                        match cap.analyze(&ctx) {
+                            Ok(r) => Some((
+                                t.id,
+                                vec![AnalysisInput {
+                                    analyzer_id: r.analyzer_id,
+                                    model_version: r.model_version,
+                                    payload: r.payload,
+                                }],
+                            )),
+                            Err(e) => {
+                                eprintln!("[darkroom] caption failed on {}: {e}", t.path);
+                                None
+                            }
+                        }
+                    });
+                    if res.is_none() {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let n = bdone.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(32) {
+                        emit_progress(app, "caption", bdone.load(Ordering::Relaxed), total_b);
+                    }
+                    res
+                })
+                .collect();
+            if !results.is_empty() {
+                let mut db = st.db.lock().map_err(|e| e.to_string())?;
+                let now = core_library::now_epoch();
+                let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+                for (id, inputs) in &results {
+                    insert_analysis(&tx, *id, now, inputs).map_err(|e| e.to_string())?;
+                }
+                tx.commit().map_err(|e| e.to_string())?;
+                analyzed += results.len();
+            }
+            emit_progress(app, "caption", bdone.load(Ordering::Relaxed), total_b);
+        }
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
     }
 
     let stats = RunStats {
@@ -309,6 +517,29 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats,
     };
     let _ = app.emit("analysis:done", &stats);
     Ok(stats)
+}
+
+/// Phase A→B boundary: cluster any faces added or still dirty this run (skipped when nothing needs
+/// placing), then a PASSIVE WAL checkpoint. Cancellation is honored inside `cluster_assign`.
+fn run_clustering(st: &AppState, faces_added: bool) -> Result<(), String> {
+    if st.analysis_cancel.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let mut db = st.db.lock().map_err(|e| e.to_string())?;
+    let dirty = has_dirty_faces(&db.conn, FACE_MODEL_TAG).map_err(|e| e.to_string())?;
+    if faces_added || dirty {
+        let now = core_library::now_epoch();
+        cluster_assign(
+            &mut db.conn,
+            FACE_MODEL_TAG,
+            now,
+            ClusterParams::default(),
+            &st.analysis_cancel,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+    Ok(())
 }
 
 /// Status for the UI: total present images, how many have BOTH analyzers at the current version.

@@ -28,6 +28,8 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/009_integrity.sql"),
     include_str!("../migrations/010_faces.sql"),
     include_str!("../migrations/011_imported_index.sql"),
+    include_str!("../migrations/012_analysis_stage_index.sql"),
+    include_str!("../migrations/013_face_marker_reconcile.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose

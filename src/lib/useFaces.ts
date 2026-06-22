@@ -19,7 +19,7 @@ export interface FacesState {
   status: FacesStatus | null;
   people: PersonRow[];
   progress: FacesProgress;
-  /** Bumped on every faces:done — lets consumers re-fetch per-image face data / the grid. */
+  /** Bumped on every scan completion (analysis:done) — lets consumers re-fetch per-image face data. */
   doneVersion: number;
 }
 
@@ -95,17 +95,24 @@ export function useFaces(): FacesState & FacesActions {
           }),
         ),
       );
+      // Faces run inside the unified scan, so progress/completion ride the `analysis:*` stream (only
+      // the model download keeps its own `faces:models` event). Skip the caption phase — face work is
+      // already done by then.
       unlisteners.push(
-        await listen<{ done: number; total: number }>("faces:progress", (ev) =>
-          setProgress({
-            kind: "finding",
-            done: ev.payload.done,
-            total: ev.payload.total,
-          }),
+        await listen<{ phase?: string; done: number; total: number }>(
+          "analysis:progress",
+          (ev) => {
+            if (ev.payload.phase === "caption") return;
+            setProgress({
+              kind: "finding",
+              done: ev.payload.done,
+              total: ev.payload.total,
+            });
+          },
         ),
       );
       unlisteners.push(
-        await listen("faces:done", () => {
+        await listen("analysis:done", () => {
           setProgress(null);
           setDoneVersion((v) => v + 1);
           void reload();
