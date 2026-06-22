@@ -6,16 +6,27 @@
 
 ## TL;DR
 
-V1 + post-V1 develop fidelity were already complete. The latest work is a **"Trust & Ship" hardening
-pass** (merged from `feat/trust-and-ship`): the catalog is no longer a single point of total data
-loss (per-image **sidecars** make it a rebuildable cache), the app stopped lying (real histogram,
-working palette search, no dead controls), perceptual dedup is sub-quadratic (BK-tree), and there is
-a **macOS CI** gate so "green" means something. Verified: `cargo clippy --workspace --examples
--D warnings` clean · `cargo test --workspace` 32 suites / 0 failures (GPU + real CR3 run) · `tsc`
-clean.
+**Latest (merged): `feat/viewport-render` — full-res zoom + near-instant edits + mask overlay.**
+Render only the visible viewport at display resolution (RapidRAW pattern): a `<canvas>` + a server
+**view-rect** replace `<img>` + CSS `transform: scale` (which on WKWebView upscaled a fit-size bitmap
+→ blurry/glitchy zoom). **Mask-layer caching** skips the full-res pre-pass on pan/zoom/scalar edits;
+**raw-RGBA** transport drops the 32 MP JPEG. **~260 ms → ~5 ms** per masked slider edit. New GPU
+`@binding(13)` `ViewUniform`; `render_view`; geometry split; `develop_render` returns raw RGBA. 41
+core-pipeline tests green, goldens byte-identical, `clippy`/`npm run build` clean, Tier-1 mock QA
+passed, 2 code-reviewer + 2 Codex passes (all Critical/High fixed). Details + gotchas:
+`CURRENT_STATE.md` → "Latest pass — viewport render"; granular leftovers: `TODO.md` top section; full
+plan: `~/.claude/plans/snoopy-floating-island.md`.
 
-The next push is **develop fidelity / new modules** (the collaborator's wishlist), now safe to build
-on. Tone target is **Lightroom/ACR** (decided).
+**Next:** (1) **real-app visual QA** (`npm run tauri dev`) — the mock is synthetic, so confirm crisp
+zoom + red overlay color + snappiness on real photos; (2) optional **B0 native-GPU-surface spike**
+(zero-readback CAMetalLayer present) — the canvas path already delivers the user-visible result, so
+it's a perf-polish; (3) whole-crop histogram pass; (4) tiered source for fit. NOTE: local photo data
+`2024/` (2.1 GB) + `Darktable_SORT/` (6.7 GB) are now git-ignored — never commit them.
+
+Earlier work (still current): V1 + post-V1 develop fidelity, plus the **"Trust & Ship" hardening
+pass** (`feat/trust-and-ship`): per-image **sidecars** (catalog is a rebuildable cache), real
+histogram + working palette search, sub-quadratic perceptual dedup (BK-tree), and a **macOS CI** gate.
+Tone target is **Lightroom/ACR** (decided).
 
 ## How to run / build / test
 

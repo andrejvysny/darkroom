@@ -42,3 +42,10 @@ library/2026/*
 !library/2026/2026-06-06
 library/2026/2026-06-06/*
 !library/2026/2026-06-06/_55A3947.CR3
+
+# Local photo/RAW data libraries (multi-GB) — never committed.
+/2024/
+/Darktable_SORT/
+
+# UI-testing (playwright-cli) session artifacts.
+.playwright-cli/

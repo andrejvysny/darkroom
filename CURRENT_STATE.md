@@ -15,6 +15,52 @@ only 1 CR3 is committed; GPU/real-CR3 tests skip without the fixture/Metal. **Pe
 of the develop changes in-app (`npm run tauri dev`) — the math is verified headless but warmth/rolloff/
 sharpen/vignette _feel_ is subjective (all single-constant tunable).
 
+## Latest pass — viewport render (full-res zoom + near-instant edits + mask overlay)
+
+Branch `feat/viewport-render` (merged to main). Render only the **visible viewport at display
+resolution** (RapidRAW pattern): a `<canvas>` viewer + a server-side **view-rect** replace the old
+`<img>` + CSS `transform: scale`, which on WKWebView rasterized at fit size and upscaled the bitmap
+(blurry/glitchy zoom). **Mask-layer caching** skips the full-res mask pre-pass on pan/zoom/scalar
+edits; **raw-RGBA** transport drops the 32 MP JPEG encode. **~260 ms → ~5 ms** per masked slider edit.
+
+- **Backend (`core-pipeline`):** `ViewUniform` **`@binding(13)`** + `ViewParams`;
+  `DevelopPipeline::render_view(ctx, prep, params, &ViewParams)` renders a crop-local viewport into a
+  display-sized target. `render()` is a **byte-identical identity wrapper** (all 37 callers/goldens/
+  export unaffected). Geometry split: `crop_to_source` in `develop.wgsl` (crop+zoom+straighten compose
+  without double-fitting). **Mask cache** lives in `PreparedImage` (`mask_layer_hash: Mutex<Vec<…>>`),
+  dirty key = `mask::mask_geometry_hash` (components/brush only, NOT scalars). Red overlay = one shader
+  `mix` on the packed mask layer. New tests: `tests/viewport.rs` (5 Codex vectors) + a mask-cache
+  correctness test; **all goldens byte-identical**; `bench_render` example (Codex-validated).
+- **IPC (`src-tauri`):** `develop_render(image_id, params, view{ox,oy,sx,sy}, out_w, out_h,
+overlay_mask_index, request_id) -> Response` returns raw bytes `[outW u32 LE][outH u32 LE][rgba]`
+  (empty = superseded). `packed_overlay_layer` resolves the frontend mask index → packed enabled GPU
+  layer. Output dims **clamped to 8192** (overflow guard). The preview-tier LRU (`DevelopLru`) was
+  removed; develop_render always uses the **full-res** cached source for crisp zoom.
+- **Frontend (`src/`):** `lib/viewport.ts` (view-rect math; `deriveViewRect` uses the per-axis-`min`
+  model — correct for any container/image aspect). Canvas `Stage` + `Loupe` (no CSS scale); overlays
+  map normalized↔px through the view rect; readout shows **true sensor dims** + %-of-1:1. Single-flight
+  rAF render coalescing, double-buffered paint, crop-aspect-correct `natural`, and a `renderTick`
+  (useDevelop → Stage) so **slider edits paint live** (not only on the next zoom).
+- **Verified:** 41 core-pipeline tests green; goldens byte-identical; `clippy` clean; `npm run build`
+  clean; Tier-1 mock visual QA (canvas renders, wheel-zoom 11%→88%, live exposure edit at +3 EV
+  without zooming). Reviewed by 2 code-reviewer agents + 2 Codex passes; all Critical/High fixed.
+
+### Gotchas / known limitations (read before extending)
+
+- **Native GPU surface (zero-readback CAMetalLayer present) is NOT built** — deferred; needs the real
+  app to validate macOS transparency/z-order/flicker. The canvas path already delivers full-res,
+  glitch-free, near-instant edits, so it's a perf-polish. Full design: `~/.claude/plans/
+snoopy-floating-island.md` (Workstream B; B0 is the go/no-go spike).
+- **`Stage.tsx` and `Loupe.tsx` duplicate** the canvas/view-rect/single-flight logic (the shared
+  `useViewport`/`CanvasViewer` were created then removed as unused) — extract a shared hook later.
+- **Histogram is now viewport-biased** (computed from the visible region). TODO in `commands.rs`:
+  a separate small whole-crop histogram pass on param change (Codex #9).
+- **First image open decodes full-res** (no preview tier in develop_render) — masked by the instant
+  embedded preview. Tiered source (preview-res for fit, full-res on zoom) is a deferred optimization
+  (Codex #3 — also the cheapest fix for fit-view minification aliasing).
+- **Real-app visual QA still pending** — the Tier-1 mock is a synthetic gradient. Confirm full-res
+  crispness, the red overlay COLOR over a real mask, and edit snappiness with `npm run tauri dev`.
+
 ## How to run / build / test
 
 ```bash
