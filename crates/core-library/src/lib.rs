@@ -52,12 +52,14 @@ pub use keywords::{
 };
 pub use maintenance::reap_dangling_import_sessions;
 pub use query::{
-    count_images, image_by_id, list_folders, query_images, FolderRow, ImageRow, QueryParams,
+    count_images, date_tree, image_by_id, list_folders, present_image_ids, query_images, DateNode,
+    DateTreeYear, FolderRow, ImageRow, QueryParams,
 };
 pub use reconcile::{reconcile, ReconcileStats};
 pub use settings::{
-    animal_detector_size, get_meta, set_animal_detector_size, set_meta, set_thumb_cache_cap,
-    thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP,
+    animal_detector_size, get_meta, library_root, preview_edge, set_animal_detector_size,
+    set_library_root, set_meta, set_preview_edge, set_thumb_cache_cap, thumb_cache_cap,
+    DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP, PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
 };
 pub use sidecar::{
     hydrate_if_blank, rebuild_from_sidecars, write_all_sidecars, write_sidecar, Sidecar,

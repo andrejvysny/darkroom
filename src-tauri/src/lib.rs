@@ -5,6 +5,7 @@ mod faces;
 mod features;
 mod protocol;
 mod state;
+mod thumb_queue;
 mod watch;
 
 use state::AppState;
@@ -61,6 +62,9 @@ pub fn run() {
                 );
             }
 
+            // Start the background canonical-thumbnail worker (parks until there's work).
+            thumb_queue::spawn_worker(app.handle().clone());
+
             // Reconcile against disk, then start the FS watcher — off the setup thread so a slow
             // stat sweep can't delay window creation. The watcher is parked in AppState to stay alive.
             let handle = app.handle().clone();
@@ -73,6 +77,10 @@ pub fn run() {
                         *slot = Some(w);
                     }
                 }
+                // Backfill canonical thumbnails for the whole library at low priority (visible /
+                // just-opened images are promoted to the front via `thumb_prioritize`). After
+                // reconcile so freshly re-added rows are included.
+                thumb_queue::enqueue_all(&handle);
             });
             Ok(())
         })
@@ -80,6 +88,7 @@ pub fn run() {
             commands::library_query,
             commands::library_count,
             commands::library_folders,
+            commands::library_date_tree,
             commands::image_meta,
             commands::library_index_root,
             commands::database_reset,
@@ -90,6 +99,8 @@ pub fn run() {
             commands::develop_regen_thumb,
             commands::develop_preview_jpeg,
             commands::loupe_jpeg,
+            commands::thumb_prioritize,
+            commands::develop_session,
             commands::develop_get_histogram,
             commands::export_image,
             commands::cull_set_rating,
@@ -112,14 +123,20 @@ pub fn run() {
             commands::collection_add_images,
             commands::collection_remove_images,
             commands::app_library_root,
+            commands::set_library_root,
             commands::dedup_scan,
             commands::dedup_scan_perceptual,
             commands::dedup_resolve,
             commands::dedup_resolve_bulk,
-            commands::import_start,
+            commands::import_list,
+            commands::import_dedup,
+            commands::import_thumb,
+            commands::import_commit,
             commands::thumb_cache_cap,
             commands::thumb_cache_size,
             commands::set_thumb_cache_cap,
+            commands::preview_edge,
+            commands::set_preview_edge,
             commands::analysis_status,
             commands::analysis_models_ensure,
             commands::analysis_run,

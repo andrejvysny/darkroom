@@ -19,6 +19,7 @@ import {
   type UserLabels,
   type ImageFace,
 } from "../../lib/ipc";
+import { useAppStore } from "../../store/app";
 
 const LABEL_COLORS: { key: string; bg: string }[] = [
   { key: "red", bg: "var(--color-lab-red)" },
@@ -125,6 +126,7 @@ export default function RightInfo({
   analysisVersion,
 }: RightInfoProps) {
   const meta = selectedImage;
+  const thumbVersions = useAppStore((s) => s.thumbVersions);
   const [kwInput, setKwInput] = useState("");
   const [aiCaption, setAiCaption] = useState<ImageCaption | null>(null);
   const [aiDetections, setAiDetections] = useState<Detection[]>([]);
@@ -220,7 +222,7 @@ export default function RightInfo({
     : [];
 
   const previewSrc = meta
-    ? thumbUrl(meta.contentHash, 512, meta.editedAt)
+    ? thumbUrl(meta.contentHash, 512, meta.editedAt, thumbVersions[meta.id])
     : null;
 
   const appliedNames = new Set(keywords.map((k) => k.name.toLowerCase()));

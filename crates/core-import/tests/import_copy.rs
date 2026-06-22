@@ -2,8 +2,9 @@
 //! catalog insertion, and idempotent re-import (no duplicates). Skips if `library/2026` is absent.
 
 use core_db::Db;
-use core_import::{import, ImportMode};
+use core_import::{dedup_scan, import, list_source, ImportMode, SourceStatus};
 use core_library::ThumbCache;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -100,6 +101,67 @@ fn copy_import_routes_and_dedupes() {
         .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, n as i64, "no duplicate rows");
+}
+
+// `list_source` + `dedup_scan` only touch raw bytes (enumerate by extension, hash via BLAKE3 — no
+// RAW decode), so these run on synthetic `.cr3` files with no real-camera fixture needed.
+
+#[test]
+fn list_source_lists_pending_and_honors_recursion() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("A.CR3"), b"AAA").unwrap();
+    std::fs::write(dir.path().join("B.CR3"), b"BBBBB").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/C.CR3"), b"CCCCCCC").unwrap();
+
+    // Recursive sees the subfolder file; all start Pending with sizes populated, no hashing.
+    let deep = list_source(dir.path(), true);
+    assert_eq!(deep.len(), 3);
+    assert!(deep.iter().all(|f| f.status == SourceStatus::Pending));
+    assert!(deep
+        .iter()
+        .all(|f| f.size_bytes > 0 && f.filename.ends_with(".CR3")));
+
+    // Non-recursive excludes the subfolder.
+    let top = list_source(dir.path(), false);
+    assert_eq!(top.len(), 2);
+    assert!(top.iter().all(|f| f.filename != "C.CR3"));
+}
+
+#[test]
+fn dedup_scan_classifies_by_content_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    // A and B share content (same bytes → same size → same hash); C has a unique size.
+    std::fs::write(dir.path().join("A.CR3"), b"SAME").unwrap();
+    std::fs::write(dir.path().join("B.CR3"), b"SAME").unwrap();
+    std::fs::write(dir.path().join("C.CR3"), b"UNIQUE-CONTENT").unwrap();
+    let a = dir.path().join("A.CR3");
+    let b = dir.path().join("B.CR3");
+    let c = dir.path().join("C.CR3");
+
+    // Empty catalog: A new, B a batch duplicate of A, C new (unique size → not even hashed).
+    let r = dedup_scan(
+        &[a.clone(), b.clone(), c.clone()],
+        &HashSet::new(),
+        &HashSet::new(),
+        |_, _, _| {},
+    );
+    let by = |p: &std::path::Path| {
+        r.iter()
+            .find(|d| d.path == p.display().to_string())
+            .unwrap()
+            .status
+    };
+    assert_eq!(by(&a), SourceStatus::New);
+    assert_eq!(by(&b), SourceStatus::DuplicateBatch);
+    assert_eq!(by(&c), SourceStatus::New);
+
+    // Catalog already holds C's content (by hash + size) → C is a library duplicate.
+    let c_hash = core_raw::content_hash(b"UNIQUE-CONTENT");
+    let present_hashes: HashSet<[u8; 32]> = [c_hash].into_iter().collect();
+    let present_sizes: HashSet<i64> = ["UNIQUE-CONTENT".len() as i64].into_iter().collect();
+    let r2 = dedup_scan(&[c.clone()], &present_hashes, &present_sizes, |_, _, _| {});
+    assert_eq!(r2[0].status, SourceStatus::DuplicateLibrary);
 }
 
 /// End-to-end Move import: the source originals must be gone (trashed) only AFTER their verified

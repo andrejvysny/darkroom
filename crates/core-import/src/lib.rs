@@ -55,6 +55,45 @@ pub struct ImportStats {
     pub source_retained: usize,
 }
 
+/// Content-hash dedup classification of a source file. `Pending` is the listing default; the real
+/// status is resolved by [`dedup_scan`] (BLAKE3 of the file vs the catalog + the rest of the batch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceStatus {
+    /// Not yet hash-checked (just listed).
+    Pending,
+    /// Content hash absent from the catalog and unique in this batch.
+    New,
+    /// Content hash already `present` in the catalog (exact byte match).
+    DuplicateLibrary,
+    /// Identical content already appeared earlier in this same batch.
+    DuplicateBatch,
+}
+
+/// One source file as listed by [`list_source`], from filesystem metadata ONLY (no file read, hash,
+/// or decode — so listing a full card is instant). Status starts `Pending`; dedup runs in the
+/// background. The thumbnail is loaded lazily, per file, on demand (`import_thumb`), never up front.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFile {
+    /// Absolute source path (the commit selection key).
+    pub path: String,
+    pub filename: String,
+    pub size_bytes: i64,
+    /// File modification time (epoch seconds) — a fast stand-in for capture date in the list. The
+    /// real EXIF capture date is read at commit time for on-disk date routing.
+    pub mtime: i64,
+    pub status: SourceStatus,
+}
+
+/// A resolved dedup verdict for one path (the output of [`dedup_scan`]).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupResult {
+    pub path: String,
+    pub status: SourceStatus,
+}
+
 /// A trash context that deletes silently and without involving Finder.
 ///
 /// On macOS the `trash` crate's default `DeleteMethod::Finder` shells out to `osascript` →
@@ -191,6 +230,25 @@ where
     F: Fn(usize, usize, Option<&ImageRow>),
 {
     let files = core_library::enumerate_raws(source, recursive);
+    import_files(db, thumbs, source, &files, mode, library_root, progress)
+}
+
+/// Import an explicit list of source files — the staged-preview commit path. Shares every per-file
+/// catalog rule with [`import`] (which is just the "enumerate the whole source" wrapper). `source`
+/// labels the import session and, in Reference mode, becomes the watched root.
+#[allow(clippy::too_many_arguments)]
+pub fn import_files<F>(
+    db: &Mutex<Db>,
+    thumbs: &ThumbCache,
+    source: &Path,
+    files: &[PathBuf],
+    mode: ImportMode,
+    library_root: &Path,
+    progress: F,
+) -> Result<ImportStats, ImportError>
+where
+    F: Fn(usize, usize, Option<&ImageRow>),
+{
     let total = files.len();
 
     // Brief lock: destination folder row (copy/move = library root; reference = the source),
@@ -302,6 +360,97 @@ where
         finish_session(&guard.conn, &stats)?;
     }
     Ok(stats)
+}
+
+/// List the importable RAW files under `source` from filesystem metadata ONLY — no file reads, no
+/// hashing, no decode — so listing a whole card returns in milliseconds. Every file starts `Pending`;
+/// [`dedup_scan`] resolves the real dedup status in the background. Thumbnails load lazily per file
+/// via `import_thumb`.
+pub fn list_source(source: &Path, recursive: bool) -> Vec<SourceFile> {
+    core_library::enumerate_raws(source, recursive)
+        .into_iter()
+        .map(|path| SourceFile {
+            filename: path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file.raw")
+                .to_string(),
+            size_bytes: std::fs::metadata(&path)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0),
+            mtime: file_mtime_epoch(&path),
+            status: SourceStatus::Pending,
+            path: path.display().to_string(),
+        })
+        .collect()
+}
+
+/// Hash-verify each path's dedup status against the catalog (`present_hashes`) and the rest of the
+/// batch. **Size prefilter:** a file is only read+hashed when its size collides with a catalog file
+/// or another batch file — a size unique everywhere can't be a byte-duplicate, so it's `New` with no
+/// I/O. This keeps a full-card check to reading only the genuine candidates. `progress(done, total,
+/// &newly_resolved)` fires periodically so the UI updates live.
+pub fn dedup_scan<F>(
+    paths: &[PathBuf],
+    present_hashes: &HashSet<[u8; 32]>,
+    present_sizes: &HashSet<i64>,
+    progress: F,
+) -> Vec<DedupResult>
+where
+    F: Fn(usize, usize, &[DedupResult]),
+{
+    let total = paths.len();
+
+    // Size histogram of the batch (cheap fs metadata) — drives the "needs hashing?" prefilter.
+    let mut size_of: Vec<i64> = Vec::with_capacity(total);
+    let mut batch_size_count: std::collections::HashMap<i64, usize> =
+        std::collections::HashMap::new();
+    for p in paths {
+        let sz = std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0);
+        *batch_size_count.entry(sz).or_insert(0) += 1;
+        size_of.push(sz);
+    }
+
+    let mut seen_batch: HashSet<[u8; 32]> = HashSet::new();
+    let mut out: Vec<DedupResult> = Vec::with_capacity(total);
+    let mut pending_batch: Vec<DedupResult> = Vec::new();
+
+    for (i, path) in paths.iter().enumerate() {
+        let size = size_of[i];
+        let needs_hash =
+            present_sizes.contains(&size) || batch_size_count.get(&size).copied().unwrap_or(0) > 1;
+
+        let status = if !needs_hash {
+            SourceStatus::New
+        } else {
+            match hash_file(path) {
+                Ok((h, _)) => {
+                    if present_hashes.contains(&h) {
+                        SourceStatus::DuplicateLibrary
+                    } else if !seen_batch.insert(h) {
+                        SourceStatus::DuplicateBatch
+                    } else {
+                        SourceStatus::New
+                    }
+                }
+                // Unreadable here → treat as New; the commit re-verifies and counts any real failure.
+                Err(_) => SourceStatus::New,
+            }
+        };
+
+        let result = DedupResult {
+            path: path.display().to_string(),
+            status,
+        };
+        out.push(result.clone());
+        pending_batch.push(result);
+
+        if i + 1 == total || pending_batch.len() >= 24 {
+            progress(i + 1, total, &pending_batch);
+            pending_batch.clear();
+        }
+    }
+    out
 }
 
 /// Unlocked per-file work: hash → dedup-check → (copy + hash-verify) → thumbnail/metadata. Touches

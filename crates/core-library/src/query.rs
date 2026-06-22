@@ -21,6 +21,10 @@ pub struct QueryParams {
     pub collection_id: Option<i64>,
     /// Restrict to images added by this import session id.
     pub import_session_id: Option<i64>,
+    /// Restrict to a capture year ("2026"), matched against `capture_date` formatted as UTC.
+    pub capture_year: Option<String>,
+    /// Restrict to a capture day ("2026-06-22"), matched against `capture_date` formatted as UTC.
+    pub capture_date: Option<String>,
     /// Restrict to images with a detected object in this bucket ("People" | "Animals" | "Vehicles").
     pub detected_category: Option<String>,
     /// Restrict to images containing a (confirmed or suggested) face of this person.
@@ -82,6 +86,8 @@ const WHERE: &str = "i.status = 'present'
     AND (:collection_id IS NULL OR EXISTS
          (SELECT 1 FROM collection_images ci WHERE ci.image_id = i.id AND ci.collection_id = :collection_id))
     AND (:import_session_id IS NULL OR i.import_session_id = :import_session_id)
+    AND (:capture_year IS NULL OR strftime('%Y', i.capture_date, 'unixepoch') = :capture_year)
+    AND (:capture_date IS NULL OR strftime('%Y-%m-%d', i.capture_date, 'unixepoch') = :capture_date)
     AND (:detected_category IS NULL
          OR EXISTS (SELECT 1 FROM image_detections d
                     WHERE d.image_id = i.id AND d.category = :detected_category)
@@ -172,6 +178,8 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":keyword_id": p.keyword_id,
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
+            ":capture_year": p.capture_year,
+            ":capture_date": p.capture_date,
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
@@ -212,6 +220,62 @@ pub fn list_folders(conn: &Connection) -> Result<Vec<FolderRow>, LibError> {
     Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DateNode {
+    /// `YYYY-MM-DD` (UTC) capture day, or "Unknown" when `capture_date` is NULL.
+    pub date: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DateTreeYear {
+    /// `YYYY` (UTC) capture year, or "Unknown" when `capture_date` is NULL.
+    pub year: String,
+    pub count: i64,
+    pub dates: Vec<DateNode>,
+}
+
+/// Year → day capture-date tree for the left-nav Folders section. Formats `capture_date` as UTC so
+/// labels match the on-disk `YYYY/YYYY-MM-DD` routing (`core-import::date_subpath`). NULL capture
+/// dates fold into an "Unknown" bucket (mirrors import's `unknown/unknown` fallback). Rows arrive
+/// already grouped/ordered (year desc, day desc); we fold them into the nested shape.
+pub fn date_tree(conn: &Connection) -> Result<Vec<DateTreeYear>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(strftime('%Y', capture_date, 'unixepoch'), 'Unknown')      AS y,
+                COALESCE(strftime('%Y-%m-%d', capture_date, 'unixepoch'), 'Unknown') AS d,
+                COUNT(*)
+         FROM images WHERE status = 'present'
+         GROUP BY y, d
+         ORDER BY y = 'Unknown', y DESC, d = 'Unknown', d DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+
+    let mut years: Vec<DateTreeYear> = Vec::new();
+    for row in rows {
+        let (year, date, count) = row?;
+        match years.last_mut() {
+            Some(y) if y.year == year => {
+                y.count += count;
+                y.dates.push(DateNode { date, count });
+            }
+            _ => years.push(DateTreeYear {
+                year,
+                count,
+                dates: vec![DateNode { date, count }],
+            }),
+        }
+    }
+    Ok(years)
+}
+
 /// Fetch a single image row by id (for the metadata panel / develop).
 pub fn image_by_id(conn: &Connection, id: i64) -> Result<Option<ImageRow>, LibError> {
     use core_db::rusqlite::OptionalExtension;
@@ -222,6 +286,15 @@ pub fn image_by_id(conn: &Connection, id: i64) -> Result<Option<ImageRow>, LibEr
          WHERE i.id = ?1"
     );
     Ok(conn.query_row(&sql, [id], map_row).optional()?)
+}
+
+/// Ids of all present images, newest capture first — the work-list for canonical thumbnail backfill.
+pub fn present_image_ids(conn: &Connection) -> Result<Vec<i64>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM images WHERE status='present' ORDER BY capture_date DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError> {
@@ -241,6 +314,8 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":keyword_id": p.keyword_id,
             ":collection_id": p.collection_id,
             ":import_session_id": p.import_session_id,
+            ":capture_year": p.capture_year,
+            ":capture_date": p.capture_date,
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,

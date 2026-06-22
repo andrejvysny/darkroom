@@ -70,6 +70,14 @@ function getParams(p: Record<string, unknown>): QueryParams {
   return (p.params as QueryParams) ?? {};
 }
 
+/** UTC "YYYY" / "YYYY-MM-DD" from epoch seconds (matches the backend's strftime('unixepoch')). */
+const utcYear = (e: number | null): string =>
+  e == null ? "Unknown" : new Date(e * 1000).toISOString().slice(0, 4);
+const utcDay = (e: number | null): string =>
+  e == null ? "Unknown" : new Date(e * 1000).toISOString().slice(0, 10);
+const dayDesc = (a: string, b: string): number =>
+  a === "Unknown" ? 1 : b === "Unknown" ? -1 : a < b ? 1 : a > b ? -1 : 0;
+
 function filterRows(q: QueryParams): ImageRow[] {
   let r = rows;
   if (q.minStars != null) r = r.filter((x) => x.stars >= q.minStars!);
@@ -81,6 +89,10 @@ function filterRows(q: QueryParams): ImageRow[] {
         : x.colorLabel === q.colorLabel,
     );
   }
+  if (q.captureYear != null)
+    r = r.filter((x) => utcYear(x.captureDate) === q.captureYear);
+  if (q.captureDate != null)
+    r = r.filter((x) => utcDay(x.captureDate) === q.captureDate);
   if (q.search) {
     const s = q.search.toLowerCase();
     r = r.filter((x) => x.filename.toLowerCase().includes(s));
@@ -272,18 +284,73 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     { id: 1, path: `${LIB_ROOT}/2026`, count: FIXTURE_COUNT },
   ],
   image_meta: (p) => rowById(num(p.id)) ?? null,
+  library_date_tree: () => {
+    const tree = new Map<string, Map<string, number>>();
+    for (const x of rows) {
+      const y = utcYear(x.captureDate);
+      const d = utcDay(x.captureDate);
+      const dm = tree.get(y) ?? tree.set(y, new Map()).get(y)!;
+      dm.set(d, (dm.get(d) ?? 0) + 1);
+    }
+    return [...tree.entries()]
+      .sort(([a], [b]) => dayDesc(a, b))
+      .map(([year, dm]) => {
+        const dates = [...dm.entries()]
+          .sort(([a], [b]) => dayDesc(a, b))
+          .map(([date, count]) => ({ date, count }));
+        return {
+          year,
+          count: dates.reduce((s, d) => s + d.count, 0),
+          dates,
+        };
+      });
+  },
   library_index_root: () => STATS,
   database_reset: () => STATS,
   app_default_library: () => LIB_ROOT,
   app_library_root: () => LIB_ROOT,
+  set_library_root: () => undefined,
 
   // Import / dedup
-  import_start: () => ({
+  import_list: () => {
+    const day = (y: number, m: number, d: number) =>
+      Math.floor(Date.UTC(y, m - 1, d, 12) / 1000);
+    const mk = (i: number, mtime: number) => ({
+      path: `/Volumes/SD_CARD/DCIM/IMG_${String(9000 + i).padStart(4, "0")}.CR3`,
+      filename: `IMG_${String(9000 + i).padStart(4, "0")}.CR3`,
+      sizeBytes: 28_000_000 + i * 1000,
+      mtime,
+      // Fast list is metadata-only → always pending; import_dedup resolves the real status.
+      status: "pending",
+    });
+    return [
+      mk(1, day(2026, 6, 22)),
+      mk(2, day(2026, 6, 22)),
+      mk(3, day(2026, 6, 22)),
+      mk(4, day(2026, 6, 21)),
+      mk(5, day(2026, 6, 21)),
+    ];
+  },
+  // Hash-dedup verdicts: flag #3 as already in library, #5 as a batch duplicate.
+  import_dedup: (p) => {
+    const paths = Array.isArray(p.paths) ? (p.paths as string[]) : [];
+    return paths.map((path) => ({
+      path,
+      status: path.includes("9003")
+        ? "duplicateLibrary"
+        : path.includes("9005")
+          ? "duplicateBatch"
+          : "new",
+    }));
+  },
+  import_thumb: () => makeDevelopJpeg(undefined),
+  import_commit: (p) => ({
     sessionId: 1,
-    total: 0,
-    added: 0,
+    total: Array.isArray(p.selected) ? p.selected.length : 0,
+    added: Array.isArray(p.selected) ? p.selected.length : 0,
     skipped: 0,
     failed: 0,
+    sourceRetained: 0,
   }),
   dedup_scan: () => [],
   dedup_scan_perceptual: () => [],
@@ -291,9 +358,11 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   dedup_resolve_bulk: () => 0,
 
   // Thumb cache settings
-  thumb_cache_cap: () => 2 * 1024 * 1024 * 1024,
+  thumb_cache_cap: () => 8 * 1024 * 1024 * 1024,
   thumb_cache_size: () => 128 * 1024 * 1024,
   set_thumb_cache_cap: () => 0,
+  preview_edge: () => 3840,
+  set_preview_edge: () => undefined,
 
   // Cull (persisted to fixtures)
   cull_set_rating: (p) => {
@@ -371,6 +440,8 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   loupe_jpeg: () => makeDevelopJpeg(undefined),
   develop_get_histogram: () => makeHistogram(),
   develop_regen_thumb: () => Date.now(),
+  thumb_prioritize: () => undefined,
+  develop_session: () => undefined,
   export_image: () => undefined,
 
   // AI analysis
@@ -503,7 +574,9 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
 function handle(cmd: string, payload?: InvokeArgs): unknown {
   const h = HANDLERS[cmd];
   if (h) return h((payload ?? {}) as Record<string, unknown>);
-  if (cmd.startsWith("plugin:")) return undefined; // dialogs/window/opener/events: no-op
+  // Folder picker: return a fake source so the staged-import flow is drivable in the mock browser.
+  if (cmd === "plugin:dialog|open") return "/Volumes/SD_CARD/DCIM";
+  if (cmd.startsWith("plugin:")) return undefined; // window/opener/events: no-op
   console.warn(`[tauriMock] unhandled command: ${cmd}`);
   return null;
 }

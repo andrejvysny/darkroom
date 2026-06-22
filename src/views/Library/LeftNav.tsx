@@ -7,7 +7,7 @@ import {
   parseSmartQuery,
   smartQueryFromParams,
   DETECTION_CATEGORIES,
-  type FolderRow,
+  type DateTreeYear,
   type KeywordRow,
   type CollectionRow,
   type QueryParams,
@@ -17,7 +17,7 @@ import {
 import type { AnalysisState, AnalysisActions } from "../../lib/useAnalysis";
 
 interface LeftNavProps {
-  folders: FolderRow[];
+  dateTree: DateTreeYear[];
   keywords: KeywordRow[];
   collections: CollectionRow[];
   grandTotal: number;
@@ -32,10 +32,6 @@ interface LeftNavProps {
   onDeleteKeyword: (id: number) => void;
   /** AI analysis facets + actions — passed from LibraryView via useAnalysis */
   analysis: AnalysisState & AnalysisActions;
-}
-
-function basename(p: string): string {
-  return p.replace(/\/$/, "").split("/").pop() ?? p;
 }
 
 function SectionHeading({
@@ -66,7 +62,7 @@ function SectionHeading({
 }
 
 export default function LeftNav({
-  folders,
+  dateTree,
   keywords,
   collections,
   grandTotal,
@@ -81,7 +77,6 @@ export default function LeftNav({
   onDeleteKeyword,
   analysis,
 }: LeftNavProps) {
-  const activeFolderId = params.folderId ?? null;
   const noFilters = !hasActiveFilters(params);
   const picksActive = params.flag === "pick";
   const recentActive = params.sort === "imported_desc";
@@ -158,27 +153,14 @@ export default function LeftNav({
         />
       </div>
 
-      {/* Folders section */}
+      {/* Folders section — Lightroom-style Year → Date tree (by capture date) */}
       <div>
         <SectionHeading>Folders</SectionHeading>
-        {folders.length === 0 ? (
-          <Empty>No folders indexed</Empty>
-        ) : (
-          folders.map((f) => (
-            <NavRow
-              key={f.id}
-              icon="folder"
-              label={basename(f.path)}
-              count={f.count.toLocaleString()}
-              active={activeFolderId === f.id}
-              onClick={() =>
-                patchParams({
-                  folderId: activeFolderId === f.id ? null : f.id,
-                })
-              }
-            />
-          ))
-        )}
+        <FolderTree
+          dateTree={dateTree}
+          params={params}
+          patchParams={patchParams}
+        />
       </div>
 
       {/* Collections section */}
@@ -301,6 +283,186 @@ function Empty({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ fontSize: 12, color: "var(--color-t3)", padding: "4px 8px" }}>
       {children}
+    </div>
+  );
+}
+
+/** Lightroom-style capture-date tree: YEAR rows (expandable) → DATE child rows. Selection drives the
+ *  `captureYear` / `captureDate` filter dimensions. Expansion is local UI state. */
+function FolderTree({
+  dateTree,
+  params,
+  patchParams,
+}: {
+  dateTree: DateTreeYear[];
+  params: QueryParams;
+  patchParams: (patch: Partial<QueryParams>) => void;
+}) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  function toggle(year: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(year)) next.delete(year);
+      else next.add(year);
+      return next;
+    });
+  }
+
+  if (dateTree.length === 0) return <Empty>No photos yet</Empty>;
+
+  return (
+    <>
+      {dateTree.map((y) => {
+        const open = expanded.has(y.year);
+        const yearActive =
+          params.captureYear === y.year && params.captureDate == null;
+        return (
+          <div key={y.year}>
+            <YearRow
+              year={y.year}
+              count={y.count}
+              open={open}
+              active={yearActive}
+              onToggle={() => toggle(y.year)}
+              onSelect={() => {
+                patchParams({
+                  captureYear: yearActive ? null : y.year,
+                  captureDate: null,
+                });
+                if (!open && !yearActive) toggle(y.year);
+              }}
+            />
+            {open &&
+              y.dates.map((d) => {
+                const dateActive = params.captureDate === d.date;
+                return (
+                  <NavRow
+                    key={d.date}
+                    icon="folder"
+                    label={d.date}
+                    count={d.count.toLocaleString()}
+                    active={dateActive}
+                    child
+                    onClick={() =>
+                      patchParams({
+                        captureYear: dateActive ? null : y.year,
+                        captureDate: dateActive ? null : d.date,
+                      })
+                    }
+                  />
+                );
+              })}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+/** A YEAR row: disclosure chevron (toggles expansion) + label (filters by year) + count. */
+function YearRow({
+  year,
+  count,
+  open,
+  active,
+  onToggle,
+  onSelect,
+}: {
+  year: string;
+  count: number;
+  open: boolean;
+  active: boolean;
+  onToggle: () => void;
+  onSelect: () => void;
+}) {
+  return (
+    <div
+      onClick={onSelect}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "6px 8px",
+        borderRadius: "var(--radius-sm)",
+        color: active ? "var(--color-t1)" : "var(--color-t2)",
+        fontSize: 12.5,
+        cursor: "pointer",
+        position: "relative",
+        background: active ? "var(--color-accent-dim)" : "transparent",
+      }}
+    >
+      {active && (
+        <span
+          style={{
+            position: "absolute",
+            left: 0,
+            top: 6,
+            bottom: 6,
+            width: 2,
+            borderRadius: 2,
+            background: "var(--color-accent)",
+          }}
+        />
+      )}
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggle();
+        }}
+        aria-label={open ? `Collapse ${year}` : `Expand ${year}`}
+        title={open ? `Collapse ${year}` : `Expand ${year}`}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          border: "none",
+          background: "transparent",
+          padding: 0,
+          cursor: "pointer",
+          color: "var(--color-t3)",
+        }}
+      >
+        <Icon
+          name="chev"
+          size={12}
+          style={
+            {
+              transform: open ? "none" : "rotate(-90deg)",
+              transition: "transform .12s ease",
+            } as React.CSSProperties
+          }
+        />
+      </button>
+      <Icon
+        name="folder"
+        style={
+          {
+            color: active ? "var(--color-t2)" : "var(--color-t3)",
+            width: 14,
+            height: 14,
+            flexShrink: 0,
+          } as React.CSSProperties
+        }
+      />
+      <span
+        style={{
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {year}
+      </span>
+      <span
+        style={{
+          marginLeft: "auto",
+          fontFamily: "var(--font-mono)",
+          fontSize: 11,
+          color: "var(--color-t3)",
+        }}
+      >
+        {count.toLocaleString()}
+      </span>
     </div>
   );
 }

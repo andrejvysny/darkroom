@@ -24,6 +24,10 @@ export type QueryParams = {
   keywordId?: number | null;
   collectionId?: number | null;
   importSessionId?: number | null;
+  /** Capture-year folder filter ("2026" | "Unknown"), matched against capture_date (UTC). */
+  captureYear?: string | null;
+  /** Capture-day folder filter ("2026-06-22" | "Unknown"), matched against capture_date (UTC). */
+  captureDate?: string | null;
   /** Detected-object bucket filter: "People" | "Animals" | "Vehicles". */
   detectedCategory?: string | null;
   /** Restrict to images containing a (confirmed or suggested) face of this person. */
@@ -43,6 +47,8 @@ export const FILTER_DIMENSIONS: (keyof QueryParams)[] = [
   "keywordId",
   "collectionId",
   "importSessionId",
+  "captureYear",
+  "captureDate",
   "detectedCategory",
   "personId",
 ];
@@ -62,6 +68,8 @@ export function clearedFilters(): Partial<QueryParams> {
     keywordId: null,
     collectionId: null,
     importSessionId: null,
+    captureYear: null,
+    captureDate: null,
     detectedCategory: null,
     personId: null,
   };
@@ -96,6 +104,21 @@ export type FolderRow = {
   count: number;
 };
 
+/** A capture-day node within a year of the Folders date tree. */
+export type DateNode = {
+  /** "YYYY-MM-DD" (UTC) or "Unknown". */
+  date: string;
+  count: number;
+};
+
+/** A capture-year node of the Folders date tree (Lightroom-style Year → Date). */
+export type DateTreeYear = {
+  /** "YYYY" (UTC) or "Unknown". */
+  year: string;
+  count: number;
+  dates: DateNode[];
+};
+
 export type IndexStats = {
   scanned: number;
   added: number;
@@ -115,6 +138,11 @@ export function libraryCount(params: QueryParams): Promise<number> {
 
 export function libraryFolders(): Promise<FolderRow[]> {
   return invoke<FolderRow[]>("library_folders", {});
+}
+
+/** Year → Date capture-date tree for the left-nav Folders section. */
+export function libraryDateTree(): Promise<DateTreeYear[]> {
+  return invoke<DateTreeYear[]>("library_date_tree", {});
 }
 
 export function imageMeta(id: number): Promise<ImageRow | null> {
@@ -149,6 +177,38 @@ export type ImportStats = {
   sourceRetained: number;
 };
 
+/** Content-hash dedup status of a source file (matches Rust `SourceStatus`). "pending" = not yet
+ *  hash-checked (the listing default; resolved by `importDedup` in the background). */
+export type SourceStatus =
+  | "pending"
+  | "new"
+  | "duplicateLibrary"
+  | "duplicateBatch";
+
+/** One source file in the fast import list — filesystem metadata only (matches Rust `SourceFile`).
+ *  No thumbnail/hash up front; previews load lazily via `importThumb(path)`. */
+export type SourceFile = {
+  /** Absolute source path — the selection key passed to `importCommit`. */
+  path: string;
+  filename: string;
+  sizeBytes: number;
+  /** File modification time (epoch seconds) — fast stand-in for capture date in the list. */
+  mtime: number;
+  status: SourceStatus;
+};
+
+/** A resolved hash-dedup verdict for one path (matches Rust `DedupResult`). */
+export type DedupResult = { path: string; status: SourceStatus };
+
+/** "Apply During Import" options (matches Rust `ImportOptions`). All optional. */
+export type ImportOptions = {
+  rating?: number | null;
+  flag?: "pick" | "reject" | null;
+  keywords?: string[];
+  collectionId?: number | null;
+  newCollection?: string | null;
+};
+
 export type DupImage = {
   id: number;
   contentHash: string;
@@ -170,13 +230,52 @@ export function appLibraryRoot(): Promise<string | null> {
   return invoke<string | null>("app_library_root", {});
 }
 
-export function importStart(
+/** Persist the library root (copy/move import destination). Creates the dir; existing photos are not
+ *  moved — only future copy/move imports file there. */
+export function setLibraryRoot(path: string): Promise<void> {
+  return invoke<void>("set_library_root", { path });
+}
+
+/** Fast list of importable files under a source (filesystem metadata only — returns in ms, no
+ *  hashing/decoding). Previews are loaded lazily per file via `importThumb`. */
+export function importList(
+  source: string,
+  recursive = true,
+): Promise<SourceFile[]> {
+  return invoke<SourceFile[]>("import_list", { source, recursive });
+}
+
+/** Hash-verify dedup for listed source paths (size-prefiltered). Emits `import:dedup:progress`
+ *  {done,total,results} as it resolves; resolves with the full verdict set. */
+export function importDedup(paths: string[]): Promise<DedupResult[]> {
+  return invoke<DedupResult[]>("import_dedup", { paths });
+}
+
+/** Lazily decode one source file's embedded preview → an object URL (caller must revoke it). */
+export async function importThumb(
+  path: string,
+  maxEdge = 1024,
+): Promise<string> {
+  const buf = await invoke<ArrayBuffer>("import_thumb", { path, maxEdge });
+  return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+}
+
+/** Commit a staged import: copy/move/reference only `selected` source paths, then apply `options`.
+ *  Emits `import:progress` (live rows) + `import:done`. */
+export function importCommit(
   source: string,
   mode: ImportMode,
   dest: string,
-  recursive = true,
+  selected: string[],
+  options: ImportOptions,
 ): Promise<ImportStats> {
-  return invoke<ImportStats>("import_start", { source, mode, dest, recursive });
+  return invoke<ImportStats>("import_commit", {
+    source,
+    mode,
+    dest,
+    selected,
+    options,
+  });
 }
 
 export function dedupScan(category: "byte" | "capture"): Promise<DupGroup[]> {
@@ -227,17 +326,70 @@ export function setThumbCacheCap(bytes: number): Promise<number> {
   return invoke<number>("set_thumb_cache_cap", { bytes });
 }
 
+/** Configured display-sharp preview longest edge (px), or 0 when unset (no default picked yet). */
+export function previewEdge(): Promise<number> {
+  return invoke<number>("preview_edge", {});
+}
+
+/** Persist the preview longest edge (px); backend clamps + re-renders previews at the new size. */
+export function setPreviewEdge(edge: number): Promise<void> {
+  return invoke<void>("set_preview_edge", { edge });
+}
+
+/** Clamp bounds for the preview edge (mirror of the Rust `PREVIEW_EDGE_MIN/MAX`). */
+export const PREVIEW_EDGE_MIN = 2560;
+export const PREVIEW_EDGE_MAX = 4096;
+
+/** The preview edge to use for `thumb://` preview URLs: the configured value, or a sensible default
+ *  derived from the display resolution (longest screen edge × DPR, clamped). Persists the default the
+ *  first time so the backend renders previews at the right size. Cached after first resolution. */
+let previewEdgeCache: number | null = null;
+export async function effectivePreviewEdge(): Promise<number> {
+  if (previewEdgeCache != null) return previewEdgeCache;
+  let edge = 0;
+  try {
+    edge = await previewEdge();
+  } catch {
+    edge = 0;
+  }
+  if (edge <= 0) {
+    const dpr =
+      typeof window !== "undefined"
+        ? Math.min(window.devicePixelRatio || 1, 2)
+        : 1;
+    const longest =
+      typeof window !== "undefined"
+        ? Math.max(window.screen?.width ?? 0, window.screen?.height ?? 0) * dpr
+        : 0;
+    edge = Math.round(
+      Math.min(
+        PREVIEW_EDGE_MAX,
+        Math.max(PREVIEW_EDGE_MIN, longest || PREVIEW_EDGE_MAX),
+      ),
+    );
+    // Persist so the backend renders previews at this size (fire-and-forget).
+    void setPreviewEdge(edge).catch(() => {});
+  }
+  previewEdgeCache = edge;
+  return edge;
+}
+
 // ── Utilities ──────────────────────────────────────────────────────────────
 
 export function thumbUrl(
   hash: string,
   size = 512,
   editedAt?: number | null,
+  /** Cache-bust token (from `thumbVersions`): changes when the backend renders a fresh
+   *  canonical/edited thumbnail, forcing the immutable-cached `<img>` to refetch. */
+  token?: number | null,
 ): string {
   const base = `thumb://localhost/${hash}?size=${size}`;
-  // `edit=<version>` makes the protocol serve the edited render and changes the URL on each edit
-  // (cache-busting the immutable-cached `<img>`).
-  const url = editedAt != null ? `${base}&edit=${editedAt}` : base;
+  // `edit=<version>` makes the protocol serve the edited render and changes the URL on each edit.
+  // `&t=<token>` busts the cache when a fresh thumbnail lands for an UNEDITED image (placeholder →
+  // canonical swap), where `editedAt` doesn't change.
+  const edited = editedAt != null ? `${base}&edit=${editedAt}` : base;
+  const url = token != null ? `${edited}&t=${token}` : edited;
   // Dev-only: in a plain browser the `thumb://` protocol has no handler. A mock backend
   // (src/dev/tauriMock.ts) installs `window.__darkroomThumbMock` to serve placeholder images.
   // Tree-shaken from production builds via the DEV guard; never set inside the Tauri shell.
@@ -251,6 +403,18 @@ export function thumbUrl(
 /** Regenerate the edited thumbnail for an image (on edit-settle); emits `develop:edit-changed`. */
 export function developRegenThumb(imageId: number): Promise<number | null> {
   return invoke<number | null>("develop_regen_thumb", { imageId });
+}
+
+/** Promote images to the front of the canonical-thumbnail backfill queue (visible range / the image
+ *  opening in Develop) so they render before the bulk backfill. Fire-and-forget. */
+export function thumbPrioritize(imageIds: number[]): Promise<void> {
+  return invoke<void>("thumb_prioritize", { imageIds });
+}
+
+/** Tell the backend whether a Develop session is open, so the background thumbnail worker yields the
+ *  GPU to interactive renders while editing. */
+export function developSession(active: boolean): Promise<void> {
+  return invoke<void>("develop_session", { active });
 }
 
 // ── Cull IPC ───────────────────────────────────────────────────────────────

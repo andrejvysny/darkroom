@@ -38,7 +38,10 @@ fn index_and_query_real_cr3() {
         return;
     };
     let files = first_n_cr3(&dir, 3);
-    assert!(!files.is_empty(), "no CR3 found in {dir:?}");
+    if files.is_empty() {
+        eprintln!("no CR3 in {dir:?} — skipping");
+        return;
+    }
 
     let tmp = std::env::temp_dir().join(format!("darkroom-thumbs-test-{}", std::process::id()));
     let thumbs = ThumbCache::new(&tmp).unwrap();

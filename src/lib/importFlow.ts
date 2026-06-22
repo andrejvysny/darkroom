@@ -3,49 +3,42 @@ import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../store/app";
 import {
   appLibraryRoot,
-  importStart,
+  importCommit,
   type ImportMode,
+  type ImportOptions,
   type ImportStats,
 } from "./ipc";
 
+/** Open the native folder picker; returns the chosen path (or null if cancelled). */
+export async function pickFolder(title: string): Promise<string | null> {
+  const picked = await open({ directory: true, title });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** The configured library root, if any (the default copy/move destination). */
+export function resolveDest(): Promise<string | null> {
+  return appLibraryRoot();
+}
+
 /**
- * Runs the interactive import flow:
- * 1. Pick a source directory
- * 2. Resolve or pick a destination (library root)
- * 3. Subscribe to progress/done events, toast updates
- * 4. Call importStart; on done call onComplete to refresh the library
+ * Commit a staged import: copy/move/reference only the `selected` source paths, then apply the
+ * on-import `options`. Subscribes to progress/done toasts; calls `onComplete` to refresh the library.
  */
-export async function runImport(
-  mode: ImportMode = "copy",
+export async function commitImport(
+  source: string,
+  mode: ImportMode,
+  dest: string,
+  selected: string[],
+  options: ImportOptions,
   onComplete?: () => void,
-  recursive = true,
 ): Promise<void> {
   const { setToast } = useAppStore.getState();
 
-  const source = await open({
-    directory: true,
-    title: "Select import source (card / folder)",
-  });
-  if (!source) return;
-
-  let dest = await appLibraryRoot();
-  if (!dest) {
-    const picked = await open({
-      directory: true,
-      title: "Select library destination",
-    });
-    if (!picked) return;
-    dest = picked as string;
-  }
-
-  // Subscribe to events before invoking so we don't miss early emissions
+  // Subscribe before invoking so we don't miss early emissions.
   const unProgress = await listen<{ done: number; total: number }>(
     "import:progress",
-    (ev) => {
-      setToast(`Importing ${ev.payload.done} / ${ev.payload.total}…`);
-    },
+    (ev) => setToast(`Importing ${ev.payload.done} / ${ev.payload.total}…`),
   );
-
   const unDone = await listen<ImportStats>("import:done", (ev) => {
     unProgress();
     unDone();
@@ -59,7 +52,7 @@ export async function runImport(
   });
 
   try {
-    await importStart(source as string, mode, dest, recursive);
+    await importCommit(source, mode, dest, selected, options);
   } catch (err) {
     unProgress();
     unDone();

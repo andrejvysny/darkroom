@@ -10,6 +10,12 @@ interface AppState {
   setLibraryImages: (rows: ImageRow[]) => void;
   /** Update one image's edit version (drives live edit-aware previews in the filmstrip/chrome). */
   setImageEdited: (id: number, editedAt: number | null) => void;
+  /** Per-image thumbnail cache-bust counter, bumped when the backend renders a fresh canonical/edited
+   *  thumbnail (`thumb:rendered`). Appended to `thumb://` URLs so the immutable-cached `<img>`
+   *  refetches when the placeholder is replaced by the canonical render. */
+  thumbVersions: Record<number, number>;
+  /** Increment the cache-bust counter for each id (batched from coalesced `thumb:rendered` events). */
+  bumpThumbVersions: (ids: number[]) => void;
   /** Primary/active selection (drives metadata panel + develop). */
   selectedId: number | null;
   setSelectedId: (id: number | null) => void;
@@ -49,6 +55,14 @@ export const useAppStore = create<AppState>((set) => ({
         r.id === id ? { ...r, editedAt } : r,
       ),
     })),
+  thumbVersions: {},
+  bumpThumbVersions: (ids) =>
+    set((s) => {
+      if (ids.length === 0) return {};
+      const next = { ...s.thumbVersions };
+      for (const id of ids) next[id] = (next[id] ?? 0) + 1;
+      return { thumbVersions: next };
+    }),
   selectedId: null,
   setSelectedId: (id) =>
     set({ selectedId: id, selectedIds: id == null ? [] : [id] }),

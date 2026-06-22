@@ -4,6 +4,7 @@ import {
   libraryQuery,
   libraryCount,
   libraryFolders,
+  libraryDateTree,
   libraryIndexRoot,
   appDefaultLibrary,
   keywordsList,
@@ -14,6 +15,7 @@ import {
   type QueryParams,
   type ImageRow,
   type FolderRow,
+  type DateTreeYear,
   type KeywordRow,
   type CollectionRow,
 } from "./ipc";
@@ -23,6 +25,8 @@ export type IndexingState = { done: number; total: number };
 export interface LibraryState {
   images: ImageRow[];
   folders: FolderRow[];
+  /** Year → Date capture-date tree for the left-nav Folders section. */
+  dateTree: DateTreeYear[];
   keywords: KeywordRow[];
   collections: CollectionRow[];
   /** Count of the current (filtered) query. */
@@ -87,6 +91,7 @@ function matchesRowFilter(row: ImageRow, p: QueryParams): boolean {
 export function useLibrary(): LibraryState & LibraryActions {
   const [images, setImages] = useState<ImageRow[]>([]);
   const [folders, setFolders] = useState<FolderRow[]>([]);
+  const [dateTree, setDateTree] = useState<DateTreeYear[]>([]);
   const [keywords, setKeywords] = useState<KeywordRow[]>([]);
   const [collections, setCollections] = useState<CollectionRow[]>([]);
   const [total, setTotal] = useState(0);
@@ -121,10 +126,11 @@ export function useLibrary(): LibraryState & LibraryActions {
       const merged = overrides
         ? { ...paramsRef.current, ...overrides }
         : paramsRef.current;
-      const [imgs, cnt, flds, grand, kws, cols] = await Promise.all([
+      const [imgs, cnt, flds, tree, grand, kws, cols] = await Promise.all([
         libraryQuery(merged),
         libraryCount(merged),
         libraryFolders(),
+        libraryDateTree(),
         libraryCount({}),
         keywordsList(),
         collectionsList(),
@@ -133,6 +139,7 @@ export function useLibrary(): LibraryState & LibraryActions {
       setTotal(cnt);
       setGrandTotal(grand);
       setFolders(flds);
+      setDateTree(tree);
       setKeywords(kws);
       setCollections(cols);
     } catch (e) {
@@ -250,8 +257,9 @@ export function useLibrary(): LibraryState & LibraryActions {
       // app that stays empty across reloads/restarts.
       const firstLaunch = localStorage.getItem("darkroom.bootstrapped") !== "1";
       try {
-        const [flds, cnt, kws, cols] = await Promise.all([
+        const [flds, tree, cnt, kws, cols] = await Promise.all([
           libraryFolders(),
+          libraryDateTree(),
           libraryCount(DEFAULT_PARAMS),
           keywordsList(),
           collectionsList(),
@@ -272,6 +280,7 @@ export function useLibrary(): LibraryState & LibraryActions {
           // Library already has data — load directly
           const imgs = await libraryQuery(DEFAULT_PARAMS);
           setFolders(flds);
+          setDateTree(tree);
           setImages(imgs);
           // DEFAULT_PARAMS carries no filter dimensions, so cnt is the unfiltered total.
           setTotal(cnt);
@@ -402,6 +411,7 @@ export function useLibrary(): LibraryState & LibraryActions {
   return {
     images,
     folders,
+    dateTree,
     keywords,
     collections,
     total,

@@ -8,7 +8,10 @@ import {
   developPreviewJpeg,
   developRegenThumb,
   developRender,
+  developSession,
   developSetEdit,
+  thumbPrioritize,
+  thumbUrl,
   MASK_CAP,
   type BrushStroke,
   type ComponentKind,
@@ -199,16 +202,27 @@ export function useDevelop() {
       imageAspect: 0,
     });
 
-    // 1. Instant first paint — embedded camera JPEG.
-    developPreviewJpeg(id)
-      .then((url) => {
-        if (cancelled) {
-          URL.revokeObjectURL(url);
-          return;
-        }
-        setPreview(url);
-      })
-      .catch((e) => console.error("develop_preview_jpeg failed", e));
+    // 1. Instant first paint — the canonical develop thumbnail (the SAME look the canvas will show).
+    //    The `thumb://` protocol serves the canonical render if it's ready, else the camera-embedded
+    //    placeholder, so one URL already implements "prefer canonical, fall back to camera" (decision
+    //    3). Prioritize this image's canonical render so a fresh import lands fast. Falls back to the
+    //    embedded-JPEG endpoint if the row isn't in the shared store yet (defensive).
+    const row = useAppStore.getState().libraryImages.find((r) => r.id === id);
+    if (row) {
+      const v = useAppStore.getState().thumbVersions[id];
+      setPreview(thumbUrl(row.contentHash, 1024, row.editedAt, v));
+    } else {
+      developPreviewJpeg(id)
+        .then((url) => {
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          setPreview(url);
+        })
+        .catch((e) => console.error("develop_preview_jpeg failed", e));
+    }
+    void thumbPrioritize([id]);
 
     // 2. Load saved params; renderFrame will be called by the canvas when it mounts.
     (async () => {
@@ -264,6 +278,15 @@ export function useDevelop() {
         URL.revokeObjectURL(previewObjUrl.current);
         previewObjUrl.current = null;
       }
+    };
+  }, []);
+
+  // Mark a Develop session open for the lifetime of this hook so the background thumbnail worker
+  // parks between jobs and interactive renders win the GPU.
+  useEffect(() => {
+    void developSession(true);
+    return () => {
+      void developSession(false);
     };
   }, []);
 

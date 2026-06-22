@@ -66,12 +66,23 @@ impl LinearImage {
     /// resize (no 400 MB clone), and uses a Triangle filter — quality is irrelevant for a preview
     /// that is already binned + fit-to-screen, and it is markedly cheaper than Lanczos3.
     pub fn downscale_into(self, max_edge: u32) -> LinearImage {
+        self.resize_consuming(max_edge, FilterType::Triangle)
+    }
+
+    /// Consuming **high-quality** (Lanczos3) downscale so the longest edge ≤ `max_edge`. Like
+    /// [`Self::downscale_into`] but sharper — for *settled* outputs (canonical + edited thumbnails)
+    /// that must match the GPU canvas, not throwaway fit-previews. Moves the buffer (no clone).
+    pub fn downscale_into_hq(self, max_edge: u32) -> LinearImage {
+        self.resize_consuming(max_edge, FilterType::Lanczos3)
+    }
+
+    /// Shared consuming downscale: move the backing buffer into a resize with `filter`. Returns
+    /// `self` unchanged when already small enough or on a dims/length mismatch (never panics).
+    fn resize_consuming(self, max_edge: u32, filter: FilterType) -> LinearImage {
         let longest = self.width.max(self.height);
         if longest <= max_edge {
             return self;
         }
-        // Defensive: never panic on a dims/length mismatch (always holds for our decoders) — skip
-        // the downscale and return the buffer unchanged.
         if self.data.len() != self.width as usize * self.height as usize * 3 {
             return self;
         }
@@ -80,7 +91,7 @@ impl LinearImage {
         let nh = ((self.height as f32 * scale).round() as u32).max(1);
         let buf =
             Rgb32FImage::from_raw(self.width, self.height, self.data).expect("dims verified above");
-        let resized = image::imageops::resize(&buf, nw, nh, FilterType::Triangle);
+        let resized = image::imageops::resize(&buf, nw, nh, filter);
         LinearImage {
             width: nw,
             height: nh,

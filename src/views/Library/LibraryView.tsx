@@ -1,8 +1,9 @@
-import { useEffect, useCallback, useState, useRef } from "react";
+import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { useAppStore } from "../../store/app";
 import { useLibrary } from "../../lib/useLibrary";
 import {
   thumbUrl,
+  thumbPrioritize,
   cullSetRating,
   cullSetFlag,
   cullSetLabel,
@@ -23,14 +24,8 @@ import {
   collectionRename,
   smartQueryFromParams,
 } from "../../lib/ipc";
-import type {
-  ImageRow,
-  KeywordRow,
-  CollectionRow,
-  ImportMode,
-} from "../../lib/ipc";
+import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
-import { runImport } from "../../lib/importFlow";
 import { runBatchExport } from "../../lib/export";
 import { useAnalysis } from "../../lib/useAnalysis";
 import LeftNav from "./LeftNav";
@@ -40,7 +35,7 @@ import BottomBar from "./BottomBar";
 import SelectionBar from "./SelectionBar";
 import Loupe from "./Loupe";
 import DedupModal from "./DedupModal";
-import ImportModal from "./ImportModal";
+import ImportDialog from "./ImportDialog";
 import SettingsModal from "./SettingsModal";
 
 // Map color label name to CSS var for the dot color in ThumbGrid
@@ -52,11 +47,11 @@ const LABEL_COLOR_MAP: Record<string, string> = {
   purple: "var(--color-lab-purple)",
 };
 
-function toGridImage(r: ImageRow): GridImage {
+function toGridImage(r: ImageRow, token?: number): GridImage {
   return {
     id: r.id,
     filename: r.filename,
-    thumbUrl: thumbUrl(r.contentHash, 512, r.editedAt),
+    thumbUrl: thumbUrl(r.contentHash, 512, r.editedAt, token),
     stars: r.stars,
     flag: r.flag === "none" ? null : r.flag,
     label: r.colorLabel
@@ -76,6 +71,7 @@ export default function LibraryView() {
   const gridMode = useAppStore((s) => s.gridMode);
   const setGridMode = useAppStore((s) => s.setGridMode);
   const setLibraryImages = useAppStore((s) => s.setLibraryImages);
+  const thumbVersions = useAppStore((s) => s.thumbVersions);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnOpenDedup = useAppStore((s) => s.setOnOpenDedup);
   const setOnOpenSettings = useAppStore((s) => s.setOnOpenSettings);
@@ -141,6 +137,12 @@ export default function LibraryView() {
   useEffect(() => {
     setLibraryImages(lib.images);
   }, [lib.images, setLibraryImages]);
+
+  // Promote the selected image to the front of the canonical-thumbnail backfill queue (the user is
+  // likely about to open it in loupe/Develop). The bulk backfill already runs newest-first.
+  useEffect(() => {
+    if (selectedId != null) void thumbPrioritize([selectedId]);
+  }, [selectedId]);
 
   useCulling({ images: lib.images, patchImage: lib.patchImage });
 
@@ -480,7 +482,10 @@ export default function LibraryView() {
     onPresenceChanged: afterPresenceChange,
   };
 
-  const gridImages = lib.images.map(toGridImage);
+  const gridImages = useMemo(
+    () => lib.images.map((r) => toGridImage(r, thumbVersions[r.id])),
+    [lib.images, thumbVersions],
+  );
 
   return (
     <div
@@ -495,7 +500,7 @@ export default function LibraryView() {
       {/* Left nav spans both rows */}
       <div style={{ gridRow: "1 / 3", gridColumn: "1", minHeight: 0 }}>
         <LeftNav
-          folders={lib.folders}
+          dateTree={lib.dateTree}
           keywords={lib.keywords}
           collections={lib.collections}
           grandTotal={lib.grandTotal}
@@ -699,13 +704,11 @@ export default function LibraryView() {
         onRefresh={() => void lib.refresh()}
       />
 
-      <ImportModal
+      <ImportDialog
         open={importOpen}
+        collections={lib.collections}
         onClose={() => setImportOpen(false)}
-        onChoose={(mode: ImportMode, recursive: boolean) => {
-          setImportOpen(false);
-          void runImport(mode, () => void lib.refresh(), recursive);
-        }}
+        onComplete={() => void lib.refresh()}
       />
 
       <SettingsModal

@@ -1,25 +1,25 @@
-Knižnica/Import na disk ako Lr →
+Knižnica/Import na disk ako Lightroom →
 →triedenie do priečinkov na disku
 
-Základný exposure edit ako Lr
+Základný exposure edit ako Lightroom
 
-Color balance modul ako Dt (najviac top feature)
+Color balance modul ako Darktable (najviac top feature)
 
-Temp + tint asi ako Lr
+Temp + tint asi ako Lightroom
 
-HSL + Color grading ako Lr + Color EQ Darktable (Dt)
-Dt HladCLUT podpra (to ti ukážem ak tak)
+HSL + Color grading ako Lightroom + Color EQ Darktable (Darktable)
+Darktable HladCLUT podpra (to ti ukážem ak tak)
 Color channels mixes ako Ps
 
-Difuse or sharpen modul ako Dt +
-+ Texture, clarity, dehaze ako Lr
+Difuse or sharpen modul ako Darktable +
++ Texture, clarity, dehaze ako Lightroom
 
-Vingette ako Lr alebo Dt
+Vingette ako Lightroom alebo Darktable
 
-Noise reduction ako Lr (Difuse or sharpen modul to má síce, ale navyše)
+Noise reduction ako Lightroom (Difuse or sharpen modul to má síce, ale navyše)
 
-Grain ako Dt
+Grain ako Darktable
 
-Framing ako Dt (to mi najviac chýba v Lr)
+Framing ako Darktable (to mi najviac chýba v Lightroom)
 
-⚠️ A hlavne podpra Lr presetov ⚠️
+⚠️ A hlavne podpra Lightroom presetov ⚠️

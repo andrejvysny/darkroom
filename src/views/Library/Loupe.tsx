@@ -7,6 +7,7 @@ import {
 } from "react";
 import { thumbUrl, developGetEdit, developRender } from "../../lib/ipc";
 import type { ImageRow, RenderedFrame } from "../../lib/ipc";
+import { useAppStore } from "../../store/app";
 import { freshDefaults } from "../../store/develop";
 import {
   deriveViewRect,
@@ -165,8 +166,9 @@ export default function Loupe({ image }: LoupeProps) {
     scheduleRender();
   }
 
-  // ── Instant first paint: thumb while the render arrives ───────────────────
-  const thumbSrc = thumbUrl(image.contentHash, 512, image.editedAt);
+  // ── Instant first paint: canonical thumb while the render arrives ─────────
+  const thumbToken = useAppStore((s) => s.thumbVersions[image.id]);
+  const thumbSrc = thumbUrl(image.contentHash, 512, image.editedAt, thumbToken);
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;

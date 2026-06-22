@@ -15,9 +15,11 @@ fn parse_size(query: Option<&str>) -> u32 {
         .unwrap_or(THUMB_SIZE)
 }
 
-/// Read the thumbnail. When `edit=<version>` is present the edit-rendered variant is served (it
-/// versions the URL so the browser refetches after an edit); falls back to the base thumbnail if
-/// the edited variant is missing. Otherwise the requested size, falling back to the default size.
+/// Read the thumbnail, preferring the canonical (unified-render) source so every surface matches the
+/// editor. Order: edited variant (when `edit=<version>` is present) → canonical develop render
+/// (`_dev<PV>`, the GPU pipeline at default params) → camera-embedded placeholder at the requested
+/// size → default size. The canonical render is size-agnostic (one 1024 thumb the browser
+/// downscales); `size` only selects among the camera placeholders.
 fn read_thumb(thumbs: &ThumbCache, hash: &str, size: u32, edit: Option<i64>) -> Option<Vec<u8>> {
     // Validate hash to prevent path traversal — must be a 64-char hex digest.
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -29,8 +31,9 @@ fn read_thumb(thumbs: &ThumbCache, hash: &str, size: u32, edit: Option<i64>) -> 
         }
     }
     thumbs
-        .read(hash, size)
+        .read_canonical(hash, crate::commands::PROCESS_VERSION)
         .ok()
+        .or_else(|| thumbs.read(hash, size).ok())
         .or_else(|| thumbs.read(hash, THUMB_SIZE).ok())
 }
 

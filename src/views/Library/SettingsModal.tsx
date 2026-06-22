@@ -5,12 +5,15 @@ import {
   setThumbCacheCap,
   analysisDetectorSize,
   setAnalysisDetectorSize,
+  appLibraryRoot,
+  setLibraryRoot,
   featuresBackfill,
   databaseReset,
   sidecarsWriteAll,
   sidecarsRebuild,
   facesDeleteAll,
 } from "../../lib/ipc";
+import { pickFolder } from "../../lib/importFlow";
 
 const GB = 1024 * 1024 * 1024;
 
@@ -28,6 +31,8 @@ interface SettingsModalProps {
 export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [capGb, setCapGb] = useState("2");
   const [usedBytes, setUsedBytes] = useState<number | null>(null);
+  const [libRoot, setLibRoot] = useState<string | null>(null);
+  const [pickingRoot, setPickingRoot] = useState(false);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [mdSize, setMdSize] = useState(1280);
@@ -47,14 +52,32 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       thumbCacheCap(),
       thumbCacheSize(),
       analysisDetectorSize(),
+      appLibraryRoot(),
     ])
-      .then(([cap, used, size]) => {
+      .then(([cap, used, size, root]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
         setMdSize(size);
+        setLibRoot(root);
       })
       .catch(() => setStatus("Failed to load settings"));
   }, [open]);
+
+  const handleChangeLibraryRoot = async () => {
+    const picked = await pickFolder("Select library location");
+    if (!picked) return;
+    setPickingRoot(true);
+    setStatus(null);
+    try {
+      await setLibraryRoot(picked);
+      setLibRoot(picked);
+      setStatus("Library location saved — applies to new copy/move imports");
+    } catch {
+      setStatus("Failed to set library location");
+    } finally {
+      setPickingRoot(false);
+    }
+  };
 
   const handleMdSize = (size: number) => {
     setMdSize(size);
@@ -170,6 +193,61 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
           }}
         >
           Settings
+        </div>
+
+        <div style={{ padding: "18px 18px 0" }}>
+          <div
+            style={{ fontSize: 13, color: "var(--color-t1)", marginBottom: 4 }}
+          >
+            Library location
+          </div>
+          <div
+            style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
+          >
+            Where copy/move imports file photos (under{" "}
+            <span style={{ fontFamily: "var(--font-mono)" }}>
+              YYYY/YYYY-MM-DD
+            </span>
+            ). Existing photos stay put; this applies to new imports.
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div
+              title={libRoot ?? undefined}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                background: "var(--color-stage)",
+                border: "1px solid var(--color-line-2)",
+                borderRadius: "var(--radius-sm)",
+                color: libRoot ? "var(--color-t1)" : "var(--color-t3)",
+                padding: "6px 8px",
+                fontSize: 12,
+                fontFamily: "var(--font-mono)",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {libRoot ?? "Not set — choose a folder"}
+            </div>
+            <button
+              onClick={() => void handleChangeLibraryRoot()}
+              disabled={pickingRoot}
+              style={{
+                background: "var(--color-accent)",
+                color: "#fff",
+                border: "none",
+                borderRadius: "var(--radius-sm)",
+                padding: "6px 14px",
+                fontSize: 12,
+                cursor: pickingRoot ? "default" : "pointer",
+                opacity: pickingRoot ? 0.6 : 1,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Change…
+            </button>
+          </div>
         </div>
 
         <div style={{ padding: "18px" }}>

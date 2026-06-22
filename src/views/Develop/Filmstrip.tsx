@@ -27,6 +27,7 @@ export default function Filmstrip() {
   const images = useAppStore((s) => s.libraryImages);
   const selectedId = useAppStore((s) => s.selectedId);
   const setSelectedId = useAppStore((s) => s.setSelectedId);
+  const thumbVersions = useAppStore((s) => s.thumbVersions);
 
   const selRef = useRef<HTMLButtonElement>(null);
   const current = images.find((i) => i.id === selectedId) ?? null;
@@ -104,7 +105,12 @@ export default function Filmstrip() {
               }}
             >
               <img
-                src={thumbUrl(img.contentHash, 256, img.editedAt)}
+                src={thumbUrl(
+                  img.contentHash,
+                  256,
+                  img.editedAt,
+                  thumbVersions[img.id],
+                )}
                 alt={img.filename}
                 loading="lazy"
                 draggable={false}

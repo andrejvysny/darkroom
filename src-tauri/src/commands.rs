@@ -3,8 +3,9 @@
 
 use crate::state::AppState;
 use core_library::{
-    CaptionRow, CollectionRow, DetectionRow, FacetRow, FolderRow, ImageFaceRow, ImageRow,
-    IndexStats, KeywordRow, PersonFaceRow, PersonRow, PresenceRow, QueryParams, UserLabels,
+    CaptionRow, CollectionRow, DateTreeYear, DetectionRow, FacetRow, FolderRow, ImageFaceRow,
+    ImageRow, IndexStats, KeywordRow, PersonFaceRow, PersonRow, PresenceRow, QueryParams,
+    UserLabels,
 };
 use core_pipeline::{DevelopParams, Histogram};
 use rayon::prelude::*;
@@ -18,7 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 // it replaces the fixed highlight shoulder, so v1/v2 rows re-render with the new tonality.
 // v4 fits the base tone curve to the real ACR default (mid-grey 0.18→0.388 ≈65% sRGB, ~+1.3 EV
 // brighter) + adds Color-balance-RGB; all prior rows re-render with the matched ACR brightness.
-const PROCESS_VERSION: i64 = 4;
+pub const PROCESS_VERSION: i64 = 4;
 
 /// Delete cached thumbnails for content hashes no longer referenced by any present row. A byte-
 /// identical keeper still shares its hash, so presence is re-checked before deleting (lowercase-hex
@@ -45,7 +46,7 @@ fn gc_orphan_thumbs(
 
 /// Evict thumbnails down to the configured cache cap (best-effort). The cap is read under a brief
 /// lock, then released before the (slower) filesystem eviction runs.
-fn enforce_thumb_cap(st: &AppState) {
+pub(crate) fn enforce_thumb_cap(st: &AppState) {
     let cap = {
         let Ok(db) = st.db.lock() else { return };
         core_library::thumb_cache_cap(&db.conn).unwrap_or(core_library::DEFAULT_THUMB_CACHE_CAP)
@@ -81,6 +82,17 @@ pub async fn library_folders(app: AppHandle) -> Result<Vec<FolderRow>, String> {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::list_folders(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn library_date_tree(app: AppHandle) -> Result<Vec<DateTreeYear>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::date_tree(&db.conn).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -179,6 +191,9 @@ fn index_root_blocking(
 
     enforce_thumb_cap(st);
     let _ = app.emit("import:done", &stats);
+    // Backfill canonical develop thumbnails for the newly indexed images (idempotent: already-cached
+    // ids are cheaply skipped by the worker's pre-check).
+    crate::thumb_queue::enqueue_all(app);
 
     // Auto-analyze newly indexed images in the background — but only if the models are already
     // downloaded (never trigger a ~400 MB download implicitly). First-time analysis is explicit.
@@ -319,7 +334,6 @@ pub async fn develop_set_edit(
     .map_err(|e| e.to_string())?
 }
 
-const PREVIEW_MAX_EDGE: u32 = 1600;
 /// Hard cap on the full-res texture's long edge — keeps it within the GPU max texture dimension
 /// (8192 on the wgpu defaults). A no-op for the validated EOS R7 (6960 px).
 const FULL_MAX_EDGE: u32 = 8192;
@@ -353,11 +367,12 @@ pub async fn develop_preview_jpeg(
     .map_err(|e| e.to_string())?
 }
 
-/// Library loupe: the unedited capture (camera embedded preview, near full sensor res on CR3) as
-/// JPEG bytes. `max_edge == 0` returns native size (capped at 8192 to bound payload/decode); any
-/// positive value downscales the long edge to that. No GPU, no develop edits — the frontend loads
-/// 2560 for fit-view, then native on zoom. Distinct from `develop_preview_jpeg` (which the Develop
-/// view owns) so the two can evolve independently.
+/// Library loupe: the canonical develop render (default params when unedited, saved edit otherwise)
+/// as JPEG bytes, so the loupe matches the editor. `max_edge == 0` returns native size (capped at
+/// 8192 to bound payload/decode); any positive value downscales the long edge to that. Falls back to
+/// the fast camera-embedded preview only when no GPU is available. The frontend loads 2560 for
+/// fit-view, then native on zoom. Distinct from `develop_preview_jpeg` (which the Develop view owns)
+/// so the two can evolve independently.
 #[tauri::command]
 pub async fn loupe_jpeg(
     app: AppHandle,
@@ -374,14 +389,11 @@ pub async fn loupe_jpeg(
                 .path
         };
         let edge = if max_edge == 0 { 8192 } else { max_edge };
-        // Edited images: show the develop-rendered result so the loupe matches the editor. Unedited
-        // images (or no GPU) fall back to the fast embedded preview.
+        // Canonical develop render so the loupe matches the editor for EVERY image (edited or not).
+        // Only when no GPU is available do we fall back to the fast camera-embedded preview.
         if let Some(gpu) = st.gpu.as_ref() {
-            if let (_, Some((jpeg, _))) =
-                render_edit_jpeg(st.inner(), gpu, image_id, edge, 90)?
-            {
-                return Ok(tauri::ipc::Response::new(jpeg));
-            }
+            let render = render_develop_jpeg(st.inner(), gpu, image_id, edge, 90)?;
+            return Ok(tauri::ipc::Response::new(render.jpeg));
         }
         let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
         let thumb = core_raw::thumbnail_jpeg(&src, edge, 90).map_err(|e| e.to_string())?;
@@ -394,21 +406,24 @@ pub async fn loupe_jpeg(
 const THUMB_EDIT_EDGE: u32 = 1024;
 const THUMB_EDIT_QUALITY: u8 = 85;
 
-/// Result of an edited-render attempt: the image's content hash plus, when it has an edit, the
-/// rendered JPEG bytes and the edit version (`updated_at`). `None` render → caller falls back to the
-/// embedded/base thumbnail.
-type EditRender = (String, Option<(Vec<u8>, i64)>);
+/// A canonical develop render to JPEG: the image's content hash, the rendered bytes, and the edit
+/// version (`updated_at`) when the image has a stored edit (`None` → rendered from defaults).
+pub struct DevelopRender {
+    pub hash: String,
+    pub jpeg: Vec<u8>,
+    /// `Some(updated_at)` when rendered from a stored edit; `None` when from `DevelopParams::default()`.
+    pub edit_version: Option<i64>,
+}
 
-/// Render an image's stored develop edit to JPEG at `max_edge`. Uses the full demosaic above the
-/// preview cap so loupe/zoom stay sharp; the cheaper superpixel decode at/below it.
-fn render_edit_jpeg(
+/// Decode an image to its full-resolution linear working buffer plus the develop params to apply —
+/// the image's stored edit, or `DevelopParams::default()` when unedited (the SAME default the Develop
+/// canvas uses, so every surface matches by construction). This is the expensive half (full
+/// `develop_linear` demosaic, already `.oriented()`); callers render it to one or more sizes.
+pub(crate) fn decode_develop(
     st: &AppState,
-    gpu: &crate::state::GpuRender,
     image_id: i64,
-    max_edge: u32,
-    quality: u8,
-) -> Result<EditRender, String> {
-    let (path, hash_hex) = {
+) -> Result<(String, DevelopParams, Option<i64>, core_raw::LinearImage), String> {
+    let (path, hash) = {
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let img = core_library::image_by_id(&db.conn, image_id)
             .map_err(|e| e.to_string())?
@@ -419,25 +434,64 @@ fn render_edit_jpeg(
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::get_edit_with_version(&db.conn, image_id).map_err(|e| e.to_string())?
     };
-    let (params_json, version) = match edit {
-        Some(v) => v,
-        None => return Ok((hash_hex, None)),
+    let (params, edit_version) = match edit {
+        Some((json, version)) => (
+            serde_json::from_str::<DevelopParams>(&json).map_err(|e| e.to_string())?,
+            Some(version),
+        ),
+        None => (DevelopParams::default(), None),
     };
-    let params: DevelopParams = serde_json::from_str(&params_json).map_err(|e| e.to_string())?;
     let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-    let lin = if max_edge > PREVIEW_MAX_EDGE {
-        core_raw::develop_linear(&src).map_err(|e| e.to_string())?
-    } else {
-        core_raw::develop_linear_preview(&src).map_err(|e| e.to_string())?
-    }
-    .downscale_into(max_edge);
-    let (w, h) = (lin.width, lin.height);
+    let lin = core_raw::develop_linear(&src).map_err(|e| e.to_string())?;
+    Ok((hash, params, edit_version, lin))
+}
+
+/// Render an already-decoded linear buffer through the pipeline and **apply the crop**, returning the
+/// crop-applied RGBA8 + its dims. `render_once` letterbox-fits the crop centered into the full frame
+/// (legacy `geom_resolve`); a plain pixel-copy of that centered rect (`export_rect` + `crop_rgba8`,
+/// same as export) yields the FILLED cropped frame — matching the loupe/develop viewport geometry, so
+/// the cached preview lines up with `develop_render` on zoom. Uses a transient `PreparedImage`; never
+/// touches `full_render_cache`. (No mask overlay — `render_once` is always `ViewParams::full`.)
+pub(crate) fn render_linear_cropped(
+    gpu: &crate::state::GpuRender,
+    lin: &core_raw::LinearImage,
+    params: &DevelopParams,
+) -> Result<(Vec<u8>, u32, u32), String> {
     let rgba = gpu
         .pipeline
-        .render_once(&gpu.ctx, &lin, &params)
+        .render_once(&gpu.ctx, lin, params)
         .map_err(|e| e.to_string())?;
+    let (cx, cy, cw, ch) = params.crop.export_rect(lin.width, lin.height);
+    if (cw, ch) == (lin.width, lin.height) {
+        Ok((rgba, lin.width, lin.height))
+    } else {
+        Ok((
+            core_pipeline::crop_rgba8(&rgba, lin.width, cx, cy, cw, ch),
+            cw,
+            ch,
+        ))
+    }
+}
+
+/// Render an image through the canonical develop pipeline to a crop-applied JPEG at `max_edge`
+/// (longest edge). Decodes (full demosaic), downscales (Lanczos3), renders + crops. A transient
+/// `PreparedImage` — never the interactive `full_render_cache`.
+pub fn render_develop_jpeg(
+    st: &AppState,
+    gpu: &crate::state::GpuRender,
+    image_id: i64,
+    max_edge: u32,
+    quality: u8,
+) -> Result<DevelopRender, String> {
+    let (hash, params, edit_version, lin) = decode_develop(st, image_id)?;
+    let lin = lin.downscale_into_hq(max_edge);
+    let (rgba, w, h) = render_linear_cropped(gpu, &lin, &params)?;
     let jpeg = core_pipeline::rgba8_to_jpeg(&rgba, w, h, quality).map_err(|e| e.to_string())?;
-    Ok((hash_hex, Some((jpeg, version))))
+    Ok(DevelopRender {
+        hash,
+        jpeg,
+        edit_version,
+    })
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -459,17 +513,17 @@ pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option
             .gpu
             .as_ref()
             .ok_or_else(|| "GPU develop unavailable".to_string())?;
-        let (hash, render) =
-            render_edit_jpeg(st.inner(), gpu, image_id, THUMB_EDIT_EDGE, THUMB_EDIT_QUALITY)?;
-        let edited_at = match render {
-            Some((jpeg, version)) => {
+        let render =
+            render_develop_jpeg(st.inner(), gpu, image_id, THUMB_EDIT_EDGE, THUMB_EDIT_QUALITY)?;
+        let edited_at = match render.edit_version {
+            Some(version) => {
                 st.thumbs
-                    .write_edited(&hash, version, &jpeg)
+                    .write_edited(&render.hash, version, &render.jpeg)
                     .map_err(|e| e.to_string())?;
                 Some(version)
             }
             None => {
-                let _ = st.thumbs.clear_edited(&hash);
+                let _ = st.thumbs.clear_edited(&render.hash);
                 None
             }
         };
@@ -478,6 +532,21 @@ pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Promote image ids to the front of the canonical-thumbnail backfill queue (the visible grid range
+/// and the image about to open in Develop), so they render before the bulk backfill. Cheap; runs
+/// synchronously on the main thread (just a queue splice).
+#[tauri::command]
+pub fn thumb_prioritize(app: AppHandle, image_ids: Vec<i64>) {
+    app.state::<AppState>().thumb_queue.prioritize(&image_ids);
+}
+
+/// Mark whether a Develop editing session is active. While active, the background thumbnail worker
+/// parks between jobs so interactive renders always win the next GPU slot.
+#[tauri::command]
+pub fn develop_session(app: AppHandle, active: bool) {
+    app.state::<AppState>().thumb_queue.set_interactive(active);
 }
 
 /// The histogram of the most recent successful render. A reliable pull-fallback for the
@@ -1143,13 +1212,17 @@ pub async fn collection_remove_images(
     .map_err(|e| e.to_string())?
 }
 
-/// A sensible default import destination: the parent of the first watched folder (the library root
-/// under which dated `YYYY/YYYY-MM-DD` folders live), if any.
+/// The copy/move import destination. Prefers the user-configured library root (Settings); falls back
+/// to the parent of the first watched folder (the root under which dated `YYYY/YYYY-MM-DD` folders
+/// live) for catalogs created before the setting existed; `None` if neither is available.
 #[tauri::command]
 pub async fn app_library_root(app: AppHandle) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
+        if let Some(root) = core_library::library_root(&db.conn).map_err(|e| e.to_string())? {
+            return Ok::<_, String>(Some(root));
+        }
         let first: Option<String> = db
             .conn
             .query_row("SELECT path FROM folders ORDER BY id LIMIT 1", [], |r| {
@@ -1161,6 +1234,20 @@ pub async fn app_library_root(app: AppHandle) -> Result<Option<String>, String> 
                 .parent()
                 .map(|parent| parent.display().to_string())
         }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Persist the library root (the copy/move import destination), creating the directory if needed.
+/// Existing photos are NOT moved — only future copy/move imports file into the new location.
+#[tauri::command]
+pub async fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(&path).map_err(|e| format!("cannot create {path}: {e}"))?;
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_library_root(&db.conn, &path).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1340,13 +1427,158 @@ pub async fn dedup_scan_perceptual(
 
 // ---------- Import ----------
 
+/// Metadata to apply to every freshly-imported row (Lightroom "Apply During Import"). All optional.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportOptions {
+    /// Star rating 0–5 to stamp on imported images.
+    pub rating: Option<i64>,
+    /// Flag ("pick" | "reject"); "none"/absent leaves it unset.
+    pub flag: Option<String>,
+    /// Keyword names to attach (created on demand).
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Existing collection to add the batch to.
+    pub collection_id: Option<i64>,
+    /// New collection name (created when `collection_id` is absent).
+    pub new_collection: Option<String>,
+}
+
+/// Apply on-import options to the freshly-added rows under one brief lock (reuses the same
+/// core-library batch fns that back the cull / keyword / collection IPC commands).
+fn apply_import_options(st: &AppState, ids: &[i64], opts: &ImportOptions) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut db = st.db.lock().map_err(|e| e.to_string())?;
+    if let Some(stars) = opts.rating {
+        core_library::set_rating_many(&mut db.conn, ids, stars).map_err(|e| e.to_string())?;
+    }
+    if let Some(flag) = opts.flag.as_deref() {
+        if flag != "none" && !flag.is_empty() {
+            core_library::set_flag_many(&mut db.conn, ids, flag).map_err(|e| e.to_string())?;
+        }
+    }
+    for kw in &opts.keywords {
+        let kw = kw.trim();
+        if !kw.is_empty() {
+            core_library::add_keyword_to_images(&db.conn, ids, kw).map_err(|e| e.to_string())?;
+        }
+    }
+    let collection_id = match (opts.collection_id, opts.new_collection.as_deref()) {
+        (Some(id), _) => Some(id),
+        (None, Some(name)) if !name.trim().is_empty() => Some(
+            core_library::create_collection(&db.conn, name.trim(), false, None)
+                .map_err(|e| e.to_string())?,
+        ),
+        _ => None,
+    };
+    if let Some(cid) = collection_id {
+        core_library::add_images_to_collection(&db.conn, cid, ids).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Fast import listing: enumerate the RAW files under `source` from filesystem metadata only — NO
+/// catalog access, hashing, decode, or thumbnail work — so a full card lists in milliseconds. Every
+/// file comes back `pending`; hash-verified dedup runs separately via `import_dedup`. Thumbnails are
+/// fetched lazily, per file, via `import_thumb`.
 #[tauri::command]
-pub async fn import_start(
+pub async fn import_list(
+    source: String,
+    recursive: Option<bool>,
+) -> Result<Vec<core_import::SourceFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok::<_, String>(core_import::list_source(
+            Path::new(&source),
+            recursive.unwrap_or(true),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Hash-verified dedup for the listed source files: classify each path as new / library-duplicate /
+/// batch-duplicate by BLAKE3 (size-prefiltered, so only genuine candidates are read). Runs in the
+/// background while the list is already visible; emits `import:dedup:progress {done,total,results}`
+/// as it resolves files, and returns the full verdict set.
+#[tauri::command]
+pub async fn import_dedup(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<core_import::DedupResult>, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+        // Brief lock: snapshot present content hashes + sizes (the size set drives the prefilter).
+        let (present_hashes, present_sizes) = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let mut stmt = db
+                .conn
+                .prepare("SELECT content_hash, file_size FROM images WHERE status = 'present'")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(|e| e.to_string())?;
+            let mut hashes = std::collections::HashSet::new();
+            let mut sizes = std::collections::HashSet::new();
+            for row in rows.filter_map(Result::ok) {
+                if row.0.len() == 32 {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&row.0);
+                    hashes.insert(a);
+                }
+                sizes.insert(row.1);
+            }
+            (hashes, sizes)
+        };
+        let files: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let progress_app = app2.clone();
+        let results = core_import::dedup_scan(
+            &files,
+            &present_hashes,
+            &present_sizes,
+            |done, total, batch| {
+                let _ = progress_app.emit(
+                    "import:dedup:progress",
+                    serde_json::json!({"done": done, "total": total, "results": batch}),
+                );
+            },
+        );
+        Ok::<_, String>(results)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Lazy single-file preview for the import list: decode just this one file's embedded preview and
+/// return JPEG bytes. Called on demand (when the user clicks a row), never up front — keeps listing
+/// instant. No catalog access.
+#[tauri::command]
+pub async fn import_thumb(
+    path: String,
+    max_edge: Option<u32>,
+) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let edge = max_edge.unwrap_or(1024);
+        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+        let thumb = core_raw::thumbnail_jpeg(&src, edge, 85).map_err(|e| e.to_string())?;
+        Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Commit a staged import: copy/move/reference only the `selected` source files, then apply
+/// `options` to the freshly-added rows. Emits `import:progress` (live rows) + `import:done`.
+#[tauri::command]
+pub async fn import_commit(
     app: AppHandle,
     source: String,
     mode: String,
     dest: String,
-    recursive: Option<bool>,
+    selected: Vec<String>,
+    options: ImportOptions,
 ) -> Result<core_import::ImportStats, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1356,23 +1588,26 @@ pub async fn import_start(
             "reference" => core_import::ImportMode::Reference,
             _ => core_import::ImportMode::Copy,
         };
+        let files: Vec<PathBuf> = selected.iter().map(PathBuf::from).collect();
         // Gate the FS watcher for the duration of the import so it can't race the now-unlocked
         // per-file copy/process phase (double-decode / duplicate insert). Dropped when this closure
         // returns (success or error), which runs one deferred watcher sync if one was suppressed.
         let _import_guard = crate::watch::ImportGuard::new(app2.clone());
         let progress_app = app2.clone();
-        // Buffer freshly-imported rows and flush them with the progress event so the frontend can
-        // append photos to the grid live (single-threaded blocking import → RefCell is sufficient).
+        // Buffer freshly-imported rows (flush with progress for live grid append) and collect their
+        // ids for the on-import options pass (single-threaded blocking import → RefCell is enough).
         let pending = std::cell::RefCell::new(Vec::<core_library::ImageRow>::new());
-        let stats = core_import::import(
+        let added_ids = std::cell::RefCell::new(Vec::<i64>::new());
+        let stats = core_import::import_files(
             &st.db,
             &st.thumbs,
             Path::new(&source),
+            &files,
             import_mode,
             Path::new(&dest),
-            recursive.unwrap_or(true),
             |done, total, added| {
                 if let Some(row) = added {
+                    added_ids.borrow_mut().push(row.id);
                     pending.borrow_mut().push(row.clone());
                 }
                 // Flush on completion, a full batch, or every 4th file (keeps the counter live even
@@ -1388,8 +1623,11 @@ pub async fn import_start(
             },
         )
         .map_err(|e| e.to_string())?;
+
+        apply_import_options(&st, &added_ids.into_inner(), &options)?;
         enforce_thumb_cap(&st);
         let _ = app2.emit("import:done", &stats);
+        crate::thumb_queue::enqueue_all(&app2);
         Ok::<_, String>(stats)
     })
     .await
@@ -1434,6 +1672,33 @@ pub async fn set_thumb_cache_cap(app: AppHandle, bytes: u64) -> Result<u64, Stri
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Configured display-sharp preview longest edge in px, or `0` when unset (frontend picks a default
+/// from the display on first launch).
+#[tauri::command]
+pub async fn preview_edge(app: AppHandle) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::preview_edge(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Persist the preview longest edge (clamped). Re-enqueues the whole library so images that were
+/// deferred (no preview because the edge was unset) — and any whose preview edge changed — render at
+/// the new size; already-current tiers are cheaply skipped by the worker's pre-check.
+#[tauri::command]
+pub async fn set_preview_edge(app: AppHandle, edge: u32) -> Result<(), String> {
+    {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_preview_edge(&db.conn, edge).map_err(|e| e.to_string())?;
+    }
+    crate::thumb_queue::enqueue_all(&app);
+    Ok(())
 }
 
 // ---------- AI analysis ----------
@@ -1740,19 +2005,30 @@ pub async fn features_backfill(app: AppHandle) -> Result<usize, String> {
 }
 
 /// Real per-image histogram for the Library metadata panel, computed from the cached thumbnail (no
-/// GPU render needed). `None` if the image/thumb is unavailable.
+/// GPU render needed). Reads the SAME canonical/edited render the grid shows (so it matches the
+/// Develop histogram), falling back to the camera placeholder. `None` if nothing is cached yet.
 #[tauri::command]
 pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<Histogram>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
-        let hash = {
+        let (hash, edit_version) = {
             let db = st.db.lock().map_err(|e| e.to_string())?;
-            match core_library::image_by_id(&db.conn, image_id).map_err(|e| e.to_string())? {
+            let hash = match core_library::image_by_id(&db.conn, image_id).map_err(|e| e.to_string())?
+            {
                 Some(r) => r.content_hash,
                 None => return Ok(None),
-            }
+            };
+            let version = core_library::get_edit_with_version(&db.conn, image_id)
+                .ok()
+                .flatten()
+                .map(|(_, v)| v);
+            (hash, version)
         };
-        let Ok(jpeg) = st.thumbs.read(&hash, core_library::THUMB_SIZE) else {
+        let jpeg = edit_version
+            .and_then(|v| st.thumbs.read_edited(&hash, v).ok())
+            .or_else(|| st.thumbs.read_canonical(&hash, PROCESS_VERSION).ok())
+            .or_else(|| st.thumbs.read(&hash, core_library::THUMB_SIZE).ok());
+        let Some(jpeg) = jpeg else {
             return Ok(None);
         };
         Ok(core_pipeline::histogram_from_jpeg(&jpeg))

@@ -1,3 +1,4 @@
+use crate::thumb_queue::ThumbQueue;
 use core_analyze::{AnalyzerRegistry, FaceAnalyzer};
 use core_db::Db;
 use core_library::ThumbCache;
@@ -19,6 +20,9 @@ pub struct AppState {
     pub db: Mutex<Db>,
     pub thumbs: ThumbCache,
     pub gpu: Option<GpuRender>,
+    /// Background queue that renders canonical develop thumbnails so the grid/filmstrip/loupe match
+    /// the editor. The worker thread is spawned in setup; this is its shared control handle.
+    pub thumb_queue: ThumbQueue,
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
     /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
     pub full_render_cache: Mutex<Option<(i64, PreparedImage)>>,
@@ -99,6 +103,7 @@ impl AppState {
             db: Mutex::new(db),
             thumbs,
             gpu,
+            thumb_queue: ThumbQueue::new(),
             full_render_cache: Mutex::new(None),
             latest_render: AtomicU64::new(0),
             last_histogram: Mutex::new(None),

@@ -4,7 +4,7 @@
 
 use core_db::rusqlite::{params, Connection};
 use core_db::Db;
-use core_library::{count_images, query_images, QueryParams};
+use core_library::{count_images, date_tree, query_images, QueryParams};
 
 /// Insert a minimal image row; returns its id. `tag` makes the content_hash unique.
 fn insert_img(
@@ -265,4 +265,90 @@ fn combined_filters_and_limit_offset() {
 fn empty_params_returns_all() {
     let db = seed();
     assert_eq!(count_images(&db.conn, &QueryParams::default()).unwrap(), 4);
+}
+
+/// Insert a row with an explicit (possibly NULL) capture_date; returns its id.
+fn insert_cap(conn: &Connection, tag: u8, capture_date: Option<i64>) -> i64 {
+    conn.execute(
+        "INSERT INTO images(content_hash, file_size, path, original_filename, status,
+            capture_date, imported_at)
+         VALUES (?1, 1024, ?2, ?3, 'present', ?4, 0)",
+        params![
+            vec![tag; 32],
+            format!("/lib/{tag}.CR3"),
+            format!("{tag}.CR3"),
+            capture_date
+        ],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+#[test]
+fn date_tree_groups_by_capture_year_and_day() {
+    let db = Db::open_in_memory().unwrap();
+    let c = &db.conn;
+    insert_cap(c, 1, Some(1_704_067_200)); // 2024-01-01 UTC
+    insert_cap(c, 2, Some(1_719_792_000)); // 2024-07-01 UTC
+    insert_cap(c, 3, Some(1_719_795_600)); // 2024-07-01 UTC (same day, +1h)
+    insert_cap(c, 4, Some(1_735_689_600)); // 2025-01-01 UTC
+    insert_cap(c, 5, None); // Unknown
+
+    let tree = date_tree(c).unwrap();
+
+    // Known years descending, "Unknown" bucket last.
+    let years: Vec<&str> = tree.iter().map(|y| y.year.as_str()).collect();
+    assert_eq!(years, vec!["2025", "2024", "Unknown"]);
+
+    // Year totals sum to the present total; each year's day counts sum to its own total.
+    let total: i64 = tree.iter().map(|y| y.count).sum();
+    assert_eq!(total, count_images(c, &QueryParams::default()).unwrap());
+    assert_eq!(total, 5);
+    for y in &tree {
+        assert_eq!(y.dates.iter().map(|d| d.count).sum::<i64>(), y.count);
+    }
+
+    // 2024 has two days, newest first; the duplicated day collapses to count 2.
+    let y2024 = tree.iter().find(|y| y.year == "2024").unwrap();
+    assert_eq!(y2024.count, 3);
+    let days: Vec<(&str, i64)> = y2024
+        .dates
+        .iter()
+        .map(|d| (d.date.as_str(), d.count))
+        .collect();
+    assert_eq!(days, vec![("2024-07-01", 2), ("2024-01-01", 1)]);
+
+    // NULL capture_date folds into an "Unknown" year + "Unknown" day.
+    let unknown = tree.iter().find(|y| y.year == "Unknown").unwrap();
+    assert_eq!(unknown.count, 1);
+    assert_eq!(unknown.dates.len(), 1);
+    assert_eq!(unknown.dates[0].date, "Unknown");
+}
+
+#[test]
+fn capture_year_and_date_filters() {
+    let db = Db::open_in_memory().unwrap();
+    let c = &db.conn;
+    insert_cap(c, 1, Some(1_704_067_200)); // 2024-01-01
+    insert_cap(c, 2, Some(1_719_792_000)); // 2024-07-01
+    insert_cap(c, 3, Some(1_719_795_600)); // 2024-07-01
+    insert_cap(c, 4, Some(1_735_689_600)); // 2025-01-01
+
+    let by_year = QueryParams {
+        capture_year: Some("2024".into()),
+        ..Default::default()
+    };
+    assert_eq!(count_images(c, &by_year).unwrap(), 3);
+
+    let by_day = QueryParams {
+        capture_date: Some("2024-07-01".into()),
+        ..Default::default()
+    };
+    assert_eq!(count_images(c, &by_day).unwrap(), 2);
+
+    let y2025 = QueryParams {
+        capture_year: Some("2025".into()),
+        ..Default::default()
+    };
+    assert_eq!(count_images(c, &y2025).unwrap(), 1);
 }
