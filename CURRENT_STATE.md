@@ -5,17 +5,68 @@
 
 ## TL;DR
 
-V1 is **functionally complete**, plus a **post-V1 develop-fidelity pass** (review-driven): linear
-**ProPhoto** wide-gamut working space, scene-referred highlights (soft rolloff), **Kelvin white
-balance** (Planckian + Bradford CAT, GPT-5.5-reviewed), independent endpoint blacks/whites, and
-**Detail** (sharpen + luma/color NR) + **Lens vignette** wired. Plus data-safety fixes (dedup keeper,
-mask zero-coverage, histogram race). `cargo test --workspace` (31 suites) + `clippy --workspace
---examples` + `npm run build` all clean. **Caveat:** the "240 CR3" validation is dev-machine-only —
-only 1 CR3 is committed; GPU/real-CR3 tests skip without the fixture/Metal. **Pending your visual QA**
-of the develop changes in-app (`npm run tauri dev`) — the math is verified headless but warmth/rolloff/
-sharpen/vignette _feel_ is subjective (all single-constant tunable).
+V1 is **functionally complete**, plus several post-V1 passes — most recently **develop fidelity: the
+base tone curve fit to the real Adobe Camera Raw default + a Color-balance-RGB grading module**
+(`feat/acr-curve-colorbalance`, merged `d3e1d3e`). Working space is linear wide-gamut **ProPhoto**;
+develop has Kelvin WB (Planckian+Bradford CAT), exposure/contrast/highlights/shadows/blacks/whites,
+tone curve, 8-band HSL, Detail (sharpen + luma/color NR), Lens vignette, **crop/straighten**, the
+**scene-referred ACR-fit base tone operator** (mid-grey 0.18→0.388 ≈65% sRGB), **Color-balance-RGB**,
+local masks (parametric/radial/brush/range), and **full-res viewport render** (canvas + view-rect).
+`cargo test --workspace` + `clippy --workspace --examples` + `npm run build` all clean. **Caveat:** the
+"240 CR3" validation is dev-machine-only — only 1 CR3 is committed; GPU/real-CR3 tests skip without the
+fixture/Metal. **Biggest pending item: in-app visual QA** (`npm run tauri dev`) of the develop look on
+varied real photos — the math is verified headless, but the ACR brightness / grading / crop _feel_ is
+subjective (`BASELINE_GAIN` in `params.rs` is the one brightness knob).
 
-## Latest pass — viewport render (full-res zoom + near-instant edits + mask overlay)
+## Latest pass — ACR tone-curve fit + Color-balance-RGB (develop fidelity)
+
+Branch `feat/acr-curve-colorbalance` (merged to main, `d3e1d3e`). Plan:
+`~/.claude/plans/act-as-senior-software-moonlit-zephyr.md`. Deep notes: memory
+`darkroom-acr-curve-colorbalance`. Began with a 9-agent audit that corrected the handoff docs (they
+lagged by two merged branches: crop/tone-operator/import-lock/AI were already done).
+
+**A. Base tone curve fit to the REAL Adobe default.**
+
+- `crates/core-pipeline/src/base_curve_ref.rs` embeds Adobe's **universal default tone curve** (1025
+  pts, from RawTherapee `adobe_camera_raw_default_curve` in `dcp.cc`). KEY FINDING (via `exiftool`):
+  the on-disk `Canon EOS R7 Adobe Standard.dcp` has **no embedded ProfileToneCurve** → the R7 renders
+  through exactly this universal curve. (DCPs live in `/Library/Application Support/Adobe/CameraRaw/
+CameraProfiles/`.)
+- User chose **match-ACR-brightness** → `params.rs::base_curve_value`/`acr_curve` map mid-grey
+  **0.18 → 0.388 display-linear** (≈65% sRGB, L\*68.6), ~+1.3 EV brighter than the old 0.18→0.18.
+  `tone_amount` (Base curve slider) blends a flat Reinhard (amount=0) → this ACR fit (amount=1, default).
+- **Highlight shoulder (Codex/GPT-5.5 fix):** above x=0.875 the curve follows an asymptotic shoulder
+  `1−(1−y0)/(1+a(x−x0))` (x0=0.875, y0=0.97702, a=10.468) — C¹ at the joint, asymptotes to 1.0, no hard
+  clip corner (avoids highlight banding). The `1−k/(x+k)` form I first planned can't pass through (1,1).
+- **`BASELINE_GAIN`** (`params.rs`, default **1.0**, rides the unused `ExtraUniform.texel.z`, applied
+  scene-linear before grading+curve) is the single visual-QA brightness knob. `examples/measure_midgrey.rs`
+  reports where mid-grey lands (fixture geomean ≈0.086, but that's the scene key — NOT a calibration
+  target; the curve's 0.18→0.388 mapping carries the match since the buffer is white-normalized).
+- Tests: `acr_fit_tests` (RMS L\* < 2.0 vs 16 ref points, via the real LUT-resample path) + updated
+  golden `param_effects::base_curve_tone_response` (0.18→8-bit 167). `PROCESS_VERSION` 3→4.
+
+**B. Color-balance-RGB (`@binding(14)` `CbRgbUniform`)** — faithful SUBSET of darktable `colorbalancergb`.
+
+- Runs scene-linear, after develop+masks, **before** the base tone operator, in **Filmlight/Kirk grading
+  RGB (D65)**. The ProPhoto⇄grading matrices are built in Rust (`params.rs::grading_matrices`, reusing
+  `XYZ_TO_PROPHOTO_D50` + `mat3_inv/mul` + `bradford_cat`), **GPT-5.5-verified** (round-trip 7e-17, cond
+  3.88), and shipped through the uniform (no magic WGSL constants). Grading RGB is NOT neutral-preserving.
+- 4-way: global offset / shadows lift / highlights gain / midtones per-channel power (sign-aware,
+  NaN-safe), each tonal-masked by darktable's exact `opacity_masks` (alpha/beta/gamma; weights 4/4/8,
+  fulcrum 0.5). Plus scene-linear contrast + global chroma. **`CbRgb::is_identity()` → `params.z` active
+  flag: at defaults the shader skips the whole grading round trip → byte-identical render** (goldens
+  unaffected). `CbRgb` on `DevelopParams` (`#[serde(default)]`).
+- Frontend: `ColorBalance.tsx` panel (4 zones × R/G/B + contrast/sat, −100..100 UI), wired through
+  `useDevelop::onColorBalanceChange` → `InstrumentPanel` "Color balance" module.
+- **Deferred tail:** JzAzBz/dtUCS perceptual saturation + brilliance (needs PQ EOTF), per-band sat/
+  brilliance, hue-shift, vibrance, gamut LUT.
+
+**Quick win:** eyedropper disarmed during crop mode (`MaskOverlay.tsx`). **New harnesses:**
+`examples/{measure_midgrey,cb_demo}.rs`. **Codex review** was opted-in + run read-only from plan mode
+(`workspace/logs/codex-curve-review.out`, gitignored; prose summary didn't flush but the numeric
+matrices + tail computations stand and are folded in).
+
+## Prior pass — viewport render (full-res zoom + near-instant edits + mask overlay)
 
 Branch `feat/viewport-render` (merged to main). Render only the **visible viewport at display
 resolution** (RapidRAW pattern): a `<canvas>` viewer + a server-side **view-rect** replace the old
@@ -112,7 +163,9 @@ Views: `views/Library/{LeftNav,ThumbGrid,RightInfo,BottomBar,Loupe,DedupModal}.t
 
 - Library: `app_default_library`, `app_library_root`, `library_query`, `library_count`,
   `library_folders`, `image_meta`, `library_index_root`
-- Develop: `develop_get_edit`, `develop_set_edit`, `develop_render` (returns JPEG ArrayBuffer)
+- Develop: `develop_get_edit`, `develop_set_edit`, `develop_render` (viewport render → **raw RGBA**
+  `[outW u32 LE][outH u32 LE][rgba]`, NOT JPEG), `develop_preview_jpeg` (instant first paint),
+  `develop_get_histogram`, `image_histogram` (Library panel)
 - Export: `export_image`
 - Culling: `cull_set_rating`, `cull_set_flag`, `cull_set_label`,
   `cull_set_rating_many`, `cull_set_flag_many`, `cull_set_label_many` (batch)
@@ -134,7 +187,7 @@ imported_desc|asc}.
 ### Data flow
 
 - **Thumbnails:** `core-raw` extracts embedded preview JPEG → downscale 512px → disk cache keyed by hash → `thumb://` protocol → `<img>`.
-- **Develop:** `core-raw::develop_linear` (rawler demosaic + our own camera→**linear wide-gamut ProPhoto** map via `clip_negative`, keeping >1.0 highlight headroom) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG → `ipc::Response` → `createObjectURL` → stage `<img>`. The shader converts ProPhoto→sRGB only at the display transition.
+- **Develop:** `core-raw::develop_linear` (rawler demosaic + our own camera→**linear wide-gamut ProPhoto** map via `clip_negative`, keeping >1.0 highlight headroom) cached once per image at FULL res (`prepare()` uploads to an `Rgba32Float` texture); slider/zoom/pan → `render_view()` renders only the visible crop-local viewport at display res (uniform rewrites + draw + small readback) → **raw RGBA bytes** → `ipc::Response` → JS paints a `<canvas>` (see "Prior pass — viewport render"). The shader does scene-linear edits → Color-balance-RGB → base tone operator → ProPhoto→sRGB at the display transition. Export re-decodes full-res → full-res render → PNG/JPEG.
 - **Export:** re-decode full-res → `render_once` (full-res GPU) → PNG/JPEG → save dialog dest.
 
 ## Critical technical facts / gotchas (verified against installed crate sources)
@@ -183,17 +236,20 @@ commands; all SQL filters are bound named params (injection-safe).
 
 **Develop fidelity (post-V1, wired + validated):** working space is now **linear wide-gamut
 ProPhoto** ("Melissa RGB") — `core-raw::map_3ch_to_rgb` targets ProPhoto, `develop.wgsl` converts
-ProPhoto→sRGB at the display transition. Scene highlight headroom preserved (`clip_negative`) + soft
-rolloff (no hard pre-OETF clamp). **Kelvin white balance** via Planckian locus (Kim 2002) + Bradford
-CAT on `@binding(8)` (GPT-5.5-reviewed; `wb_matrix(0,0)` is exact identity). Independent endpoint
-blacks/whites. **Detail** (3×3 unsharp sharpen + luma/color NR) + **Lens vignette** on `@binding(9)`.
+ProPhoto→sRGB at the display transition. Scene highlight headroom preserved (`clip_negative`).
+**Kelvin white balance** via Planckian locus (Kim 2002) + Bradford CAT on `@binding(8)` (GPT-5.5-
+reviewed; `wb_matrix(0,0)` is exact identity). Independent endpoint blacks/whites. **Detail** (3×3
+unsharp sharpen + luma/color NR) + **Lens vignette** on `@binding(9)`. **Scene-referred base tone
+operator fit to the real ACR default** (`@binding(10/11)`, `base_curve_ref.rs`; mid-grey 0.18→0.388).
+**Color-balance-RGB** 4-way grading (`@binding(14)`, Filmlight grading RGB). **Crop/straighten**
+(`@binding(12)`). **Viewport render** (`@binding(13)`).
 
 **Crop/straighten — DONE (visual-QA pending), as of `feat/tone-operator-crop`:** GeomUniform
 `@binding(12)` + `crop_to_source`/`sample_bilinear` (the bilinear-remap "helper" the old note asked
 for already exists, `develop.wgsl`), interactive `CropOverlay.tsx`, aspect presets + straighten slider,
-export at true dims via `Crop::export_rect`. Scene-referred **ACR base tone operator** (`@binding(10/11)`)
-and **viewport render** (`@binding(13)`) also landed. **Still UI-only / NOT wired:** Lens distortion /
-chromatic-aberration only (greenfield — no shader math; controls were removed from the UI).
+export at true dims via `Crop::export_rect`. **Still UI-absent / NOT wired:** Lens distortion /
+chromatic-aberration only (greenfield — no shader math, no UI controls yet). **Bindings 0–14 all used;
+next free = 15.**
 
 **Not done (deferred from spec):** keyword hierarchy UI, "recent import" as a true session filter,
 per-display ICC, RCD/AMaZE demosaic, Windows/Linux, notarization, CSP hardening. (Thumbnail LRU
@@ -212,14 +268,23 @@ eviction and FS-watcher reconciliation are DONE — see `thumbs.rs::evict_to` an
 
 ## Suggested next steps (priority order)
 
-See **TODO.md → "Leftovers / next"** for the authoritative list. In short:
+See **TODO.md → top "DONE/NEXT" section** for the authoritative list. In short:
 
-1. **Visual QA** the develop fidelity in-app (Temp/Tint/Highlights/Sharpen/Vignette on real CR3);
-   tune the single constants if the feel is off (mired span, rolloff shoulder, NR/sharpen strength).
-2. **Lens distortion / chromatic-aberration** (the only still-UI-only geometric module; greenfield —
-   reuse `sample_bilinear` for a radial UV / per-channel scale). Crop/straighten is DONE.
-3. **Develop fidelity push** (in progress): ACR base tone-curve fit + Color-balance-RGB (`@binding(14)`).
-4. Higher-leverage review items not yet done: dedup orientation-normalize before dHash; per-mask
-   WB-as-CAT; bilateral (not box) NR; loupe ≥1536px preview; export full-res cache.
-5. Pre-distribution only (de-scoped while personal): CSP hardening, command path-scoping, ort dylib
-   bundling, codesign + notarize, core-analyze/src-tauri tests.
+1. **In-app visual QA** (`npm run tauri dev`) — the #1 pending item. Confirm the brighter ACR default
+   - Color balance panel + crop/straighten + Temp/Tint/Sharpen/Vignette on varied real CR3. Tune
+     `BASELINE_GAIN` (`params.rs`, default 1.0) if the default look is too bright/dark. The math is
+     verified headless; the look is subjective.
+2. **Develop fidelity continuation** (now unblocked by the curve fit): Lightroom `.xmp` preset import
+   (new `core-preset` crate); clarity/texture/dehaze (needs a multi-scale blur beyond the 3×3);
+   color-balance perceptual tail (JzAzBz sat/brilliance, per-band, hue-shift, vibrance); grain /
+   channel-mixer / HaldCLUT.
+3. **Lens distortion / chromatic-aberration** (the only UI-absent geometric module; greenfield —
+   reuse `sample_bilinear` for a radial UV / per-channel scale on a fresh binding).
+4. **Viewport leftovers:** whole-crop histogram pass (`commands.rs` TODO); extract the shared
+   Stage/Loupe `useViewport` hook (~200 LOC dup); tiered preview source; B0 native-GPU-surface spike.
+5. Higher-leverage review items: dedup orientation-normalize before dHash; per-mask WB-as-CAT;
+   bilateral (not box) NR; loupe ≥1536px preview; export full-res cache.
+6. AI tail: ort dylib bundling (HIGH iff distributing a built `.app`), Florence-2 KV-cache,
+   PresenceProbe calibration. Tests: `src-tauri`/`core-db`/`core-analyze` have 0 integration tests.
+7. Pre-distribution only (de-scoped while personal): CSP hardening, command path-scoping, codesign +
+   notarize.

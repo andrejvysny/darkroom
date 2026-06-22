@@ -2,26 +2,46 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
-## DONE: ACR tone-curve fit + Color-balance-RGB (develop-fidelity pass)
+## DONE: ACR tone-curve fit + Color-balance-RGB (develop-fidelity pass) — MERGED `d3e1d3e`
 
-> Branch `feat/acr-curve-colorbalance`. Plan: `~/.claude/plans/act-as-senior-software-moonlit-zephyr.md`.
+> Branch `feat/acr-curve-colorbalance`, **merged to `main`** (`d3e1d3e`). Plan:
+> `~/.claude/plans/act-as-senior-software-moonlit-zephyr.md`. Deep notes: memory
+> `darkroom-acr-curve-colorbalance`. All workspace tests + clippy + npm build green.
 
-- [x] **Base tone curve fit to real ACR** (`base_curve_ref.rs` = Adobe universal default curve, 1025
-      pts from RawTherapee `dcp.cc`; the R7 Adobe-Standard DCP has no embedded ProfileToneCurve). Maps
-      mid-grey 0.18→0.388 (≈65% sRGB) so unedited imports match the Lightroom default brightness
-      (~+1.3 EV vs before). Codex-reviewed asymptotic highlight shoulder (no hard clip). Golden
-      `param_effects::base_curve_tone_response` + `acr_fit_tests` (RMS L\* < 2.0). `BASELINE_GAIN`
-      (`EX.texel.z`, default 1.0) is the visual-QA knob. `PROCESS_VERSION` 3→4.
+- [x] **Base tone curve fit to real ACR** (`core-pipeline/src/base_curve_ref.rs` = Adobe universal
+      default curve, 1025 pts from RawTherapee `dcp.cc`; verified via `exiftool` the R7 Adobe-Standard
+      DCP has no embedded ProfileToneCurve → renders through this universal curve). Maps mid-grey
+      0.18→0.388 (≈65% sRGB) so unedited imports match the Lightroom default brightness (~+1.3 EV vs
+      before). `acr_curve` blends flat Reinhard (amount=0) → ACR fit (amount=1=default `tone_amount`).
+      Codex-reviewed C¹ asymptotic highlight shoulder (x>0.875; the `1−k/(x+k)` form can't pass (1,1)).
+      Golden `param_effects::base_curve_tone_response` (0.18→8-bit 167) + `acr_fit_tests` (RMS L\* < 2.0).
+      `BASELINE_GAIN` (`params.rs`, default 1.0, rides `ExtraUniform.texel.z`) = the visual-QA brightness
+      knob; `examples/measure_midgrey.rs` reports mid-grey placement. `PROCESS_VERSION` 3→4.
 - [x] **Color-balance-RGB** (`@binding(14)` `CbRgbUniform`) — faithful subset of darktable
-      `colorbalancergb`: 4-way (global/shadows/midtones/highlights) + scene-linear contrast +
-      saturation, in the GPT-5.5-verified Filmlight grading RGB (`grading_matrices`), tonal opacity
-      masks. Identity at defaults (byte-identical render). `ColorBalance.tsx` panel. Tests:
-      `grading_space_tests`, `color_balance_*` (GPU).
+      `colorbalancergb`: 4-way (global offset / shadows lift / highlights gain / midtones per-channel
+      power) + scene-linear contrast + global chroma, in the GPT-5.5-verified Filmlight grading RGB
+      (`params.rs::grading_matrices`, round-trip 7e-17), with darktable's exact `opacity_masks`. Runs
+      scene-linear BEFORE the base tone operator. `CbRgb::is_identity()`→active flag ⇒ defaults skip the
+      round trip (byte-identical render). `ColorBalance.tsx` panel + `useDevelop::onColorBalanceChange`.
+      Tests: `grading_space_tests`, `color_balance_*` (GPU). Deferred tail: JzAzBz perceptual sat/
+      brilliance, per-band sat, hue-shift, vibrance, gamut LUT.
 - [x] Quick win: eyedropper disarmed during crop mode (`MaskOverlay.tsx`).
-- [ ] **Visual QA in-app** (`npm run tauri dev`): confirm the brighter ACR default on varied photos +
-      tune `BASELINE_GAIN` if needed; exercise the Color balance panel.
-- [ ] **Codex follow-up** (optional): the prose summary didn't flush; the numeric review stands
-      (`workspace/logs/codex-curve-review.out`). Re-run if extending the curve/grading math.
+
+### NEXT (after this pass, prioritized)
+
+- [ ] **In-app visual QA** (`npm run tauri dev`) — THE #1 pending item. Confirm the brighter ACR
+      default + Color balance panel + crop/straighten + Temp/Tint/Sharpen/Vignette on varied real CR3.
+      Tune `BASELINE_GAIN` if the default look wants nudging. Math verified headless; look is subjective.
+- [ ] **Lightroom `.xmp` preset import** (now unblocked) — new `core-preset` crate mapping `crs:` keys
+      → `DevelopParams` (~70%: exposure/WB/contrast/tone-curve/HSL/sat/color-grading). Sidecar JSON can
+      grow an XMP-`crs:` bridge.
+- [ ] **Clarity / texture / dehaze** (local contrast) — needs a multi-scale (Gaussian/bilateral) blur
+      beyond the current 3×3. New binding(s) ≥15.
+- [ ] **Color-balance perceptual tail:** JzAzBz/dtUCS saturation + brilliance (PQ EOTF), per-band sat,
+      hue-shift, vibrance, gamut soft-clip.
+- [ ] Smaller wins: grain (noise LUT), channel mixer (3×3 linear), HaldCLUT/.cube (3D texture).
+- [ ] **Codex follow-up** (optional): the plan-mode prose summary didn't flush; the numeric review
+      stands (`workspace/logs/codex-curve-review.out`, gitignored). Re-run if extending the math.
 
 ## DONE: Viewport render — full-res zoom + near-instant edits + mask overlay
 
@@ -164,10 +184,13 @@
       hashing (rotation-sensitive); per-mask WB as a CAT (currently per-channel gain delta);
       bilateral/edge-aware NR (currently a plain 3×3 box → softens edges); dedicated loupe preview
       (≥1536px, not upscaled 512 thumb); cache full-res developed buffer for repeat export.
-- [ ] **Minor / honesty:** aspect-correct the linear gradient mask (`mask_prepass.wgsl::linear_cov`,
-      needs FE+BE coord consistency); decide brush `flow` (wire buildup off MAX-blend, or remove from
-      schema+UI); frontend nits (init `selectedId` to null not `6`; re-key `Stage` zoom/pan on
-      `selectedId` not `imageUrl`; remove the fake `RightInfo` histogram + dead Filmstrip zoom/1:1).
+- [ ] **Viewport leftovers:** whole-crop histogram pass (current histogram is viewport-biased, TODO in
+      `commands.rs`); extract a shared `useViewport` hook (`Stage.tsx`/`Loupe.tsx` duplicate ~200 LOC);
+      tiered preview source (preview-res for fit, full-res on zoom); B0 native-GPU-surface spike.
+- [ ] **Minor:** aspect-correct the linear gradient mask (`mask_prepass.wgsl::linear_cov`, needs FE+BE
+      coord consistency); decide brush `flow` (wire buildup off MAX-blend, or remove from schema+UI).
+      (DONE already: real Library histogram, `selectedId` inits null, Stage re-key on `selectedId`,
+      eyedropper-vs-crop guard — don't re-flag these.)
 - [ ] **Pre-distribution only** (de-scoped while personal/single-user): CSP hardening; canonicalize
       `export_image`/`import_start`/`library_index_root` dest/source/path against allowed roots in the
       Rust command layer; ort dylib bundling (`externalBin`/frameworks) so the AI feature loads in a
@@ -301,10 +324,11 @@ Quality: `cargo test --workspace` (31 suites, all green) · `cargo clippy --work
       `ExtraUniform`; goldens in `param_effects.rs`.
 - [x] **Lens vignette** — radial darken/brighten in the display stage (`@binding(9)`). Dead
       Profile/CA toggles removed.
-- [ ] **Crop / geometry** (aspect + straighten angle) — still UI-only. Needs bilinear remap +
-      export-aware output dims/overlay + interactive crop box + **visual QA**.
-- [ ] **Lens distortion / chromatic-aberration** (manual k1 / per-channel radial) — still UI-only.
-      Needs the same bilinear-remap infra + visual QA.
+- [x] **Crop / geometry** (aspect + straighten angle) — DONE (`@binding(12)`, `crop_to_source` +
+      `sample_bilinear`, `CropOverlay.tsx`, export at true dims). Visual-QA pending.
+- [x] **Base tone operator + Color-balance-RGB** — DONE (`@binding(10/11/14)`; see top section).
+- [ ] **Lens distortion / chromatic-aberration** (manual k1 / per-channel radial) — still UI-absent
+      (greenfield). Reuse the `sample_bilinear`/UV-remap infra on a fresh binding ≥15 + visual QA.
 
 ### Performance / robustness
 
@@ -349,8 +373,9 @@ Quality: `cargo test --workspace` (31 suites, all green) · `cargo clippy --work
   ProPhoto→sRGB at the display transition (`PP_TO_SRGB`, derived in
   `core-raw/examples/print_color_matrices.rs`). Global WB is a **CAT mat3 on `@binding(8)`**
   (`params.rs::wb_matrix`, Planckian+Bradford, identity at temp=0); `ParamsUniform.wb_gain` stays
-  identity. Detail/vignette = `ExtraUniform` on `@binding(9)`. Bindings 0–13 are now all wired
-  (10 ToneOp, 11 base_lut, 12 Geom crop/straighten, 13 View viewport/overlay); **next free = 14**.
+  identity. Detail/vignette = `ExtraUniform` on `@binding(9)`. Bindings 0–14 are now all wired
+  (10 ToneOp, 11 base_lut, 12 Geom crop/straighten, 13 View viewport/overlay, 14 CbRgb color-balance);
+  **next free = 15**. `ExtraUniform.texel.z` carries `BASELINE_GAIN` (ACR-brightness knob, default 1.0).
 - Keep ALL rawler calls in `core-raw` (pinned `=0.7.2`, non-SemVer).
 - `rusqlite 0.39` / `rusqlite_migration =2.5.0` pinned for rustc 1.91 — don't bump without checking MSRV.
 - wgpu is `=29`; its API differs a lot from older majors (see CURRENT_STATE.md).
