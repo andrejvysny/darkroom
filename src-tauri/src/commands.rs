@@ -195,14 +195,9 @@ fn index_root_blocking(
     // ids are cheaply skipped by the worker's pre-check).
     crate::thumb_queue::enqueue_all(app);
 
-    // Auto-analyze newly indexed images in the background — but only if the models are already
-    // downloaded (never trigger a ~400 MB download implicitly). First-time analysis is explicit.
-    if analyze && stats.added > 0 && crate::analysis::models_ready(st) {
-        let app3 = app.clone();
-        std::thread::spawn(move || {
-            let _ = crate::analysis::run_pass(&app3, false);
-        });
-    }
+    // The AI scan is fully MANUAL — one unified pass triggered from the UI. Nothing auto-runs after
+    // import, so a 10k–100k library never kicks off a multi-hour background job on its own.
+    let _ = analyze;
     Ok(stats)
 }
 
@@ -1797,13 +1792,38 @@ pub async fn faces_run(app: AppHandle, force: bool) -> Result<crate::faces::Face
         .map_err(|e| e.to_string())?
 }
 
-/// Request the running face pass to stop after the current batch commits. No-op if idle.
+/// Request the running scan to stop after the current batch commits. No-op if idle. Faces run inside
+/// the unified scan, so this shares the analysis cancel flag.
 #[tauri::command]
 pub fn faces_cancel(app: AppHandle) {
     let st = app.state::<AppState>();
-    if st.faces_running.load(Ordering::SeqCst) {
-        st.faces_cancel.store(true, Ordering::SeqCst);
+    if st.analysis_running.load(Ordering::SeqCst) {
+        st.analysis_cancel.store(true, Ordering::SeqCst);
     }
+}
+
+/// Whether the face stage participates in the unified AI scan (Settings toggle; default on).
+#[tauri::command]
+pub async fn face_stage_enabled(app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::face_stage_enabled(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Enable/disable the face stage in the unified scan.
+#[tauri::command]
+pub async fn set_face_stage_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_face_stage_enabled(&db.conn, enabled).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// People for the sidebar (named first, then unnamed "Suggested" clusters); each with a cover crop.
@@ -1954,6 +1974,10 @@ pub async fn face_assign(
 pub async fn faces_delete_all(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
+        // Guard against an in-flight scan repopulating the data we're about to wipe.
+        if st.analysis_running.load(Ordering::SeqCst) {
+            return Err("an AI scan is running — stop it before deleting face data".into());
+        }
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         let tx = db.conn.transaction().map_err(|e| e.to_string())?;
         core_library::delete_all_face_data(&tx).map_err(|e| e.to_string())?;

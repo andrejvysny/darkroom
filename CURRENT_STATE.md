@@ -5,6 +5,14 @@
 
 ## TL;DR
 
+**Newest work — branch `feat/unified-ai-pipeline`, UNMERGED / uncommitted:** the two separate on-device
+AI passes — object detection (auto-after-import) + face recognition (manual "Find People") — are merged
+into ONE manual scan for **10k–100k-image libraries** (single shared decode, per-stage dirty-DAG,
+deferred captions, data-safe face reconcile). `cargo test --workspace` + `clippy` + `npx tsc --noEmit`
+clean; **NOT committed** (working-tree changes) and **in-app GUI QA + an independent Codex cross-check
+are still pending**. Details: "Latest work — Unified AI pipeline" below; design + rationale in memory
+`darkroom-unified-ai-pipeline`; fix plan `~/.claude/plans/act-as-senior-ai-linear-tome.md`.
+
 V1 is **functionally complete**, plus several post-V1 passes — most recently **develop fidelity: the
 base tone curve fit to the real Adobe Camera Raw default + a Color-balance-RGB grading module**
 (`feat/acr-curve-colorbalance`, merged `d3e1d3e`). Working space is linear wide-gamut **ProPhoto**;
@@ -17,6 +25,48 @@ local masks (parametric/radial/brush/range), and **full-res viewport render** (c
 fixture/Metal. **Biggest pending item: in-app visual QA** (`npm run tauri dev`) of the develop look on
 varied real photos — the math is verified headless, but the ACR brightness / grading / crop _feel_ is
 subjective (`BASELINE_GAIN` in `params.rs` is the one brightness knob).
+
+## Latest work — Unified AI pipeline (branch `feat/unified-ai-pipeline`, UNMERGED / uncommitted)
+
+Merges the two on-device AI passes into ONE manual scan for **10k–100k libraries**. Coordinator =
+`src-tauri/src/analysis.rs::run_pass`, one job (single `analysis_running` guard + `analysis_cancel`):
+
+- **Single shared decode** — `core_raw::preview_with_orientation` decodes the embedded JPEG ONCE →
+  native ≤1024 (object detectors) + EXIF-oriented ≤1536 (faces); byte-equivalent to the old separate
+  `preview_image`/`oriented_preview` (proven by `crates/core-raw/tests/decode_once.rs`) → no model
+  re-validation.
+- **Per-stage dirty-DAG** — `core_library::stale_targets`/`stale_count`/`present_targets_after`
+  (keyset-paginated, `status='ok'` gate, never OFFSET; each image runs only its STALE stages). Bumping
+  one stage no longer re-runs all (incl. MegaDetector@~0.95 s) across the library.
+- **Phase A** detection + faces → **clustering** → **Phase B** captions (deferred; Florence built
+  lazily via `build_captioner`, kept out of the Phase-A memory peak, dropped after).
+- **Key CV decision (Codex-reviewed reframe):** NO upstream person-gate — SCRFD self-gates
+  ArcFace/clustering (a body-detection gate would miss portraits/headshots and save little). Faces
+  auto-participate when enabled (`face_stage_enabled`, default on) AND models present — never an
+  implicit 190 MB download.
+- **Face data-safety** — `core_library::reconcile_faces` (IoU-match) REPLACES the destructive
+  `insert_faces`: a re-scan preserves stable face id + `person_id` + confirmed/rejected + cover, and a
+  face clustering assigned to a person is NEVER dropped. Face inference errors no longer become a
+  "0 faces" success (they retry). Clustering is EXACT pairwise (0.45 threshold) — ANN
+  (instant-distance HNSW) is the documented lever for >~200 k faces.
+- **Migrations** `012` (`images(status,id)` keyset index) + `013` (`json_extract` clears suspect legacy
+  zero-face `face_detection` markers).
+- **IPC:** auto-after-import trigger REMOVED (fully manual); `faces_run`/`faces_cancel`/`faces_status`
+  are thin shims over the unified pass; new `face_stage_enabled` / `set_face_stage_enabled` (Settings
+  "Detect people" toggle). Progress + completion ride ONE `analysis:*` stream (`useFaces` rewired off
+  `faces:*`; `faces:models` kept for downloads).
+
+Built in 6 phases (0–5) + a 3-aspect review (R1 correctness/data-safety, R2 perf/scale, R3 clean-code;
+Codex was usage-limited so Claude review agents ran — **Codex cross-check still pending**). Regression
+tests: `reconcile_keeps_person_assigned_unconfirmed_face`, `mismatched_dim_face_excluded`,
+`json_extract_targets_only_zero_face_markers`, `decode_once`, `stale_targets_*`.
+
+**Pending:** (1) **in-app GUI QA** (`npm run tauri dev`) — one scan does detection+faces+captions; one
+progress bar; People populate before captions; a confirmed/assigned face survives a re-scan; cancel +
+`faces_delete_all`-during-scan behave. (2) **Codex cross-check** — re-run the 3 Codex agents after the
+OpenAI usage limit resets (~Jun 23 00:44); fold findings in. (3) **commit the branch.** (4) Deferred:
+full Phase-A/B `run_pass` fn-split (cosmetic), ANN clustering for >200 k faces. NOTE: this work adds NO
+GPU bindings — the develop pipeline's "next free = 15" is unchanged.
 
 ## Latest pass — ACR tone-curve fit + Color-balance-RGB (develop fidelity)
 
@@ -175,6 +225,15 @@ Views: `views/Library/{LeftNav,ThumbGrid,RightInfo,BottomBar,Loupe,DedupModal}.t
   `collection_rename`, `collection_delete`, `collection_add_images`, `collection_remove_images`
 - Dedup: `dedup_scan`, `dedup_resolve`
 - Import: `import_start`
+- AI scan / People (**unified manual pass** — `feat/unified-ai-pipeline`): `analysis_status`,
+  `analysis_run(force)`, `analysis_cancel`, `analysis_models_ensure`, `analysis_facets`,
+  `analysis_detector_size`/`set_analysis_detector_size`, `face_stage_enabled`/`set_face_stage_enabled`,
+  `image_detections`, `image_caption`; People — `faces_run`/`faces_cancel`/`faces_status`/
+  `faces_models_ensure` (now **shims** over the unified pass), `people_list`, `person_faces`,
+  `image_faces`, `person_set_name`/`person_set_hidden`/`person_set_cover`, `person_merge`,
+  `face_confirm`/`face_reject`/`face_assign`, `faces_delete_all`. Events: `analysis:{models,progress,done}`
+  (single stream — `{phase:"detect"|"caption",done,total}`) + `faces:models` (download only).
+  `library_index_root`'s `analyze` flag is now a **no-op** (scan is fully manual).
 
 `QueryParams` filter dimensions: `folder_id`, `min_stars`, `flag`, `color_label`
 (`"__none__"` = unlabeled), `keyword_id`, `collection_id`, `import_session_id`, `search`

@@ -20,9 +20,10 @@ pub mod thumbs;
 
 pub use analysis::{
     analysis_facets, caption_for_image, detections_for_image, existing_analysis, insert_analysis,
-    labeled_images, presence_for_image, present_image_count, present_images, set_user_label,
-    set_user_label_many, user_labels, AnalysisInput, AnalyzeTarget, CaptionRow, DetectionRow,
-    FacetRow, LabeledImage, PresenceRow, UserLabels,
+    labeled_images, presence_for_image, present_image_count, present_images, present_targets_after,
+    set_user_label, set_user_label_many, stale_count, stale_targets, user_labels, AnalysisInput,
+    AnalyzeTarget, CaptionRow, DetectionRow, FacetRow, LabeledImage, PresenceRow, StageSpec,
+    StaleTarget, UserLabels,
 };
 pub use collections::{
     add_images_to_collection, collections_for_image, create_collection, delete_collection,
@@ -34,11 +35,11 @@ pub use error::LibError;
 pub use events::{append_event, event_count, ids_json, Event};
 pub use face::{
     assign_face_person, confirm_face, create_person, delete_all_face_data, faces_for_clustering,
-    faces_summary, image_faces, insert_faces, list_people, merge_people, person_faces,
-    prune_empty_unnamed, reject_face, set_person_cover, set_person_hidden, set_person_name,
-    FaceInput, ImageFaceRow, PersonFaceRow, PersonRow,
+    faces_summary, image_faces, list_people, merge_people, person_faces, prune_empty_unnamed,
+    reconcile_faces, reject_face, set_person_cover, set_person_hidden, set_person_name, FaceInput,
+    ImageFaceRow, PersonFaceRow, PersonRow,
 };
-pub use face_cluster::{cluster_assign, ClusterParams, ClusterStats};
+pub use face_cluster::{cluster_assign, has_dirty_faces, ClusterParams, ClusterStats};
 pub use features::{
     compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
 };
@@ -57,9 +58,10 @@ pub use query::{
 };
 pub use reconcile::{reconcile, ReconcileStats};
 pub use settings::{
-    animal_detector_size, get_meta, library_root, preview_edge, set_animal_detector_size,
-    set_library_root, set_meta, set_preview_edge, set_thumb_cache_cap, thumb_cache_cap,
-    DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP, PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
+    animal_detector_size, face_stage_enabled, get_meta, library_root, preview_edge,
+    set_animal_detector_size, set_face_stage_enabled, set_library_root, set_meta, set_preview_edge,
+    set_thumb_cache_cap, thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP,
+    PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
 };
 pub use sidecar::{
     hydrate_if_blank, rebuild_from_sidecars, write_all_sidecars, write_sidecar, Sidecar,

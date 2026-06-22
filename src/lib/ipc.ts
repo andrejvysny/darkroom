@@ -1073,6 +1073,15 @@ export function setAnalysisDetectorSize(size: number): Promise<void> {
   return invoke<void>("set_analysis_detector_size", { size });
 }
 
+/** Whether the face stage runs as part of the unified AI scan (default on; needs face models). */
+export function faceStageEnabled(): Promise<boolean> {
+  return invoke<boolean>("face_stage_enabled", {});
+}
+
+export function setFaceStageEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>("set_face_stage_enabled", { enabled });
+}
+
 // ── Faces / People ───────────────────────────────────────────────────────────
 
 /** Face lifecycle status. */

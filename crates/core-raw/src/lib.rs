@@ -12,7 +12,7 @@ pub use develop::{as_shot_wb, develop_linear, develop_linear_preview, LinearImag
 pub use error::RawError;
 pub use hash::{content_hash, hash_file, hex};
 pub use meta::{capture_fingerprint, read_metadata, RawMeta};
-pub use thumb::{oriented_preview, preview_image, thumbnail_jpeg, Thumb};
+pub use thumb::{oriented_preview, preview_image, preview_with_orientation, thumbnail_jpeg, Thumb};
 
 pub use rawler::rawsource::RawSource;
 

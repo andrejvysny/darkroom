@@ -7,6 +7,7 @@
 //! rejected faces are sticky — never auto-reassigned — and `face_rejection` pairs are never re-suggested.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use core_db::rusqlite::{params, Connection};
 use serde::Serialize;
@@ -44,18 +45,40 @@ pub struct ClusterStats {
     pub deferred: usize,
 }
 
+/// Candidate faces re-checked between cancel polls during a long bulk cluster, so a multi-hour scan's
+/// clustering phase stays responsive. Partial work commits (assignments are independent + idempotent;
+/// unprocessed dirty faces stay unassigned and resume next pass).
+const CANCEL_CHECK_EVERY: usize = 256;
+
 fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
-    // Both L2-normalized ⇒ cosine distance = 1 − dot.
+    // Both L2-normalized ⇒ cosine distance = 1 − dot. Callers only pass equal-length vectors (the
+    // dim guard in `cluster_assign` excludes mismatched ones), so the zip covers the full vector.
     1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
+}
+
+/// True if any face at `model_tag` still needs clustering (unassigned + non-sticky). Lets the caller
+/// skip the whole pass when nothing changed — clustering is otherwise re-run on every scan.
+pub fn has_dirty_faces(conn: &Connection, model_tag: &str) -> Result<bool, LibError> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM face f JOIN face_embedding e ON e.face_id = f.id
+          WHERE e.model_tag = ?1 AND f.person_id IS NULL
+            AND f.status NOT IN ('rejected','ignored')",
+        params![model_tag],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Run one incremental clustering pass over every embedded face at `model_tag`. Assigned/confirmed
 /// faces are left in place; only unassigned (`person_id IS NULL`) non-rejected faces are placed.
+/// `cancel` is polled periodically — on cancellation the work done so far is committed and the pass
+/// returns early (remaining dirty faces resume on the next run).
 pub fn cluster_assign(
     conn: &mut Connection,
     model_tag: &str,
     now: i64,
     p: ClusterParams,
+    cancel: &AtomicBool,
 ) -> Result<ClusterStats, LibError> {
     // Quality-sorted so the best faces seed clusters first.
     let mut faces = faces_for_clustering(conn, model_tag)?;
@@ -63,20 +86,45 @@ pub fn cluster_assign(
     let n = faces.len();
     let mut stats = ClusterStats::default();
 
+    // Vectors are read IN PLACE (no n×dim matrix copy) — the neighbor scan stays EXACT pairwise, so
+    // the validated 0.45 threshold needs no recalibration, and an incremental pass over a 100k-image
+    // library doesn't allocate hundreds of MB. The outer loop only visits dirty (unassigned,
+    // non-sticky) faces → O(dirty × n); a one-time bulk cluster is O(n²), dwarfed by detection at
+    // scale — for >~200k faces, swap this exact scan for an ANN index (e.g. instant-distance HNSW).
+    //
+    // A face whose embedding length differs from the model's dim (corrupt / mixed model) is EXCLUDED
+    // rather than zero-padded: padding would shrink cosine distance and cause false merges.
+    let dim = faces.first().map(|f| f.vector.len()).unwrap_or(0);
+    let valid: Vec<bool> = faces
+        .iter()
+        .map(|f| dim > 0 && f.vector.len() == dim)
+        .collect();
+
     let tx = conn.transaction()?;
+    let mut since_poll = 0usize;
     for i in 0..n {
-        if faces[i].person_id.is_some()
+        if !valid[i]
+            || faces[i].person_id.is_some()
             || faces[i].status == "rejected"
             || faces[i].status == "ignored"
         {
             continue;
         }
-        // Tally neighbors within threshold.
+        // Cooperative cancel: commit the (independent, idempotent) assignments done so far.
+        since_poll += 1;
+        if since_poll >= CANCEL_CHECK_EVERY {
+            since_poll = 0;
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        // Tally neighbors within threshold (exact cosine distance = 1 − dot).
         let mut person_count: HashMap<i64, usize> = HashMap::new();
         let mut person_best: HashMap<i64, f32> = HashMap::new();
         let mut unassigned_neighbors: Vec<usize> = Vec::new();
         for j in 0..n {
-            if j == i || faces[j].status == "rejected" || faces[j].status == "ignored" {
+            if j == i || !valid[j] || faces[j].status == "rejected" || faces[j].status == "ignored"
+            {
                 continue;
             }
             let d = cosine_dist(&faces[i].vector, &faces[j].vector);
@@ -168,7 +216,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::face::{faces_for_clustering, insert_faces, list_people, FaceInput};
+    use crate::face::{faces_for_clustering, list_people, reconcile_faces, FaceInput};
     use core_db::Db;
 
     const TAG: &str = "test_v1";
@@ -215,11 +263,18 @@ mod tests {
         {
             let tx = db.conn.transaction().unwrap();
             for (img, e) in &groups {
-                insert_faces(&tx, *img, "mv", TAG, 0, &[face_with(e.to_vec())]).unwrap();
+                reconcile_faces(&tx, *img, "mv", TAG, 0, &[face_with(e.to_vec())]).unwrap();
             }
             tx.commit().unwrap();
         }
-        let stats = cluster_assign(&mut db.conn, TAG, 0, ClusterParams::default()).unwrap();
+        let stats = cluster_assign(
+            &mut db.conn,
+            TAG,
+            0,
+            ClusterParams::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(stats.new_people, 2, "two clusters");
         assert_eq!(stats.assigned, 6, "6 of 7 faces assigned");
         assert_eq!(stats.deferred, 1, "singleton deferred");
@@ -233,5 +288,49 @@ mod tests {
             .filter(|f| f.person_id.is_none())
             .count();
         assert_eq!(unassigned, 1);
+    }
+
+    /// A face whose embedding dim differs from the model's is EXCLUDED (not zero-padded into a false
+    /// merge): it stays unassigned while the consistent-dim faces still cluster.
+    #[test]
+    fn mismatched_dim_face_excluded() {
+        let mut db = Db::open_in_memory().unwrap();
+        for id in 1..=4 {
+            db.conn
+                .execute(
+                    "INSERT INTO images(id, content_hash, file_size, path, original_filename, status, imported_at)
+                     VALUES (?1, X'00', 1, ?2, 'f', 'present', 0)",
+                    params![id, format!("/img{id}")],
+                )
+                .unwrap();
+        }
+        {
+            let tx = db.conn.transaction().unwrap();
+            // Three consistent 3-dim faces (one cluster) + one corrupt 2-dim face near them.
+            reconcile_faces(&tx, 1, "mv", TAG, 0, &[face_with(vec![1.0, 0.02, 0.0])]).unwrap();
+            reconcile_faces(&tx, 2, "mv", TAG, 0, &[face_with(vec![1.0, 0.0, 0.03])]).unwrap();
+            reconcile_faces(&tx, 3, "mv", TAG, 0, &[face_with(vec![0.99, 0.01, 0.0])]).unwrap();
+            reconcile_faces(&tx, 4, "mv", TAG, 0, &[face_with(vec![1.0, 0.0])]).unwrap();
+            tx.commit().unwrap();
+        }
+        cluster_assign(
+            &mut db.conn,
+            TAG,
+            0,
+            ClusterParams::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let faces = faces_for_clustering(&db.conn, TAG).unwrap();
+        let corrupt = faces.iter().find(|f| f.vector.len() == 2).unwrap();
+        assert!(
+            corrupt.person_id.is_none(),
+            "mismatched-dim face must not be clustered"
+        );
+        assert_eq!(
+            list_people(&db.conn, false).unwrap().len(),
+            1,
+            "valid faces still cluster"
+        );
     }
 }
