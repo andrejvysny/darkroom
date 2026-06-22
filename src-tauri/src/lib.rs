@@ -14,8 +14,7 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[allow(unused_mut)]
-    let mut builder = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init());
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
 
     // Tier-3 E2E: real-backend UI automation via the tauri-plugin-playwright socket bridge.
     // Behind a feature + optional dep so it is never compiled into release builds.
@@ -98,7 +97,6 @@ pub fn run() {
             commands::develop_render,
             commands::develop_regen_thumb,
             commands::develop_preview_jpeg,
-            commands::loupe_jpeg,
             commands::thumb_prioritize,
             commands::develop_session,
             commands::develop_get_histogram,

@@ -5,8 +5,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { thumbUrl, developGetEdit, developRender } from "../../lib/ipc";
-import type { ImageRow, RenderedFrame } from "../../lib/ipc";
+import {
+  thumbUrl,
+  developGetEdit,
+  developRender,
+  effectivePreviewEdge,
+} from "../../lib/ipc";
+import type { DevelopParams, ImageRow, RenderedFrame } from "../../lib/ipc";
 import { useAppStore } from "../../store/app";
 import { freshDefaults } from "../../store/develop";
 import {
@@ -31,12 +36,21 @@ export default function Loupe({ image }: LoupeProps) {
   const viewStateRef = useRef<ViewState>(viewState);
   viewStateRef.current = viewState;
 
-  // The rendered frame's pixel dims = sensor dims × the saved crop extent (set once params load).
-  // Using sensor dims when a crop is saved would distort the view rect for cropped images.
-  const [cropExtent, setCropExtent] = useState({ hw: 0.5, hh: 0.5 });
-  const natural = {
-    w: Math.max(1, (image.width ?? 3) * cropExtent.hw * 2),
-    h: Math.max(1, (image.height ?? 2) * cropExtent.hh * 2),
+  // The display-sharp preview (crop-applied, so its dims ARE the cropped-frame aspect → no letterbox
+  // and a 1:1 match with `develop_render`). Drawn directly at fit/light zoom (no GPU/IPC); only deep
+  // zoom past its resolution falls back to the full-res `develop_render`.
+  const thumbToken = useAppStore((s) => s.thumbVersions[image.id]);
+  const previewImgRef = useRef<HTMLImageElement | null>(null);
+  const [previewDims, setPreviewDims] = useState<{
+    w: number;
+    h: number;
+  } | null>(null);
+
+  // Frame dims drive the view rect. Use the preview's real (crop-applied) dims once loaded; before
+  // that, the sensor dims are a close-enough fallback for the brief pre-load moment.
+  const natural = previewDims ?? {
+    w: Math.max(1, image.width ?? 3),
+    h: Math.max(1, image.height ?? 2),
   };
   const naturalRef = useRef(natural);
   naturalRef.current = natural;
@@ -70,49 +84,41 @@ export default function Loupe({ image }: LoupeProps) {
     return () => ro.disconnect();
   }, []);
 
-  // ── Saved params (read-once per image for the render call) ────────────────
-  const savedParamsRef = useRef<Awaited<
-    ReturnType<typeof developGetEdit>
-  > | null>(null);
-
-  useEffect(() => {
-    savedParamsRef.current = null;
-    setCropExtent({ hw: 0.5, hh: 0.5 });
-    setViewState(fitViewState());
-    developGetEdit(image.id)
-      .then((p) => {
-        savedParamsRef.current = p;
-        if (p?.crop) setCropExtent({ hw: p.crop.hw, hh: p.crop.hh });
-        scheduleRender();
-      })
-      .catch(() => {
-        savedParamsRef.current = null;
-        scheduleRender();
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [image.id]);
-
-  // ── Double-buffering ──────────────────────────────────────────────────────
+  // ── Render state ──────────────────────────────────────────────────────────
+  const savedParamsRef = useRef<DevelopParams | null>(null);
   const lastFrameRef = useRef<RenderedFrame | null>(null);
   const rafRef = useRef<number | null>(null);
   const inFlightRef = useRef(false);
   const dirtyRef = useRef(false);
   const scheduleRenderRef = useRef<() => void>(() => {});
+  // True while we're in full-res (develop_render) mode — used for zoom hysteresis so a zoom hovering
+  // at the threshold doesn't thrash between the preview draw and the GPU decode.
+  const decodeModeRef = useRef(false);
 
-  // Size canvas backing store
-  const canvas = canvasRef.current;
-  const { outW, outH, visCssW, visCssH } = derived;
-  if (canvas && (canvas.width !== outW || canvas.height !== outH)) {
-    canvas.width = outW;
-    canvas.height = outH;
-    const last = lastFrameRef.current;
-    if (last && last.w === outW && last.h === outH) {
-      const ctx = canvas.getContext("2d");
-      if (ctx) ctx.putImageData(new ImageData(last.data, last.w, last.h), 0, 0);
-    }
-  }
+  // Draw a view sub-rect of the preview image straight to the canvas (instant; pan/light-zoom never
+  // hit the backend). The preview is crop-applied, so view-uv [0,1] maps directly to its pixels.
+  const drawPreview = useCallback((d: DerivedView) => {
+    const c = canvasRef.current;
+    const img = previewImgRef.current;
+    if (!c || !img) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const bw = img.naturalWidth;
+    const bh = img.naturalHeight;
+    ctx.drawImage(
+      img,
+      d.view.ox * bw,
+      d.view.oy * bh,
+      d.view.sx * bw,
+      d.view.sy * bh,
+      0,
+      0,
+      d.outW,
+      d.outH,
+    );
+  }, []);
 
-  // Single-flight render with a trailing coalesced re-render (see Stage/useViewport).
+  // Single-flight render with a trailing coalesced re-render.
   const scheduleRender = useCallback(() => {
     dirtyRef.current = true;
     if (inFlightRef.current || rafRef.current !== null) return;
@@ -120,65 +126,113 @@ export default function Loupe({ image }: LoupeProps) {
       rafRef.current = null;
       if (!dirtyRef.current) return;
       dirtyRef.current = false;
-      inFlightRef.current = true;
+
       const vs = viewStateRef.current;
       const nat = naturalRef.current;
       const css = containerCssRef.current;
       const dprNow = Math.min(window.devicePixelRatio || 1, 2);
-      const d: DerivedView = deriveViewRect(
-        vs.zoom,
-        vs.panNorm,
-        nat,
-        css,
-        dprNow,
-      );
+      const d = deriveViewRect(vs.zoom, vs.panNorm, nat, css, dprNow);
+
+      const c = canvasRef.current;
+      if (!c) return;
+      if (c.width !== d.outW || c.height !== d.outH) {
+        c.width = d.outW;
+        c.height = d.outH;
+      }
+
+      // Decide tier: the preview supplies enough detail when it has ≥1 source pixel per output
+      // pixel across the visible window. Hysteresis (0.85×) avoids thrash at the boundary.
+      const img = previewImgRef.current;
+      const previewPxAcross = img ? d.view.sx * img.naturalWidth : 0;
+      let useDecode = decodeModeRef.current
+        ? previewPxAcross < d.outW * 0.85
+        : previewPxAcross < d.outW;
+      if (!img) useDecode = true; // no preview yet → must decode
+      decodeModeRef.current = useDecode;
+
+      if (!useDecode) {
+        drawPreview(d);
+        return;
+      }
+
+      // Deep zoom → full-res render. Keep the (slightly soft) preview drawn underneath so there's no
+      // blank flash while the decode runs; swap to the sharp frame when it lands.
+      inFlightRef.current = true;
+      drawPreview(d);
       const p = savedParamsRef.current ?? freshDefaults();
       void developRender(image.id, p, d.view, d.outW, d.outH, -1)
         .then((frame) => {
           if (!frame) return;
-          const c = canvasRef.current;
-          if (!c) return;
+          const c2 = canvasRef.current;
+          if (!c2) return;
           lastFrameRef.current = frame;
-          if (c.width !== frame.w || c.height !== frame.h) {
-            c.width = frame.w;
-            c.height = frame.h;
+          if (c2.width !== frame.w || c2.height !== frame.h) {
+            c2.width = frame.w;
+            c2.height = frame.h;
           }
-          const ctx = c.getContext("2d");
-          if (!ctx) return;
-          ctx.putImageData(new ImageData(frame.data, frame.w, frame.h), 0, 0);
+          const ctx = c2.getContext("2d");
+          if (ctx)
+            ctx.putImageData(new ImageData(frame.data, frame.w, frame.h), 0, 0);
         })
         .catch(() => {
-          // Render failed — keep the last frame.
+          // Render failed — keep the preview/last frame.
         })
         .finally(() => {
           inFlightRef.current = false;
           if (dirtyRef.current) scheduleRenderRef.current();
         });
     });
-  }, [image.id]);
+  }, [image.id, drawPreview]);
   scheduleRenderRef.current = scheduleRender;
 
-  // Trigger render on view change
+  // ── Per-image load: saved params (for deep-zoom render) + the preview image ───────────────────
+  useEffect(() => {
+    let cancelled = false;
+    previewImgRef.current = null;
+    setPreviewDims(null);
+    setViewState(fitViewState());
+    decodeModeRef.current = false;
+    lastFrameRef.current = null;
+
+    savedParamsRef.current = null;
+    developGetEdit(image.id)
+      .then((p) => {
+        if (!cancelled) savedParamsRef.current = p;
+      })
+      .catch(() => {});
+
+    void effectivePreviewEdge().then((edge) => {
+      if (cancelled) return;
+      const img = new Image();
+      img.onload = () => {
+        if (cancelled) return;
+        previewImgRef.current = img;
+        setPreviewDims({ w: img.naturalWidth, h: img.naturalHeight });
+        scheduleRenderRef.current();
+      };
+      img.src = thumbUrl(
+        image.contentHash,
+        512,
+        image.editedAt,
+        thumbToken,
+        edge,
+      );
+    });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [image.id, image.contentHash, image.editedAt, thumbToken]);
+
+  // Trigger render on view change (zoom/pan/resize).
   const prevDerived = useRef<string>("");
+  const { outW, outH, visCssW, visCssH } = derived;
   const derivedKey = `${outW},${outH},${derived.view.ox.toFixed(6)},${derived.view.oy.toFixed(6)},${derived.view.sx.toFixed(6)},${derived.view.sy.toFixed(6)}`;
   if (prevDerived.current !== derivedKey) {
     prevDerived.current = derivedKey;
     scheduleRender();
   }
-
-  // ── Instant first paint: canonical thumb while the render arrives ─────────
-  const thumbToken = useAppStore((s) => s.thumbVersions[image.id]);
-  const thumbSrc = thumbUrl(image.contentHash, 512, image.editedAt, thumbToken);
-  useEffect(() => {
-    const c = canvasRef.current;
-    if (!c) return;
-    const img = new Image();
-    img.onload = () => {
-      const ctx = c.getContext("2d");
-      if (ctx) ctx.drawImage(img, 0, 0, c.width, c.height);
-    };
-    img.src = thumbSrc;
-  }, [image.id, thumbSrc]);
 
   // ── Wheel zoom ────────────────────────────────────────────────────────────
   const onWheel = useCallback((e: WheelEvent) => {

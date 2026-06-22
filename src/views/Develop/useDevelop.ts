@@ -10,6 +10,7 @@ import {
   developRender,
   developSession,
   developSetEdit,
+  effectivePreviewEdge,
   thumbPrioritize,
   thumbUrl,
   MASK_CAP,
@@ -202,15 +203,17 @@ export function useDevelop() {
       imageAspect: 0,
     });
 
-    // 1. Instant first paint — the canonical develop thumbnail (the SAME look the canvas will show).
-    //    The `thumb://` protocol serves the canonical render if it's ready, else the camera-embedded
-    //    placeholder, so one URL already implements "prefer canonical, fall back to camera" (decision
-    //    3). Prioritize this image's canonical render so a fresh import lands fast. Falls back to the
-    //    embedded-JPEG endpoint if the row isn't in the shared store yet (defensive).
+    // 1. Instant first paint — the display-sharp preview (the SAME look the canvas will show). The
+    //    `thumb://` protocol serves the cached preview if ready, else the thumb/placeholder, so one
+    //    URL implements "prefer sharp preview, fall back" (decision 3). Falls back to the embedded-JPEG
+    //    endpoint if the row isn't in the shared store yet (defensive). Prioritize this image's render.
     const row = useAppStore.getState().libraryImages.find((r) => r.id === id);
     if (row) {
       const v = useAppStore.getState().thumbVersions[id];
-      setPreview(thumbUrl(row.contentHash, 1024, row.editedAt, v));
+      void effectivePreviewEdge().then((edge) => {
+        if (cancelled) return;
+        setPreview(thumbUrl(row.contentHash, 1024, row.editedAt, v, edge));
+      });
     } else {
       developPreviewJpeg(id)
         .then((url) => {
@@ -280,6 +283,18 @@ export function useDevelop() {
       }
     };
   }, []);
+
+  // On leaving an image (navigate away / close Develop), enqueue it so the background queue fills its
+  // display-sharp preview tier. Edited previews are generated lazily here — NOT on every slider settle
+  // (a full-size render each settle would jank editing); `develop_regen_thumb` keeps the small edited
+  // thumb current per settle, and this catches the larger preview once editing stops.
+  useEffect(() => {
+    if (selectedId === null) return;
+    const id = selectedId;
+    return () => {
+      void thumbPrioritize([id]);
+    };
+  }, [selectedId]);
 
   // Mark a Develop session open for the lifetime of this hook so the background thumbnail worker
   // parks between jobs and interactive renders win the GPU.

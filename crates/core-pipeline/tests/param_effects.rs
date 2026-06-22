@@ -423,7 +423,10 @@ fn color_balance_saturation_neutralizes() {
 
     let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
     let spread_base = mean_channel(&base, 0) - mean_channel(&base, 2);
-    assert!(spread_base > 20.0, "fixture must start saturated (r-b={spread_base})");
+    assert!(
+        spread_base > 20.0,
+        "fixture must start saturated (r-b={spread_base})"
+    );
 
     let desat = DevelopParams {
         cb_rgb: CbRgb {

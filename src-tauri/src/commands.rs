@@ -367,42 +367,6 @@ pub async fn develop_preview_jpeg(
     .map_err(|e| e.to_string())?
 }
 
-/// Library loupe: the canonical develop render (default params when unedited, saved edit otherwise)
-/// as JPEG bytes, so the loupe matches the editor. `max_edge == 0` returns native size (capped at
-/// 8192 to bound payload/decode); any positive value downscales the long edge to that. Falls back to
-/// the fast camera-embedded preview only when no GPU is available. The frontend loads 2560 for
-/// fit-view, then native on zoom. Distinct from `develop_preview_jpeg` (which the Develop view owns)
-/// so the two can evolve independently.
-#[tauri::command]
-pub async fn loupe_jpeg(
-    app: AppHandle,
-    image_id: i64,
-    max_edge: u32,
-) -> Result<tauri::ipc::Response, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let path = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::image_by_id(&db.conn, image_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "image not found".to_string())?
-                .path
-        };
-        let edge = if max_edge == 0 { 8192 } else { max_edge };
-        // Canonical develop render so the loupe matches the editor for EVERY image (edited or not).
-        // Only when no GPU is available do we fall back to the fast camera-embedded preview.
-        if let Some(gpu) = st.gpu.as_ref() {
-            let render = render_develop_jpeg(st.inner(), gpu, image_id, edge, 90)?;
-            return Ok(tauri::ipc::Response::new(render.jpeg));
-        }
-        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-        let thumb = core_raw::thumbnail_jpeg(&src, edge, 90).map_err(|e| e.to_string())?;
-        Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 const THUMB_EDIT_EDGE: u32 = 1024;
 const THUMB_EDIT_QUALITY: u8 = 85;
 
@@ -513,8 +477,13 @@ pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option
             .gpu
             .as_ref()
             .ok_or_else(|| "GPU develop unavailable".to_string())?;
-        let render =
-            render_develop_jpeg(st.inner(), gpu, image_id, THUMB_EDIT_EDGE, THUMB_EDIT_QUALITY)?;
+        let render = render_develop_jpeg(
+            st.inner(),
+            gpu,
+            image_id,
+            THUMB_EDIT_EDGE,
+            THUMB_EDIT_QUALITY,
+        )?;
         let edited_at = match render.edit_version {
             Some(version) => {
                 st.thumbs
@@ -527,7 +496,13 @@ pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option
                 None
             }
         };
-        let _ = app.emit("develop:edit-changed", EditChanged { image_id, edited_at });
+        let _ = app.emit(
+            "develop:edit-changed",
+            EditChanged {
+                image_id,
+                edited_at,
+            },
+        );
         Ok(edited_at)
     })
     .await
@@ -956,7 +931,8 @@ pub async fn cull_set_rating_many(
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_rating_many(&mut db.conn, &image_ids, stars).map_err(|e| e.to_string())?;
+        core_library::set_rating_many(&mut db.conn, &image_ids, stars)
+            .map_err(|e| e.to_string())?;
         sync_sidecars(&db.conn, &image_ids);
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
             core_library::Event {
@@ -1057,8 +1033,8 @@ pub async fn keyword_add_to_image(
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
-        let row =
-            core_library::add_keyword_to_image(&db.conn, image_id, &name).map_err(|e| e.to_string())?;
+        let row = core_library::add_keyword_to_image(&db.conn, image_id, &name)
+            .map_err(|e| e.to_string())?;
         sync_sidecar(&db.conn, image_id);
         Ok(row)
     })
@@ -1852,7 +1828,8 @@ pub async fn person_faces(
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::person_faces(&db.conn, person_id, status.as_deref()).map_err(|e| e.to_string())
+        core_library::person_faces(&db.conn, person_id, status.as_deref())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1894,11 +1871,7 @@ pub async fn person_set_name(
 
 /// Hide/unhide a person (excluded from the sidebar + library filter when hidden).
 #[tauri::command]
-pub async fn person_set_hidden(
-    app: AppHandle,
-    person_id: i64,
-    hidden: bool,
-) -> Result<(), String> {
+pub async fn person_set_hidden(app: AppHandle, person_id: i64, hidden: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
@@ -1911,11 +1884,7 @@ pub async fn person_set_hidden(
 
 /// Set a person's cover (key) face. The face must belong to the person.
 #[tauri::command]
-pub async fn person_set_cover(
-    app: AppHandle,
-    person_id: i64,
-    face_id: i64,
-) -> Result<(), String> {
+pub async fn person_set_cover(app: AppHandle, person_id: i64, face_id: i64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
@@ -2013,11 +1982,11 @@ pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<His
         let st = app.state::<AppState>();
         let (hash, edit_version) = {
             let db = st.db.lock().map_err(|e| e.to_string())?;
-            let hash = match core_library::image_by_id(&db.conn, image_id).map_err(|e| e.to_string())?
-            {
-                Some(r) => r.content_hash,
-                None => return Ok(None),
-            };
+            let hash =
+                match core_library::image_by_id(&db.conn, image_id).map_err(|e| e.to_string())? {
+                    Some(r) => r.content_hash,
+                    None => return Ok(None),
+                };
             let version = core_library::get_edit_with_version(&db.conn, image_id)
                 .ok()
                 .flatten()
@@ -2115,11 +2084,14 @@ pub async fn set_image_user_label_many(
         )
         .map_err(|e| e.to_string())?;
         let et = format!("label.{field}_set");
-        let ctx = format!("{{\"field\":\"{field}\",\"value\":{}}}", match value {
-            Some(true) => "true",
-            Some(false) => "false",
-            None => "null",
-        });
+        let ctx = format!(
+            "{{\"field\":\"{field}\",\"value\":{}}}",
+            match value {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "null",
+            }
+        );
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
             core_library::Event {
                 event_type: et.clone(),

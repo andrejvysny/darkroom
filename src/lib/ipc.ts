@@ -374,6 +374,18 @@ export async function effectivePreviewEdge(): Promise<number> {
   return edge;
 }
 
+/** Change the preview edge from Settings: clamp, update the in-session cache (so new `thumb://`
+ *  preview URLs target the new size), and persist (backend clamps + re-renders previews). Returns
+ *  the clamped value applied. */
+export async function updatePreviewEdge(edge: number): Promise<number> {
+  const clamped = Math.round(
+    Math.min(PREVIEW_EDGE_MAX, Math.max(PREVIEW_EDGE_MIN, edge)),
+  );
+  previewEdgeCache = clamped;
+  await setPreviewEdge(clamped);
+  return clamped;
+}
+
 // ── Utilities ──────────────────────────────────────────────────────────────
 
 export function thumbUrl(
@@ -383,13 +395,20 @@ export function thumbUrl(
   /** Cache-bust token (from `thumbVersions`): changes when the backend renders a fresh
    *  canonical/edited thumbnail, forcing the immutable-cached `<img>` to refetch. */
   token?: number | null,
+  /** When > 0, request the display-sharp PREVIEW tier at this longest edge (loupe / develop
+   *  first-paint) instead of the small thumb tier (grid / filmstrip). */
+  previewEdge?: number | null,
 ): string {
   const base = `thumb://localhost/${hash}?size=${size}`;
   // `edit=<version>` makes the protocol serve the edited render and changes the URL on each edit.
-  // `&t=<token>` busts the cache when a fresh thumbnail lands for an UNEDITED image (placeholder →
-  // canonical swap), where `editedAt` doesn't change.
+  // `pv=1&edge=<n>` requests the larger preview tier. `&t=<token>` busts the cache when a fresh
+  // render lands for an UNEDITED image (placeholder → canonical swap), where `editedAt` doesn't change.
   const edited = editedAt != null ? `${base}&edit=${editedAt}` : base;
-  const url = token != null ? `${edited}&t=${token}` : edited;
+  const previewed =
+    previewEdge != null && previewEdge > 0
+      ? `${edited}&pv=1&edge=${previewEdge}`
+      : edited;
+  const url = token != null ? `${previewed}&t=${token}` : previewed;
   // Dev-only: in a plain browser the `thumb://` protocol has no handler. A mock backend
   // (src/dev/tauriMock.ts) installs `window.__darkroomThumbMock` to serve placeholder images.
   // Tree-shaken from production builds via the DEV guard; never set inside the Tauri shell.
@@ -880,19 +899,6 @@ export async function developRender(
  */
 export async function developPreviewJpeg(imageId: number): Promise<string> {
   const buf = await invoke<ArrayBuffer>("develop_preview_jpeg", { imageId });
-  return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
-}
-
-/**
- * Library loupe source: the unedited capture (camera embedded preview, near full sensor res).
- * `maxEdge === 0` returns native size (capped backend-side); positive downscales the long edge.
- * Returns an object URL backed by JPEG bytes. Caller must revoke when done.
- */
-export async function loupeJpeg(
-  imageId: number,
-  maxEdge: number,
-): Promise<string> {
-  const buf = await invoke<ArrayBuffer>("loupe_jpeg", { imageId, maxEdge });
   return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
 }
 

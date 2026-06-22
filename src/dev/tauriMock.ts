@@ -437,7 +437,6 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   // New viewport model: returns [outW u32 LE][outH u32 LE][rgba8 outW*outH*4]
   develop_render: (p) => makeDevelopRgba(p),
   develop_preview_jpeg: () => makeDevelopJpeg(undefined),
-  loupe_jpeg: () => makeDevelopJpeg(undefined),
   develop_get_histogram: () => makeHistogram(),
   develop_regen_thumb: () => Date.now(),
   thumb_prioritize: () => undefined,

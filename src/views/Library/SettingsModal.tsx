@@ -5,6 +5,8 @@ import {
   setThumbCacheCap,
   analysisDetectorSize,
   setAnalysisDetectorSize,
+  previewEdge,
+  updatePreviewEdge,
   appLibraryRoot,
   setLibraryRoot,
   featuresBackfill,
@@ -36,6 +38,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [mdSize, setMdSize] = useState(1280);
+  const [pEdge, setPEdge] = useState(0);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
@@ -53,15 +56,29 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       thumbCacheSize(),
       analysisDetectorSize(),
       appLibraryRoot(),
+      previewEdge(),
     ])
-      .then(([cap, used, size, root]) => {
+      .then(([cap, used, size, root, pe]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
         setMdSize(size);
         setLibRoot(root);
+        setPEdge(pe);
       })
       .catch(() => setStatus("Failed to load settings"));
   }, [open]);
+
+  const handlePreviewEdge = (edge: number) => {
+    setPEdge(edge);
+    void updatePreviewEdge(edge)
+      .then((applied) => {
+        setPEdge(applied);
+        setStatus(
+          `Preview resolution set to ${applied}px — regenerating previews`,
+        );
+      })
+      .catch(() => setStatus("Failed to save preview resolution"));
+  };
 
   const handleChangeLibraryRoot = async () => {
     const picked = await pickFolder("Select library location");
@@ -336,6 +353,49 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
                       ? "var(--color-accent)"
                       : "var(--color-elev)",
                   color: mdSize === size ? "#fff" : "var(--color-t1)",
+                  border: "1px solid var(--color-line-2)",
+                  borderRadius: "var(--radius-sm)",
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ padding: "0 18px 18px" }}>
+          <div
+            style={{ fontSize: 13, color: "var(--color-t1)", marginBottom: 4 }}
+          >
+            Preview resolution
+          </div>
+          <div
+            style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
+          >
+            Longest edge of the sharp full-screen preview generated per photo
+            (defaults to your display). Higher = crisper when viewing large, but
+            more disk. Changing it regenerates previews in the background.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {[
+              [2560, "2560"],
+              [3200, "3200"],
+              [3840, "3840"],
+              [4096, "4096"],
+            ].map(([edge, label]) => (
+              <button
+                key={edge}
+                onClick={() => handlePreviewEdge(edge as number)}
+                style={{
+                  flex: 1,
+                  background:
+                    pEdge === edge
+                      ? "var(--color-accent)"
+                      : "var(--color-elev)",
+                  color: pEdge === edge ? "#fff" : "var(--color-t1)",
                   border: "1px solid var(--color-line-2)",
                   borderRadius: "var(--radius-sm)",
                   padding: "6px 10px",
