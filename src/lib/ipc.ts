@@ -36,6 +36,13 @@ export type QueryParams = {
   sort?: SortKey;
   limit?: number;
   offset?: number;
+  /** Keyset (seek) cursor: capture_date / imported_at of the last loaded row. null + null cursorId =
+   *  first page; null value + set cursorId = a cursor inside the NULL capture_date block. */
+  cursorValue?: number | null;
+  /** Keyset cursor: id of the last loaded row (tie-break). Presence marks "has cursor". */
+  cursorId?: number | null;
+  /** Use keyset/seek pagination (time-based sorts) instead of LIMIT/OFFSET. */
+  seek?: boolean;
 };
 
 /** The filter dimensions (excludes sort/search/paging) — the keys "All photos" clears. */
@@ -96,6 +103,9 @@ export type ImageRow = {
   colorLabel: string | null;
   /** `edits.updated_at` if the image has a develop edit; versions edit-aware previews (null = none). */
   editedAt: number | null;
+  /** When the image was catalogued (epoch seconds): keyset cursor for import-date sorts + a live
+   *  sorted-merge comparator key. */
+  importedAt: number;
 };
 
 export type FolderRow = {

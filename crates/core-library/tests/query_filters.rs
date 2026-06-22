@@ -352,3 +352,137 @@ fn capture_year_and_date_filters() {
     };
     assert_eq!(count_images(c, &y2025).unwrap(), 1);
 }
+
+// ── Keyset (seek) pagination ──────────────────────────────────────────────────
+
+/// Insert a row with an explicit id + (possibly NULL) capture_date + imported_at.
+fn insert_row(conn: &Connection, id: i64, capture_date: Option<i64>, imported_at: i64) {
+    conn.execute(
+        "INSERT INTO images(id, content_hash, file_size, path, original_filename, status,
+            capture_date, imported_at)
+         VALUES (?1, ?2, 1024, ?3, ?4, 'present', ?5, ?6)",
+        params![
+            id,
+            vec![id as u8; 32],
+            format!("/lib/{id}.CR3"),
+            format!("{id}.CR3"),
+            capture_date,
+            imported_at
+        ],
+    )
+    .unwrap();
+}
+
+/// Walk every page via keyset/seek pagination (cursor = last row), returning the full id sequence.
+/// `imported` selects the cursor key (imported_at vs capture_date). Asserts nothing on its own — the
+/// caller compares the sequence to the expected total order to prove "every row exactly once".
+fn page_all_seek(conn: &Connection, sort: &str, page: i64, imported: bool) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    let mut cursor_value: Option<i64> = None;
+    let mut cursor_id: Option<i64> = None;
+    loop {
+        let rows = query_images(
+            conn,
+            &QueryParams {
+                sort: Some(sort.into()),
+                seek: Some(true),
+                limit: Some(page),
+                cursor_value,
+                cursor_id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        if rows.is_empty() {
+            break;
+        }
+        let n = rows.len() as i64;
+        let last = rows.last().unwrap();
+        cursor_value = if imported {
+            Some(last.imported_at)
+        } else {
+            last.capture_date
+        };
+        cursor_id = Some(last.id);
+        out.extend(rows.into_iter().map(|r| r.id));
+        if n < page {
+            break; // a short page is the last page
+        }
+    }
+    out
+}
+
+#[test]
+fn keyset_seek_capture_with_nulls_and_ties() {
+    // Codex test vector: rows (capture_date, id) with a NULL block and an equal-date id tie.
+    let db = Db::open_in_memory().unwrap();
+    let c = &db.conn;
+    insert_row(c, 2, None, 0);
+    insert_row(c, 6, None, 0);
+    insert_row(c, 8, Some(10), 0);
+    insert_row(c, 7, Some(20), 0);
+    insert_row(c, 9, Some(20), 0);
+
+    // DESC: non-NULL newest-first (id desc on ties), then the NULL block (id desc).
+    let desc_full = query_images(
+        c,
+        &QueryParams {
+            sort: Some("capture_desc".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .into_iter()
+    .map(|r| r.id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        desc_full,
+        vec![9, 7, 8, 6, 2],
+        "non-seek baseline DESC order"
+    );
+
+    // Seek must reproduce that exact order with no gaps/dupes across every page size, including
+    // sizes that split the equal-date tie and that end exactly on the non-NULL→NULL boundary.
+    for page in 1..=6 {
+        assert_eq!(
+            page_all_seek(c, "capture_desc", page, false),
+            vec![9, 7, 8, 6, 2],
+            "capture_desc seek, page size {page}"
+        );
+    }
+
+    // ASC mirror: NULL block first (id asc), then non-NULL oldest-first (id asc on ties).
+    for page in 1..=6 {
+        assert_eq!(
+            page_all_seek(c, "capture_asc", page, false),
+            vec![2, 6, 8, 7, 9],
+            "capture_asc seek, page size {page}"
+        );
+    }
+}
+
+#[test]
+fn keyset_seek_imported_with_ties() {
+    let db = Db::open_in_memory().unwrap();
+    let c = &db.conn;
+    insert_row(c, 1, Some(100), 5);
+    insert_row(c, 2, Some(100), 20);
+    insert_row(c, 3, Some(100), 20); // imported_at tie with id 2
+    insert_row(c, 4, Some(100), 30);
+
+    // imported_desc: imported_at desc, id desc on ties.
+    for page in 1..=5 {
+        assert_eq!(
+            page_all_seek(c, "imported_desc", page, true),
+            vec![4, 3, 2, 1],
+            "imported_desc seek, page size {page}"
+        );
+    }
+    for page in 1..=5 {
+        assert_eq!(
+            page_all_seek(c, "imported_asc", page, true),
+            vec![1, 2, 3, 4],
+            "imported_asc seek, page size {page}"
+        );
+    }
+}

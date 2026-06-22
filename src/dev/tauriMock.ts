@@ -58,6 +58,7 @@ function makeRows(n: number): ImageRow[] {
       flag: FLAGS[i % FLAGS.length],
       colorLabel: null,
       editedAt: null,
+      importedAt: base - i * 3600,
     };
   });
 }
@@ -120,8 +121,14 @@ function sortRows(r: ImageRow[], sort: QueryParams["sort"]): ImageRow[] {
 
 function queryRows(q: QueryParams): ImageRow[] {
   const filtered = sortRows(filterRows(q), q.sort);
-  const offset = q.offset ?? 0;
   const limit = q.limit ?? filtered.length;
+  // Keyset/seek pagination: start just after the cursor row (matches the Rust backend); else OFFSET.
+  if (q.seek && q.cursorId != null) {
+    const at = filtered.findIndex((r) => r.id === q.cursorId);
+    const start = at >= 0 ? at + 1 : filtered.length;
+    return filtered.slice(start, start + limit);
+  }
+  const offset = q.seek ? 0 : (q.offset ?? 0);
   return filtered.slice(offset, offset + limit);
 }
 

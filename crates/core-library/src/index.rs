@@ -91,6 +91,16 @@ pub fn existing_paths(conn: &Connection) -> Result<std::collections::HashSet<Str
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+/// File modification time as epoch seconds, or `None` if unavailable. Used as the capture-date
+/// fallback when EXIF carries no `DateTimeOriginal` (mirrors core-import's path-routing fallback).
+fn file_mtime_epoch(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
+
 /// Hash + metadata + thumbnail for one file (no DB access; safe to run in parallel).
 /// Writes the thumbnail to `thumbs` as a side effect.
 pub fn process_file(
@@ -104,7 +114,15 @@ pub fn process_file(
     let file_size = bytes.len() as i64;
 
     let src = source_from_bytes(bytes, path);
-    let meta = read_metadata(&src)?;
+    let mut meta = read_metadata(&src)?;
+    // Never store a NULL capture_date: when EXIF has no DateTimeOriginal, fall back to the file's
+    // mtime — the same value the importer uses to route the file into its `YYYY/YYYY-MM-DD` folder
+    // (core-import `date_subpath`). This keeps capture-date sort, the Folders tree, and the on-disk
+    // layout consistent (a no-EXIF file no longer sorts/groups as "Unknown" while living in a dated
+    // folder). Legacy rows imported before this stay NULL (no backfill) and fall into the NULL block.
+    if meta.capture_date.is_none() {
+        meta.capture_date = file_mtime_epoch(path);
+    }
     let thumb = core_raw::thumbnail_jpeg(&src, thumb_size, 82)?;
     thumbs.write(&hex_digest, thumb_size, &thumb.jpeg)?;
 
