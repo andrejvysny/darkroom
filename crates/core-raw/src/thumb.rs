@@ -40,6 +40,30 @@ pub fn preview_image(src: &RawSource) -> Result<DynamicImage, RawError> {
     Err(RawError::NoPreview)
 }
 
+/// Embedded preview **uprighted to its EXIF orientation** — i.e. display space, matching what
+/// [`thumbnail_jpeg`] serves (unlike [`preview_image`], which is sensor-native). Use this when boxes
+/// derived from the pixels must line up with the displayed thumbnail (face detection / overlays).
+pub fn oriented_preview(src: &RawSource) -> Result<DynamicImage, RawError> {
+    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let params = RawDecodeParams::default();
+    let mut img = match decoder.preview_image(src, &params).map_err(de)? {
+        Some(img) => img,
+        None => decoder
+            .full_image(src, &params)
+            .map_err(de)?
+            .ok_or(RawError::NoPreview)?,
+    };
+    if let Some(o) = decoder
+        .raw_metadata(src, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation)
+        .and_then(|v| Orientation::from_exif(v as u8))
+    {
+        img.apply_orientation(o);
+    }
+    Ok(img)
+}
+
 /// Extract the embedded preview, apply EXIF orientation, downscale so the longest edge ≤ `max_edge`,
 /// encode JPEG at `quality`.
 ///

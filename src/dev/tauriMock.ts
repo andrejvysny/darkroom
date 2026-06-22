@@ -393,6 +393,111 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   set_image_user_label_many: () => undefined,
   analysis_detector_size: () => 640,
   set_analysis_detector_size: () => undefined,
+
+  // Faces / People
+  faces_status: () => ({
+    total: FIXTURE_COUNT,
+    processed: FIXTURE_COUNT,
+    pending: 0,
+    modelsReady: true,
+    running: false,
+    faces: 7,
+    people: 3,
+  }),
+  faces_models_ensure: () => undefined,
+  faces_run: () => ({
+    images: FIXTURE_COUNT,
+    faces: 7,
+    cluster: { assigned: 6, newPeople: 2, deferred: 1 },
+  }),
+  faces_cancel: () => undefined,
+  people_list: () => [
+    {
+      id: 1,
+      name: "Ada Lovelace",
+      hidden: false,
+      faceCount: 4,
+      coverFaceId: 11,
+      coverImageHash: "mockhash3",
+      coverBbox: [0.36, 0.18, 0.64, 0.52],
+    },
+    {
+      id: 2,
+      name: "Alan Turing",
+      hidden: false,
+      faceCount: 3,
+      coverFaceId: 21,
+      coverImageHash: "mockhash7",
+      coverBbox: [0.4, 0.22, 0.66, 0.56],
+    },
+    {
+      id: 3,
+      name: null,
+      hidden: false,
+      faceCount: 2,
+      coverFaceId: 31,
+      coverImageHash: "mockhash12",
+      coverBbox: [0.3, 0.2, 0.58, 0.5],
+    },
+  ],
+  person_faces: (p) => {
+    const pid = num(p.personId);
+    const hash =
+      pid === 1 ? "mockhash3" : pid === 2 ? "mockhash7" : "mockhash12";
+    return [
+      {
+        id: pid * 10 + 1,
+        imageId: 3,
+        imageHash: hash,
+        bbox: [0.36, 0.18, 0.64, 0.52],
+        status: "confirmed",
+        detScore: 0.93,
+        quality: 1.2e7,
+      },
+      {
+        id: pid * 10 + 2,
+        imageId: 8,
+        imageHash: "mockhash8",
+        bbox: [0.42, 0.24, 0.68, 0.58],
+        status: "unconfirmed",
+        detScore: 0.81,
+        quality: 9e6,
+      },
+      {
+        id: pid * 10 + 3,
+        imageId: 15,
+        imageHash: "mockhash15",
+        bbox: [0.3, 0.2, 0.55, 0.5],
+        status: "unconfirmed",
+        detScore: 0.77,
+        quality: 7e6,
+      },
+    ];
+  },
+  image_faces: () => [
+    {
+      id: 1,
+      personId: 1,
+      personName: "Ada Lovelace",
+      bbox: [0.36, 0.18, 0.64, 0.52],
+      status: "confirmed",
+    },
+    {
+      id: 2,
+      personId: null,
+      personName: null,
+      bbox: [0.7, 0.3, 0.86, 0.6],
+      status: "unconfirmed",
+    },
+  ],
+  person_set_name: () => undefined,
+  person_set_hidden: () => undefined,
+  person_set_cover: () => undefined,
+  person_merge: () => undefined,
+  face_confirm: () => undefined,
+  face_reject: () => undefined,
+  face_assign: () => undefined,
+  faces_delete_all: () => undefined,
 };
 
 function handle(cmd: string, payload?: InvokeArgs): unknown {

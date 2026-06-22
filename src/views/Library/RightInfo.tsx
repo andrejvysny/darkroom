@@ -7,6 +7,7 @@ import {
   imageUserLabels,
   setImageUserLabel,
   imageHistogram,
+  imageFaces,
   DETECTION_CATEGORIES,
   type HistData,
   type ImageRow,
@@ -16,6 +17,7 @@ import {
   type ImageCaption,
   type Presence,
   type UserLabels,
+  type ImageFace,
 } from "../../lib/ipc";
 
 const LABEL_COLORS: { key: string; bg: string }[] = [
@@ -127,6 +129,7 @@ export default function RightInfo({
   const [aiCaption, setAiCaption] = useState<ImageCaption | null>(null);
   const [aiDetections, setAiDetections] = useState<Detection[]>([]);
   const [aiPresence, setAiPresence] = useState<Presence | null>(null);
+  const [aiFaces, setAiFaces] = useState<ImageFace[]>([]);
   const [labels, setLabels] = useState<UserLabels>({
     containsPerson: null,
     containsAnimal: null,
@@ -138,6 +141,7 @@ export default function RightInfo({
       setAiCaption(null);
       setAiDetections([]);
       setAiPresence(null);
+      setAiFaces([]);
       setLabels({ containsPerson: null, containsAnimal: null });
       setHist(null);
       return;
@@ -152,12 +156,14 @@ export default function RightInfo({
       imageDetections(meta.id),
       imagePresence(meta.id),
       imageUserLabels(meta.id),
-    ]).then(([cap, dets, pres, lab]) => {
+      imageFaces(meta.id),
+    ]).then(([cap, dets, pres, lab, faces]) => {
       if (!cancelled) {
         setAiCaption(cap);
         setAiDetections(dets);
         setAiPresence(pres);
         setLabels(lab);
+        setAiFaces(faces);
       }
     });
     return () => {
@@ -613,7 +619,8 @@ export default function RightInfo({
           </div>
         ) : aiCaption === null &&
           aiDetections.length === 0 &&
-          aiPresence === null ? (
+          aiPresence === null &&
+          aiFaces.length === 0 ? (
           <div style={{ fontSize: 11.5, color: "var(--color-t3)" }}>
             Not analyzed yet
           </div>
@@ -691,6 +698,45 @@ export default function RightInfo({
                 </div>
               );
             })}
+            {aiFaces.length > 0 && (
+              <div style={{ marginBottom: 8 }}>
+                <div
+                  style={{
+                    fontSize: 10,
+                    letterSpacing: ".05em",
+                    textTransform: "uppercase",
+                    color: "var(--color-t3)",
+                    fontWeight: 600,
+                    marginBottom: 5,
+                  }}
+                >
+                  People
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                  {aiFaces.map((f) => (
+                    <span
+                      key={f.id}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        fontSize: 11,
+                        color:
+                          f.personName != null
+                            ? "var(--color-t2)"
+                            : "var(--color-t3)",
+                        fontStyle: f.personName != null ? undefined : "italic",
+                        background: "var(--color-elev)",
+                        border: "1px solid var(--color-line)",
+                        borderRadius: 20,
+                        padding: "2px 8px",
+                      }}
+                    >
+                      {f.personName ?? "Unknown"}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
             {aiPresence !== null && (
               <div
                 style={{

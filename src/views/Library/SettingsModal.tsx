@@ -9,6 +9,7 @@ import {
   databaseReset,
   sidecarsWriteAll,
   sidecarsRebuild,
+  facesDeleteAll,
 } from "../../lib/ipc";
 
 const GB = 1024 * 1024 * 1024;
@@ -34,11 +35,14 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [resetting, setResetting] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
   const [sidecarBusy, setSidecarBusy] = useState(false);
+  const [confirmFaceWipe, setConfirmFaceWipe] = useState(false);
+  const [faceWiping, setFaceWiping] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setStatus(null);
     setConfirmReset(false);
+    setConfirmFaceWipe(false);
     void Promise.all([
       thumbCacheCap(),
       thumbCacheSize(),
@@ -346,6 +350,56 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
               {sidecarBusy ? "Working…" : "Rebuild from sidecars"}
             </button>
           </div>
+        </div>
+
+        <div style={{ padding: "0 18px 18px" }}>
+          <div
+            style={{ fontSize: 13, color: "var(--color-t1)", marginBottom: 4 }}
+          >
+            Face data
+          </div>
+          <div
+            style={{ fontSize: 11, color: "var(--color-t3)", marginBottom: 10 }}
+          >
+            Face grouping runs entirely on this Mac; face data is stored only in
+            your local catalog and never leaves this device. Delete all detected
+            faces, embeddings, and people (your photos are untouched).
+          </div>
+          <button
+            onClick={async () => {
+              if (!confirmFaceWipe) {
+                setConfirmFaceWipe(true);
+                return;
+              }
+              setFaceWiping(true);
+              try {
+                await facesDeleteAll();
+                setStatus("Face data deleted");
+              } catch (e) {
+                setStatus(`Delete failed: ${e}`);
+              } finally {
+                setFaceWiping(false);
+                setConfirmFaceWipe(false);
+              }
+            }}
+            disabled={faceWiping}
+            style={{
+              background: confirmFaceWipe ? "#b3261e" : "var(--color-elev)",
+              color: confirmFaceWipe ? "#fff" : "var(--color-danger, #e5685f)",
+              border: `1px solid ${confirmFaceWipe ? "#b3261e" : "var(--color-line-2)"}`,
+              borderRadius: "var(--radius-sm)",
+              padding: "6px 14px",
+              fontSize: 12,
+              cursor: faceWiping ? "default" : "pointer",
+              opacity: faceWiping ? 0.6 : 1,
+            }}
+          >
+            {faceWiping
+              ? "Deleting…"
+              : confirmFaceWipe
+                ? "Click again to confirm delete"
+                : "Delete all face data…"}
+          </button>
         </div>
 
         <div style={{ padding: "0 18px 18px" }}>

@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -25,6 +26,8 @@ export type QueryParams = {
   importSessionId?: number | null;
   /** Detected-object bucket filter: "People" | "Animals" | "Vehicles". */
   detectedCategory?: string | null;
+  /** Restrict to images containing a (confirmed or suggested) face of this person. */
+  personId?: number | null;
   search?: string | null;
   sort?: SortKey;
   limit?: number;
@@ -41,6 +44,7 @@ export const FILTER_DIMENSIONS: (keyof QueryParams)[] = [
   "collectionId",
   "importSessionId",
   "detectedCategory",
+  "personId",
 ];
 
 /** True when any filter dimension is active. Single source of truth for nav/footer state. */
@@ -59,6 +63,7 @@ export function clearedFilters(): Partial<QueryParams> {
     collectionId: null,
     importSessionId: null,
     detectedCategory: null,
+    personId: null,
   };
 }
 
@@ -886,4 +891,181 @@ export function analysisDetectorSize(): Promise<number> {
 
 export function setAnalysisDetectorSize(size: number): Promise<void> {
   return invoke<void>("set_analysis_detector_size", { size });
+}
+
+// ── Faces / People ───────────────────────────────────────────────────────────
+
+/** Face lifecycle status. */
+export type FaceStatus = "unconfirmed" | "confirmed" | "rejected" | "ignored";
+
+/** A person/cluster for the sidebar. `name` null = an unnamed "Suggested" cluster. The cover fields
+ *  let the UI CSS-crop a face thumbnail from the person's best photo (see {@link faceCropStyle}). */
+export type PersonRow = {
+  id: number;
+  name: string | null;
+  hidden: boolean;
+  faceCount: number;
+  coverFaceId: number | null;
+  coverImageHash: string | null;
+  /** Normalized `[x1,y1,x2,y2]` of the cover face. */
+  coverBbox: [number, number, number, number] | null;
+};
+
+/** One face of a person (person detail / Review grid). `bbox` normalized `[x1,y1,x2,y2]`. */
+export type PersonFace = {
+  id: number;
+  imageId: number;
+  imageHash: string;
+  bbox: [number, number, number, number];
+  status: FaceStatus;
+  detScore: number;
+  quality: number;
+};
+
+/** A face detected in one image (RightInfo chips). */
+export type ImageFace = {
+  id: number;
+  personId: number | null;
+  personName: string | null;
+  bbox: [number, number, number, number];
+  status: FaceStatus;
+};
+
+export type FacesStatus = {
+  total: number;
+  processed: number;
+  pending: number;
+  modelsReady: boolean;
+  running: boolean;
+  faces: number;
+  people: number;
+};
+
+export type ClusterStats = {
+  assigned: number;
+  newPeople: number;
+  deferred: number;
+};
+export type FacesRunStats = {
+  images: number;
+  faces: number;
+  cluster: ClusterStats;
+};
+
+/** People status: counts + model/running state. */
+export function facesStatus(): Promise<FacesStatus> {
+  return invoke<FacesStatus>("faces_status", {});
+}
+
+/** Download the face models (~190 MB, first run). Emits `faces:models` `{done,total}`. */
+export function facesModelsEnsure(): Promise<void> {
+  return invoke<void>("faces_models_ensure", {});
+}
+
+/** Run "Find People" (detect → align → embed → cluster). Emits `faces:progress`/`faces:done`. */
+export function facesRun(force = false): Promise<FacesRunStats> {
+  return invoke<FacesRunStats>("faces_run", { force });
+}
+
+/** Request the running face pass to stop after the current batch. */
+export function facesCancel(): Promise<void> {
+  return invoke<void>("faces_cancel", {});
+}
+
+export function peopleList(includeHidden = false): Promise<PersonRow[]> {
+  return invoke<PersonRow[]>("people_list", { includeHidden });
+}
+
+/** Faces of a person, optionally a single status (e.g. "unconfirmed" for Review). */
+export function personFaces(
+  personId: number,
+  status?: FaceStatus,
+): Promise<PersonFace[]> {
+  return invoke<PersonFace[]>("person_faces", {
+    personId,
+    status: status ?? null,
+  });
+}
+
+export function imageFaces(id: number): Promise<ImageFace[]> {
+  return invoke<ImageFace[]>("image_faces", { id });
+}
+
+/** Set or clear (`null`) a person's name. */
+export function personSetName(
+  personId: number,
+  name: string | null,
+): Promise<void> {
+  return invoke<void>("person_set_name", { personId, name });
+}
+
+export function personSetHidden(
+  personId: number,
+  hidden: boolean,
+): Promise<void> {
+  return invoke<void>("person_set_hidden", { personId, hidden });
+}
+
+export function personSetCover(
+  personId: number,
+  faceId: number,
+): Promise<void> {
+  return invoke<void>("person_set_cover", { personId, faceId });
+}
+
+/** Merge person `src` into `dst` (move all faces, delete `src`). Not reversible. */
+export function personMerge(dst: number, src: number): Promise<void> {
+  return invoke<void>("person_merge", { dst, src });
+}
+
+export function faceConfirm(faceId: number): Promise<void> {
+  return invoke<void>("face_confirm", { faceId });
+}
+
+export function faceReject(faceId: number): Promise<void> {
+  return invoke<void>("face_reject", { faceId });
+}
+
+/** Reassign a face to a person (confirmed), or `null` to unlink it. */
+export function faceAssign(
+  faceId: number,
+  personId: number | null,
+): Promise<void> {
+  return invoke<void>("face_assign", { faceId, personId });
+}
+
+/** Delete ALL face + person data (privacy). Not reversible. */
+export function facesDeleteAll(): Promise<void> {
+  return invoke<void>("faces_delete_all", {});
+}
+
+/** Inline-style props that crop a face out of its image thumbnail (a CSS sprite crop), padded for a
+ *  pleasant headshot. `bbox` is normalized `[x1,y1,x2,y2]`; the thumbnail is aspect-preserving and
+ *  EXIF-oriented, matching the (also oriented) face coordinates. */
+export function faceCropStyle(
+  hash: string,
+  bbox: [number, number, number, number],
+  pad = 0.4,
+): CSSProperties {
+  const [x1, y1, x2, y2] = bbox;
+  const bw = x2 - x1;
+  const bh = y2 - y1;
+  // Pad the box (clamped) so the crop isn't tight on the face.
+  const px = bw * pad;
+  const py = bh * pad;
+  const cx1 = Math.max(0, x1 - px);
+  const cy1 = Math.max(0, y1 - py);
+  const cx2 = Math.min(1, x2 + px);
+  const cy2 = Math.min(1, y2 + py);
+  const cw = Math.max(1e-3, cx2 - cx1);
+  const ch = Math.max(1e-3, cy2 - cy1);
+  // Standard sprite math: scale the image up so the crop fills the element, then position it.
+  const posX = cw < 1 ? (cx1 / (1 - cw)) * 100 : 0;
+  const posY = ch < 1 ? (cy1 / (1 - ch)) * 100 : 0;
+  return {
+    backgroundImage: `url("${thumbUrl(hash)}")`,
+    backgroundRepeat: "no-repeat",
+    backgroundSize: `${100 / cw}% ${100 / ch}%`,
+    backgroundPosition: `${posX}% ${posY}%`,
+  };
 }

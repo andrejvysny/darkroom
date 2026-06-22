@@ -1,6 +1,7 @@
 mod analysis;
 mod commands;
 mod events;
+mod faces;
 mod features;
 mod protocol;
 mod state;
@@ -132,6 +133,21 @@ pub fn run() {
             commands::set_image_user_label_many,
             commands::analysis_detector_size,
             commands::set_analysis_detector_size,
+            commands::faces_status,
+            commands::faces_models_ensure,
+            commands::faces_run,
+            commands::faces_cancel,
+            commands::people_list,
+            commands::person_faces,
+            commands::image_faces,
+            commands::person_set_name,
+            commands::person_set_hidden,
+            commands::person_set_cover,
+            commands::person_merge,
+            commands::face_confirm,
+            commands::face_reject,
+            commands::face_assign,
+            commands::faces_delete_all,
             commands::features_backfill,
             commands::sidecars_write_all,
             commands::sidecars_rebuild,

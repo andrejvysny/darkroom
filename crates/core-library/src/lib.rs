@@ -6,6 +6,8 @@ pub mod cull;
 pub mod edits;
 pub mod error;
 pub mod events;
+pub mod face;
+pub mod face_cluster;
 pub mod features;
 pub mod index;
 pub mod keywords;
@@ -30,6 +32,13 @@ pub use cull::{set_flag, set_flag_many, set_label, set_label_many, set_rating, s
 pub use edits::{get_edit, get_edit_with_version, set_edit};
 pub use error::LibError;
 pub use events::{append_event, event_count, ids_json, Event};
+pub use face::{
+    assign_face_person, confirm_face, create_person, delete_all_face_data, faces_for_clustering,
+    faces_summary, image_faces, insert_faces, list_people, merge_people, person_faces,
+    prune_empty_unnamed, reject_face, set_person_cover, set_person_hidden, set_person_name,
+    FaceInput, ImageFaceRow, PersonFaceRow, PersonRow,
+};
+pub use face_cluster::{cluster_assign, ClusterParams, ClusterStats};
 pub use features::{
     compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
 };

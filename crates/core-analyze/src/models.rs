@@ -129,6 +129,24 @@ pub const ANIMAL_DETECTOR_FILES: &[RemoteFile] = &[RemoteFile {
     sha256: "d00e778327cc2e67f0d4927d94da5a0494a470e23a13520d0fad569abf78adff",
 }];
 
+/// Face detector: SCRFD-10G-KPS (InsightFace `buffalo_l/detection`). NON-COMMERCIAL pretrained weights
+/// — acceptable for this personal/local app; a commercial build must swap to a permissive model.
+pub const FACE_DETECTOR_FILES: &[RemoteFile] = &[RemoteFile {
+    rel: "faces/det_10g.onnx",
+    url: "https://huggingface.co/immich-app/buffalo_l/resolve/main/detection/model.onnx",
+    min_size: 15_000_000,
+    sha256: "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+}];
+
+/// Face embedder: ArcFace `w600k_r50` (InsightFace `buffalo_l/recognition`), 512-d. Same
+/// non-commercial caveat as the detector.
+pub const FACE_EMBEDDER_FILES: &[RemoteFile] = &[RemoteFile {
+    rel: "faces/w600k_r50.onnx",
+    url: "https://huggingface.co/immich-app/buffalo_l/resolve/main/recognition/model.onnx",
+    min_size: 150_000_000,
+    sha256: "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43",
+}];
+
 /// Detection verifier: MobileCLIP-S1 (Apple, MIT) — fp32 vision + text encoders + CLIP tokenizer.
 pub const VERIFIER_FILES: &[RemoteFile] = &[
     RemoteFile {
@@ -175,6 +193,14 @@ impl ModelStore {
 
     pub fn animal_detector_path(&self) -> PathBuf {
         self.path("megadetector/md_v5a_dynamic.onnx")
+    }
+
+    pub fn face_detector_path(&self) -> PathBuf {
+        self.path("faces/det_10g.onnx")
+    }
+
+    pub fn face_embedder_path(&self) -> PathBuf {
+        self.path("faces/w600k_r50.onnx")
     }
 
     /// `(vision, text, tokenizer)` paths for the MobileCLIP verifier.

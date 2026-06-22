@@ -3,8 +3,8 @@
 
 use crate::state::AppState;
 use core_library::{
-    CaptionRow, CollectionRow, DetectionRow, FacetRow, FolderRow, ImageRow, IndexStats, KeywordRow,
-    PresenceRow, QueryParams, UserLabels,
+    CaptionRow, CollectionRow, DetectionRow, FacetRow, FolderRow, ImageFaceRow, ImageRow,
+    IndexStats, KeywordRow, PersonFaceRow, PersonRow, PresenceRow, QueryParams, UserLabels,
 };
 use core_pipeline::{DevelopParams, Histogram};
 use rayon::prelude::*;
@@ -1521,6 +1521,209 @@ pub async fn image_presence(app: AppHandle, id: i64) -> Result<Option<PresenceRo
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::presence_for_image(&db.conn, id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---- Faces / People ----
+
+/// People status: present-image total, how many are face-processed, total faces/people, model state.
+#[tauri::command]
+pub async fn faces_status(app: AppHandle) -> Result<crate::faces::FacesStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        crate::faces::status(&st)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Download any missing face models (~190 MB, first run only). Emits `faces:models` progress.
+#[tauri::command]
+pub async fn faces_models_ensure(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::faces::ensure_face_models(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Run the "Find People" pass (detect → align → embed → cluster). `force` re-processes everything.
+/// Emits `faces:progress`/`faces:done`.
+#[tauri::command]
+pub async fn faces_run(app: AppHandle, force: bool) -> Result<crate::faces::FacesRunStats, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::faces::run_pass(&app, force))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Request the running face pass to stop after the current batch commits. No-op if idle.
+#[tauri::command]
+pub fn faces_cancel(app: AppHandle) {
+    let st = app.state::<AppState>();
+    if st.faces_running.load(Ordering::SeqCst) {
+        st.faces_cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// People for the sidebar (named first, then unnamed "Suggested" clusters); each with a cover crop.
+#[tauri::command]
+pub async fn people_list(app: AppHandle, include_hidden: bool) -> Result<Vec<PersonRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::list_people(&db.conn, include_hidden).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Faces of one person, optionally restricted to a status (e.g. `"unconfirmed"` for the Review flow).
+#[tauri::command]
+pub async fn person_faces(
+    app: AppHandle,
+    person_id: i64,
+    status: Option<String>,
+) -> Result<Vec<PersonFaceRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::person_faces(&db.conn, person_id, status.as_deref()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Faces detected in one image (+ their person names) — the RightInfo "People" chips.
+#[tauri::command]
+pub async fn image_faces(app: AppHandle, id: i64) -> Result<Vec<ImageFaceRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::image_faces(&db.conn, id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set (or clear with `null`) a person's name.
+#[tauri::command]
+pub async fn person_set_name(
+    app: AppHandle,
+    person_id: i64,
+    name: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_person_name(
+            &db.conn,
+            person_id,
+            name.as_deref(),
+            core_library::now_epoch(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Hide/unhide a person (excluded from the sidebar + library filter when hidden).
+#[tauri::command]
+pub async fn person_set_hidden(
+    app: AppHandle,
+    person_id: i64,
+    hidden: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_person_hidden(&db.conn, person_id, hidden, core_library::now_epoch())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set a person's cover (key) face. The face must belong to the person.
+#[tauri::command]
+pub async fn person_set_cover(
+    app: AppHandle,
+    person_id: i64,
+    face_id: i64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_person_cover(&db.conn, person_id, face_id, core_library::now_epoch())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Merge person `src` into `dst` (move all faces + rejections, delete `src`). Atomic; not reversible.
+#[tauri::command]
+pub async fn person_merge(app: AppHandle, dst: i64, src: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+        core_library::merge_people(&tx, dst, src).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Confirm a face belongs to its person ("yes" in the Review flow).
+#[tauri::command]
+pub async fn face_confirm(app: AppHandle, face_id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::confirm_face(&db.conn, face_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Reject a face from its person ("not this person") — unlink + remember the rejection.
+#[tauri::command]
+pub async fn face_reject(app: AppHandle, face_id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::reject_face(&db.conn, face_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Reassign a face to a person (confirmed), or `null` to send it back to the suggestion pool.
+#[tauri::command]
+pub async fn face_assign(
+    app: AppHandle,
+    face_id: i64,
+    person_id: Option<i64>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::assign_face_person(&db.conn, face_id, person_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Delete ALL face + person data (privacy "Delete all face data"). Atomic; not reversible.
+#[tauri::command]
+pub async fn faces_delete_all(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+        core_library::delete_all_face_data(&tx).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
