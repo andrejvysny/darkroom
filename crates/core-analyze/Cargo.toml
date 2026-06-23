@@ -5,9 +5,11 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-# ONNX Runtime bindings. CoreML EP (ANE/GPU) on Apple Silicon. Pinned exactly (no stable release yet).
-# Default features (std, ndarray, download-binaries, copy-dylibs, tls-native, api-24) + coreml EP.
-ort = { version = "=2.0.0-rc.12", features = ["coreml"] }
+# ONNX Runtime bindings. Pinned exactly (no stable release yet). Default features
+# (std, ndarray, download-binaries, copy-dylibs, tls-native, api-24); the accelerated EP is
+# selected per target below. download-binaries statically links onnxruntime on every platform
+# (no dylib to ship). EP that can't register at runtime falls back to CPU automatically.
+ort = { version = "=2.0.0-rc.12" }
 ndarray = "0.17"
 image = "0.25"
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +25,16 @@ sha2 = "0.10"
 nalgebra = "0.33"
 # Affine warp of the aligned 112x112 face crop (image-0.25 compatible).
 imageproc = "0.25"
+
+# Accelerated execution providers, selected per platform (Cargo unions features for the same
+# crate across these tables). CoreML (ANE/GPU) on Apple Silicon; DirectML (any DX12 GPU) on
+# Windows — pyke's prebuilt Windows onnxruntime is already compiled with DirectML, so this only
+# exposes the `ort::ep::DirectML` type (no extra redistributable). Linux/other -> CPU.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.12", features = ["coreml"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "=2.0.0-rc.12", features = ["directml"] }
 
 [dev-dependencies]
 anyhow = "1"

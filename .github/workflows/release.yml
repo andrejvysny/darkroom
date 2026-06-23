@@ -1,0 +1,56 @@
+name: release
+
+# Tag a version (e.g. `git tag v0.1.0 && git push --tags`) to build installers and attach them
+# to a draft GitHub Release. `workflow_dispatch` allows a manual run for testing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon .dmg (ad-hoc signed, matching the current local build).
+          - {
+              platform: macos-latest,
+              args: "--target aarch64-apple-darwin --bundles dmg",
+            }
+          # Per-user NSIS .exe -> bundle/nsis/Darkroom_<version>_x64-setup.exe (unsigned for now).
+          - { platform: windows-latest, args: "--bundles nsis" }
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # tauri-action runs beforeBuildCommand (npm run build), bundles, and uploads to the release.
+      - name: Build app + create release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+          tagName: ${{ github.ref_name }}
+          releaseName: "Darkroom ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: true

@@ -47,3 +47,37 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  # Compile-only gate so PRs catch Windows breakage (cross-platform cfg, ort/DirectML linking,
+  # MSVC-built C deps). GPU/CR3 behaviour is validated by the macOS job + manual run-through; the
+  # headless windows-latest runner can't exercise the real DX12 path, so no tests run here.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91 (+ clippy)
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Frontend type-check + build
+        run: npm run build
+
+      - name: Clippy (warnings = errors)
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --workspace --release

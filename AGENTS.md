@@ -13,6 +13,7 @@ Darkroom is a macOS Tauri v2 application. The React 19/TypeScript frontend lives
 - `cargo test --workspace`: run Rust unit and integration tests.
 - `cargo clippy --workspace --examples -- -D warnings`: enforce CI Rust linting.
 - `npm run tauri build -- --bundles dmg`: create the macOS DMG.
+- `npm run tauri build -- --bundles nsis`: create the per-user Windows NSIS installer (build on Windows / `windows-latest`; unsigned). CI builds both via `.github/workflows/release.yml` on a `v*` tag.
 - `cd e2e && ../node_modules/.bin/playwright test --project=browser`: run mocked-browser E2E tests. Use `--project=tauri` with the E2E-enabled Tauri app for real-backend verification.
 
 ## Coding Style & Naming Conventions
