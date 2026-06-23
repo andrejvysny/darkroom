@@ -7,18 +7,20 @@
 
 ## TL;DR
 
-**Active — branch `chore/cleanups-viewport-histogram` (uncommitted):** a tech-debt pass. (1) Extracted
-the ~200 LOC of duplicated canvas-viewport logic from `Stage.tsx` + `Library/Loupe.tsx` into a shared
-`src/lib/useViewport.ts` hook (+ `src/lib/canvasPaint.ts` `paintFrame`); behavior-preserving (crop
-fit-lock via `transformViewState`, tiered preview/decode stays in Loupe). (2) **Whole-crop histogram**:
-new `develop_histogram` IPC renders the full crop `{0,0,1,1}` at 384² and histograms it (correct while
-zoomed) — `develop_render` no longer emits the viewport-biased histogram; the frontend triggers it on
-param/before-after change + first warm render (skip-if-cold avoids a duplicate decode on open). (3) These
-doc reconciliations. `npx tsc --noEmit` clean; `cargo test`/`clippy`/`npm run build` verification in
-progress. Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`.
+**Latest — branch `chore/cleanups-viewport-histogram` (MERGED to `main` `01a7b84`, not pushed):** a
+tech-debt pass. (1) Extracted the ~200 LOC of duplicated canvas-viewport logic from `Stage.tsx` +
+`Library/Loupe.tsx` into a shared `src/lib/useViewport.ts` hook (+ `src/lib/canvasPaint.ts` `paintFrame`);
+behavior-preserving (crop fit-lock via `transformViewState`, tiered preview/decode stays in Loupe).
+(2) **Whole-crop histogram**: new `develop_histogram` IPC renders the full crop `{0,0,1,1}` at 384² and
+histograms it (correct while zoomed) — `develop_render` no longer emits the viewport-biased histogram;
+the frontend triggers it on param/before-after change + first warm render (skip-if-cold avoids a
+duplicate decode on open). (3) These doc reconciliations. `npx tsc --noEmit` + `cargo test` (Metal
+goldens byte-identical) + `clippy --workspace --examples -D warnings` + `npm run build` all clean;
+in-app visual QA pending. Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`.
 
 **Latest MERGED to `main`:** `feat/unified-ai-pipeline` (`f663ee0`) + `feat/import-ordering-keyset-paging`
-(`595685d`). NOTE: `main` is **8 commits ahead of `origin/main` (unpushed)**.
+(`595685d`) — both already on `origin/main` (at `f663ee0`). The only unpushed work is the cleanup pass
+below (2 commits, merged `01a7b84`).
 
 - **`feat/unified-ai-pipeline` (MERGED `f663ee0`):** the two separate on-device AI passes (object
   detection auto-after-import + face recognition manual "Find People") are now ONE **manual** scan for
@@ -134,10 +136,10 @@ New tests this pass: import-session reaper, schema downgrade guard, sidecar roun
    GUI-verified: one scan does detection+faces+captions; ONE progress bar; People populate before
    captions; a confirmed/assigned face survives a re-scan; cancel works; `faces_delete_all` during a
    scan is refused. (First run downloads ≈900 MB object + 190 MB face models.)
-2. **This branch (`chore/cleanups-viewport-histogram`) visual QA** — zoom/pan/reset in Develop Stage +
-   Library Loupe (the `useViewport` extraction must not regress); whole-crop histogram stays correct
-   while zoomed + updates on slider drag. Then **commit** (currently uncommitted) and decide on push
-   (`main` is 8 commits ahead of `origin`).
+2. **Cleanup-pass visual QA** (`chore/cleanups-viewport-histogram`, merged `01a7b84`) — zoom/pan/reset
+   in Develop Stage + Library Loupe (the `useViewport` extraction must not regress); whole-crop
+   histogram stays correct while zoomed + updates on slider drag. Then decide on **push** (this cleanup
+   is the only work ahead of `origin/main`).
 3. Deferred AI (optional): full Phase-A/B `run_pass` fn-split (cosmetic); ANN clustering
    (instant-distance HNSW) for >~200 k faces; drop the now-dead `analyze: bool` param in
    `index_root_blocking`. Optional independent Codex cross-check of the AI pass. Granular: `TODO.md`.

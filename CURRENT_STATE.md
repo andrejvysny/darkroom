@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-**Active branch — `chore/cleanups-viewport-histogram` (uncommitted):** a tech-debt pass. (1) Shared
+**Latest — `chore/cleanups-viewport-histogram` (MERGED `01a7b84`, not pushed):** a tech-debt pass. (1) Shared
 `src/lib/useViewport.ts` hook (+ `src/lib/canvasPaint.ts`) extracts the ~200 LOC of canvas-viewport
 logic duplicated between `Stage.tsx` + `Library/Loupe.tsx` (behavior-preserving). (2) **Whole-crop
 histogram**: new `develop_histogram` IPC renders the full crop `{0,0,1,1}` at 384² (correct while
@@ -13,7 +13,7 @@ zoomed); `develop_render` no longer emits the viewport-biased one. (3) Doc recon
 clean; `cargo test`/`clippy`/`npm run build` green; in-app visual QA pending. Plan:
 `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`.
 
-**Recently MERGED to `main`** (`main` is 8 commits ahead of `origin/main`, unpushed): the two separate
+**Recently MERGED to `main`** (`origin/main` is at `f663ee0`; only this cleanup — 2 commits — is unpushed): the two separate
 on-device AI passes — object detection (auto-after-import) + face recognition (manual "Find People") —
 are now ONE manual scan (`feat/unified-ai-pipeline`, `f663ee0`: single shared decode, per-stage
 dirty-DAG, deferred captions, data-safe face reconcile; **in-app GUI QA still pending**); plus

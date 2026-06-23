@@ -2,11 +2,11 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
-## DONE (UNCOMMITTED): Cleanups & tech-debt — branch `chore/cleanups-viewport-histogram`
+## DONE (MERGED `01a7b84`): Cleanups & tech-debt — branch `chore/cleanups-viewport-histogram`
 
 > Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`. `npx tsc --noEmit` +
 > `cargo test --workspace` (goldens byte-identical) + `clippy --workspace --examples -D warnings` +
-> `npm run build` all clean. **NOT committed.**
+> `npm run build` all clean. Committed `0f1dd88`, merged to `main` `01a7b84` (--no-ff); **not pushed**.
 
 - [x] **Shared `useViewport` hook** — `src/lib/useViewport.ts` (+ `src/lib/canvasPaint.ts` `paintFrame`)
       owns the ~200 LOC of canvas-viewport logic that `Stage.tsx` + `Library/Loupe.tsx` duplicated
@@ -24,7 +24,8 @@
 - [x] Doc reconciliation (HAND_OFF/CURRENT_STATE/TODO) — docs had lagged `main` by 8 commits.
 - [ ] **In-app visual QA** (`npm run tauri dev` or Tier-1 mock): zoom/pan/reset in Develop Stage +
       Library Loupe (no regression from the hook extraction); whole-crop histogram correct while zoomed + live on slider drag.
-- [ ] **Commit** the branch; decide on **push** (`main` is 8 commits ahead of `origin/main`, unpushed).
+- [x] **Committed** (`0f1dd88`) + **merged to `main`** (`01a7b84`, `--no-ff`). Decide on **push**:
+      `origin/main` is at `f663ee0`, so this cleanup (2 commits) is the only unpushed work.
 
 ## DONE (MERGED `f663ee0`): Unified AI pipeline + post-review fixes — branch `feat/unified-ai-pipeline`
 
