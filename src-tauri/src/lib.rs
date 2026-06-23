@@ -100,6 +100,7 @@ pub fn run() {
             commands::thumb_prioritize,
             commands::develop_session,
             commands::develop_get_histogram,
+            commands::develop_histogram,
             commands::export_image,
             commands::cull_set_rating,
             commands::cull_set_flag,

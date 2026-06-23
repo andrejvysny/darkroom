@@ -1,7 +1,7 @@
 //! IPC command handlers. Heavy/DB work runs on `spawn_blocking`; state is fetched via the
 //! `AppHandle` inside the blocking closure (never held across `.await`).
 
-use crate::state::AppState;
+use crate::state::{AppState, GpuRender};
 use core_library::{
     CaptionRow, CollectionRow, DateTreeYear, DetectionRow, FacetRow, FolderRow, ImageFaceRow,
     ImageRow, IndexStats, KeywordRow, PersonFaceRow, PersonRow, PresenceRow, QueryParams,
@@ -333,6 +333,10 @@ pub async fn develop_set_edit(
 /// (8192 on the wgpu defaults). A no-op for the validated EOS R7 (6960 px).
 const FULL_MAX_EDGE: u32 = 8192;
 
+/// Output edge for the whole-crop histogram render. Small + square: a histogram is invariant to the
+/// (anisotropic) resample, and `{0,0,1,1}` fills the whole output with the entire developed crop.
+const HIST_RENDER_EDGE: u32 = 384;
+
 fn profiling() -> bool {
     std::env::var_os("DARKROOM_PROFILE").is_some()
 }
@@ -561,6 +565,59 @@ fn packed_overlay_layer(params: &DevelopParams, idx: i32) -> i32 {
     }
 }
 
+/// Ensure the full-resolution decoded + GPU-prepared source for `image_id` lives in
+/// `full_render_cache` (keyed by id). Evicts a different image's texture first, then decodes (lock
+/// released across the expensive decode) + prepares only when absent. Returns `false` WITHOUT
+/// populating when `superseded()` turns true before the decode (caller should bail with an empty
+/// response); `true` once the cache holds `image_id`.
+fn ensure_full_render_cache(
+    st: &AppState,
+    gpu: &GpuRender,
+    image_id: i64,
+    superseded: impl Fn() -> bool,
+) -> Result<bool, String> {
+    // Free the large full-res texture as soon as we render a different image.
+    {
+        let mut slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
+        if slot.as_ref().is_some_and(|(id, _)| *id != image_id) {
+            *slot = None;
+        }
+    }
+
+    // --- Full-res source: decode the whole frame at full demosaic, cached in a single slot. ---
+    let present = {
+        let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
+        slot.as_ref().is_some_and(|(id, _)| *id == image_id)
+    };
+    if !present {
+        // Skip the expensive decode if a newer request already arrived.
+        if superseded() {
+            return Ok(false);
+        }
+        let path = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::image_by_id(&db.conn, image_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "image not found".to_string())?
+                .path
+        };
+        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+        let t = Instant::now();
+        let lin = core_raw::develop_linear(&src)
+            .map_err(|e| e.to_string())?
+            .downscale_into(FULL_MAX_EDGE);
+        if profiling() {
+            eprintln!("[profile] decode(full): {:?}", t.elapsed());
+        }
+        let prepared = gpu
+            .pipeline
+            .prepare(&gpu.ctx, &lin)
+            .map_err(|e| e.to_string())?;
+        *st.full_render_cache.lock().map_err(|e| e.to_string())? = Some((image_id, prepared));
+    }
+    Ok(true)
+}
+
 /// Render a crop-local viewport window of `image_id` at the requested output size, returning raw
 /// RGBA8 framed by its dimensions: `[out_w u32 LE][out_h u32 LE][rgba8 (out_w*out_h*4)]`.
 ///
@@ -593,44 +650,9 @@ pub async fn develop_render(
         st.latest_render.fetch_max(request_id, Ordering::SeqCst);
         let superseded = || st.latest_render.load(Ordering::SeqCst) > request_id;
 
-        // Free the large full-res texture as soon as we render a different image.
-        {
-            let mut slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-            if slot.as_ref().is_some_and(|(id, _)| *id != image_id) {
-                *slot = None;
-            }
-        }
-
-        // --- Full-res source: decode the whole frame at full demosaic, cached in a single slot. ---
-        let present = {
-            let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-            slot.as_ref().is_some_and(|(id, _)| *id == image_id)
-        };
-        if !present {
-            // Skip the expensive decode if a newer request already arrived.
-            if superseded() {
-                return Ok(tauri::ipc::Response::new(Vec::new()));
-            }
-            let path = {
-                let db = st.db.lock().map_err(|e| e.to_string())?;
-                core_library::image_by_id(&db.conn, image_id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "image not found".to_string())?
-                    .path
-            };
-            let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-            let t = Instant::now();
-            let lin = core_raw::develop_linear(&src)
-                .map_err(|e| e.to_string())?
-                .downscale_into(FULL_MAX_EDGE);
-            if prof {
-                eprintln!("[profile] decode(full): {:?}", t.elapsed());
-            }
-            let prepared = gpu
-                .pipeline
-                .prepare(&gpu.ctx, &lin)
-                .map_err(|e| e.to_string())?;
-            *st.full_render_cache.lock().map_err(|e| e.to_string())? = Some((image_id, prepared));
+        if !ensure_full_render_cache(st.inner(), gpu, image_id, superseded)? {
+            // A newer request overtook this one before the (skipped) decode.
+            return Ok(tauri::ipc::Response::new(Vec::new()));
         }
 
         // Build the viewport descriptor and render the crop-local window into an out_w × out_h
@@ -659,17 +681,9 @@ pub async fn develop_render(
         }
         drop(slot);
 
-        // Histogram from the rendered buffer: store for pull + emit for push. Skip if a newer render
-        // has superseded this one — otherwise a slower earlier render (e.g. a cache hit racing a
-        // just-started newer request) could clobber the live histogram with a stale buffer's stats.
-        // TODO: whole-crop histogram pass (this is now the visible-viewport histogram).
-        if !superseded() {
-            let hist = core_pipeline::histogram(&rgba);
-            if let Ok(mut last) = st.last_histogram.lock() {
-                *last = Some(hist.clone());
-            }
-            let _ = app.emit("develop:histogram", hist);
-        }
+        // The histogram is computed by the dedicated `develop_histogram` whole-crop pass (driven on
+        // param change), NOT from this viewport buffer — so it stays correct (whole image) while
+        // zoomed and is not recomputed on every pan/zoom.
 
         // Frame the raw RGBA8 with its dimensions: [out_w LE][out_h LE][rgba8].
         let mut buf = Vec::with_capacity(8 + rgba.len());
@@ -677,6 +691,59 @@ pub async fn develop_render(
         buf.extend_from_slice(&out_h.to_le_bytes());
         buf.extend_from_slice(&rgba);
         Ok::<_, String>(tauri::ipc::Response::new(buf))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Compute the histogram of the WHOLE developed crop (not the visible viewport). Renders the full
+/// crop-local frame `{0,0,1,1}` at a small fixed size and histograms it, so the Develop panel
+/// reflects the entire image regardless of pan/zoom. Stored for pull (`develop_get_histogram`) +
+/// emitted on `develop:histogram` for push. Driven by the frontend on param / before-after change
+/// (NOT on pan/zoom), so the extra small render is cheap and infrequent.
+#[tauri::command]
+pub async fn develop_histogram(
+    app: AppHandle,
+    image_id: i64,
+    params: DevelopParams,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let gpu = st
+            .gpu
+            .as_ref()
+            .ok_or_else(|| "GPU develop unavailable".to_string())?;
+
+        let view = core_pipeline::ViewParams {
+            origin: [0.0, 0.0],
+            size: [1.0, 1.0],
+            out_w: HIST_RENDER_EDGE,
+            out_h: HIST_RENDER_EDGE,
+            active: true,
+            overlay_layer: -1,
+            overlay_color: [0.0, 0.0, 0.0],
+            overlay_strength: 0.0,
+        };
+        // Reuse the WARM full-res cache only — never decode here. If it's cold (decode for this image
+        // still in flight, or a different image is cached), skip: the frontend re-triggers this after
+        // the first viewport render warms the cache, so we avoid a duplicate full-res decode on open.
+        let rgba = {
+            let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
+            match slot.as_ref() {
+                Some((id, prepared)) if *id == image_id => gpu
+                    .pipeline
+                    .render_view(&gpu.ctx, prepared, &params, &view)
+                    .map_err(|e| e.to_string())?,
+                _ => return Ok(()),
+            }
+        };
+
+        let hist = core_pipeline::histogram(&rgba);
+        if let Ok(mut last) = st.last_histogram.lock() {
+            *last = Some(hist.clone());
+        }
+        let _ = app.emit("develop:histogram", hist);
+        Ok::<_, String>(())
     })
     .await
     .map_err(|e| e.to_string())?

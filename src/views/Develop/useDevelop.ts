@@ -5,6 +5,7 @@ import { useDevelopStore, freshDefaults } from "../../store/develop";
 import {
   developGetEdit,
   developGetHistogram,
+  developHistogram,
   developPreviewJpeg,
   developRegenThumb,
   developRender,
@@ -34,6 +35,9 @@ import type { DerivedView } from "../../lib/viewport";
 
 // Warm-cache renders are single-digit ms; a short debounce keeps sliders feeling real-time.
 const RENDER_DEBOUNCE_MS = 20;
+// The whole-crop histogram is a separate (cheap, warm-cache) render; a longer debounce keeps it off
+// the hot path during fast slider drags — it only needs to settle, not track every frame.
+const HISTOGRAM_DEBOUNCE_MS = 120;
 
 export function useDevelop() {
   const selectedId = useAppStore((s) => s.selectedId);
@@ -57,6 +61,9 @@ export function useDevelop() {
   const prevShowBefore = useRef(showBefore);
   // Last view the canvas passed to us — used to re-render on param/overlay changes.
   const lastDerivedRef = useRef<DerivedView | null>(null);
+  // Image id whose whole-crop histogram has been seeded since load (so the first warm render seeds it
+  // exactly once — not on every pan/zoom). Reset to null on image change.
+  const histogramSeededFor = useRef<number | null>(null);
   // Reactive trigger: bumped on every param/overlay/before-after change so Stage re-renders (paints)
   // the canvas at the current view. (Slider edits don't change the view, so without this they'd only
   // appear on the next zoom/pan.)
@@ -67,6 +74,32 @@ export function useDevelop() {
     previewObjUrl.current = url;
     setPreviewUrl(url);
   }
+
+  // Debounced whole-crop histogram refresh — the dedicated full-frame pass (not the viewport buffer),
+  // so the panel stays correct while zoomed. Reads showBefore/params at fire time. Skips on the
+  // backend if the full-res cache is cold (a warm pass follows the first viewport render).
+  const debouncedHistogram = useCallback(
+    (() => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const run = (id: number) => {
+        if (timer !== null) clearTimeout(timer);
+        timer = setTimeout(() => {
+          const st = useDevelopStore.getState();
+          const p = st.showBefore ? freshDefaults() : st.params;
+          developHistogram(id, p).catch((e) =>
+            console.error("develop_histogram failed", e),
+          );
+        }, HISTOGRAM_DEBOUNCE_MS);
+      };
+      return Object.assign(run, {
+        cancel: () => {
+          if (timer !== null) clearTimeout(timer);
+          timer = null;
+        },
+      });
+    })(),
+    [],
+  );
 
   /**
    * The render function given to Stage/CanvasViewer.
@@ -102,6 +135,12 @@ export function useDevelop() {
           overlayIdx,
         );
         if (seq !== renderSeq.current) return null; // superseded
+        // The full-res cache is now warm for `id`. Seed the whole-crop histogram once per image open
+        // (param edits / before-after toggle trigger their own refresh; pan/zoom must not).
+        if (frame && histogramSeededFor.current !== id) {
+          histogramSeededFor.current = id;
+          debouncedHistogram(id);
+        }
         return frame;
       } catch (err) {
         console.error("develop_render failed", err);
@@ -110,7 +149,7 @@ export function useDevelop() {
         if (seq === renderSeq.current) setRendering(false);
       }
     },
-    [setRendering],
+    [setRendering, debouncedHistogram],
   );
 
   // Re-render at the current view (used when params/overlay change without a view change). Bumping
@@ -166,10 +205,13 @@ export function useDevelop() {
     (id: number, next: DevelopParams) => {
       touchCount.current += 1;
       useDevelopStore.setState({ params: next });
-      if (!useDevelopStore.getState().showBefore) debouncedRerender();
+      if (!useDevelopStore.getState().showBefore) {
+        debouncedRerender();
+        debouncedHistogram(id);
+      }
       debouncedPersist(id, next);
     },
-    [debouncedRerender, debouncedPersist],
+    [debouncedRerender, debouncedHistogram, debouncedPersist],
   );
 
   // Histogram: live updates via event.
@@ -195,6 +237,8 @@ export function useDevelop() {
 
     const id = selectedId;
     let cancelled = false;
+    // New image: the first warm render reseeds the whole-crop histogram.
+    histogramSeededFor.current = null;
 
     useDevelopStore.setState({
       selectedMaskIndex: null,
@@ -255,12 +299,14 @@ export function useDevelop() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
-  // Before/after toggle: re-render only when it actually flips.
+  // Before/after toggle: re-render only when it actually flips. The histogram follows the displayed
+  // image (BEFORE = defaults, AFTER = edited) — debouncedHistogram reads showBefore at fire time.
   useEffect(() => {
     if (selectedId === null) return;
     if (prevShowBefore.current === showBefore) return;
     prevShowBefore.current = showBefore;
     rerenderCurrent();
+    debouncedHistogram(selectedId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showBefore]);
 
