@@ -16,6 +16,7 @@ npm install
 npm run tauri dev                          # run app; first launch auto-indexes library/2026/
 npm run build                              # frontend type-check (tsc) + vite build
 npm run tauri build -- --bundles dmg       # ad-hoc-signed .dmg → target/release/bundle/dmg/
+npm run tauri build -- --bundles nsis      # (on Windows) per-user NSIS .exe → bundle/nsis/  (unsigned)
 
 cargo test --workspace                     # unit + integration (decode/index/pipeline/import/dedup) over real CR3
 cargo test -p core-pipeline --test param_effects   # single integration test (file = test name)

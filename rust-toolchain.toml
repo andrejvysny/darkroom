@@ -1,0 +1,6 @@
+# Pinned for MSRV-sensitive deps (rusqlite 0.39 + rusqlite_migration =2.5.0 need rustc <1.95;
+# newer breaks the build). Keep in sync with the version in .github/workflows/*.yml.
+# Builds are native-per-platform (CI: macos-latest + windows-latest), so no cross-target is listed.
+[toolchain]
+channel = "1.91.0"
+components = ["clippy", "rustfmt"]

@@ -322,9 +322,19 @@ export at true dims via `Crop::export_rect`. **Still UI-absent / NOT wired:** Le
 chromatic-aberration only (greenfield — no shader math, no UI controls yet). **Bindings 0–14 all used;
 next free = 15.**
 
+**Windows packaging — WIRED (branch `feat/windows-packaging`):** NSIS per-user `.exe` target
+(`tauri.conf.json` `bundle.windows`), DirectML EP for AI (`core-analyze` per-target `ort` features +
+cfg-gated `models.rs`; CoreML on macOS, DirectML on Windows, CPU fallback), `release.yml`
+(tag-triggered macOS+Windows artifacts via `tauri-action`) + a `windows-build` compile gate in
+`ci.yml` + `rust-toolchain.toml` (1.91.0). onnxruntime stays statically linked on Windows (no DLL to
+ship); `DirectML.dll` is a Win10 1903+ system component. **Pending:** first green `windows-build` run +
+manual end-to-end QA on a Windows box. Unsigned (SmartScreen warning); custom title bar still
+macOS-only (Windows uses native decorations).
+
 **Not done (deferred from spec):** keyword hierarchy UI, "recent import" as a true session filter,
-per-display ICC, RCD/AMaZE demosaic, Windows/Linux, notarization, CSP hardening. (Thumbnail LRU
-eviction and FS-watcher reconciliation are DONE — see `thumbs.rs::evict_to` and `src-tauri/watch.rs`.)
+per-display ICC, RCD/AMaZE demosaic, Linux, macOS notarization, Windows code-signing, CSP hardening.
+(Thumbnail LRU eviction and FS-watcher reconciliation are DONE — see `thumbs.rs::evict_to` and
+`src-tauri/watch.rs`.)
 
 ## Known issues / caveats
 

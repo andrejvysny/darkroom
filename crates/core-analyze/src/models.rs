@@ -8,20 +8,23 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "macos")]
 use ort::ep::coreml::{ComputeUnits, ModelFormat};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 
 use crate::error::AnalyzeError;
 
-/// Build an `ort` Session with CoreML (graceful CPU fallback if unavailable) at the given graph
-/// optimization level. `level1=true` is REQUIRED for the Florence-2 q4f16 components (default `All`
-/// trips a layernorm-fusion bug — see SPIKE.md); the D-FINE detector loads fine at `All` (`level1=false`).
+/// Build an `ort` Session with the platform's accelerated execution provider (CoreML on macOS,
+/// DirectML on Windows, CPU elsewhere — all with graceful CPU fallback if the EP can't register)
+/// at the given graph optimization level. `level1=true` is REQUIRED for the Florence-2 q4f16
+/// components (default `All` trips a layernorm-fusion bug — see SPIKE.md); the D-FINE detector
+/// loads fine at `All` (`level1=false`).
 ///
 /// `mlprogram=true` selects CoreML's newer **MLProgram** model format (vs the legacy `NeuralNetwork`
 /// default, which silently downcasts intermediates to FP16 and broadens op coverage). Used for the
 /// detector to keep score boundaries stable/deterministic for the precision-gated decode; Florence-2
-/// keeps the default (its q4f16 graph is tuned for it).
+/// keeps the default (its q4f16 graph is tuned for it). Ignored on non-CoreML platforms.
 pub fn build_session(
     model_path: &Path,
     level1: bool,
@@ -30,24 +33,40 @@ pub fn build_session(
     if !model_path.exists() {
         return Err(AnalyzeError::ModelMissing(model_path.display().to_string()));
     }
-    let mut coreml = ort::ep::CoreML::default().with_compute_units(ComputeUnits::All);
-    if mlprogram {
-        // MLProgram can't compile the model's dynamic input dims; we always feed a fixed shape, so
-        // require static input shapes (dynamic-shape nodes fall back to CPU).
-        coreml = coreml
-            .with_model_format(ModelFormat::MLProgram)
-            .with_static_input_shapes(true);
-    }
-    let coreml = coreml.build();
     let mut b = Session::builder().map_err(AnalyzeError::inference)?;
     if level1 {
         b = b
             .with_optimization_level(GraphOptimizationLevel::Level1)
             .map_err(AnalyzeError::inference)?;
     }
-    // Best-effort EP: ort logs a warning and falls back to CPU if CoreML can't register.
+    // Accelerated EP, selected per platform. Best-effort: ort logs a warning and falls back to
+    // CPU if the EP can't register (e.g. no compatible GPU). `.build()` type-erases each EP to a
+    // uniform `ExecutionProviderDispatch` so every platform feeds one list.
+    #[allow(unused_mut)]
+    let mut eps: Vec<ort::ep::ExecutionProviderDispatch> = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let mut coreml = ort::ep::CoreML::default().with_compute_units(ComputeUnits::All);
+        if mlprogram {
+            // MLProgram can't compile the model's dynamic input dims; we always feed a fixed
+            // shape, so require static input shapes (dynamic-shape nodes fall back to CPU).
+            coreml = coreml
+                .with_model_format(ModelFormat::MLProgram)
+                .with_static_input_shapes(true);
+        }
+        eps.push(coreml.build());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // DirectML accelerates any DX12 GPU and needs no model-format hint.
+        let _ = mlprogram;
+        eps.push(ort::ep::DirectML::default().build());
+    }
+    // Other targets register no accelerated EP and run on CPU.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = mlprogram;
     b = b
-        .with_execution_providers([coreml])
+        .with_execution_providers(eps)
         .map_err(AnalyzeError::inference)?;
     b.commit_from_file(model_path)
         .map_err(AnalyzeError::inference)
