@@ -7,24 +7,39 @@
 
 ## TL;DR
 
-**Newest — branch `feat/unified-ai-pipeline` (UNMERGED / uncommitted):** the two separate on-device AI
-passes (object detection auto-after-import + face recognition manual "Find People") are merged into ONE
-**manual** scan for **10k–100k libraries** — single shared decode (`core_raw::preview_with_orientation`),
-per-stage dirty-DAG keyset pagination (`stale_targets`), deferred Phase-B captions (Florence built
-lazily), and a **data-safe `reconcile_faces`** (a re-scan never drops a person-assigned face; inference
-errors retry instead of recording "0 faces"). Codex-reviewed reframe: **no upstream person-gate** —
-SCRFD self-gates ArcFace/clustering. Built phases 0–5 + a 3-aspect review (R1 correctness/data-safety,
-R2 perf/scale, R3 clean-code); `cargo test --workspace` + `clippy` + `npx tsc --noEmit` all clean.
-Migrations `012` (`images(status,id)`) + `013` (`json_extract` marker cleanup); new `face_stage_enabled`
-IPC + Settings toggle; scan is fully manual (auto-trigger removed); People ride the unified `analysis:*`
-event stream. **NOT committed; in-app GUI QA + an independent Codex cross-check (usage-limited, resets
-~Jun 23 00:44) are pending.** Design + rationale: memory `darkroom-unified-ai-pipeline`; fix plan
-`~/.claude/plans/act-as-senior-ai-linear-tome.md`. Supersedes the prior separate AI passes.
+**Active — branch `chore/cleanups-viewport-histogram` (uncommitted):** a tech-debt pass. (1) Extracted
+the ~200 LOC of duplicated canvas-viewport logic from `Stage.tsx` + `Library/Loupe.tsx` into a shared
+`src/lib/useViewport.ts` hook (+ `src/lib/canvasPaint.ts` `paintFrame`); behavior-preserving (crop
+fit-lock via `transformViewState`, tiered preview/decode stays in Loupe). (2) **Whole-crop histogram**:
+new `develop_histogram` IPC renders the full crop `{0,0,1,1}` at 384² and histograms it (correct while
+zoomed) — `develop_render` no longer emits the viewport-biased histogram; the frontend triggers it on
+param/before-after change + first warm render (skip-if-cold avoids a duplicate decode on open). (3) These
+doc reconciliations. `npx tsc --noEmit` clean; `cargo test`/`clippy`/`npm run build` verification in
+progress. Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`.
 
-**Latest MERGED (→ `main`, commit `d3e1d3e`): `feat/acr-curve-colorbalance` — base tone curve fit to
-the REAL Adobe Camera Raw default + Color-balance-RGB.** Started from a 9-agent state audit that found
-the docs lagged reality by two merged branches (crop/straighten, tone operator, import-lock fix, AI
-F1 0.905 were all already done despite docs calling them open). Two features shipped:
+**Latest MERGED to `main`:** `feat/unified-ai-pipeline` (`f663ee0`) + `feat/import-ordering-keyset-paging`
+(`595685d`). NOTE: `main` is **8 commits ahead of `origin/main` (unpushed)**.
+
+- **`feat/unified-ai-pipeline` (MERGED `f663ee0`):** the two separate on-device AI passes (object
+  detection auto-after-import + face recognition manual "Find People") are now ONE **manual** scan for
+  **10k–100k libraries** — single shared decode (`core_raw::preview_with_orientation`), per-stage
+  dirty-DAG keyset pagination (`stale_targets`), deferred Phase-B captions (Florence built lazily), and
+  a **data-safe `reconcile_faces`** (a re-scan never drops a person-assigned face; inference errors retry
+  instead of recording "0 faces"). No upstream person-gate — SCRFD self-gates ArcFace/clustering.
+  Migrations `012` (`images(status,id)`) + `013` (`json_extract` marker cleanup); new `face_stage_enabled`
+  IPC + Settings toggle; scan fully manual (auto-trigger removed); People ride the unified `analysis:*`
+  stream. **Still pending: in-app GUI QA** + an optional independent Codex cross-check (not blocking).
+  Design: memory `darkroom-unified-ai-pipeline`.
+- **`feat/import-ordering-keyset-paging` (MERGED `595685d`):** capture-date ordering (file-mtime
+  fallback, no stored NULLs), **keyset (cursor) pagination** for time-ordered sorts (migration `011`
+  `idx_images_imported(status, imported_at, id)`; filename/rating keep OFFSET), client-side sorted-merge
+  of incoming rows (kills live-import duplicates), and a throttled (500 ms) **live sidebar** (date tree +
+  counts). ~500-line `useLibrary.ts` refactor. Design: memory `darkroom-library-tree-staged-import`.
+
+**Prior MERGED pass (`d3e1d3e`): `feat/acr-curve-colorbalance` — base tone curve fit to the REAL Adobe
+Camera Raw default + Color-balance-RGB.** Started from a 9-agent state audit that found the docs lagged
+reality by two merged branches (crop/straighten, tone operator, import-lock fix, AI F1 0.905 were all
+already done despite docs calling them open). Two features shipped:
 
 - **Base tone curve fit to real ACR.** Replaced the placeholder analytic seed (`x^p/(x^p+c)`, p=1.35)
   with Adobe's **universal default tone curve** (1025-pt reference embedded in
@@ -113,18 +128,19 @@ New tests this pass: import-session reaper, schema downgrade guard, sidecar roun
 
 ## Suggested next steps
 
-### 0. Finish the unified AI pipeline branch (`feat/unified-ai-pipeline`) — UNMERGED, do first
+### 0. Outstanding verification on already-MERGED work (do first)
 
-1. **In-app GUI QA** (`npm run tauri dev`): one scan does detection+faces+captions; ONE progress bar;
-   People populate before captions; a confirmed/assigned face survives a re-scan; cancel works;
-   `faces_delete_all` during a scan is refused. (First run downloads ≈900 MB object + 190 MB face models.)
-2. **Codex cross-check** — re-run the 3 Codex agents (correctness / perf / clean-code) once the OpenAI
-   usage limit resets (~Jun 23 00:44); this is the independent non-Claude review the user asked for.
-   Fold in findings — esp. the query-plan/index second opinion and the Florence lazy-load trade-off.
-3. **Commit** the branch (changes are uncommitted working-tree edits).
-4. Deferred (optional, post-merge): full Phase-A/B `run_pass` fn-split (cosmetic); ANN clustering
+1. **Unified-AI in-app GUI QA** (`npm run tauri dev`) — `feat/unified-ai-pipeline` is MERGED but never
+   GUI-verified: one scan does detection+faces+captions; ONE progress bar; People populate before
+   captions; a confirmed/assigned face survives a re-scan; cancel works; `faces_delete_all` during a
+   scan is refused. (First run downloads ≈900 MB object + 190 MB face models.)
+2. **This branch (`chore/cleanups-viewport-histogram`) visual QA** — zoom/pan/reset in Develop Stage +
+   Library Loupe (the `useViewport` extraction must not regress); whole-crop histogram stays correct
+   while zoomed + updates on slider drag. Then **commit** (currently uncommitted) and decide on push
+   (`main` is 8 commits ahead of `origin`).
+3. Deferred AI (optional): full Phase-A/B `run_pass` fn-split (cosmetic); ANN clustering
    (instant-distance HNSW) for >~200 k faces; drop the now-dead `analyze: bool` param in
-   `index_root_blocking`. Full granular list: `TODO.md` top section.
+   `index_root_blocking`. Optional independent Codex cross-check of the AI pass. Granular: `TODO.md`.
 
 ### A. Feature push — Develop fidelity (highest collaborator value; tone target = LR/ACR)
 

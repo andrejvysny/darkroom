@@ -2,13 +2,42 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
-## DONE (UNMERGED / uncommitted): Unified AI pipeline + post-review fixes — branch `feat/unified-ai-pipeline`
+## DONE (UNCOMMITTED): Cleanups & tech-debt — branch `chore/cleanups-viewport-histogram`
+
+> Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`. `npx tsc --noEmit` +
+> `cargo test --workspace` (goldens byte-identical) + `clippy --workspace --examples -D warnings` +
+> `npm run build` all clean. **NOT committed.**
+
+- [x] **Shared `useViewport` hook** — `src/lib/useViewport.ts` (+ `src/lib/canvasPaint.ts` `paintFrame`)
+      owns the ~200 LOC of canvas-viewport logic that `Stage.tsx` + `Library/Loupe.tsx` duplicated
+      (container measure, zoom/pan, single-flight rAF scheduler, wheel/drag/reset). Behavior-preserving:
+      Stage injects crop fit-lock via `transformViewState` + keeps its `renderFn`/preview-paint/overlays;
+      Loupe keeps its tiered preview/decode render body. Hook does NOT pre-size the canvas (each render
+      body sizes+paints atomically → no flash); skip-if-canvas-not-mounted retries.
+- [x] **Whole-crop histogram** — new `develop_histogram` IPC (`commands.rs`, registered `lib.rs`) renders
+      the full crop `{0,0,1,1}` at 384² + histograms it, so the panel is correct while zoomed. Factored
+      `ensure_full_render_cache` helper out of `develop_render`; removed `develop_render`'s viewport-biased
+      histogram emit. `develop_histogram` is **skip-if-cold** (reuses warm full-res cache only — never
+      decodes) to avoid a duplicate full-res decode on image open. Frontend (`useDevelop`/`ipc.ts`):
+      `developHistogram` wrapper triggered debounced on param + before/after change + first warm render
+      (`histogramSeededFor`), never on pan/zoom.
+- [x] Doc reconciliation (HAND_OFF/CURRENT_STATE/TODO) — docs had lagged `main` by 8 commits.
+- [ ] **In-app visual QA** (`npm run tauri dev` or Tier-1 mock): zoom/pan/reset in Develop Stage +
+      Library Loupe (no regression from the hook extraction); whole-crop histogram correct while zoomed + live on slider drag.
+- [ ] **Commit** the branch; decide on **push** (`main` is 8 commits ahead of `origin/main`, unpushed).
+
+## DONE (MERGED `f663ee0`): Unified AI pipeline + post-review fixes — branch `feat/unified-ai-pipeline`
 
 > Merges object detection + faces + captions into ONE manual scan for **10k–100k libraries**. Fix plan:
 > `~/.claude/plans/act-as-senior-ai-linear-tome.md`; design + decisions: memory
 > `darkroom-unified-ai-pipeline`. `cargo test --workspace` + `clippy` + `npx tsc --noEmit` all clean.
-> **NOT committed** (working-tree changes on the branch). Supersedes the two separate AI passes recorded
-> further down ("AI People/Animal detection accuracy overhaul" + the face pass).
+> **MERGED to `main`** (`f663ee0`); only in-app GUI QA remains (below). Supersedes the two separate AI
+> passes recorded further down ("AI People/Animal detection accuracy overhaul" + the face pass).
+>
+> Also MERGED (`595685d`, `feat/import-ordering-keyset-paging`, undocumented until now): capture-date
+> ordering (file-mtime fallback), keyset (cursor) pagination for time sorts (migration `011`
+> `idx_images_imported`; filename/rating keep OFFSET), client-side sorted-merge import dedup, throttled
+> live sidebar. ~500-line `useLibrary.ts` refactor. Memory: `darkroom-library-tree-staged-import`.
 
 - [x] **Phase 0** decode-once: `core_raw::preview_with_orientation` (one JPEG decode → native ≤1024 +
       oriented ≤1536); pixel-equivalence test `core-raw/tests/decode_once.rs` (justifies "no model
@@ -31,21 +60,16 @@
       spam (÷32), Florence residency, event duplication. +3 regression tests (reconcile / dim-guard /
       json_extract).
 
-### NEXT (this branch — before merge)
+### NEXT (post-merge — still open)
 
 - [ ] **In-app GUI QA** (`npm run tauri dev`): one scan runs detection+faces+captions; ONE progress
       bar; People populate before captions; a confirmed/assigned face survives a re-scan; cancel stops
       it; `faces_delete_all` during a scan is refused. (Models ≈ 900 MB object + 190 MB faces on first
-      run.)
-- [ ] **Codex cross-check** (independent non-Claude review the user asked for): re-run the 3 Codex
-      agents (correctness / perf / clean-code) after the OpenAI usage limit resets (~Jun 23 00:44);
-      fold findings in. Specifically second-opinion the query-plan/index call (Claude judged the
-      `analysis_results` PK + new `images(status,id)` sufficient — no extra index) and the Florence
-      lazy-load trade-off.
-- [ ] **Commit** the branch (currently uncommitted working-tree changes; `git commit` not yet run).
-- [ ] Deferred (optional, post-merge): full Phase-A/B `run_pass` fn-split (cosmetic — `run_clustering`
+      run.) — the only genuinely-blocking item; the branch is already merged.
+- [ ] Deferred (optional): full Phase-A/B `run_pass` fn-split (cosmetic — `run_clustering`
       already extracted); ANN clustering (instant-distance) for >~200 k faces; remove the now-dead
-      `analyze: bool` param from `commands.rs::index_root_blocking`.
+      `analyze: bool` param from `commands.rs::index_root_blocking`; optional independent Codex
+      cross-check (correctness / perf / clean-code) of the AI pass.
 
 ## DONE: ACR tone-curve fit + Color-balance-RGB (develop-fidelity pass) — MERGED `d3e1d3e`
 
@@ -115,10 +139,10 @@
 - [ ] **B0 native-GPU-surface spike** (go/no-go): CAMetalLayer under a transparent webview, zero
       readback. If go → **Workstream B** (render thread owns Device/Queue/Surface, `run_on_main_thread`
       present, `develop:preview-rendered` event, surface lifecycle). Plan: snoopy-floating-island.md.
-- [ ] Whole-crop histogram pass (current histogram is viewport-biased; TODO marked in `commands.rs`).
+- [x] Whole-crop histogram pass — DONE (`chore/cleanups-viewport-histogram`): `develop_histogram` IPC.
 - [ ] Tiered source: preview-res for fit, full-res on zoom (faster first-open + fixes fit-view
       minification aliasing, Codex #3).
-- [ ] Extract a shared viewport hook — `Stage.tsx` and `Loupe.tsx` duplicate the canvas logic.
+- [x] Extract a shared viewport hook — DONE (`chore/cleanups-viewport-histogram`): `src/lib/useViewport.ts`.
 - [ ] Deferred review nits: derived-key float accumulation; eyedropper-while-cropping guard.
 
 ## DONE: Behavioral-signal capture (Phase 0 — labeled data for future AI)
@@ -229,9 +253,9 @@
       hashing (rotation-sensitive); per-mask WB as a CAT (currently per-channel gain delta);
       bilateral/edge-aware NR (currently a plain 3×3 box → softens edges); dedicated loupe preview
       (≥1536px, not upscaled 512 thumb); cache full-res developed buffer for repeat export.
-- [ ] **Viewport leftovers:** whole-crop histogram pass (current histogram is viewport-biased, TODO in
-      `commands.rs`); extract a shared `useViewport` hook (`Stage.tsx`/`Loupe.tsx` duplicate ~200 LOC);
-      tiered preview source (preview-res for fit, full-res on zoom); B0 native-GPU-surface spike.
+- [ ] **Viewport leftovers:** ~~whole-crop histogram pass~~ DONE; ~~shared `useViewport` hook~~ DONE
+      (both on `chore/cleanups-viewport-histogram`); remaining — tiered preview source (preview-res for
+      fit, full-res on zoom); B0 native-GPU-surface spike.
 - [ ] **Minor:** aspect-correct the linear gradient mask (`mask_prepass.wgsl::linear_cov`, needs FE+BE
       coord consistency); decide brush `flow` (wire buildup off MAX-blend, or remove from schema+UI).
       (DONE already: real Library histogram, `selectedId` inits null, Stage re-key on `selectedId`,

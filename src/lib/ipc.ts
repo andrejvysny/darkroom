@@ -917,6 +917,18 @@ export function developGetHistogram(): Promise<HistData | null> {
   return invoke<HistData | null>("develop_get_histogram", {});
 }
 
+/**
+ * Compute the WHOLE-crop histogram for `params` (a small dedicated full-frame render, NOT the
+ * viewport buffer — so it stays correct while zoomed). Stores it for pull + emits `develop:histogram`.
+ * Call on param / before-after change (debounced), never on pan/zoom.
+ */
+export function developHistogram(
+  imageId: number,
+  params: DevelopParams,
+): Promise<void> {
+  return invoke<void>("develop_histogram", { imageId, params });
+}
+
 /** Real per-image histogram (from the cached thumbnail) for the Library metadata panel. */
 export function imageHistogram(imageId: number): Promise<HistData | null> {
   return invoke<HistData | null>("image_histogram", { imageId });

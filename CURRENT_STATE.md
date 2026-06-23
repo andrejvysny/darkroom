@@ -5,13 +5,21 @@
 
 ## TL;DR
 
-**Newest work — branch `feat/unified-ai-pipeline`, UNMERGED / uncommitted:** the two separate on-device
-AI passes — object detection (auto-after-import) + face recognition (manual "Find People") — are merged
-into ONE manual scan for **10k–100k-image libraries** (single shared decode, per-stage dirty-DAG,
-deferred captions, data-safe face reconcile). `cargo test --workspace` + `clippy` + `npx tsc --noEmit`
-clean; **NOT committed** (working-tree changes) and **in-app GUI QA + an independent Codex cross-check
-are still pending**. Details: "Latest work — Unified AI pipeline" below; design + rationale in memory
-`darkroom-unified-ai-pipeline`; fix plan `~/.claude/plans/act-as-senior-ai-linear-tome.md`.
+**Active branch — `chore/cleanups-viewport-histogram` (uncommitted):** a tech-debt pass. (1) Shared
+`src/lib/useViewport.ts` hook (+ `src/lib/canvasPaint.ts`) extracts the ~200 LOC of canvas-viewport
+logic duplicated between `Stage.tsx` + `Library/Loupe.tsx` (behavior-preserving). (2) **Whole-crop
+histogram**: new `develop_histogram` IPC renders the full crop `{0,0,1,1}` at 384² (correct while
+zoomed); `develop_render` no longer emits the viewport-biased one. (3) Doc reconciliation. `npx tsc`
+clean; `cargo test`/`clippy`/`npm run build` green; in-app visual QA pending. Plan:
+`~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`.
+
+**Recently MERGED to `main`** (`main` is 8 commits ahead of `origin/main`, unpushed): the two separate
+on-device AI passes — object detection (auto-after-import) + face recognition (manual "Find People") —
+are now ONE manual scan (`feat/unified-ai-pipeline`, `f663ee0`: single shared decode, per-stage
+dirty-DAG, deferred captions, data-safe face reconcile; **in-app GUI QA still pending**); plus
+**capture-date ordering + keyset pagination + live-import dedup + live sidebar**
+(`feat/import-ordering-keyset-paging`, `595685d`, migration `011`). Details: "Latest work — Unified AI
+pipeline" below; designs in memory `darkroom-unified-ai-pipeline` + `darkroom-library-tree-staged-import`.
 
 V1 is **functionally complete**, plus several post-V1 passes — most recently **develop fidelity: the
 base tone curve fit to the real Adobe Camera Raw default + a Color-balance-RGB grading module**
@@ -26,7 +34,7 @@ fixture/Metal. **Biggest pending item: in-app visual QA** (`npm run tauri dev`) 
 varied real photos — the math is verified headless, but the ACR brightness / grading / crop _feel_ is
 subjective (`BASELINE_GAIN` in `params.rs` is the one brightness knob).
 
-## Latest work — Unified AI pipeline (branch `feat/unified-ai-pipeline`, UNMERGED / uncommitted)
+## Latest AI work — Unified AI pipeline (branch `feat/unified-ai-pipeline`, MERGED `f663ee0`)
 
 Merges the two on-device AI passes into ONE manual scan for **10k–100k libraries**. Coordinator =
 `src-tauri/src/analysis.rs::run_pass`, one job (single `analysis_running` guard + `analysis_cancel`):
@@ -152,10 +160,13 @@ overlay_mask_index, request_id) -> Response` returns raw bytes `[outW u32 LE][ou
   app to validate macOS transparency/z-order/flicker. The canvas path already delivers full-res,
   glitch-free, near-instant edits, so it's a perf-polish. Full design: `~/.claude/plans/
 snoopy-floating-island.md` (Workstream B; B0 is the go/no-go spike).
-- **`Stage.tsx` and `Loupe.tsx` duplicate** the canvas/view-rect/single-flight logic (the shared
-  `useViewport`/`CanvasViewer` were created then removed as unused) — extract a shared hook later.
-- **Histogram is now viewport-biased** (computed from the visible region). TODO in `commands.rs`:
-  a separate small whole-crop histogram pass on param change (Codex #9).
+- **Shared viewport hook DONE** (`chore/cleanups-viewport-histogram`): `src/lib/useViewport.ts` +
+  `src/lib/canvasPaint.ts` now own the canvas/view-rect/single-flight logic; `Stage.tsx` and
+  `Library/Loupe.tsx` consume it (Stage injects crop fit-lock via `transformViewState`; Loupe keeps its
+  tiered preview/decode render body). No more ~200 LOC dup.
+- **Whole-crop histogram DONE** (same branch): `develop_histogram` IPC renders the full crop at 384²
+  (correct while zoomed); `develop_render` no longer emits a viewport-biased histogram. Frontend
+  triggers it on param/before-after change + first warm render (skip-if-cold avoids a duplicate decode).
 - **First image open decodes full-res** (no preview tier in develop_render) — masked by the instant
   embedded preview. Tiered source (preview-res for fit, full-res on zoom) is a deferred optimization
   (Codex #3 — also the cheapest fix for fit-view minification aliasing).
@@ -215,7 +226,8 @@ Views: `views/Library/{LeftNav,ThumbGrid,RightInfo,BottomBar,Loupe,DedupModal}.t
   `library_folders`, `image_meta`, `library_index_root`
 - Develop: `develop_get_edit`, `develop_set_edit`, `develop_render` (viewport render → **raw RGBA**
   `[outW u32 LE][outH u32 LE][rgba]`, NOT JPEG), `develop_preview_jpeg` (instant first paint),
-  `develop_get_histogram`, `image_histogram` (Library panel)
+  `develop_get_histogram` (pull), `develop_histogram` (whole-crop pass → emits `develop:histogram`),
+  `image_histogram` (Library panel)
 - Export: `export_image`
 - Culling: `cull_set_rating`, `cull_set_flag`, `cull_set_label`,
   `cull_set_rating_many`, `cull_set_flag_many`, `cull_set_label_many` (batch)
