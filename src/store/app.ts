@@ -2,8 +2,8 @@ import { create } from "zustand";
 import type { ImageRow } from "../lib/ipc";
 
 interface AppState {
-  view: "library" | "develop";
-  setView: (v: "library" | "develop") => void;
+  view: "library" | "develop" | "dedup";
+  setView: (v: "library" | "develop" | "dedup") => void;
   /** The current (filtered) library image set — shared so Develop's filmstrip/chrome can read it
    *  even while the LibraryView is unmounted. */
   libraryImages: ImageRow[];
@@ -34,8 +34,6 @@ interface AppState {
   // Library action callbacks registered by LibraryView
   onImport: (() => void) | null;
   setOnImport: (fn: (() => void) | null) => void;
-  onOpenDedup: (() => void) | null;
-  setOnOpenDedup: (fn: (() => void) | null) => void;
   onOpenSettings: (() => void) | null;
   setOnOpenSettings: (fn: (() => void) | null) => void;
   onSearch: ((query: string) => void) | null;
@@ -79,8 +77,6 @@ export const useAppStore = create<AppState>((set) => ({
   setGridMode: (m) => set({ gridMode: m }),
   onImport: null,
   setOnImport: (fn) => set({ onImport: fn }),
-  onOpenDedup: null,
-  setOnOpenDedup: (fn) => set({ onOpenDedup: fn }),
   onOpenSettings: null,
   setOnOpenSettings: (fn) => set({ onOpenSettings: fn }),
   onSearch: null,

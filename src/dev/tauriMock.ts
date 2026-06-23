@@ -65,6 +65,54 @@ function makeRows(n: number): ImageRow[] {
 
 const rows = makeRows(FIXTURE_COUNT);
 
+// ── Dedup fixtures (DupGroup[] for the Duplicates view) ──────────────────────
+function dupImg(r: ImageRow, sizeMb: number) {
+  return {
+    id: r.id,
+    contentHash: r.contentHash,
+    path: r.path,
+    filename: r.filename,
+    fileSize: Math.round(sizeMb * 1024 * 1024),
+    captureDate: r.captureDate,
+    stars: r.stars,
+    iso: r.iso,
+    shutter: r.shutter,
+    aperture: r.aperture,
+  };
+}
+const dupGroup = (
+  key: string,
+  category: string,
+  picks: [number, number][],
+) => ({
+  key,
+  category,
+  images: picks.map(([id, mb]) => dupImg(rows[id - 1], mb)),
+});
+const DUP_GROUPS = [
+  dupGroup("a1b2c3d4", "byte", [
+    [1, 21.2],
+    [2, 21.2],
+  ]),
+  dupGroup("e5f6a7b8", "capture", [
+    [10, 20.1],
+    [11, 22.4],
+    [12, 18.7],
+    [13, 21.0],
+  ]),
+  dupGroup("c9d0e1f2", "capture", [
+    [20, 14.7],
+    [21, 14.9],
+  ]),
+  dupGroup("p3a4b5c6", "perceptual", [
+    [30, 12.1],
+    [31, 12.3],
+    [32, 11.8],
+    [33, 12.2],
+    [34, 12.0],
+  ]),
+];
+
 // ── Query / filter / sort ────────────────────────────────────────────────────
 
 function getParams(p: Record<string, unknown>): QueryParams {
@@ -359,10 +407,11 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     failed: 0,
     sourceRetained: 0,
   }),
-  dedup_scan: () => [],
-  dedup_scan_perceptual: () => [],
-  dedup_resolve: () => 0,
-  dedup_resolve_bulk: () => 0,
+  dedup_scan: (p) =>
+    String(p.category) === "byte" ? [DUP_GROUPS[0]] : DUP_GROUPS.slice(1, 3),
+  dedup_scan_perceptual: () => [DUP_GROUPS[3]],
+  dedup_resolve: (p) => ids(p.trashIds).length,
+  dedup_resolve_bulk: () => 1,
 
   // Thumb cache settings
   thumb_cache_cap: () => 8 * 1024 * 1024 * 1024,

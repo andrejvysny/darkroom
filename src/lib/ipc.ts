@@ -226,6 +226,10 @@ export type DupImage = {
   filename: string;
   fileSize: number;
   captureDate: number | null;
+  stars: number;
+  iso: number | null;
+  shutter: string | null;
+  aperture: number | null;
 };
 
 export type DupGroup = {

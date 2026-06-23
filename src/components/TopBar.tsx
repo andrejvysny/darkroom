@@ -23,7 +23,6 @@ export default function TopBar() {
   const setView = useAppStore((s) => s.setView);
   const setPaletteOpen = useAppStore((s) => s.setPaletteOpen);
   const onImport = useAppStore((s) => s.onImport);
-  const onOpenDedup = useAppStore((s) => s.onOpenDedup);
   const onSearch = useAppStore((s) => s.onSearch);
   const onDevelopReset = useAppStore((s) => s.onDevelopReset);
   const currentFilename = useAppStore(
@@ -99,6 +98,21 @@ export default function TopBar() {
         >
           Develop
         </button>
+        <button
+          data-testid="nav-dedup"
+          onClick={() => setView("dedup")}
+          style={{
+            padding: "4px 13px",
+            borderRadius: 4,
+            fontSize: 12.5,
+            fontWeight: 500,
+            color: view === "dedup" ? "var(--color-t1)" : "var(--color-t2)",
+            background: view === "dedup" ? "var(--color-hover)" : "transparent",
+            boxShadow: view === "dedup" ? "0 1px 0 rgba(0,0,0,.25)" : "none",
+          }}
+        >
+          Duplicates
+        </button>
       </div>
 
       {/* Context-aware right side */}
@@ -138,10 +152,6 @@ export default function TopBar() {
           <button className="tbtn ghost" onClick={() => onImport?.()}>
             <Icon name="import" />
             Import
-          </button>
-          <button className="tbtn ghost" onClick={() => onOpenDedup?.()}>
-            <Icon name="copy" />
-            Find duplicates
           </button>
         </>
       ) : (

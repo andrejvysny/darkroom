@@ -17,7 +17,6 @@ export default function CommandPalette() {
   const view = useAppStore((s) => s.view);
   const selectedId = useAppStore((s) => s.selectedId);
   const onImport = useAppStore((s) => s.onImport);
-  const onOpenDedup = useAppStore((s) => s.onOpenDedup);
   const onOpenSettings = useAppStore((s) => s.onOpenSettings);
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
@@ -42,7 +41,7 @@ export default function CommandPalette() {
       icon: "copy",
       label: "Find duplicates",
       shortcut: "⌘D",
-      run: () => onOpenDedup?.(),
+      run: () => setView("dedup"),
     },
     {
       icon: "edit",

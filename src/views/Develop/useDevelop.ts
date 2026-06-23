@@ -402,13 +402,9 @@ export function useDevelop() {
     (patch: Partial<CbRgb>) => {
       if (selectedId === null) return;
       const cur = useDevelopStore.getState().params;
-      // Live-drag (setState + debounced persist); pointer-up callers pass a final commit.
-      touchCount.current += 1;
-      const next = { ...cur, cbRgb: { ...cur.cbRgb, ...patch } };
-      useDevelopStore.setState({ params: next });
-      debouncedPersist(selectedId, next);
+      commit(selectedId, { ...cur, cbRgb: { ...cur.cbRgb, ...patch } });
     },
-    [selectedId, debouncedPersist],
+    [selectedId, commit],
   );
 
   // ── Mask operations ───────────────────────────────────────────────────────

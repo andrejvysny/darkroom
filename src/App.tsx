@@ -8,6 +8,7 @@ import CommandPalette from "./components/CommandPalette";
 import Toast from "./components/Toast";
 import LibraryView from "./views/Library/LibraryView";
 import DevelopView from "./views/Develop/DevelopView";
+import DedupView from "./views/Dedup/DedupView";
 
 export default function App() {
   useKeyboard();
@@ -29,7 +30,9 @@ export default function App() {
       }}
     >
       <TopBar />
-      {view === "library" ? <LibraryView /> : <DevelopView />}
+      {view === "library" && <LibraryView />}
+      {view === "develop" && <DevelopView />}
+      {view === "dedup" && <DedupView />}
       <CommandPalette />
       <Toast />
     </div>

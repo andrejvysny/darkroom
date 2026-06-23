@@ -34,7 +34,6 @@ import RightInfo, { RightInfoHandlers } from "./RightInfo";
 import BottomBar from "./BottomBar";
 import SelectionBar from "./SelectionBar";
 import Loupe from "./Loupe";
-import DedupModal from "./DedupModal";
 import ImportDialog from "./ImportDialog";
 import SettingsModal from "./SettingsModal";
 
@@ -73,10 +72,8 @@ export default function LibraryView() {
   const setLibraryImages = useAppStore((s) => s.setLibraryImages);
   const thumbVersions = useAppStore((s) => s.thumbVersions);
   const setOnImport = useAppStore((s) => s.setOnImport);
-  const setOnOpenDedup = useAppStore((s) => s.setOnOpenDedup);
   const setOnOpenSettings = useAppStore((s) => s.setOnOpenSettings);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
-  const [dedupOpen, setDedupOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
@@ -105,22 +102,14 @@ export default function LibraryView() {
   // Register library action callbacks so TopBar/CommandPalette can call them
   useEffect(() => {
     setOnImport(() => setImportOpen(true));
-    setOnOpenDedup(() => setDedupOpen(true));
     setOnOpenSettings(() => setSettingsOpen(true));
     setOnSearch((q: string) => lib.setSearch(q.trim() ? q.trim() : null));
     return () => {
       setOnImport(null);
-      setOnOpenDedup(null);
       setOnOpenSettings(null);
       setOnSearch(null);
     };
-  }, [
-    lib.setSearch,
-    setOnImport,
-    setOnOpenDedup,
-    setOnOpenSettings,
-    setOnSearch,
-  ]);
+  }, [lib.setSearch, setOnImport, setOnOpenSettings, setOnSearch]);
 
   // Keep a valid primary selection: if it's unset or no longer in the current (filtered) set,
   // fall back to the first visible image.
@@ -697,12 +686,6 @@ export default function LibraryView() {
           setSort={lib.setSort}
         />
       </div>
-
-      <DedupModal
-        open={dedupOpen}
-        onClose={() => setDedupOpen(false)}
-        onRefresh={() => void lib.refresh()}
-      />
 
       <ImportDialog
         open={importOpen}
