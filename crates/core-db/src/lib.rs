@@ -30,6 +30,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/011_imported_index.sql"),
     include_str!("../migrations/012_analysis_stage_index.sql"),
     include_str!("../migrations/013_face_marker_reconcile.sql"),
+    include_str!("../migrations/014_similarity_features.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -157,6 +158,7 @@ mod tests {
             "image_features",
             "image_keywords",
             "image_presence",
+            "image_similarity_features",
             "image_user_labels",
             "images",
             "import_sessions",

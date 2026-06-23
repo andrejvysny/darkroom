@@ -113,24 +113,80 @@ fn resolve_rejects_invalid_keeper_and_trashes_nothing() {
     );
 }
 
-fn insert_ph(db: &Db, hash: &[u8], path: &str, phash: u64) {
+fn insert_sim(db: &Db, hash: &[u8], path: &str, captured: i64, dhash: u64, phash: u64) -> i64 {
     db.conn
         .execute(
-            "INSERT INTO images(content_hash, file_size, path, original_filename, status, imported_at, phash)
-             VALUES(?1, ?2, ?3, ?4, 'present', 0, ?5)",
-            params![hash, 1000i64, path, path, phash as i64],
+            "INSERT INTO images(content_hash, file_size, path, original_filename, status,
+                                capture_date, imported_at, width, height, camera_model, body_serial)
+             VALUES(?1, ?2, ?3, ?4, 'present', ?5, 0, 6000, 4000, 'Canon', 'body-1')",
+            params![hash, 1000i64, path, path, captured],
         )
         .unwrap();
+    let id = db.conn.last_insert_rowid();
+    insert_features(db, id, dhash, phash, &gradient_luma(0), &landscape_color());
+    id
+}
+
+fn insert_features(db: &Db, id: i64, dhash: u64, phash: u64, luma: &[u8], color: &[u8]) {
+    db.conn
+        .execute(
+            "INSERT INTO image_similarity_features(
+                image_id, feature_version, dhash64, phash64, tiny_luma32, color_grid4x4, computed_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![
+                id,
+                core_dedup::SIMILARITY_FEATURE_VERSION,
+                dhash as i64,
+                phash as i64,
+                luma,
+                color,
+            ],
+        )
+        .unwrap();
+}
+
+fn gradient_luma(offset: u8) -> Vec<u8> {
+    (0..1024)
+        .map(|i| ((i % 32) as u8).saturating_mul(4).saturating_add(offset))
+        .collect()
+}
+
+fn flat_luma(value: u8) -> Vec<u8> {
+    vec![value; 1024]
+}
+
+fn landscape_color() -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    for y in 0..4 {
+        for _ in 0..4 {
+            out.extend(if y < 2 { [90, 150, 220] } else { [90, 130, 60] });
+        }
+    }
+    out
+}
+
+fn sky_color() -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    for _ in 0..16 {
+        out.extend([130, 180, 230]);
+    }
+    out
 }
 
 #[test]
 fn perceptual_groups_within_threshold() {
     let db = Db::open_in_memory().unwrap();
     let base: u64 = 0x00FF_00FF_00FF_00FF;
-    insert_ph(&db, &[10u8; 32], "a.cr3", base);
-    insert_ph(&db, &[11u8; 32], "b.cr3", base ^ 0b1); // 1 bit from base
-    insert_ph(&db, &[12u8; 32], "c.cr3", base ^ 0b11); // 2 bits from base
-    insert_ph(&db, &[13u8; 32], "d.cr3", !base); // ~64 bits away
+    insert_sim(&db, &[10u8; 32], "a.cr3", 100, base, base);
+    insert_sim(&db, &[11u8; 32], "b.cr3", 101, base ^ 0b1, base ^ 0b1);
+    insert_sim(&db, &[12u8; 32], "c.cr3", 102, base ^ 0b11, base ^ 0b11);
+    let d = insert_sim(&db, &[13u8; 32], "d.cr3", 101, !base, !base);
+    db.conn
+        .execute(
+            "UPDATE image_similarity_features SET tiny_luma32=?1, color_grid4x4=?2 WHERE image_id=?3",
+            params![flat_luma(20), sky_color(), d],
+        )
+        .unwrap();
 
     let g = core_dedup::find_perceptual(&db.conn, 4).unwrap();
     assert_eq!(g.len(), 1, "the three near hashes form one group");
@@ -140,9 +196,70 @@ fn perceptual_groups_within_threshold() {
         !g[0].images.iter().any(|i| i.filename == "d.cr3"),
         "the far hash is excluded"
     );
+}
 
-    // Threshold 0: only exact-phash matches group — here none, so no groups.
-    assert_eq!(core_dedup::find_perceptual(&db.conn, 0).unwrap().len(), 0);
+#[test]
+fn perceptual_requires_capture_time_window() {
+    let db = Db::open_in_memory().unwrap();
+    let base = 0x00FF_00FF_00FF_00FFu64;
+    insert_sim(&db, &[20u8; 32], "near.cr3", 100, base, base);
+    insert_sim(&db, &[21u8; 32], "late.cr3", 200, base ^ 1, base ^ 1);
+
+    assert_eq!(core_dedup::find_perceptual(&db.conn, 10).unwrap().len(), 0);
+    assert_eq!(core_dedup::find_perceptual(&db.conn, 11).unwrap().len(), 1);
+}
+
+#[test]
+fn perceptual_rejects_same_hash_but_different_scene_color() {
+    let db = Db::open_in_memory().unwrap();
+    let base = 0x00FF_00FF_00FF_00FFu64;
+    let a = insert_sim(&db, &[30u8; 32], "field.cr3", 100, base, base);
+    let b = insert_sim(&db, &[31u8; 32], "sky.cr3", 101, base ^ 1, base ^ 1);
+    db.conn
+        .execute(
+            "UPDATE image_similarity_features SET tiny_luma32=?1, color_grid4x4=?2 WHERE image_id=?3",
+            params![gradient_luma(0), landscape_color(), a],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "UPDATE image_similarity_features SET tiny_luma32=?1, color_grid4x4=?2 WHERE image_id=?3",
+            params![flat_luma(160), sky_color(), b],
+        )
+        .unwrap();
+
+    assert_eq!(core_dedup::find_perceptual(&db.conn, 10).unwrap().len(), 0);
+}
+
+#[test]
+fn perceptual_splits_weak_transitive_chains() {
+    let db = Db::open_in_memory().unwrap();
+    let a = 0x0000_0000_0000_00FFu64;
+    let b = 0x0000_0000_0000_0000u64;
+    let c = 0x0000_0000_0000_FF00u64;
+    insert_sim(&db, &[40u8; 32], "a.cr3", 100, a, a);
+    insert_sim(&db, &[41u8; 32], "b.cr3", 101, b, b);
+    insert_sim(&db, &[42u8; 32], "c.cr3", 102, c, c);
+
+    let groups = core_dedup::find_perceptual(&db.conn, 10).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].images.len(), 2, "do not form A-B-C via bridge B");
+}
+
+#[test]
+fn perceptual_ignores_missing_capture_date() {
+    let db = Db::open_in_memory().unwrap();
+    let base = 0x00FF_00FF_00FF_00FFu64;
+    insert_sim(&db, &[50u8; 32], "a.cr3", 100, base, base);
+    let id = insert_sim(&db, &[51u8; 32], "b.cr3", 101, base ^ 1, base ^ 1);
+    db.conn
+        .execute(
+            "UPDATE images SET capture_date=NULL WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+    assert_eq!(core_dedup::find_perceptual(&db.conn, 10).unwrap().len(), 0);
 }
 
 #[test]

@@ -11,3 +11,4 @@ thiserror = "2"
 trash = "5"
 # JPEG decode only — perceptual dHash is computed from the cached thumbnail JPEGs.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+rustdct = "0.7"

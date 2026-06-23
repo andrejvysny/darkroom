@@ -1389,9 +1389,9 @@ pub async fn dedup_resolve_bulk(app: AppHandle) -> Result<usize, String> {
     .map_err(|e| e.to_string())?
 }
 
-/// Perceptual near-duplicate scan. Lazily computes & persists a dHash for any present image that
-/// lacks one (parallel decode of cached thumbnails, emitting `dedup:progress`), then groups images
-/// within `threshold` Hamming bits. Never auto-trashes — resolution stays manual per group.
+/// Perceptual same-scene scan. Lazily computes versioned visual features for any present image that
+/// lacks them (parallel decode of cached thumbnails, emitting `dedup:progress`), then groups only
+/// capture-time-gated, visually verified candidates. Never auto-trashes.
 #[tauri::command]
 pub async fn dedup_scan_perceptual(
     app: AppHandle,
@@ -1401,36 +1401,41 @@ pub async fn dedup_scan_perceptual(
     tauri::async_runtime::spawn_blocking(move || {
         let st = app2.state::<AppState>();
 
-        // Present rows lacking a phash: (id, lowercase-hex content hash for the thumb lookup).
+        // Present rows lacking current similarity features: (id, lowercase-hex content hash).
         let todo: Vec<(i64, String)> = {
             let db = st.db.lock().map_err(|e| e.to_string())?;
             let mut stmt = db
                 .conn
                 .prepare(
-                    "SELECT id, lower(hex(content_hash)) FROM images \
-                     WHERE status='present' AND phash IS NULL",
+                    "SELECT i.id, lower(hex(i.content_hash)) FROM images i \
+                     LEFT JOIN image_similarity_features sf \
+                       ON sf.image_id=i.id AND sf.feature_version=?1 \
+                     WHERE i.status='present' AND sf.image_id IS NULL",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map(
+                    core_db::rusqlite::params![core_dedup::SIMILARITY_FEATURE_VERSION],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .map_err(|e| e.to_string())?
                 .collect::<core_db::rusqlite::Result<Vec<(i64, String)>>>()
                 .map_err(|e| e.to_string())?;
             rows
         };
 
-        // Compute dHashes in parallel from the cached thumbnails, then persist in one transaction.
+        // Compute visual features in parallel from cached thumbnails, then persist in one tx.
         if !todo.is_empty() {
             let total = todo.len();
             let done = AtomicUsize::new(0);
-            let computed: Vec<(i64, i64)> = todo
+            let computed: Vec<(i64, core_dedup::SimilarityFeatures)> = todo
                 .par_iter()
                 .filter_map(|(id, hex)| {
-                    let phash = st
+                    let features = st
                         .thumbs
                         .read(hex, core_library::THUMB_SIZE)
                         .ok()
-                        .and_then(|bytes| core_dedup::dhash_from_jpeg(&bytes));
+                        .and_then(|bytes| core_dedup::similarity_features_from_jpeg(&bytes));
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == total || n.is_multiple_of(16) {
                         let _ = app2.emit(
@@ -1438,18 +1443,44 @@ pub async fn dedup_scan_perceptual(
                             serde_json::json!({"done": n, "total": total}),
                         );
                     }
-                    phash.map(|p| (*id, p as i64))
+                    features.map(|f| (*id, f))
                 })
                 .collect();
 
             let mut db = st.db.lock().map_err(|e| e.to_string())?;
             let tx = db.conn.transaction().map_err(|e| e.to_string())?;
             {
-                let mut s = tx
+                let mut upsert = tx
+                    .prepare(
+                        "INSERT INTO image_similarity_features(
+                            image_id, feature_version, dhash64, phash64,
+                            tiny_luma32, color_grid4x4, computed_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'))
+                         ON CONFLICT(image_id) DO UPDATE SET
+                            feature_version=excluded.feature_version,
+                            dhash64=excluded.dhash64,
+                            phash64=excluded.phash64,
+                            tiny_luma32=excluded.tiny_luma32,
+                            color_grid4x4=excluded.color_grid4x4,
+                            computed_at=excluded.computed_at",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let mut legacy = tx
                     .prepare("UPDATE images SET phash=?1 WHERE id=?2")
                     .map_err(|e| e.to_string())?;
-                for (id, p) in &computed {
-                    s.execute(core_db::rusqlite::params![p, id])
+                for (id, f) in &computed {
+                    upsert
+                        .execute(core_db::rusqlite::params![
+                            id,
+                            core_dedup::SIMILARITY_FEATURE_VERSION,
+                            f.dhash64 as i64,
+                            f.phash64 as i64,
+                            &f.tiny_luma32,
+                            &f.color_grid4x4,
+                        ])
+                        .map_err(|e| e.to_string())?;
+                    legacy
+                        .execute(core_db::rusqlite::params![f.dhash64 as i64, id])
                         .map_err(|e| e.to_string())?;
                 }
             }
