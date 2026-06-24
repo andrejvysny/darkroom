@@ -25,12 +25,12 @@ jobs:
       matrix:
         include:
           - {
-              platform: macos-latest,
+              platform: macos-15,
               rustTargets: "aarch64-apple-darwin",
               args: "--target aarch64-apple-darwin --bundles dmg",
             }
           - {
-              platform: macos-latest,
+              platform: macos-15,
               rustTargets: "x86_64-apple-darwin",
               args: "--target x86_64-apple-darwin --bundles dmg",
             }
@@ -116,6 +116,8 @@ jobs:
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Install frontend deps
         run: npm ci
