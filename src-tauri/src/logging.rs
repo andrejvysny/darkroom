@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, Runtime};
-use tracing::Level;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::prelude::*;
@@ -328,8 +327,13 @@ fn is_log_file(path: &Path) -> bool {
 
 fn filter_for(level: &str) -> Result<EnvFilter, String> {
     validate_level(level)?;
+    // Include the workspace's own crates (notably `core_pipeline`, which emits the GPU adapter
+    // diagnostics) so app-level logs are captured at the chosen level; everything else stays at
+    // `warn` to keep dependency noise out of the file.
     Ok(EnvFilter::new(format!(
-        "darkroom={level},darkroom_lib={level},frontend={level},warn"
+        "darkroom={level},darkroom_lib={level},frontend={level},\
+         core_pipeline={level},core_raw={level},core_library={level},\
+         core_import={level},core_dedup={level},core_db={level},warn"
     )))
 }
 
@@ -344,7 +348,13 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        // `max` is a byte index; back it off to the nearest char boundary so a multibyte char
+        // straddling the limit (frontend log messages are arbitrary UTF-8) can't panic the slice.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
@@ -387,13 +397,30 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
-fn _level_to_tracing(level: &str) -> Level {
-    match level {
-        "error" => Level::ERROR,
-        "warn" => Level::WARN,
-        "info" => Level::INFO,
-        "trace" => Level::TRACE,
-        _ => Level::DEBUG,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        // A multibyte char straddling the byte limit must not panic and must yield valid UTF-8.
+        let s = "a".repeat(199) + "é"; // 'é' is 2 bytes spanning byte index 199..201
+        let out = truncate(&s, 200);
+        assert!(out.ends_with('…'));
+        // Backed off to the 199-byte boundary (drops the partial 'é').
+        assert_eq!(out.chars().filter(|&c| c == 'a').count(), 199);
+    }
+
+    #[test]
+    fn truncate_keeps_short_strings() {
+        assert_eq!(truncate("hello", 200), "hello");
+    }
+
+    #[test]
+    fn truncate_handles_all_multibyte() {
+        let s = "😀".repeat(100); // each emoji is 4 bytes
+        let out = truncate(&s, 10); // 10 is mid-char
+        assert!(out.ends_with('…'));
+        assert!(out.chars().all(|c| c == '😀' || c == '…'));
     }
 }
