@@ -1,12 +1,16 @@
 use crate::thumb_queue::ThumbQueue;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use core_analyze::{AnalyzerRegistry, FaceAnalyzer};
 use core_db::Db;
 use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-use std::sync::{Arc, Mutex};
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+use std::sync::Arc;
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager, Runtime};
 
 /// GPU device + the compiled develop pipeline. Optional — the library works without a GPU.
@@ -41,9 +45,11 @@ pub struct AppState {
     /// completion guard then runs exactly one deferred sync to catch any real external change.
     pub watch_pending: AtomicBool,
     /// Directory holding downloaded ML model files (`<app-data>/models`).
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub models_dir: PathBuf,
     /// AI analyzer registry, lazily built on first analysis run (loading ~300 MB of ONNX is deferred
     /// until the user actually analyzes). `None` until then.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub analyzers: Mutex<Option<Arc<AnalyzerRegistry>>>,
     /// Guards against two analysis passes running at once.
     pub analysis_running: AtomicBool,
@@ -51,6 +57,7 @@ pub struct AppState {
     pub analysis_cancel: AtomicBool,
     /// Face detector + embedder (SCRFD + ArcFace, ~190 MB ONNX), lazily built on first scan with faces
     /// enabled. The face stage runs inside the unified scan, guarded by `analysis_running`.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub face_analyzer: Mutex<Option<Arc<FaceAnalyzer>>>,
     /// Per-launch id stamped on every captured user-event (groups a usage session).
     pub session_id: String,
@@ -87,6 +94,7 @@ impl AppState {
             }
         };
 
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         let models_dir = data_dir.join("models");
 
         // Per-launch session id: start-millis + pid (no extra dep; unique enough for a local app).
@@ -107,10 +115,13 @@ impl AppState {
             watcher: Mutex::new(None),
             import_active: AtomicUsize::new(0),
             watch_pending: AtomicBool::new(false),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             models_dir,
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             analyzers: Mutex::new(None),
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             face_analyzer: Mutex::new(None),
             session_id,
             app_version: env!("CARGO_PKG_VERSION"),

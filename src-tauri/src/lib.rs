@@ -1,12 +1,21 @@
-mod analysis;
 mod commands;
 mod events;
-mod faces;
 mod features;
 mod protocol;
 mod state;
 mod thumb_queue;
 mod watch;
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+mod analysis;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[path = "analysis_stub.rs"]
+mod analysis;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+mod faces;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[path = "faces_stub.rs"]
+mod faces;
 
 use state::AppState;
 use tauri::Manager;

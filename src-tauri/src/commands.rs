@@ -2239,6 +2239,17 @@ pub async fn analysis_detector_size(app: AppHandle) -> Result<u32, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn clear_analyzer_cache(st: &AppState) -> Result<(), String> {
+    *st.analyzers.lock().map_err(|e| e.to_string())? = None;
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn clear_analyzer_cache(_st: &AppState) -> Result<(), String> {
+    Ok(())
+}
+
 /// Set the MegaDetector input size; invalidates the cached analyzer registry so the next pass
 /// rebuilds at the new resolution.
 #[tauri::command]
@@ -2249,8 +2260,7 @@ pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(),
             let db = st.db.lock().map_err(|e| e.to_string())?;
             core_library::set_animal_detector_size(&db.conn, size).map_err(|e| e.to_string())?;
         }
-        *st.analyzers.lock().map_err(|e| e.to_string())? = None;
-        Ok(())
+        clear_analyzer_cache(&st)
     })
     .await
     .map_err(|e| e.to_string())?

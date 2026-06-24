@@ -35,8 +35,9 @@ core-library = { path = "../crates/core-library" }
 core-pipeline = { path = "../crates/core-pipeline" }
 core-dedup = { path = "../crates/core-dedup" }
 core-import = { path = "../crates/core-import" }
-core-analyze = { path = "../crates/core-analyze" }
 image = "0.25"
 rayon = "1"
 notify = "8"
 
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+core-analyze = { path = "../crates/core-analyze" }
