@@ -24,13 +24,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Apple Silicon .dmg (ad-hoc signed, matching the current local build).
           - {
               platform: macos-latest,
+              rustTargets: "aarch64-apple-darwin",
               args: "--target aarch64-apple-darwin --bundles dmg",
             }
-          # Per-user NSIS .exe -> bundle/nsis/Darkroom_<version>_x64-setup.exe (unsigned for now).
-          - { platform: windows-latest, args: "--bundles nsis" }
+          - {
+              platform: macos-latest,
+              rustTargets: "x86_64-apple-darwin",
+              args: "--target x86_64-apple-darwin --bundles dmg",
+            }
+          - { platform: windows-latest, rustTargets: "", args: "--bundles nsis" }
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -108,7 +112,7 @@ jobs:
       - name: Install Rust 1.91
         uses: dtolnay/rust-toolchain@1.91.0
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+          targets: ${{ matrix.rustTargets }}
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -129,7 +133,7 @@ jobs:
           releaseName: "Darkroom ${{ env.RELEASE_TAG }}"
           releaseBody: |
             Release artifacts:
-            - macOS Apple Silicon DMG is ad-hoc signed and not notarized.
+            - macOS Apple Silicon and Intel DMGs are ad-hoc signed and not notarized.
             - Windows x64 NSIS installer is unsigned.
           releaseDraft: true
           prerelease: true
