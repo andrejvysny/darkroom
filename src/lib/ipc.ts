@@ -5,7 +5,11 @@ import { log } from "./logger";
 function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args)) {
-    if (["path", "source", "dest", "filename", "search"].some((s) => key.toLowerCase().includes(s))) {
+    if (
+      ["path", "source", "dest", "filename", "search"].some((s) =>
+        key.toLowerCase().includes(s),
+      )
+    ) {
       out[key] = "[redacted]";
     } else if (Array.isArray(value)) {
       out[key] = { count: value.length };
@@ -20,12 +24,16 @@ function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
 
 function summarizeResult(value: unknown): Record<string, unknown> {
   if (Array.isArray(value)) return { resultCount: value.length };
-  if (value instanceof Uint8Array || value instanceof ArrayBuffer) return { resultBytes: value.byteLength };
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer)
+    return { resultBytes: value.byteLength };
   if (value && typeof value === "object") return { resultType: "object" };
   return { resultType: typeof value };
 }
 
-async function invoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
+async function invoke<T>(
+  command: string,
+  args: Record<string, unknown>,
+): Promise<T> {
   if (command === "frontend_log") return tauriInvoke<T>(command, args);
   const start = performance.now();
   log.debug("ipc", "invoke start", { command, args: summarizeArgs(args) });
@@ -493,6 +501,15 @@ export async function updatePreviewEdge(edge: number): Promise<number> {
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 
+// Tauri v2 serves custom protocols as `scheme://localhost/…` on macOS/Linux but only as
+// `http://scheme.localhost/…` on Windows (WebView2 cannot navigate the bare scheme). Mirror
+// Tauri's own convertFileSrc switch. We can't call convertFileSrc directly: it
+// encodeURIComponent-encodes its whole argument, which would mangle our query string.
+const THUMB_BASE =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows")
+    ? "http://thumb.localhost"
+    : "thumb://localhost";
+
 export function thumbUrl(
   hash: string,
   size = 512,
@@ -504,7 +521,7 @@ export function thumbUrl(
    *  first-paint) instead of the small thumb tier (grid / filmstrip). */
   previewEdge?: number | null,
 ): string {
-  const base = `thumb://localhost/${hash}?size=${size}`;
+  const base = `${THUMB_BASE}/${hash}?size=${size}`;
   // `edit=<version>` makes the protocol serve the edited render and changes the URL on each edit.
   // `pv=1&edge=<n>` requests the larger preview tier. `&t=<token>` busts the cache when a fresh
   // render lands for an UNEDITED image (placeholder → canonical swap), where `editedAt` doesn't change.
@@ -960,7 +977,12 @@ let renderRequestSeq = 0;
 export type ViewRect = { ox: number; oy: number; sx: number; sy: number };
 
 /** Rendered frame pixel data, or null when the request was superseded. */
-export type RenderedFrame = { data: Uint8ClampedArray; w: number; h: number; previewSource?: boolean };
+export type RenderedFrame = {
+  data: Uint8ClampedArray;
+  w: number;
+  h: number;
+  previewSource?: boolean;
+};
 
 /**
  * Render the develop viewport at display resolution.
@@ -998,7 +1020,12 @@ export async function developRender(
   const hasFlags = buf.byteLength === 9 + payloadBytes;
   const offset = hasFlags ? 9 : 8;
   const pixels = new Uint8ClampedArray(buf, offset);
-  return { data: pixels, w, h, previewSource: hasFlags && new Uint8Array(buf, 8, 1)[0] !== 0 };
+  return {
+    data: pixels,
+    w,
+    h,
+    previewSource: hasFlags && new Uint8Array(buf, 8, 1)[0] !== 0,
+  };
 }
 
 /**

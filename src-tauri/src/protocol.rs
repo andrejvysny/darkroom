@@ -88,10 +88,20 @@ pub fn handle_thumb<R: Runtime>(
             .header("Cache-Control", "public, max-age=31536000, immutable")
             .body(bytes)
             .unwrap_or_else(|_| Response::new(Vec::new())),
-        None => Response::builder()
-            .status(404)
-            .body(Vec::new())
-            .unwrap_or_else(|_| Response::new(Vec::new())),
+        None => {
+            // Silent misses make protocol regressions (e.g. a wrong scheme on a platform)
+            // invisible in the log. Record host/path/hash so they're diagnosable.
+            tracing::debug!(
+                host = uri.host(),
+                path = uri.path(),
+                %hash,
+                "thumb protocol: no cached render (404)"
+            );
+            Response::builder()
+                .status(404)
+                .body(Vec::new())
+                .unwrap_or_else(|_| Response::new(Vec::new()))
+        }
     };
     responder.respond(resp);
 }
