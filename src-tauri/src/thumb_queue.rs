@@ -149,7 +149,7 @@ pub fn spawn_worker(app: AppHandle) {
     let queue = {
         let st = app.state::<AppState>();
         if st.gpu.is_none() {
-            eprintln!("[thumb_queue] no GPU — canonical thumbnail backfill disabled");
+            tracing::warn!("canonical thumbnail backfill disabled: no GPU");
             return;
         }
         st.thumb_queue.clone()
@@ -213,8 +213,8 @@ fn render_one(app: &AppHandle, image_id: i64) {
     // edit may have changed since the pre-check; this is self-correcting on the next enqueue).
     let (hash, params, edit_version, lin) = match decode_develop(st.inner(), image_id) {
         Ok(t) => t,
-        Err(e) => {
-            eprintln!("[thumb_queue] decode image {image_id} failed: {e}");
+        Err(_e) => {
+            tracing::warn!(image_id, "thumbnail decode failed");
             return;
         }
     };
@@ -259,7 +259,7 @@ fn render_one(app: &AppHandle, image_id: i64) {
                     }
                 }
             }
-            Err(e) => eprintln!("[thumb_queue] preview render image {image_id} failed: {e}"),
+            Err(_e) => tracing::warn!(image_id, "preview render failed"),
         }
     } else if need_thumb {
         // Preview not wanted yet (edge unset) or already present: render just the thumb.
@@ -270,7 +270,7 @@ fn render_one(app: &AppHandle, image_id: i64) {
                     wrote |= write_thumb(&jpeg);
                 }
             }
-            Err(e) => eprintln!("[thumb_queue] thumb render image {image_id} failed: {e}"),
+            Err(_e) => tracing::warn!(image_id, "thumbnail render failed"),
         }
     }
 

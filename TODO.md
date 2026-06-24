@@ -2,6 +2,18 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## IN PROGRESS: Windows GPU/performance optimization
+
+> Goal: make Develop rendering and other heavy paths perform correctly on Windows 10+ systems,
+> preferring NVIDIA/DX12 when available, without regressing macOS/Apple Silicon behavior.
+
+- [x] Windows GPU selection/diagnostics: DX12 first, prefer NVIDIA discrete adapter, log selected
+      adapter/backend/driver, expose `gpu_status` for debug.
+- [x] Reuse viewport render targets/readback buffers instead of allocating them per frame.
+- [x] Add preview-source first paint for fit views using `develop_linear_preview`, then warm full-res
+      cache and re-render when ready. Full-res/export/canonical output remains authoritative.
+- [x] Validate with `cargo fmt --all`, `cargo test --workspace`, clippy, `npx tsc --noEmit`, build.
+
 ## DONE (MERGED `01a7b84`): Cleanups & tech-debt — branch `chore/cleanups-viewport-histogram`
 
 > Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`. `npx tsc --noEmit` +

@@ -32,6 +32,7 @@ import {
   DEFAULT_CROP,
 } from "../../lib/ipc";
 import type { DerivedView } from "../../lib/viewport";
+import { log } from "../../lib/logger";
 
 // Warm-cache renders are single-digit ms; a short debounce keeps sliders feeling real-time.
 const RENDER_DEBOUNCE_MS = 20;
@@ -87,7 +88,7 @@ export function useDevelop() {
           const st = useDevelopStore.getState();
           const p = st.showBefore ? freshDefaults() : st.params;
           developHistogram(id, p).catch((e) =>
-            console.error("develop_histogram failed", e),
+            log.warn("develop", "histogram failed", { imageId: id, ...log.errorSummary(e) }),
           );
         }, HISTOGRAM_DEBOUNCE_MS);
       };
@@ -143,7 +144,7 @@ export function useDevelop() {
         }
         return frame;
       } catch (err) {
-        console.error("develop_render failed", err);
+        log.warn("develop", "render failed", { imageId: id, ...log.errorSummary(err) });
         return null;
       } finally {
         if (seq === renderSeq.current) setRendering(false);
@@ -187,7 +188,7 @@ export function useDevelop() {
           touchCount.current = 0;
           developSetEdit(id, p, tc)
             .then(() => developRegenThumb(id))
-            .catch((e) => console.error("develop_set_edit failed", e));
+            .catch((e) => log.warn("develop", "set edit failed", { imageId: id, ...log.errorSummary(e) }));
         }, 500);
       };
       return Object.assign(run, {
@@ -225,6 +226,24 @@ export function useDevelop() {
       void un.then((fn) => fn());
     };
   }, [setHistogram]);
+
+  // A preview-source fit render can land before the full-resolution GPU source is ready. The backend
+  // warms the full source in the background and emits this event so the canvas swaps to the
+  // authoritative full-res render without waiting for another user interaction.
+  useEffect(() => {
+    let active = true;
+    const un = listen<{ imageId: number }>("develop:full-ready", (ev) => {
+      if (!active) return;
+      const id = useAppStore.getState().selectedId;
+      if (id !== ev.payload.imageId) return;
+      rerenderCurrent();
+      debouncedHistogram(id);
+    });
+    return () => {
+      active = false;
+      void un.then((fn) => fn());
+    };
+  }, [rerenderCurrent, debouncedHistogram]);
 
   // Load + render on image change.
   useEffect(() => {
@@ -267,7 +286,7 @@ export function useDevelop() {
           }
           setPreview(url);
         })
-        .catch((e) => console.error("develop_preview_jpeg failed", e));
+        .catch((e) => log.warn("develop", "preview jpeg failed", { imageId: id, ...log.errorSummary(e) }));
     }
     void thumbPrioritize([id]);
 
@@ -277,7 +296,7 @@ export function useDevelop() {
       try {
         p = await developGetEdit(id);
       } catch (err) {
-        console.error("develop_get_edit failed", err);
+        log.warn("develop", "get edit failed", { imageId: id, ...log.errorSummary(err) });
         p = freshDefaults();
       }
       if (cancelled) return;
@@ -288,7 +307,7 @@ export function useDevelop() {
         const h = await developGetHistogram();
         if (!cancelled && h) setHistogram(h);
       } catch (e) {
-        console.error("develop_get_histogram failed", e);
+        log.warn("develop", "get histogram failed", { imageId: id, ...log.errorSummary(e) });
       }
     })();
 
@@ -581,7 +600,12 @@ export function useDevelop() {
     rerenderCurrent();
     developSetEdit(selectedId, p, undefined, true)
       .then(() => developRegenThumb(selectedId))
-      .catch((e) => console.error("develop_set_edit failed", e));
+      .catch((e) =>
+        log.warn("develop", "reset edit failed", {
+          imageId: selectedId,
+          ...log.errorSummary(e),
+        }),
+      );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     selectedId,

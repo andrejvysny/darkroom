@@ -367,16 +367,14 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats,
                     };
                     match a.analyze(&ctx) {
                         Ok(r) => records.push(r),
-                        Err(e) => {
-                            eprintln!("[darkroom] analyzer {} failed on {}: {e}", a.id(), t.path)
-                        }
+                        Err(e) => tracing::warn!(image_id = t.id, analyzer = a.id(), error = %e, "analyzer failed"),
                     }
                 }
                 let face_out: FaceOut = match (need_face, fa.as_ref(), oriented.as_ref()) {
                     (true, Some(f), Some(img)) => Some(match f.detect_embed(img) {
                         Ok(recs) => Ok(recs.into_iter().map(to_input).collect()),
                         Err(e) => {
-                            eprintln!("[darkroom] face analyze failed on {}: {e}", t.path);
+                            tracing::warn!(image_id = t.id, error = %e, "face analysis failed");
                             Err(())
                         }
                     }),
@@ -480,7 +478,7 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats,
                                 }],
                             )),
                             Err(e) => {
-                                eprintln!("[darkroom] caption failed on {}: {e}", t.path);
+                                tracing::warn!(image_id = t.id, error = %e, "caption analysis failed");
                                 None
                             }
                         }

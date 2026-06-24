@@ -9,6 +9,7 @@ import {
   type FacesStatus,
   type PersonRow,
 } from "./ipc";
+import { log } from "./logger";
 
 export type FacesProgress =
   | { kind: "models"; done: number; total: number }
@@ -43,8 +44,8 @@ export function useFaces(): FacesState & FacesActions {
       const [st, ppl] = await Promise.all([facesStatus(), peopleList(false)]);
       setStatus(st);
       setPeople(ppl);
-    } catch {
-      /* non-fatal */
+    } catch (err) {
+      log.debug("faces", "reload failed", log.errorSummary(err));
     }
   }, []);
 
@@ -60,8 +61,8 @@ export function useFaces(): FacesState & FacesActions {
         }
         setStatus((prev) => (prev ? { ...prev, running: true } : prev));
         await facesRun(force);
-      } catch {
-        /* errors clear via reload below */
+      } catch (err) {
+        log.warn("faces", "find people failed", { force, ...log.errorSummary(err) });
       } finally {
         setProgress(null);
         setDoneVersion((v) => v + 1);
@@ -74,8 +75,8 @@ export function useFaces(): FacesState & FacesActions {
   const cancel = useCallback(async () => {
     try {
       await facesCancel();
-    } catch {
-      /* non-fatal */
+    } catch (err) {
+      log.debug("faces", "cancel failed", log.errorSummary(err));
     }
   }, []);
 

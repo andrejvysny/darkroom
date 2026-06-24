@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "./styles.css";
 import App from "./App";
+import ErrorBoundary from "./components/ErrorBoundary";
 
 async function bootstrap() {
   // Dev-only: when the frontend runs in a plain browser (no Tauri shell), install a mock Tauri
@@ -14,7 +15,9 @@ async function bootstrap() {
 
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <App />
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
     </React.StrictMode>,
   );
 }

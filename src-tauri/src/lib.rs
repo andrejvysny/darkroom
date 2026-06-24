@@ -1,6 +1,7 @@
 mod commands;
 mod events;
 mod features;
+mod logging;
 mod protocol;
 mod state;
 mod thumb_queue;
@@ -37,6 +38,7 @@ pub fn run() {
             protocol::handle_thumb(ctx, req, responder)
         })
         .setup(|app| {
+            logging::init(app.handle()).map_err(std::io::Error::other)?;
             // Grant the playwright permission at runtime (debug-only `dynamic-acl`), so the
             // capability never lives in capabilities/ and feature-off builds stay clean.
             #[cfg(feature = "e2e-testing")]
@@ -98,6 +100,7 @@ pub fn run() {
             commands::library_folders,
             commands::library_date_tree,
             commands::image_meta,
+            commands::gpu_status,
             commands::library_index_root,
             commands::database_reset,
             commands::app_default_library,
@@ -179,6 +182,12 @@ pub fn run() {
             commands::sidecars_write_all,
             commands::sidecars_rebuild,
             commands::image_histogram,
+            commands::frontend_log,
+            commands::logs_status,
+            commands::set_logs_directory,
+            commands::set_log_level,
+            commands::logs_export_zip,
+            commands::logs_delete_all,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

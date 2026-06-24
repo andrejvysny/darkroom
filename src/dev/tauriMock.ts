@@ -271,7 +271,7 @@ function makeDevelopJpeg(
 
 /**
  * Raw-RGBA response for `develop_render` (new viewport model).
- * Layout: [outW u32 LE][outH u32 LE][rgba8 outW*outH*4]
+ * Layout: [outW u32 LE][outH u32 LE][flags u8][rgba8 outW*outH*4]
  * The gradient shifts with view.ox/oy so panning is visually confirmed.
  */
 function makeDevelopRgba(p: Record<string, unknown>): ArrayBuffer {
@@ -289,13 +289,14 @@ function makeDevelopRgba(p: Record<string, unknown>): ArrayBuffer {
   const exposure = num(params.exposure);
   const temp = num(params.temp);
 
-  // 8-byte header
-  const buf = new ArrayBuffer(8 + outW * outH * 4);
+  // 9-byte header
+  const buf = new ArrayBuffer(9 + outW * outH * 4);
   const header = new DataView(buf, 0, 8);
   header.setUint32(0, outW, true);
   header.setUint32(4, outH, true);
+  new Uint8Array(buf, 8, 1)[0] = 0;
 
-  const pixels = new Uint8Array(buf, 8);
+  const pixels = new Uint8Array(buf, 9);
   const light = Math.max(20, Math.min(235, 128 + Math.round(exposure * 30)));
   const warmShift = Math.round(temp * 0.4);
 
@@ -360,6 +361,19 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
         };
       });
   },
+  gpu_status: () => ({
+    name: "Mock GPU",
+    vendor: 0,
+    device: 0,
+    deviceType: "Other",
+    backend: "Mock",
+    driver: "mock",
+    driverInfo: "browser mock",
+    devicePciBusId: "",
+    subgroupMinSize: 0,
+    subgroupMaxSize: 0,
+    transientSavesMemory: false,
+  }),
   library_index_root: () => STATS,
   database_reset: () => STATS,
   app_default_library: () => LIB_ROOT,
@@ -419,6 +433,32 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   set_thumb_cache_cap: () => 0,
   preview_edge: () => 3840,
   set_preview_edge: () => undefined,
+  frontend_log: () => undefined,
+  logs_status: () => ({
+    directory: "/tmp/darkroom-logs",
+    sizeBytes: 128 * 1024,
+    fileCount: 1,
+    level: "debug",
+  }),
+  set_logs_directory: (_args?: unknown) => ({
+    directory: "/tmp/darkroom-logs",
+    sizeBytes: 128 * 1024,
+    fileCount: 1,
+    level: "debug",
+  }),
+  set_log_level: (args?: { level?: string }) => ({
+    directory: "/tmp/darkroom-logs",
+    sizeBytes: 128 * 1024,
+    fileCount: 1,
+    level: args?.level ?? "debug",
+  }),
+  logs_export_zip: () => 4096,
+  logs_delete_all: () => ({
+    directory: "/tmp/darkroom-logs",
+    sizeBytes: 0,
+    fileCount: 0,
+    level: "debug",
+  }),
 
   // Cull (persisted to fixtures)
   cull_set_rating: (p) => {
@@ -490,7 +530,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   // Develop
   develop_get_edit: () => structuredClone(DEFAULT_PARAMS),
   develop_set_edit: () => undefined,
-  // New viewport model: returns [outW u32 LE][outH u32 LE][rgba8 outW*outH*4]
+  // New viewport model: returns [outW u32 LE][outH u32 LE][flags u8][rgba8 outW*outH*4]
   develop_render: (p) => makeDevelopRgba(p),
   develop_preview_jpeg: () => makeDevelopJpeg(undefined),
   develop_get_histogram: () => makeHistogram(),

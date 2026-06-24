@@ -1,4 +1,4 @@
-//! wgpu/Metal develop backend.
+//! wgpu develop backend (Metal on macOS, DX12 preferred on Windows).
 //!
 //! `prepare()` uploads the cached linear buffer to a GPU texture and allocates the per-image
 //! output/readback/uniform resources ONCE. `render()` then only rewrites the uniform and redraws,
@@ -9,28 +9,152 @@ use crate::params::DevelopParams;
 use core_raw::LinearImage;
 use wgpu::util::DeviceExt;
 
+#[cfg(target_os = "windows")]
+const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+
 /// Long-lived GPU device + queue.
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    pub info: GpuAdapterInfo,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuAdapterInfo {
+    pub name: String,
+    pub vendor: u32,
+    pub device: u32,
+    pub device_type: String,
+    pub backend: String,
+    pub driver: String,
+    pub driver_info: String,
+    pub device_pci_bus_id: String,
+    pub subgroup_min_size: u32,
+    pub subgroup_max_size: u32,
+    pub transient_saves_memory: bool,
+}
+
+impl From<wgpu::AdapterInfo> for GpuAdapterInfo {
+    fn from(info: wgpu::AdapterInfo) -> Self {
+        Self {
+            name: info.name,
+            vendor: info.vendor,
+            device: info.device,
+            device_type: format!("{:?}", info.device_type),
+            backend: format!("{:?}", info.backend),
+            driver: info.driver,
+            driver_info: info.driver_info,
+            device_pci_bus_id: info.device_pci_bus_id,
+            subgroup_min_size: info.subgroup_min_size,
+            subgroup_max_size: info.subgroup_max_size,
+            transient_saves_memory: info.transient_saves_memory,
+        }
+    }
 }
 
 impl GpuContext {
     pub fn new() -> Result<Self, PipelineError> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|_| PipelineError::NoAdapter)?;
+        let desc = instance_descriptor();
+        let enabled_backends = desc.backends;
+        let instance = wgpu::Instance::new(desc);
+        let adapter = select_adapter(&instance, enabled_backends)?;
+        let raw_info = adapter.get_info();
+        let info = GpuAdapterInfo::from(raw_info.clone());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("darkroom-device"),
             ..Default::default()
         }))
         .map_err(|e| PipelineError::Device(e.to_string()))?;
-        Ok(Self { device, queue })
+        tracing::info!(
+            name = %info.name,
+            vendor = format_args!("0x{:04x}", info.vendor),
+            device = format_args!("0x{:04x}", info.device),
+            device_type = %info.device_type,
+            backend = %info.backend,
+            driver = %info.driver,
+            driver_info = %info.driver_info,
+            "selected GPU adapter"
+        );
+        Ok(Self {
+            device,
+            queue,
+            info,
+        })
     }
+}
+
+fn instance_descriptor() -> wgpu::InstanceDescriptor {
+    #[cfg(target_os = "windows")]
+    {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            desc.backends = wgpu::Backends::DX12;
+        }
+        desc
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+    }
+}
+
+fn select_adapter(
+    instance: &wgpu::Instance,
+    enabled_backends: wgpu::Backends,
+) -> Result<wgpu::Adapter, PipelineError> {
+    #[cfg(target_os = "windows")]
+    {
+        let adapters = pollster::block_on(instance.enumerate_adapters(enabled_backends));
+        for adapter in &adapters {
+            let info = adapter.get_info();
+            tracing::debug!(
+                name = %info.name,
+                vendor = format_args!("0x{:04x}", info.vendor),
+                device = format_args!("0x{:04x}", info.device),
+                device_type = ?info.device_type,
+                backend = ?info.backend,
+                driver = %info.driver,
+                "available GPU adapter"
+            );
+        }
+        if let Some(adapter) = adapters
+            .iter()
+            .find(|a| {
+                let info = a.get_info();
+                info.vendor == NVIDIA_VENDOR_ID && info.device_type == wgpu::DeviceType::DiscreteGpu
+            })
+            .cloned()
+        {
+            return Ok(adapter);
+        }
+        if let Some(adapter) = adapters
+            .iter()
+            .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+            .cloned()
+        {
+            return Ok(adapter);
+        }
+        if let Some(adapter) = adapters
+            .iter()
+            .find(|a| a.get_info().device_type == wgpu::DeviceType::IntegratedGpu)
+            .cloned()
+        {
+            return Ok(adapter);
+        }
+        if let Some(adapter) = adapters.into_iter().next() {
+            return Ok(adapter);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = enabled_backends;
+
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .map_err(|_| PipelineError::NoAdapter)
 }
 
 const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -132,10 +256,52 @@ pub struct PreparedImage {
     // Mask alpha layers (R16Float, MASK_CAP layers). The pre-pass writes per-mask coverage here;
     // the develop pass samples it. Kept alive for the bind group's array view + per-layer targets.
     mask_tex: wgpu::Texture,
+    view_target: std::sync::Mutex<Option<ViewTarget>>,
     // Geometry hash of the mask baked into each `mask_tex` layer (None = stale). Lets `render_to`
     // skip the pre-pass when a mask's coverage is unchanged. `Mutex` (not `RefCell`) keeps
     // `PreparedImage: Sync` so it can live in the shared develop caches.
     mask_layer_hash: std::sync::Mutex<Vec<Option<u64>>>,
+}
+
+struct ViewTarget {
+    width: u32,
+    height: u32,
+    bpr: u32,
+    texture: wgpu::Texture,
+    readback: wgpu::Buffer,
+}
+
+impl ViewTarget {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("develop-view-output"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let bpr = padded_bpr(width);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("develop-view-readback"),
+            size: (bpr * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Self {
+            width,
+            height,
+            bpr,
+            texture,
+            readback,
+        }
+    }
 }
 
 /// The reusable develop render pipeline (created once per `GpuContext`).
@@ -764,6 +930,7 @@ impl DevelopPipeline {
             refine_uniform,
             _input: input,
             mask_tex,
+            view_target: std::sync::Mutex::new(None),
             mask_layer_hash: std::sync::Mutex::new(vec![None; crate::params::MASK_CAP]),
         })
     }
@@ -1093,30 +1260,21 @@ impl DevelopPipeline {
                 oh,
             );
         }
-        let device = &ctx.device;
-        let out_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("develop-view-output"),
-            size: wgpu::Extent3d {
-                width: ow,
-                height: oh,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let out_bpr = padded_bpr(ow);
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("develop-view-readback"),
-            size: (out_bpr * oh) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let mut target = prepared.view_target.lock().unwrap();
+        let target = target.get_or_insert_with(|| ViewTarget::new(&ctx.device, ow, oh));
+        if target.width != ow || target.height != oh {
+            *target = ViewTarget::new(&ctx.device, ow, oh);
+        }
         self.render_to(
-            ctx, prepared, params, view, &out_tex, &readback, out_bpr, ow, oh,
+            ctx,
+            prepared,
+            params,
+            view,
+            &target.texture,
+            &target.readback,
+            target.bpr,
+            ow,
+            oh,
         )
     }
 

@@ -9,6 +9,7 @@ import {
   type AnalysisStatus,
   type FacetRow,
 } from "./ipc";
+import { log } from "./logger";
 
 export type AnalysisProgress =
   | { kind: "models"; done: number; total: number }
@@ -41,8 +42,8 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
   const reloadFacets = useCallback(async () => {
     try {
       setFacets(await analysisFacets());
-    } catch {
-      /* non-fatal */
+    } catch (err) {
+      log.debug("analysis", "reload facets failed", log.errorSummary(err));
     }
   }, []);
 
@@ -70,8 +71,8 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
   const reloadStatus = useCallback(async () => {
     try {
       setStatus(await analysisStatus());
-    } catch {
-      /* non-fatal */
+    } catch (err) {
+      log.debug("analysis", "reload status failed", log.errorSummary(err));
     }
   }, []);
 
@@ -91,8 +92,8 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
           prev ? { ...prev, running: true } : { ...st, running: true },
         );
         await analysisRun(force);
-      } catch {
-        /* errors surface via progress state clearing */
+      } catch (err) {
+        log.warn("analysis", "run failed", { force, ...log.errorSummary(err) });
       } finally {
         setProgress(null);
         setDoneVersion((v) => v + 1);
@@ -105,8 +106,8 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
   const cancelAnalysis = useCallback(async () => {
     try {
       await analysisCancel();
-    } catch {
-      /* non-fatal */
+    } catch (err) {
+      log.debug("analysis", "cancel failed", log.errorSummary(err));
     }
   }, []);
 

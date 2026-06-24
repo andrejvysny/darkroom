@@ -1,5 +1,51 @@
 import type { CSSProperties } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { log } from "./logger";
+
+function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (["path", "source", "dest", "filename", "search"].some((s) => key.toLowerCase().includes(s))) {
+      out[key] = "[redacted]";
+    } else if (Array.isArray(value)) {
+      out[key] = { count: value.length };
+    } else if (value && typeof value === "object") {
+      out[key] = "[object]";
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function summarizeResult(value: unknown): Record<string, unknown> {
+  if (Array.isArray(value)) return { resultCount: value.length };
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer) return { resultBytes: value.byteLength };
+  if (value && typeof value === "object") return { resultType: "object" };
+  return { resultType: typeof value };
+}
+
+async function invoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
+  if (command === "frontend_log") return tauriInvoke<T>(command, args);
+  const start = performance.now();
+  log.debug("ipc", "invoke start", { command, args: summarizeArgs(args) });
+  try {
+    const result = await tauriInvoke<T>(command, args);
+    log.debug("ipc", "invoke success", {
+      command,
+      durationMs: Math.round(performance.now() - start),
+      ...summarizeResult(result),
+    });
+    return result;
+  } catch (err) {
+    log.warn("ipc", "invoke failed", {
+      command,
+      durationMs: Math.round(performance.now() - start),
+      ...log.errorSummary(err),
+    });
+    throw err;
+  }
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -157,6 +203,24 @@ export function libraryDateTree(): Promise<DateTreeYear[]> {
 
 export function imageMeta(id: number): Promise<ImageRow | null> {
   return invoke<ImageRow | null>("image_meta", { id });
+}
+
+export type GpuStatus = {
+  name: string;
+  vendor: number;
+  device: number;
+  deviceType: string;
+  backend: string;
+  driver: string;
+  driverInfo: string;
+  devicePciBusId: string;
+  subgroupMinSize: number;
+  subgroupMaxSize: number;
+  transientSavesMemory: boolean;
+};
+
+export function gpuStatus(): Promise<GpuStatus | null> {
+  return invoke<GpuStatus | null>("gpu_status", {});
 }
 
 export function libraryIndexRoot(path: string): Promise<IndexStats> {
@@ -348,6 +412,33 @@ export function previewEdge(): Promise<number> {
 /** Persist the preview longest edge (px); backend clamps + re-renders previews at the new size. */
 export function setPreviewEdge(edge: number): Promise<void> {
   return invoke<void>("set_preview_edge", { edge });
+}
+
+export type LogsStatus = {
+  directory: string;
+  sizeBytes: number;
+  fileCount: number;
+  level: "error" | "warn" | "info" | "debug" | "trace";
+};
+
+export function logsStatus(): Promise<LogsStatus> {
+  return invoke<LogsStatus>("logs_status", {});
+}
+
+export function setLogsDirectory(path: string): Promise<LogsStatus> {
+  return invoke<LogsStatus>("set_logs_directory", { path });
+}
+
+export function setLogLevel(level: LogsStatus["level"]): Promise<LogsStatus> {
+  return invoke<LogsStatus>("set_log_level", { level });
+}
+
+export function logsExportZip(dest: string): Promise<number> {
+  return invoke<number>("logs_export_zip", { dest });
+}
+
+export function logsDeleteAll(): Promise<LogsStatus> {
+  return invoke<LogsStatus>("logs_delete_all", {});
 }
 
 /** Clamp bounds for the preview edge (mirror of the Rust `PREVIEW_EDGE_MIN/MAX`). */
@@ -869,12 +960,12 @@ let renderRequestSeq = 0;
 export type ViewRect = { ox: number; oy: number; sx: number; sy: number };
 
 /** Rendered frame pixel data, or null when the request was superseded. */
-export type RenderedFrame = { data: Uint8ClampedArray; w: number; h: number };
+export type RenderedFrame = { data: Uint8ClampedArray; w: number; h: number; previewSource?: boolean };
 
 /**
  * Render the develop viewport at display resolution.
  *
- * The backend returns raw bytes: [outW u32 LE][outH u32 LE][rgba8 outW*outH*4].
+ * The backend returns raw bytes: [outW u32 LE][outH u32 LE][flags?][rgba8 outW*outH*4].
  * An empty ArrayBuffer means the request was superseded — returns null.
  *
  * @param view      Visible window in crop-local uv [0,1] (ox,oy = top-left, sx,sy = size)
@@ -903,8 +994,11 @@ export async function developRender(
   const header = new DataView(buf, 0, 8);
   const w = header.getUint32(0, true); // little-endian
   const h = header.getUint32(4, true);
-  const pixels = new Uint8ClampedArray(buf, 8);
-  return { data: pixels, w, h };
+  const payloadBytes = w * h * 4;
+  const hasFlags = buf.byteLength === 9 + payloadBytes;
+  const offset = hasFlags ? 9 : 8;
+  const pixels = new Uint8ClampedArray(buf, offset);
+  return { data: pixels, w, h, previewSource: hasFlags && new Uint8Array(buf, 8, 1)[0] !== 0 };
 }
 
 /**

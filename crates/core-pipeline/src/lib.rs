@@ -13,7 +13,7 @@ pub mod histogram;
 pub mod mask;
 pub mod params;
 
-pub use backend::{DevelopPipeline, GpuContext};
+pub use backend::{DevelopPipeline, GpuAdapterInfo, GpuContext};
 pub use curve::build_lut;
 pub use encode::{crop_rgba8, resize_rgba8, rgba8_to_jpeg, rgba8_to_png};
 pub use error::PipelineError;

@@ -26,6 +26,8 @@ pub fn stamp(st: &AppState, mut e: Event) -> Event {
 pub fn log_event(st: &AppState, e: Event) {
     let e = stamp(st, e);
     if let Ok(db) = st.db.lock() {
-        let _ = core_library::append_event(&db.conn, &e);
+        if let Err(err) = core_library::append_event(&db.conn, &e) {
+            tracing::warn!(event_type = %e.event_type, error = %err, "behavioral event append failed");
+        }
     }
 }

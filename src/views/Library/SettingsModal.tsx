@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   thumbCacheCap,
   thumbCacheSize,
@@ -16,6 +17,12 @@ import {
   sidecarsWriteAll,
   sidecarsRebuild,
   facesDeleteAll,
+  logsStatus,
+  setLogsDirectory,
+  setLogLevel,
+  logsExportZip,
+  logsDeleteAll,
+  type LogsStatus,
 } from "../../lib/ipc";
 import { pickFolder } from "../../lib/importFlow";
 
@@ -95,6 +102,9 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [sidecarBusy, setSidecarBusy] = useState(false);
   const [confirmFaceWipe, setConfirmFaceWipe] = useState(false);
   const [faceWiping, setFaceWiping] = useState(false);
+  const [logs, setLogs] = useState<LogsStatus | null>(null);
+  const [logsBusy, setLogsBusy] = useState(false);
+  const [confirmLogsDelete, setConfirmLogsDelete] = useState(false);
 
   // Track whether the initial load has settled so debounce doesn't fire on open
   const initializedRef = useRef(false);
@@ -113,6 +123,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     setStatus(null);
     setConfirmReset(false);
     setConfirmFaceWipe(false);
+    setConfirmLogsDelete(false);
     void Promise.all([
       thumbCacheCap(),
       thumbCacheSize(),
@@ -120,14 +131,16 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       appLibraryRoot(),
       previewEdge(),
       faceStageEnabled(),
+      logsStatus(),
     ])
-      .then(([cap, used, size, root, pe, fse]) => {
+      .then(([cap, used, size, root, pe, fse, logStatus]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
         setMdSize(size);
         setLibRoot(root);
         setPEdge(pe);
         setFaceStage(fse);
+        setLogs(logStatus);
         initializedRef.current = true;
       })
       .catch(() => showStatus("Failed to load settings"));
@@ -202,6 +215,65 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       .then((n) => showStatus(`Computed features for ${n} image(s)`))
       .catch(() => showStatus("Failed to compute features"))
       .finally(() => setBackfilling(false));
+  };
+
+  const handleLogsLocation = async () => {
+    const picked = await pickFolder("Select logs location");
+    if (!picked) return;
+    setLogsBusy(true);
+    try {
+      setLogs(await setLogsDirectory(picked));
+      showStatus("Logs location changed");
+    } catch {
+      showStatus("Failed to change logs location");
+    } finally {
+      setLogsBusy(false);
+    }
+  };
+
+  const handleLogLevel = (level: LogsStatus["level"]) => {
+    setLogs((prev) => (prev ? { ...prev, level } : prev));
+    void setLogLevel(level)
+      .then((next) => {
+        setLogs(next);
+        showStatus(`Log level set to ${level}`);
+      })
+      .catch(() => showStatus("Failed to set log level"));
+  };
+
+  const handleExportLogs = async () => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const dest = await save({
+      defaultPath: `darkroom-logs-${stamp}.zip`,
+      filters: [{ name: "ZIP", extensions: ["zip"] }],
+    });
+    if (!dest) return;
+    setLogsBusy(true);
+    try {
+      const bytes = await logsExportZip(dest);
+      showStatus(`Exported logs (${fmtBytes(bytes)})`);
+    } catch {
+      showStatus("Failed to export logs");
+    } finally {
+      setLogsBusy(false);
+    }
+  };
+
+  const handleDeleteLogs = async () => {
+    if (!confirmLogsDelete) {
+      setConfirmLogsDelete(true);
+      return;
+    }
+    setLogsBusy(true);
+    try {
+      setLogs(await logsDeleteAll());
+      showStatus("Logs deleted");
+    } catch {
+      showStatus("Failed to delete logs");
+    } finally {
+      setLogsBusy(false);
+      setConfirmLogsDelete(false);
+    }
   };
 
   const handleWriteSidecars = () => {
@@ -523,6 +595,75 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
                 }}
               >
                 {sidecarBusy ? "Working…" : "Rebuild from sidecars"}
+              </button>
+            </div>
+          </div>
+
+          {/* Diagnostics logs */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>Diagnostics logs</div>
+            <div style={descStyle}>
+              Detailed local logs help debug production issues. Logs are redacted to avoid paths,
+              filenames, search text, captions, keywords, and people names.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <div
+                title={logs?.directory}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: "var(--color-stage)",
+                  border: "1px solid var(--color-line-2)",
+                  borderRadius: "var(--radius-sm)",
+                  color: logs ? "var(--color-t1)" : "var(--color-t3)",
+                  padding: "6px 8px",
+                  fontSize: 12,
+                  fontFamily: "var(--font-mono)",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {logs?.directory ?? "Loading…"}
+              </div>
+              <button
+                onClick={() => void handleLogsLocation()}
+                disabled={logsBusy}
+                style={{ ...btnSecondary, opacity: logsBusy ? 0.6 : 1 }}
+              >
+                Change…
+              </button>
+            </div>
+            <div style={{ ...descStyle, marginBottom: 8 }}>
+              Using {logs ? fmtBytes(logs.sizeBytes) : "…"} across {logs?.fileCount ?? "…"} log file(s).
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+              {(["error", "warn", "info", "debug", "trace"] as LogsStatus["level"][]).map((level) => (
+                <button key={level} onClick={() => handleLogLevel(level)} style={segmentBtn(logs?.level === level)}>
+                  {level}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => void handleExportLogs()}
+                disabled={logsBusy}
+                style={{ ...btnSecondary, opacity: logsBusy ? 0.6 : 1 }}
+              >
+                Export ZIP…
+              </button>
+              <button
+                onClick={() => void handleDeleteLogs()}
+                disabled={logsBusy}
+                style={{
+                  ...btnBase,
+                  background: confirmLogsDelete ? "#b3261e" : "var(--color-elev)",
+                  color: confirmLogsDelete ? "#fff" : "var(--color-danger, #e5685f)",
+                  borderColor: confirmLogsDelete ? "#b3261e" : "var(--color-line-2)",
+                  opacity: logsBusy ? 0.6 : 1,
+                }}
+              >
+                {confirmLogsDelete ? "Click again to delete logs" : "Delete all logs…"}
               </button>
             </div>
           </div>

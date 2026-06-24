@@ -30,6 +30,9 @@ pub struct AppState {
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
     /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
     pub full_render_cache: Mutex<Option<(i64, PreparedImage)>>,
+    /// Single half-resolution prepared image used for fast first paint on fit/whole-crop views,
+    /// especially useful on Windows where full-res upload/readback is expensive.
+    pub preview_render_cache: Mutex<Option<(i64, PreparedImage)>>,
     /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
     /// newer request has already superseded it.
     pub latest_render: AtomicU64,
@@ -89,7 +92,7 @@ impl AppState {
                 Some(GpuRender { ctx, pipeline })
             }
             Err(e) => {
-                eprintln!("[darkroom] GPU develop unavailable: {e}");
+                tracing::warn!(error = %crate::logging::safe_error(&e), "GPU develop unavailable");
                 None
             }
         };
@@ -110,6 +113,7 @@ impl AppState {
             gpu,
             thumb_queue: ThumbQueue::new(),
             full_render_cache: Mutex::new(None),
+            preview_render_cache: Mutex::new(None),
             latest_render: AtomicU64::new(0),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),

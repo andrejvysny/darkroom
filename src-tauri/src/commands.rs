@@ -14,6 +14,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 
+#[tauri::command]
+pub fn frontend_log(
+    level: String,
+    target: String,
+    message: String,
+    fields: Option<serde_json::Value>,
+) {
+    crate::logging::frontend_log(&level, &target, &message, fields);
+}
+
 // v2 adds local adjustment masks (DevelopParams.masks). v1 rows deserialize with masks: [].
 // v3 adds the scene-referred base tone operator (DevelopParams.tone_amount, default 100 = full ACR);
 // it replaces the fixed highlight shoulder, so v1/v2 rows re-render with the new tonality.
@@ -107,6 +117,14 @@ pub async fn image_meta(app: AppHandle, id: i64) -> Result<Option<ImageRow>, Str
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn gpu_status(app: AppHandle) -> Option<core_pipeline::GpuAdapterInfo> {
+    app.state::<AppState>()
+        .gpu
+        .as_ref()
+        .map(|gpu| gpu.ctx.info.clone())
 }
 
 /// Index (or re-index) a folder as a watched root. Emits `import:progress`/`import:done`.
@@ -221,6 +239,9 @@ pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
         if let Ok(mut slot) = st.full_render_cache.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = st.preview_render_cache.lock() {
+            *slot = None;
+        }
         if let Ok(mut h) = st.last_histogram.lock() {
             *h = None;
         }
@@ -255,10 +276,7 @@ pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopPa
                 // Don't silently default — surface the parse failure. The stored blob is left intact
                 // on disk; `develop_set_edit` refuses to overwrite an unreadable blob (unless forced
                 // by an explicit Reset), so the user's real edit isn't destroyed by the next auto-save.
-                eprintln!(
-                    "[darkroom] develop params for image {image_id} failed to parse ({e}); \
-                     showing defaults but preserving the stored edit"
-                );
+                tracing::warn!(image_id, error = %e, "develop params failed to parse; preserving stored edit");
                 DevelopParams::default()
             }),
             None => DevelopParams::default(),
@@ -583,6 +601,12 @@ fn ensure_full_render_cache(
             *slot = None;
         }
     }
+    {
+        let mut slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
+        if slot.as_ref().is_some_and(|(id, _)| *id != image_id) {
+            *slot = None;
+        }
+    }
 
     // --- Full-res source: decode the whole frame at full demosaic, cached in a single slot. ---
     let present = {
@@ -607,7 +631,7 @@ fn ensure_full_render_cache(
             .map_err(|e| e.to_string())?
             .downscale_into(FULL_MAX_EDGE);
         if profiling() {
-            eprintln!("[profile] decode(full): {:?}", t.elapsed());
+            tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "decode full profile");
         }
         let prepared = gpu
             .pipeline
@@ -616,6 +640,84 @@ fn ensure_full_render_cache(
         *st.full_render_cache.lock().map_err(|e| e.to_string())? = Some((image_id, prepared));
     }
     Ok(true)
+}
+
+fn ensure_preview_render_cache(
+    st: &AppState,
+    gpu: &GpuRender,
+    image_id: i64,
+    superseded: impl Fn() -> bool,
+) -> Result<bool, String> {
+    {
+        let mut slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
+        if slot.as_ref().is_some_and(|(id, _)| *id != image_id) {
+            *slot = None;
+        }
+    }
+    let present = {
+        let slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
+        slot.as_ref().is_some_and(|(id, _)| *id == image_id)
+    };
+    if !present {
+        if superseded() {
+            return Ok(false);
+        }
+        let path = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::image_by_id(&db.conn, image_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "image not found".to_string())?
+                .path
+        };
+        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+        let t = Instant::now();
+        let lin = core_raw::develop_linear_preview(&src).map_err(|e| e.to_string())?;
+        if profiling() {
+            tracing::debug!(
+                elapsed_ms = t.elapsed().as_millis(),
+                "decode preview profile"
+            );
+        }
+        let prepared = gpu
+            .pipeline
+            .prepare(&gpu.ctx, &lin)
+            .map_err(|e| e.to_string())?;
+        *st.preview_render_cache.lock().map_err(|e| e.to_string())? = Some((image_id, prepared));
+    }
+    Ok(true)
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevelopFullReady {
+    image_id: i64,
+}
+
+fn warm_full_render_cache(app: AppHandle, image_id: i64) {
+    std::thread::spawn(move || {
+        let st = app.state::<AppState>();
+        let Some(gpu) = st.gpu.as_ref() else { return };
+        let already_full = st
+            .full_render_cache
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|(id, _)| *id == image_id))
+            .unwrap_or(false);
+        if already_full {
+            return;
+        }
+        let superseded = || false;
+        if matches!(
+            ensure_full_render_cache(st.inner(), gpu, image_id, superseded),
+            Ok(true)
+        ) {
+            let _ = app.emit("develop:full-ready", DevelopFullReady { image_id });
+        }
+    });
+}
+
+fn can_use_preview_source(view: &core_pipeline::ViewParams) -> bool {
+    view.size[0] >= 0.90 && view.size[1] >= 0.90 && view.overlay_layer < 0
 }
 
 /// Render a crop-local viewport window of `image_id` at the requested output size, returning raw
@@ -650,11 +752,6 @@ pub async fn develop_render(
         st.latest_render.fetch_max(request_id, Ordering::SeqCst);
         let superseded = || st.latest_render.load(Ordering::SeqCst) > request_id;
 
-        if !ensure_full_render_cache(st.inner(), gpu, image_id, superseded)? {
-            // A newer request overtook this one before the (skipped) decode.
-            return Ok(tauri::ipc::Response::new(Vec::new()));
-        }
-
         // Build the viewport descriptor and render the crop-local window into an out_w × out_h
         // target. Lock held across render+readback so the slot can't be swapped mid-render.
         let view = core_pipeline::ViewParams {
@@ -667,28 +764,56 @@ pub async fn develop_render(
             overlay_color: [0.85, 0.10, 0.10],
             overlay_strength: 0.5,
         };
-        let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-        let (_, prepared) = slot
-            .as_ref()
-            .ok_or_else(|| "full-res image evicted before render".to_string())?;
-        let t = Instant::now();
-        let rgba = gpu
-            .pipeline
-            .render_view(&gpu.ctx, prepared, &params, &view)
-            .map_err(|e| e.to_string())?;
-        if prof {
-            eprintln!("[profile] gpu render_view+readback: {:?}", t.elapsed());
+
+        let have_full = {
+            let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
+            slot.as_ref().is_some_and(|(id, _)| *id == image_id)
+        };
+        let use_preview = !have_full && can_use_preview_source(&view);
+        if use_preview {
+            if !ensure_preview_render_cache(st.inner(), gpu, image_id, superseded)? {
+                return Ok(tauri::ipc::Response::new(Vec::new()));
+            }
+        } else if !ensure_full_render_cache(st.inner(), gpu, image_id, superseded)? {
+            // A newer request overtook this one before the (skipped) decode.
+            return Ok(tauri::ipc::Response::new(Vec::new()));
         }
-        drop(slot);
+
+        let t = Instant::now();
+        let rgba = if use_preview {
+            let slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
+            let (_, prepared) = slot
+                .as_ref()
+                .ok_or_else(|| "preview image evicted before render".to_string())?;
+            gpu.pipeline
+                .render_view(&gpu.ctx, prepared, &params, &view)
+                .map_err(|e| e.to_string())?
+        } else {
+            let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
+            let (_, prepared) = slot
+                .as_ref()
+                .ok_or_else(|| "full-res image evicted before render".to_string())?;
+            gpu.pipeline
+                .render_view(&gpu.ctx, prepared, &params, &view)
+                .map_err(|e| e.to_string())?
+        };
+        if prof {
+            tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "gpu render profile");
+        }
+        if use_preview {
+            warm_full_render_cache(app.clone(), image_id);
+        }
 
         // The histogram is computed by the dedicated `develop_histogram` whole-crop pass (driven on
         // param change), NOT from this viewport buffer — so it stays correct (whole image) while
         // zoomed and is not recomputed on every pan/zoom.
 
-        // Frame the raw RGBA8 with its dimensions: [out_w LE][out_h LE][rgba8].
-        let mut buf = Vec::with_capacity(8 + rgba.len());
+        // Frame the raw RGBA8 with its dimensions and source tier:
+        // [out_w LE][out_h LE][flags u8: bit0=preview-source][rgba8].
+        let mut buf = Vec::with_capacity(9 + rgba.len());
         buf.extend_from_slice(&out_w.to_le_bytes());
         buf.extend_from_slice(&out_h.to_le_bytes());
+        buf.push(u8::from(use_preview));
         buf.extend_from_slice(&rgba);
         Ok::<_, String>(tauri::ipc::Response::new(buf))
     })
@@ -839,7 +964,7 @@ where
 /// source of edit intent. Never fails the command — a sidecar error is logged and swallowed.
 fn sync_sidecar(conn: &core_db::rusqlite::Connection, image_id: i64) {
     if let Err(e) = core_library::write_sidecar(conn, image_id) {
-        eprintln!("sidecar write failed for image {image_id}: {e}");
+        tracing::warn!(image_id, error = %crate::logging::safe_error(&e), "sidecar write failed");
     }
 }
 
@@ -1704,6 +1829,35 @@ pub async fn import_commit(
 }
 
 // ---------- Settings ----------
+
+#[tauri::command]
+pub fn logs_status() -> Result<crate::logging::LogsStatus, String> {
+    crate::logging::status()
+}
+
+#[tauri::command]
+pub async fn set_logs_directory(path: String) -> Result<crate::logging::LogsStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::logging::set_directory(Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn set_log_level(level: String) -> Result<crate::logging::LogsStatus, String> {
+    crate::logging::set_level(&level)
+}
+
+#[tauri::command]
+pub async fn logs_export_zip(dest: String) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::logging::export_zip(Path::new(&dest)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn logs_delete_all() -> Result<crate::logging::LogsStatus, String> {
+    crate::logging::delete_all()
+}
 
 /// Configured thumbnail-cache cap in bytes (default when unset).
 #[tauri::command]
