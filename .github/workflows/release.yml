@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to build, e.g. v0.1.0 or beta-0.1"
+        description: "Existing release tag to build, e.g. v0.1.1 or beta-1.1"
         required: true
         type: string
 
@@ -34,7 +34,11 @@ jobs:
               rustTargets: "x86_64-apple-darwin",
               args: "--target x86_64-apple-darwin --bundles dmg",
             }
-          - { platform: windows-latest, rustTargets: "", args: "--bundles nsis" }
+          - {
+              platform: windows-latest,
+              rustTargets: "",
+              args: "--bundles nsis",
+            }
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +95,9 @@ jobs:
             throw new Error(`Missing version in [${section}] of ${path}`);
           }
 
-          const expected = versionTag ? versionTag[1] : `${betaTag[1]}.${betaTag[2]}.0`;
+          // Pre-1.0 beta scheme: a `beta-X.Y` tag maps to app version `0.X.Y`, so beta releases
+          // ride the project's 0.x patch line (e.g. beta-1.1 -> 0.1.1) rather than forcing a major.
+          const expected = versionTag ? versionTag[1] : `0.${betaTag[1]}.${betaTag[2]}`;
           const versions = {
             "package.json": readJsonVersion("package.json"),
             "src-tauri/tauri.conf.json": readJsonVersion("src-tauri/tauri.conf.json"),

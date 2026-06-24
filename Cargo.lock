@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "core-analyze"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "core-db",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "core-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rusqlite",
  "rusqlite_migration",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "core-dedup"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-db",
  "image",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "core-import"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "core-db",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "core-library"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-db",
  "core-raw",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "core-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "core-raw"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -923,7 +923,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "darkroom"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-analyze",
  "core-db",
