@@ -17,6 +17,9 @@ pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: GpuAdapterInfo,
+    /// `max_texture_dimension_2d` granted by the device. Bounds the largest input image and the
+    /// largest viewport/export target this GPU can render (DX12 / Apple Silicon report 16384).
+    pub max_texture_dim: u32,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -33,6 +36,8 @@ pub struct GpuAdapterInfo {
     pub subgroup_min_size: u32,
     pub subgroup_max_size: u32,
     pub transient_saves_memory: bool,
+    /// Filled in from the granted device limits after creation (0 from the adapter-only `From`).
+    pub max_texture_dim: u32,
 }
 
 impl From<wgpu::AdapterInfo> for GpuAdapterInfo {
@@ -49,6 +54,8 @@ impl From<wgpu::AdapterInfo> for GpuAdapterInfo {
             subgroup_min_size: info.subgroup_min_size,
             subgroup_max_size: info.subgroup_max_size,
             transient_saves_memory: info.transient_saves_memory,
+            // Not available from AdapterInfo; set from the granted device limits in `GpuContext::new`.
+            max_texture_dim: 0,
         }
     }
 }
@@ -58,29 +65,65 @@ impl GpuContext {
         let desc = instance_descriptor();
         let enabled_backends = desc.backends;
         let instance = wgpu::Instance::new(desc);
-        let adapter = select_adapter(&instance, enabled_backends)?;
-        let raw_info = adapter.get_info();
-        let info = GpuAdapterInfo::from(raw_info.clone());
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("darkroom-device"),
-            ..Default::default()
-        }))
-        .map_err(|e| PipelineError::Device(e.to_string()))?;
-        tracing::info!(
-            name = %info.name,
-            vendor = format_args!("0x{:04x}", info.vendor),
-            device = format_args!("0x{:04x}", info.device),
-            device_type = %info.device_type,
-            backend = %info.backend,
-            driver = %info.driver,
-            driver_info = %info.driver_info,
-            "selected GPU adapter"
-        );
-        Ok(Self {
-            device,
-            queue,
-            info,
-        })
+
+        // Candidates are returned in preference order. We try `request_device` down the list so a
+        // broken primary driver (e.g. a flaky NVIDIA install on Windows) falls back to the next
+        // adapter instead of disabling GPU develop entirely.
+        let candidates = candidate_adapters(&instance, enabled_backends);
+        if candidates.is_empty() {
+            return Err(PipelineError::NoAdapter);
+        }
+
+        let mut last_err: Option<String> = None;
+        for adapter in candidates {
+            let raw_info = adapter.get_info();
+            // Request exactly what the adapter supports (not `Limits::default()`'s 8192 floor): this
+            // never fails on a below-default adapter and unlocks the true max texture dim on capable
+            // GPUs. `MemoryHints::MemoryUsage` is friendlier to shared-memory iGPUs (DX12/Vulkan
+            // honor it; Metal ignores it).
+            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("darkroom-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                ..Default::default()
+            })) {
+                Ok((device, queue)) => {
+                    let max_texture_dim = device.limits().max_texture_dimension_2d;
+                    let mut info = GpuAdapterInfo::from(raw_info.clone());
+                    info.max_texture_dim = max_texture_dim;
+                    tracing::info!(
+                        name = %info.name,
+                        vendor = format_args!("0x{:04x}", info.vendor),
+                        device = format_args!("0x{:04x}", info.device),
+                        device_type = %info.device_type,
+                        backend = %info.backend,
+                        driver = %info.driver,
+                        driver_info = %info.driver_info,
+                        max_texture_dim,
+                        "selected GPU adapter"
+                    );
+                    return Ok(Self {
+                        device,
+                        queue,
+                        info,
+                        max_texture_dim,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        name = %raw_info.name,
+                        backend = ?raw_info.backend,
+                        error = %e,
+                        "request_device failed; trying next adapter"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+        Err(PipelineError::Device(last_err.unwrap_or_else(|| {
+            "no enumerated adapter could create a device".to_string()
+        })))
     }
 }
 
@@ -89,7 +132,9 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
     {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
         if std::env::var_os("WGPU_BACKEND").is_none() {
-            desc.backends = wgpu::Backends::DX12;
+            // DX12 first (preferred), Vulkan as a fallback for stripped Windows SKUs / Wine where
+            // DX12 enumeration is empty. The candidate sort keeps DX12 ahead of Vulkan per GPU.
+            desc.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
         }
         desc
     }
@@ -99,13 +144,14 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
     }
 }
 
-fn select_adapter(
+/// Adapters to try, in preference order. The caller attempts `request_device` down the list.
+fn candidate_adapters(
     instance: &wgpu::Instance,
     enabled_backends: wgpu::Backends,
-) -> Result<wgpu::Adapter, PipelineError> {
+) -> Vec<wgpu::Adapter> {
     #[cfg(target_os = "windows")]
     {
-        let adapters = pollster::block_on(instance.enumerate_adapters(enabled_backends));
+        let mut adapters = pollster::block_on(instance.enumerate_adapters(enabled_backends));
         for adapter in &adapters {
             let info = adapter.get_info();
             tracing::debug!(
@@ -118,43 +164,43 @@ fn select_adapter(
                 "available GPU adapter"
             );
         }
-        if let Some(adapter) = adapters
-            .iter()
-            .find(|a| {
-                let info = a.get_info();
-                info.vendor == NVIDIA_VENDOR_ID && info.device_type == wgpu::DeviceType::DiscreteGpu
-            })
-            .cloned()
-        {
-            return Ok(adapter);
-        }
-        if let Some(adapter) = adapters
-            .iter()
-            .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
-            .cloned()
-        {
-            return Ok(adapter);
-        }
-        if let Some(adapter) = adapters
-            .iter()
-            .find(|a| a.get_info().device_type == wgpu::DeviceType::IntegratedGpu)
-            .cloned()
-        {
-            return Ok(adapter);
-        }
-        if let Some(adapter) = adapters.into_iter().next() {
-            return Ok(adapter);
-        }
+        // Stable sort by (device tier, backend rank): NVIDIA discrete first, then any discrete, then
+        // integrated, then anything else; within a tier prefer DX12 over the Vulkan fallback.
+        adapters.sort_by_cached_key(|a| {
+            let info = a.get_info();
+            let tier: u8 = if info.vendor == NVIDIA_VENDOR_ID
+                && info.device_type == wgpu::DeviceType::DiscreteGpu
+            {
+                0
+            } else if info.device_type == wgpu::DeviceType::DiscreteGpu {
+                1
+            } else if info.device_type == wgpu::DeviceType::IntegratedGpu {
+                2
+            } else {
+                3
+            };
+            let backend_rank: u8 = match info.backend {
+                wgpu::Backend::Dx12 => 0,
+                wgpu::Backend::Vulkan => 1,
+                _ => 2,
+            };
+            (tier, backend_rank)
+        });
+        adapters
     }
 
     #[cfg(not(target_os = "windows"))]
-    let _ = enabled_backends;
-
-    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        ..Default::default()
-    }))
-    .map_err(|_| PipelineError::NoAdapter)
+    {
+        let _ = enabled_backends;
+        // macOS (single Metal GPU) / Linux: let wgpu pick the high-performance adapter.
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .ok()
+        .into_iter()
+        .collect()
+    }
 }
 
 const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -566,8 +612,20 @@ impl DevelopPipeline {
         img: &LinearImage,
     ) -> Result<PreparedImage, PipelineError> {
         let device = &ctx.device;
-        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let (w, h) = (img.width, img.height);
+
+        // Reject images larger than the device can hold *before* touching the GPU. Exceeding
+        // `max_texture_dimension_2d` is a validation error, which the OutOfMemory scope below would
+        // NOT capture — it would surface as an uncaptured device error rather than a clean Result.
+        if w > ctx.max_texture_dim || h > ctx.max_texture_dim {
+            return Err(PipelineError::ImageTooLarge {
+                w,
+                h,
+                max: ctx.max_texture_dim,
+            });
+        }
+
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
         // RGB f32 -> RGBA f32 (alpha = 1).
         let mut rgba = vec![0f32; (w * h * 4) as usize];
@@ -1241,12 +1299,12 @@ impl DevelopPipeline {
         params: &DevelopParams,
         view: &crate::params::ViewParams,
     ) -> Result<Vec<u8>, PipelineError> {
-        // Clamp the output to the GPU max texture edge. This also bounds `ow * oh * 4` well within
-        // u32 (8192² × 4 ≈ 256 MB), so the readback allocation can't silently overflow on a bad
-        // request from the IPC layer.
-        const MAX_VIEW_EDGE: u32 = 8192;
-        let ow = view.out_w.clamp(1, MAX_VIEW_EDGE);
-        let oh = view.out_h.clamp(1, MAX_VIEW_EDGE);
+        // Clamp the output to the device's real max texture edge. This also bounds `ow * oh * 4`
+        // within u32 (16384² × 4 ≈ 1 GiB), so the readback allocation can't silently overflow on a
+        // bad request from the IPC layer; the OutOfMemory error scope guards the allocation itself.
+        let max_edge = ctx.max_texture_dim;
+        let ow = view.out_w.clamp(1, max_edge);
+        let oh = view.out_h.clamp(1, max_edge);
         if !view.active && view.overlay_layer < 0 && ow == prepared.width && oh == prepared.height {
             return self.render_to(
                 ctx,

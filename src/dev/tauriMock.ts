@@ -373,6 +373,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     subgroupMinSize: 0,
     subgroupMaxSize: 0,
     transientSavesMemory: false,
+    maxTextureDim: 16384,
   }),
   library_index_root: () => STATS,
   database_reset: () => STATS,

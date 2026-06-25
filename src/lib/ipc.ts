@@ -225,6 +225,7 @@ export type GpuStatus = {
   subgroupMinSize: number;
   subgroupMaxSize: number;
   transientSavesMemory: boolean;
+  maxTextureDim: number;
 };
 
 export function gpuStatus(): Promise<GpuStatus | null> {

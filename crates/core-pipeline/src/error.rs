@@ -6,6 +6,8 @@ pub enum PipelineError {
     NoAdapter,
     #[error("request device: {0}")]
     Device(String),
+    #[error("image {w}x{h} exceeds GPU max texture dimension {max}")]
+    ImageTooLarge { w: u32, h: u32, max: u32 },
     #[error("buffer map: {0}")]
     Map(String),
     #[error("raw: {0}")]
