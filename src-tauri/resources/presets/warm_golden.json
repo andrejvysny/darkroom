@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "name": "Warm Golden",
+  "groupName": "Built-in",
+  "fieldKeys": ["temp", "tint", "saturation", "highlights"],
+  "processVersion": 4,
+  "params": {
+    "temp": 30,
+    "tint": 6,
+    "saturation": 8,
+    "highlights": -10
+  }
+}

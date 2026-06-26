@@ -31,6 +31,8 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/012_analysis_stage_index.sql"),
     include_str!("../migrations/013_face_marker_reconcile.sql"),
     include_str!("../migrations/014_similarity_features.sql"),
+    include_str!("../migrations/015_presets.sql"),
+    include_str!("../migrations/016_develop_snapshots.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -148,6 +150,7 @@ mod tests {
             "app_meta",
             "collection_images",
             "collections",
+            "develop_snapshots",
             "edits",
             "face",
             "face_embedding",
@@ -164,6 +167,7 @@ mod tests {
             "import_sessions",
             "keywords",
             "person",
+            "presets",
             "ratings_flags",
             "user_events",
         ];

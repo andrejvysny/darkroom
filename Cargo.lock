@@ -793,6 +793,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-preset"
+version = "0.1.1"
+dependencies = [
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "core-raw"
 version = "0.1.1"
 dependencies = [
@@ -931,6 +941,7 @@ dependencies = [
  "core-import",
  "core-library",
  "core-pipeline",
+ "core-preset",
  "core-raw",
  "image",
  "notify",
@@ -4569,6 +4580,12 @@ name = "rle-decode-fast"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
+
+[[package]]
+name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rsqlite-vfs"

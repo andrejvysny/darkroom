@@ -12,10 +12,12 @@ pub mod features;
 pub mod index;
 pub mod keywords;
 pub mod maintenance;
+pub mod presets;
 pub mod query;
 pub mod reconcile;
 pub mod settings;
 pub mod sidecar;
+pub mod snapshots;
 pub mod thumbs;
 
 pub use analysis::{
@@ -52,6 +54,10 @@ pub use keywords::{
     keywords_for_image, list_keywords, remove_keyword_from_image, KeywordRow,
 };
 pub use maintenance::reap_dangling_import_sessions;
+pub use presets::{
+    delete_preset, get_preset, insert_preset, is_builtin, list_presets, seed_builtin_preset,
+    unique_name, update_preset, PresetFull, PresetSummary,
+};
 pub use query::{
     count_images, date_tree, image_by_id, list_folders, present_image_ids, query_images, DateNode,
     DateTreeYear, FolderRow, ImageRow, QueryParams,
@@ -65,5 +71,9 @@ pub use settings::{
 };
 pub use sidecar::{
     hydrate_if_blank, rebuild_from_sidecars, write_all_sidecars, write_sidecar, Sidecar,
+};
+pub use snapshots::{
+    create_snapshot, delete_snapshot, get_snapshot_params, list_snapshots, rename_snapshot,
+    unique_snapshot_name, SnapshotSummary,
 };
 pub use thumbs::ThumbCache;

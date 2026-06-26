@@ -2,12 +2,40 @@
 
 > Read order when resuming: this file → `CURRENT_STATE.md` (architecture, gotchas, IPC surface) →
 > `TODO.md` (granular leftovers) → `SPEC_V1.md` (full spec) → `CLAUDE.md` (hard constraints).
-> Memory index: `~/.claude/.../memory/MEMORY.md` (latest: **darkroom-unified-ai-pipeline**,
-> **darkroom-acr-curve-colorbalance**, **darkroom-tone-crop**, **darkroom-trust-and-ship**).
+> Memory index: `~/.claude/.../memory/MEMORY.md` (latest: **darkroom-presets-history**,
+> **darkroom-unified-ai-pipeline**, **darkroom-acr-curve-colorbalance**, **darkroom-tone-crop**).
+
+## Repo state sync (2026-06-26)
+
+`main` = **`f7445df`**, `origin/main` = **`1cbb3e3` (v0.1.1)**, **2 unpushed** (`e880fda` GPU hardening,
+`f7445df` progressive preview). Since this TL;DR was last accurate, `main` also gained: Windows
+packaging (NSIS + DirectML + Windows CI), the **dedup redesign** (UI + similarity-pipeline tightening),
+**diagnostic logging**, Intel-macOS/beta CI, and the **v0.1.1 release**. `feat/presets-history` is
+**100% uncommitted** on `f7445df` (18 modified + 14 new); its **hardening pass is DONE + headless-green
+(2026-06-26)** — only in-app QA + commit remain. The "origin/main at f663ee0 / cleanup is the only
+unpushed work" statements below are stale. **Consolidated in-app QA checklist: end of this file.**
 
 ## TL;DR
 
-**Latest — branch `chore/cleanups-viewport-histogram` (MERGED to `main` `01a7b84`, not pushed):** a
+**Latest — branch `feat/presets-history` (built + verified headless & Tier-1, NOT committed/merged):**
+Develop **Presets + edit-History + Lightroom preset import**. New **`core-preset`** crate (pure CPU, no
+wgpu): a `serde_json::Value`-level **sparse merge engine** (`apply_sparse` + amount-blend), a `ModuleScope`
+group→field map (Rust source of truth; `src/lib/presetScope.ts` mirrors it; drift-guarded), and a
+format-agnostic import `Registry` (`PresetImporter` trait) with **Lightroom `.xmp`** (roxmltree, `crs:` ns)
+
+- **`.lrtemplate`** (minimal Lua parser) → a `PresetIr` → an honest `ImportReport{mapped,approximated,
+dropped}`. **Sparse per-field** presets (store only touched top-level `DevelopParams` fields, so applying
+  never resets `toneAmount=100`/existing masks; typed round-trip in `src-tauri` keeps wgpu out of the parser).
+  **LR fidelity best-effort:** absolute WB Kelvin + color-grade/split-tone **dropped** (no anchor /
+  incompatible `cb_rgb` gain-power channels), basic-tone **approx**, HSL 1:1, curve `/255`. **Hybrid history:**
+  in-memory ⌘Z/⌘⇧Z undo (burst-coalesced) + persistent DB **snapshots**. Migrations `015_presets` +
+  `016_develop_snapshots`; 5 bundled built-ins; new left `DevelopSidePanel` (Presets | History) + create
+  dialog + import-report modal + hover live-preview + copy/paste. All headless gates green + Tier-1 mock UI
+  QA passed (0 console errors). **Pending: in-app GPU/CR3 QA + commit; then harden + extend** (`TODO.md` top:
+  verify/harden/extend). Plan: `~/.claude/plans/act-as-senior-software-purrfect-glade.md`; memory
+  `darkroom-presets-history`. **Adds no GPU bindings** (next free still = 15).
+
+**Previously — branch `chore/cleanups-viewport-histogram` (MERGED to `main` `01a7b84`, not pushed):** a
 tech-debt pass. (1) Extracted the ~200 LOC of duplicated canvas-viewport logic from `Stage.tsx` +
 `Library/Loupe.tsx` into a shared `src/lib/useViewport.ts` hook (+ `src/lib/canvasPaint.ts` `paintFrame`);
 behavior-preserving (crop fit-lock via `transformViewState`, tiered preview/decode stays in Loupe).
@@ -18,9 +46,9 @@ duplicate decode on open). (3) These doc reconciliations. `npx tsc --noEmit` + `
 goldens byte-identical) + `clippy --workspace --examples -D warnings` + `npm run build` all clean;
 in-app visual QA pending. Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`.
 
-**Latest MERGED to `main`:** `feat/unified-ai-pipeline` (`f663ee0`) + `feat/import-ordering-keyset-paging`
-(`595685d`) — both already on `origin/main` (at `f663ee0`). The only unpushed work is the cleanup pass
-below (2 commits, merged `01a7b84`).
+**Latest MERGED to `main`:** see "Repo state sync" above — `main` is now `f7445df` (v0.1.1 + Windows
+packaging + dedup redesign + logging on top of the AI/import work). `feat/unified-ai-pipeline`
+(`f663ee0`) + `feat/import-ordering-keyset-paging` (`595685d`) are long since on `origin/main`.
 
 - **`feat/unified-ai-pipeline` (MERGED `f663ee0`):** the two separate on-device AI passes (object
   detection auto-after-import + face recognition manual "Find People") are now ONE **manual** scan for
@@ -130,8 +158,12 @@ New tests this pass: import-session reaper, schema downgrade guard, sidecar roun
 
 ## Suggested next steps
 
-### 0. Outstanding verification on already-MERGED work (do first)
+### 0. Outstanding verification (do first)
 
+0. **Presets/History in-app QA + commit** (newest, branch `feat/presets-history`, **uncommitted**;
+   **hardening DONE 2026-06-26 + headless-green**) — run the consolidated QA checklist at the end of this
+   file (`npm run tauri dev`), then **commit the branch**. Extensions remain in `TODO.md` top ("extend").
+   Memory: `darkroom-presets-history`.
 1. **Unified-AI in-app GUI QA** (`npm run tauri dev`) — `feat/unified-ai-pipeline` is MERGED but never
    GUI-verified: one scan does detection+faces+captions; ONE progress bar; People populate before
    captions; a confirmed/assigned face survives a re-scan; cancel works; `faces_delete_all` during a
@@ -155,9 +187,12 @@ The input path is LR-grade. Items 1–2 are now **DONE** (`feat/acr-curve-colorb
 2. ✅ **Darktable color-balance-RGB — DONE (faithful subset).** 4-way + scene-linear contrast/sat in
    the Filmlight grading RGB, `@binding(14)`. **Deferred tail:** JzAzBz perceptual saturation +
    brilliance (needs PQ EOTF), per-band sat/brilliance, hue-shift, vibrance, gamut LUT.
-3. **Lightroom `.xmp` preset import** (Marek's ⚠️; now unblocked by the curve fit) — new `core-preset`
-   crate mapping `crs:` keys → `DevelopParams` (~70% maps: exposure/WB-via-as-shot/contrast/tone-curve/
-   HSL/sat/color-grading). The sidecar JSON format can grow an XMP-`crs:` bridge here.
+3. ✅ **Lightroom `.xmp` preset import — DONE** (`feat/presets-history`, uncommitted): `core-preset` crate
+   maps `crs:` keys → `DevelopParams` via a sparse IR (also `.lrtemplate`). Honest `ImportReport` — absolute
+   WB Kelvin + color-grade/split-tone are **dropped** (no anchor / incompatible `cb_rgb` channels), not the
+   "~70% incl. WB/color-grading" the earlier note assumed. Plus full preset CRUD + edit-history. **Verify +
+   commit, then harden/extend** per `TODO.md` top. Remaining LR-adjacent extensions there: `.pp3`/`.costyle`
+   importers, `.cube`/HaldCLUT (needs a new GPU 3D-LUT stage first), LR local-adjustment→masks import.
 4. **Local-contrast family** (clarity/texture, then dehaze) — needs a multi-radius blur beyond the
    current 3×3. **Grain**, **channel mixer** (3×3 linear), **HaldCLUT/.cube** (3D texture, trilinear)
    are smaller independent wins. (NOTE: the earlier "saturation/HSL clamps away ProPhoto headroom"
@@ -208,3 +243,40 @@ multi-format (ARW/NEF/DNG/Fuji) validation. All deferred while personal/macOS-on
   bindings. Bindings 0–14 are now all wired (10 ToneOp, 11 base_lut, 12 Geom, 13 View, 14 CbRgb);
   **next free = 15**. rawler `=0.7.2`, wgpu `=29`, rusqlite `0.39`/`_migration =2.5.0` pinned for rustc
   1.91. See `CLAUDE.md`.
+
+## Consolidated in-app QA checklist (run once via `npm run tauri dev`)
+
+> These need a real GPU (Metal) + real CR3 and CANNOT be done headless — that's why they've stacked up.
+> One app session burns down several merged-but-unverified branches at once. Tick each; note any
+> regression. Headless gates are all green as of 2026-06-26.
+
+**A. Presets / History / LR import** (branch `feat/presets-history`, uncommitted — verify THEN commit):
+
+- [ ] Apply a preset to a **2nd, already-edited** image → only the preset's modules change; the prior
+      edit's untouched modules (exposure, masks, crop, …) survive intact.
+- [ ] **Amount** slider blends the look 0→100; the amount also applies on paste/snapshot where wired.
+- [ ] **Hover** a preset row → live preview; mouse-out restores; hovering during a slider drag never
+      sticks; switching image mid-hover doesn't restore the old photo's state (drag/hover guards).
+- [ ] **Copy/paste settings** ⌘⇧C / ⌘⇧V; **undo/redo** ⌘Z / ⌘⇧Z (a slider drag = one undo step).
+- [ ] **Snapshot** create → restore → **survives an app restart** (persisted in DB).
+- [ ] **Import a REAL Lightroom `.xmp` AND `.lrtemplate`** → ImportReport shows WB-Kelvin + color-grade
+      as **DROPPED** (not silently applied); basic-tone as approximated; HSL/tone-curve mapped. Confirm
+      an element-form `.xmp` and a `.lrtemplate` with comments both import. A bogus/oversized/garbage
+      file is rejected with a clear error (write-time validation + 4 MB cap).
+- [ ] **Save** the current edit as a preset (module checklist) → reappears grouped, ★ toggles, export
+      round-trips.
+
+**B. Merged-but-unverified GPU work** (opportunistic — all already on `main`):
+
+- [ ] **ACR brightness + Color-balance-RGB** look on varied real CR3 (the doc-flagged #1). Tune
+      `BASELINE_GAIN` (`params.rs`) if the default is too bright/dark. (`feat/acr-curve-colorbalance`.)
+- [ ] **Crop / straighten** — interactive rect + angle; export at true dims. (`feat/tone-operator-crop`.)
+- [ ] **Whole-crop histogram** stays correct while **zoomed** + updates live on slider drag.
+      (`chore/cleanups-viewport-histogram`.)
+- [ ] **Viewport render** — crisp full-res zoom; red **mask overlay** color over a real mask; snappy
+      masked edits. (`feat/viewport-render`.)
+- [ ] **Unified AI scan** — ONE scan does detection + faces + captions; ONE progress bar; People
+      populate before captions; a confirmed/assigned face survives a re-scan; cancel works;
+      `faces_delete_all` during a scan is refused. (~900 MB + 190 MB models on first run.)
+      (`feat/unified-ai-pipeline`.)
+- [ ] **Dedup redesign** + **diagnostic logging** + (if on Windows) **NSIS build** smoke-check.

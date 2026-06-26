@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "Soft Matte",
+  "groupName": "Built-in",
+  "fieldKeys": ["contrast", "blacks", "whites", "highlights", "saturation"],
+  "processVersion": 4,
+  "params": {
+    "contrast": -14,
+    "blacks": 20,
+    "whites": -10,
+    "highlights": -18,
+    "saturation": -6
+  }
+}

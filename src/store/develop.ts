@@ -59,6 +59,26 @@ interface DevelopState {
   /** Source image aspect (W/H), set by DevelopView from the ImageRow — used by crop aspect presets. */
   imageAspect: number;
   setImageAspect: (a: number) => void;
+  /** Preset / paste apply strength, 0..100 (100 = full). Shared by the Presets panel + paste. */
+  presetAmount: number;
+  setPresetAmount: (n: number) => void;
+  /** Copied develop settings (full source params + the field scope), for Paste settings. */
+  copiedSettings: CopiedSettings | null;
+  setCopiedSettings: (c: CopiedSettings | null) => void;
+  /** In-memory session undo/redo of full param states (cleared on image change). */
+  undoStack: DevelopParams[];
+  redoStack: DevelopParams[];
+  /** Record a pre-edit state for undo (clears the redo stack). */
+  pushUndo: (prior: DevelopParams) => void;
+  clearHistory: () => void;
+}
+
+/** Max session undo depth (full param snapshots, ~2–5 KB each). */
+const UNDO_CAP = 60;
+
+export interface CopiedSettings {
+  params: DevelopParams;
+  fieldKeys: string[];
 }
 
 export interface BrushSettings {
@@ -105,4 +125,16 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setCropMode: (b) => set({ cropMode: b }),
   imageAspect: 1.5,
   setImageAspect: (a) => set({ imageAspect: a }),
+  presetAmount: 100,
+  setPresetAmount: (n) => set({ presetAmount: n }),
+  copiedSettings: null,
+  setCopiedSettings: (c) => set({ copiedSettings: c }),
+  undoStack: [],
+  redoStack: [],
+  pushUndo: (prior) =>
+    set((s) => ({
+      undoStack: [...s.undoStack, prior].slice(-UNDO_CAP),
+      redoStack: [],
+    })),
+  clearHistory: () => set({ undoStack: [], redoStack: [] }),
 }));

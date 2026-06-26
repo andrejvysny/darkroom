@@ -3,9 +3,41 @@
 > Snapshot for resuming in a new session. Pairs with `TODO.md` (what's next + leftovers), `README.md`
 > (overview), `SPEC_V1.md` (full spec).
 
+## Repo state sync (2026-06-26)
+
+`main` = **`f7445df`**, `origin/main` = **`1cbb3e3` (v0.1.1)**, **2 unpushed** (`e880fda` GPU hardening,
+`f7445df` progressive preview). Merged to `main` since the prose below was last accurate (and not yet
+folded into it): `feat/windows-packaging` (NSIS + DirectML + Windows CI), **dedup redesign** (UI +
+similarity-pipeline tightening), **diagnostic logging**, Intel-macOS/beta CI, the **v0.1.1 release**,
+and the GPU/preview fixes. `feat/presets-history` is **100% uncommitted** on `f7445df`; its hardening
+pass is DONE + headless-green (2026-06-26) — only in-app QA + commit remain (see `TODO.md` top).
+Anything below that says "origin/main is at f663ee0" or "cleanup is the only unpushed work" is stale.
+
 ## TL;DR
 
-**Latest — `chore/cleanups-viewport-histogram` (MERGED `01a7b84`, not pushed):** a tech-debt pass. (1) Shared
+**Latest — `feat/presets-history` (built, NOT committed/merged):** Develop **Presets + edit-History +
+Lightroom preset import**. New **`core-preset`** crate (pure CPU, **no wgpu**) holds a `serde_json::Value`-level
+**sparse merge engine** (`apply_sparse` + amount-blend), a `ModuleScope` group→field map (Rust source of
+truth, mirrored by `src/lib/presetScope.ts`, drift-guarded), and a format-agnostic import `Registry`
+(`PresetImporter` trait) with **Lightroom `.xmp`** (roxmltree, `crs:` ns) + **`.lrtemplate`** (minimal Lua
+parser) importers → a `PresetIr` → an honest `ImportReport{mapped,approximated,dropped}`. **Presets are
+sparse per-field** (store only touched top-level `DevelopParams` fields → applying never resets
+`toneAmount=100`/existing masks); typed round-trip happens in `src-tauri` so the parser never pulls in the
+GPU stack. **LR fidelity = best-effort:** absolute WB Kelvin + color-grade/split-tone are **dropped**
+(no anchor / incompatible `cb_rgb` gain-power channels), basic-tone sliders **approximated**, HSL 1:1,
+tone-curve `/255`. **History = hybrid:** in-memory session undo/redo (⌘Z/⌘⇧Z, burst-coalesced) +
+persistent named **snapshots** (DB). DB migrations **`015_presets`** + **`016_develop_snapshots`** (latest
+schema = 16); 5 bundled built-ins seeded at setup. New left `DevelopSidePanel` (Presets | History tabs)
+
+- create dialog (module checklist + masks caveat) + import-report modal + hover live-preview + copy/paste
+  (⌘⇧C/V). **All headless gates green** (`cargo test --workspace`, `fmt --check`, `tsc`, `npm run build`;
+  new code clippy-clean) + **Tier-1 mock UI QA passed** (panel renders, create/apply/undo, 0 console
+  errors). **Hardening pass DONE (2026-06-26, headless-green — write-time validation, XMP scoping +
+  element form + size cap, Lua depth-guard/long-brackets/schemaVersion gate, drag-clobber guard,
+  built-in self-check + merge tests, PV-migration seam). Pending: in-app GPU/CR3 QA + commit.** Plan: `~/.claude/plans/act-as-senior-software-purrfect-glade.md`;
+  deep notes: memory `darkroom-presets-history`; granular next (verify/harden/extend): `TODO.md` top section.
+
+**Previously — `chore/cleanups-viewport-histogram` (MERGED `01a7b84`, not pushed):** a tech-debt pass. (1) Shared
 `src/lib/useViewport.ts` hook (+ `src/lib/canvasPaint.ts`) extracts the ~200 LOC of canvas-viewport
 logic duplicated between `Stage.tsx` + `Library/Loupe.tsx` (behavior-preserving). (2) **Whole-crop
 histogram**: new `develop_histogram` IPC renders the full crop `{0,0,1,1}` at 384² (correct while
@@ -13,7 +45,8 @@ zoomed); `develop_render` no longer emits the viewport-biased one. (3) Doc recon
 clean; `cargo test`/`clippy`/`npm run build` green; in-app visual QA pending. Plan:
 `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`.
 
-**Recently MERGED to `main`** (`origin/main` is at `f663ee0`; only this cleanup — 2 commits — is unpushed): the two separate
+**Recently MERGED to `main`** (NOTE: superseded — see "Repo state sync" at top; `main` is now `f7445df`
+with Windows packaging / dedup redesign / logging / v0.1.1 also merged): the two separate
 on-device AI passes — object detection (auto-after-import) + face recognition (manual "Find People") —
 are now ONE manual scan (`feat/unified-ai-pipeline`, `f663ee0`: single shared decode, per-stage
 dirty-DAG, deferred captions, data-safe face reconcile; **in-app GUI QA still pending**); plus
@@ -204,15 +237,16 @@ cargo run -p core-pipeline --example export_full       # full-res export → /tm
 Cargo workspace (root `Cargo.toml`) — members: `src-tauri` + `crates/*`. Frontend at repo root `src/`
 (deviates from spec's `/ui` intentionally, to reuse the scaffold).
 
-| Crate           | Role                                                                                                   | Key files                                            |
-| --------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------- |
-| `core-db`       | SQLite catalog: full DDL (STRICT), migrations, pragmas. Re-exports `rusqlite`.                         | `src/lib.rs`, `migrations/001_init.sql`              |
-| `core-raw`      | rawler decode, embedded thumb/preview, EXIF meta, BLAKE3 hash, capture fingerprint, **linear develop** | `src/{develop,meta,thumb,hash}.rs`                   |
-| `core-library`  | indexing (rayon), thumb cache, queries, culling, edit persistence                                      | `src/{index,query,thumbs,cull,edits}.rs`             |
-| `core-pipeline` | **wgpu/Metal develop pipeline** (WGSL, prepare/render), PNG/JPEG encode                                | `src/{backend,params,encode}.rs`, `src/develop.wgsl` |
-| `core-import`   | copy/move/reference import, date routing, verify, Trash                                                | `src/lib.rs`                                         |
-| `core-dedup`    | byte + capture grouping, safe resolve→Trash                                                            | `src/lib.rs`                                         |
-| `src-tauri`     | IPC commands, `thumb://` protocol, managed state                                                       | `src/{commands,protocol,state,lib}.rs`               |
+| Crate           | Role                                                                                                        | Key files                                                                            |
+| --------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `core-db`       | SQLite catalog: full DDL (STRICT), migrations, pragmas. Re-exports `rusqlite`.                              | `src/lib.rs`, `migrations/001_init.sql`                                              |
+| `core-raw`      | rawler decode, embedded thumb/preview, EXIF meta, BLAKE3 hash, capture fingerprint, **linear develop**      | `src/{develop,meta,thumb,hash}.rs`                                                   |
+| `core-library`  | indexing (rayon), thumb cache, queries, culling, edit persistence                                           | `src/{index,query,thumbs,cull,edits}.rs`                                             |
+| `core-pipeline` | **wgpu/Metal develop pipeline** (WGSL, prepare/render), PNG/JPEG encode                                     | `src/{backend,params,encode}.rs`, `src/develop.wgsl`                                 |
+| `core-import`   | copy/move/reference import, date routing, verify, Trash                                                     | `src/lib.rs`                                                                         |
+| `core-dedup`    | byte + capture grouping, safe resolve→Trash                                                                 | `src/lib.rs`                                                                         |
+| `core-preset`   | **(NEW)** sparse merge engine + format-agnostic preset import (LR `.xmp`/`.lrtemplate`). Pure CPU, no wgpu. | `src/{apply,scope,ir,map,registry,report}.rs`, `src/formats/{lr_xmp,lr_template}.rs` |
+| `src-tauri`     | IPC commands, `thumb://` protocol, managed state                                                            | `src/{commands,protocol,state,lib}.rs`                                               |
 
 **Frontend** (`src/`): `App.tsx` → `TopBar` + (`LibraryView` | `DevelopView`) + `CommandPalette` + `Toast`.
 State in `store/app.ts` (zustand). IPC wrappers in `lib/ipc.ts`. Library data hook `lib/useLibrary.ts`;
@@ -228,6 +262,12 @@ Views: `views/Library/{LeftNav,ThumbGrid,RightInfo,BottomBar,Loupe,DedupModal}.t
   `[outW u32 LE][outH u32 LE][rgba]`, NOT JPEG), `develop_preview_jpeg` (instant first paint),
   `develop_get_histogram` (pull), `develop_histogram` (whole-crop pass → emits `develop:histogram`),
   `image_histogram` (Library panel)
+- Presets (**NEW**, `feat/presets-history`): `presets_list`, `presets_get`, `presets_save`,
+  `presets_update`, `presets_delete`, `presets_duplicate`, `presets_apply(image_id, preset_id, amount,
+replace_all) → DevelopParams` (merged, NOT persisted — FE commits), `presets_export(id, dest)`,
+  `presets_import_file(src) → {preset_id, report}`, `develop_apply_settings` (copy/paste, sparse-merge)
+- History / snapshots (**NEW**): `snapshots_list`, `snapshot_create`, `snapshot_restore` (→ params,
+  FE commits), `snapshot_rename`, `snapshot_delete`. Session undo/redo is **frontend-only** (no IPC).
 - Export: `export_image`
 - Culling: `cull_set_rating`, `cull_set_flag`, `cull_set_label`,
   `cull_set_rating_many`, `cull_set_flag_many`, `cull_set_label_many` (batch)
@@ -284,6 +324,14 @@ imported_desc|asc}.
 - **`app_default_library()`** uses `env!("CARGO_MANIFEST_DIR")` → only resolves on the build machine (auto-bootstraps `library/2026` in dev); returns `None` elsewhere (user adds folders via Import).
 
 ## Done / Partial / Not done
+
+**Presets + Edit-History + LR import (NEW — branch `feat/presets-history`, built + headless-verified +
+Tier-1 mock UI QA, NOT committed):** sparse-per-field presets (DB `presets`, 5 built-ins) with
+create/apply/amount/duplicate/export/import + copy-paste settings; hybrid history (session undo/redo +
+DB snapshots); Lightroom `.xmp` + `.lrtemplate` import with an honest `ImportReport`. New `core-preset`
+crate (no wgpu), migrations 015/016, left `DevelopSidePanel`. Adds **no GPU bindings** (the develop
+pipeline's "next free = 15" is unchanged). **Pending: in-app GPU/CR3 QA + commit** — see `TODO.md` top
+("verify / harden / extend") and memory `darkroom-presets-history`.
 
 **Done & validated:** catalog + indexing + thumbnails; Library grid/nav/metadata; GPU develop (WB,
 exposure, contrast, highlights, shadows, saturation, blacks, whites) + edit persistence; culling

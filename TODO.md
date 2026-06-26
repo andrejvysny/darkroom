@@ -2,6 +2,110 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## Repo state sync (2026-06-26) — docs had drifted from `main`
+
+- **`main` = `f7445df`; `origin/main` = `1cbb3e3` (v0.1.1 released); 2 commits unpushed** (`e880fda`
+  GPU device-acquisition hardening, `f7445df` progressive full-screen preview). The earlier claim
+  "origin/main = f663ee0, only the cleanup is unpushed" is **stale**.
+- **Merged to `main` since these docs were last accurate** (and previously undocumented here):
+  `feat/windows-packaging` (NSIS + DirectML AI + Windows CI, `55ca6fc`), **dedup redesign** (UI
+  `175dd44` + pipeline tightening `ab1bcc6`), **diagnostic logging** (`626e447` + fix `e583817`),
+  Intel-macOS/beta **CI** config, **v0.1.1 release** (`1cbb3e3`), GPU hardening, progressive preview,
+  Windows thumb-protocol fix (`ec3b20a`). (See memory `darkroom-windows-packaging`,
+  `darkroom-dedup-redesign`, `darkroom-logging`.)
+- **`feat/presets-history` is 100% uncommitted** on top of `main` (`f7445df`): 18 modified + 14 new
+  files. Implementation feature-complete; hardening DONE (below); only in-app QA + commit remain.
+
+## DONE (branch `feat/presets-history`, not merged): Develop Presets + Edit-History + Lightroom import
+
+> Plan: `~/.claude/plans/act-as-senior-software-purrfect-glade.md`. All headless gates green:
+> `cargo test --workspace` + `cargo fmt --all --check` + `npx tsc` + `npm run build` clean; new code
+> clippy-clean (pre-existing warnings in core-dedup/core-import/core-pipeline are untouched). Tier-1
+> mock UI QA passed (panel renders, create-dialog + module checklist + masks caveat + save toast,
+> History undo/redo, apply-preset enables Undo, 0 console errors). **Pending: in-app GPU/CR3 QA**
+> (`npm run tauri dev`) — hover live-preview snappiness, amount-blend look, LR `.xmp` import report on a
+> real preset, snapshots surviving restart.
+
+- [x] **`core-preset` crate (pure CPU, no wgpu)** — the sparse merge engine + format-agnostic import.
+      `apply_sparse` (Value-level overlay + amount lerp), `ModuleScope` (group→field, Rust source of
+      truth; `presetScope.ts` mirrors it; drift-guarded by a test in `commands.rs`), `PresetIr` +
+      `map::ir_to_sparse` (CLEAN/APPROX/DROPPED `ImportReport`), `Registry`/`PresetImporter` trait.
+      Importers: `formats/lr_xmp.rs` (roxmltree, `crs:` ns, tone-curve `rdf:Seq`) +
+      `formats/lr_template.rs` (minimal Lua-table parser, reuses `build_ir`). Golden tests:
+      `tests/{preset,lr_import}.rs` (+ fixtures `sample.xmp`/`sample.lrtemplate`).
+- [x] **Sparse-per-field model (review C2 fix):** a preset stores ONLY touched top-level fields; apply
+      overlays just those (never resets `toneAmount=100` or existing masks). `replace_all` = base from
+      `DevelopParams::default()`. Typed round-trip happens in `src-tauri` (keeps wgpu out of the parser).
+- [x] **LR fidelity = best-effort + honest report:** absolute WB `Temperature` + color-grade/split-tone
+      DROPPED (no anchor / incompatible `cb_rgb` gain-power channels); basic-tone sliders APPROX; HSL
+      1:1 by color index; tone curve `/255`; only relative Tint nudge + un-rotated crop imported.
+- [x] **DB:** migration `015_presets` (sparse `params` + `field_keys` + builtin/favorite/group) +
+      `016_develop_snapshots` (full-params named snapshots, `ON DELETE CASCADE`). `core-library/
+{presets,snapshots}.rs` CRUD; 5 bundled built-ins seeded at setup (`resources/presets/*.json`).
+- [x] **IPC:** `presets_{list,get,save,update,delete,duplicate,apply,export,import_file}`,
+      `develop_apply_settings` (copy/paste), `snapshot_{list,create,restore,rename,delete}` — all in
+      `commands.rs`, registered in `lib.rs`. Apply/restore return merged params (NOT persisted; FE commits).
+- [x] **History = hybrid:** in-memory session undo/redo ring in `store/develop.ts` (⌘Z/⌘⇧Z; burst-coalesced
+      so a slider drag = one step; cleared on image change) + persistent named snapshots (DB). No
+      per-commit history table (keeps `user_events` analytics log separate; no WAL churn).
+- [x] **Frontend:** left `DevelopSidePanel` (Presets | History tabs, collapsible) in `DevelopView`;
+      `PresetsPanel` (grouped, ★/⋯ menu, amount slider, hover live-preview, copy/paste),
+      `CreatePresetDialog` (module checklist + masks geometry caveat), `ImportReportModal`,
+      `HistoryPanel` (undo/redo/revert/reset + snapshots), `usePresets`/`useHistory` hooks. CommandPalette
+      rows (⌘⇧N/C/V). "Reset all" renamed "Reset to default".
+
+### NEXT — verify · harden · extend (continue in a new session)
+
+**Harden — DONE (2026-06-26, headless-verified, still uncommitted):** all 7 review items landed; gates
+re-run green (`cargo test --workspace` 0 failed · `clippy --workspace --examples -D warnings` ·
+`fmt --check` · `tsc` · `npm run build`). Also fixed a **pre-existing** `core-dedup` clippy error
+(`explicit_counter_loop` at `lib.rs:393`, from merged main commit `ab1bcc6`) that was blocking the
+clippy gate — unrelated to presets; commit it separately if desired.
+
+- [x] **Validate imported/saved params at write time** — `validate_sparse_params` (round-trips
+      `apply_sparse(default, sparse)` → `DevelopParams`) wired into `presets_save` + `presets_import_file`.
+- [x] **Built-in self-check test** — `commands.rs::preset_tests::builtin_presets_are_valid`
+      (params ⊆ field_keys ⊆ `all_field_keys` + deserializes).
+- [x] **src-tauri merge unit test** — `applying_a_sparse_preset_leaves_untouched_fields_intact` (the mod
+      `preset_scope_tests` was renamed `preset_tests`). [Earlier "src-tauri has 0 tests" was already stale —
+      4 inline tests existed.]
+- [x] **XMP parser robustness** (`lr_xmp.rs`) — scoped the scan to the crs-bearing `rdf:Description`
+      (`node_has_crs`/`collect_crs`), now reads child-ELEMENT crs settings too; ~4 MB import cap
+      (`core_preset::MAX_IMPORT_BYTES`, enforced in `Registry::import` + `presets_import_file` via metadata).
+- [x] **Lua parser robustness** (`lr_template.rs`) — recursion **depth guard** (`MAX_DEPTH=64`),
+      `[[…]]` long-bracket strings, and native-JSON import now **requires `schemaVersion`**
+      (`PresetEnvelope.schema_version: Option<i64>`). Tests in `tests/robustness.rs`.
+- [x] **Restore/apply vs in-flight drag (review H2)** — `applyPreset`/`pasteSettings`/`restoreSnapshot`
+      snapshot the `params` reference and drop a stale async result if it changed (covers mid-drag clobber,
+      edit-during-await, AND apply-onto-a-different-image); `hoverSaved` cleared on image change.
+- [x] **PV-migration hook** — `core_preset::{migrate_sparse,migrate_full}` (no-op seam today) wired into
+      `presets_apply` + `snapshot_restore` (snapshot loader now returns `process_version`).
+
+**Verify (blocking — then commit the branch):**
+
+- [ ] **In-app GPU/CR3 QA** (`npm run tauri dev`): apply a preset to a 2nd already-edited image (untouched
+      modules stay intact); amount-blend look; hover live-preview snappiness; copy/paste (⌘⇧C/V); ⌘Z/⌘⇧Z;
+      snapshot create→restore **survives an app restart**; import a REAL Lightroom `.xmp` AND `.lrtemplate`
+      and read the ImportReport (WB-temp + color-grade must show as **dropped**, not silently applied).
+      See the consolidated checklist at the bottom of `HAND_OFF.md`.
+- [ ] **Commit + decide merge/push** once QA passes (branch `feat/presets-history` is currently uncommitted).
+
+**Extend (functionality):**
+
+- [ ] **Update/overwrite a user preset** from the current edit; **preset search box** + **drag-reorder**
+      (the `sort_order` column already exists) + group rename/merge.
+- [ ] **Bulk import** a folder of `.xmp`/`.lrtemplate`; **export/import a whole group** as one bundle.
+- [ ] **More formats via the registry** (pure mapping, no pipeline change): RawTherapee `.pp3` (INI),
+      Capture One `.costyle`. **`.cube`/HaldCLUT** needs a NEW GPU 3D-LUT stage (binding ≥15) FIRST — until
+      then it would import as "dropped (no LUT stage)".
+- [ ] **Per-camera default / auto-apply-on-import** preset (LR "default develop settings").
+- [ ] **LR local-adjustment import** (GradientBased/CircularGradient/PaintBased → `masks`) — opt-in,
+      approximate geometry (the image-relative caveat is already surfaced in the create dialog).
+- [ ] **Snapshot hover-preview** + an Amount on paste/snapshot restore; optional **color-grade additive
+      remap** on import (the currently-dropped path — rebuild as additive offsets per review C4, validate
+      the Sat→offset scale numerically before shipping).
+- [ ] NOT needed: a `core-types` leaf crate — `core-preset` is already wgpu-free (Value-level merge).
+
 ## IN PROGRESS: Windows GPU/performance optimization
 
 > Goal: make Develop rendering and other heavy paths perform correctly on Windows 10+ systems,

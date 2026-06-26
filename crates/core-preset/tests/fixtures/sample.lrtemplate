@@ -1,0 +1,30 @@
+s = {
+	id = "B1F2C3D4-0000-0000-0000-000000000000",
+	internalName = "My Look",
+	title = "My Look",
+	type = "Develop",
+	value = {
+		settings = {
+			ProcessVersion = "11.0",
+			WhiteBalance = "Custom",
+			Temperature = 5500,
+			Tint = 20,
+			Exposure2012 = 0.5,
+			Contrast2012 = 15,
+			Highlights2012 = -30,
+			Shadows2012 = 25,
+			Saturation = 12,
+			Vibrance = 20,
+			Sharpness = 45,
+			Clarity2012 = 30,
+			HueAdjustmentRed = 10,
+			LuminanceAdjustmentBlue = 15,
+			ToneCurvePV2012 = {
+				"0, 0",
+				"128, 140",
+				"255, 255",
+			},
+		},
+	},
+	version = 0,
+}

@@ -535,10 +535,106 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   develop_render: (p) => makeDevelopRgba(p),
   develop_preview_jpeg: () => makeDevelopJpeg(undefined),
   develop_get_histogram: () => makeHistogram(),
+  develop_histogram: () => undefined,
   develop_regen_thumb: () => Date.now(),
   thumb_prioritize: () => undefined,
   develop_session: () => undefined,
   export_image: () => undefined,
+
+  // Presets + edit history (new)
+  presets_list: () => [
+    {
+      id: 1,
+      name: "Punchy",
+      groupName: "Built-in",
+      builtin: true,
+      isFavorite: false,
+      fieldKeys: ["contrast", "saturation", "blacks", "whites", "sharpen"],
+      sortOrder: 0,
+    },
+    {
+      id: 2,
+      name: "Soft Matte",
+      groupName: "Built-in",
+      builtin: true,
+      isFavorite: false,
+      fieldKeys: ["contrast", "blacks", "whites", "highlights", "saturation"],
+      sortOrder: 0,
+    },
+    {
+      id: 3,
+      name: "B&W Contrast",
+      groupName: "Built-in",
+      builtin: true,
+      isFavorite: true,
+      fieldKeys: ["saturation", "contrast", "sharpen", "blacks"],
+      sortOrder: 0,
+    },
+    {
+      id: 4,
+      name: "Warm Golden",
+      groupName: "Built-in",
+      builtin: true,
+      isFavorite: false,
+      fieldKeys: ["temp", "tint", "saturation", "highlights"],
+      sortOrder: 0,
+    },
+    {
+      id: 10,
+      name: "My Sunset Look",
+      groupName: "My Presets",
+      builtin: false,
+      isFavorite: false,
+      fieldKeys: ["exposure", "temp", "contrast"],
+      sortOrder: 0,
+    },
+  ],
+  presets_get: (p) => ({
+    id: num(p.presetId),
+    name: "Preset",
+    groupName: "My Presets",
+    builtin: false,
+    isFavorite: false,
+    fieldKeys: ["exposure"],
+    sortOrder: 0,
+    params: '{"exposure":0.5}',
+    processVersion: 4,
+  }),
+  presets_save: () => 11,
+  presets_update: () => undefined,
+  presets_delete: () => undefined,
+  presets_duplicate: () => 12,
+  presets_apply: () => {
+    const p = structuredClone(DEFAULT_PARAMS);
+    p.contrast = 24;
+    p.saturation = 12;
+    return p;
+  },
+  presets_export: () => undefined,
+  presets_import_file: () => ({
+    presetId: 100,
+    report: {
+      sourceFormat: "lightroom-xmp",
+      sourceProcessVersion: "11.0",
+      mapped: [
+        { key: "exposure", note: "" },
+        { key: "toneCurve", note: "" },
+      ],
+      approximated: [
+        { key: "contrast", note: "magnitude only — retune expected" },
+      ],
+      dropped: [
+        { key: "Temperature", note: "absolute WB Kelvin has no anchor" },
+        { key: "ColorGradeMidtoneHue", note: "incompatible grading channels" },
+      ],
+    },
+  }),
+  develop_apply_settings: () => structuredClone(DEFAULT_PARAMS),
+  snapshots_list: () => [],
+  snapshot_create: () => 1,
+  snapshot_restore: () => structuredClone(DEFAULT_PARAMS),
+  snapshot_rename: () => undefined,
+  snapshot_delete: () => undefined,
 
   // AI analysis
   analysis_status: () => ({

@@ -1,0 +1,47 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    crs:Version="15.0"
+    crs:ProcessVersion="11.0"
+    crs:WhiteBalance="Custom"
+    crs:Temperature="5500"
+    crs:Tint="+20"
+    crs:Exposure2012="+0.50"
+    crs:Contrast2012="+15"
+    crs:Highlights2012="-30"
+    crs:Shadows2012="+25"
+    crs:Whites2012="+10"
+    crs:Blacks2012="-8"
+    crs:Saturation="+12"
+    crs:Vibrance="+20"
+    crs:Sharpness="45"
+    crs:LuminanceSmoothing="20"
+    crs:ColorNoiseReduction="25"
+    crs:PostCropVignetteAmount="-15"
+    crs:Clarity2012="+30"
+    crs:ColorGradeMidtoneHue="210"
+    crs:ColorGradeMidtoneSat="30"
+    crs:ConvertToGrayscale="False"
+    crs:HueAdjustmentRed="+10"
+    crs:SaturationAdjustmentRed="-20"
+    crs:LuminanceAdjustmentBlue="+15"
+    crs:HasCrop="True"
+    crs:CropTop="0.05"
+    crs:CropLeft="0.05"
+    crs:CropBottom="0.95"
+    crs:CropRight="0.95"
+    crs:CropAngle="0"
+    crs:ToneCurveName2012="Custom">
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 50</rdf:li>
+     <rdf:li>128, 140</rdf:li>
+     <rdf:li>192, 205</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>

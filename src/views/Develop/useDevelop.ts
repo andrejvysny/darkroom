@@ -39,6 +39,9 @@ const RENDER_DEBOUNCE_MS = 20;
 // The whole-crop histogram is a separate (cheap, warm-cache) render; a longer debounce keeps it off
 // the hot path during fast slider drags — it only needs to settle, not track every frame.
 const HISTOGRAM_DEBOUNCE_MS = 120;
+// Edits within this window of each other coalesce into ONE undo step (so a slider drag is a single
+// ⌘Z, not dozens). A new burst (first edit after this idle gap) snapshots the pre-edit state.
+const UNDO_BURST_MS = 700;
 
 export function useDevelop() {
   const selectedId = useAppStore((s) => s.selectedId);
@@ -65,6 +68,10 @@ export function useDevelop() {
   // Image id whose whole-crop histogram has been seeded since load (so the first warm render seeds it
   // exactly once — not on every pan/zoom). Reset to null on image change.
   const histogramSeededFor = useRef<number | null>(null);
+  // Timestamp of the last commit, for undo-burst coalescing.
+  const lastCommitAt = useRef(0);
+  // The params as first loaded for the current image (the "opened" state, for Revert to opened).
+  const openedParams = useRef<DevelopParams | null>(null);
   // Reactive trigger: bumped on every param/overlay/before-after change so Stage re-renders (paints)
   // the canvas at the current view. (Slider edits don't change the view, so without this they'd only
   // appear on the next zoom/pan.)
@@ -212,8 +219,9 @@ export function useDevelop() {
     [],
   );
 
-  // Apply a new param set: update store, debounce-render, persist.
-  const commit = useCallback(
+  // Update the store, debounce-render, and persist — WITHOUT touching undo history. Used by undo/redo
+  // and snapshot restore (which manage history themselves).
+  const persistAndRender = useCallback(
     (id: number, next: DevelopParams) => {
       touchCount.current += 1;
       useDevelopStore.setState({ params: next });
@@ -225,6 +233,56 @@ export function useDevelop() {
     },
     [debouncedRerender, debouncedHistogram, debouncedPersist],
   );
+
+  // Apply a new param set as a user edit: record one undo step per edit burst, then persist.
+  const commit = useCallback(
+    (id: number, next: DevelopParams) => {
+      const now = Date.now();
+      if (now - lastCommitAt.current > UNDO_BURST_MS) {
+        // New burst: snapshot the pre-edit state so ⌘Z returns to it (drags coalesce into one step).
+        useDevelopStore.getState().pushUndo(useDevelopStore.getState().params);
+      }
+      lastCommitAt.current = now;
+      persistAndRender(id, next);
+    },
+    [persistAndRender],
+  );
+
+  // Session undo: step back to the previous pre-edit state, pushing the current one onto redo.
+  const undo = useCallback(() => {
+    const id = useAppStore.getState().selectedId;
+    if (id === null) return;
+    const st = useDevelopStore.getState();
+    if (st.undoStack.length === 0) return;
+    const prev = st.undoStack[st.undoStack.length - 1];
+    useDevelopStore.setState({
+      undoStack: st.undoStack.slice(0, -1),
+      redoStack: [...st.redoStack, st.params],
+    });
+    lastCommitAt.current = 0; // the next edit starts a fresh burst (won't merge into the undone one)
+    persistAndRender(id, prev);
+  }, [persistAndRender]);
+
+  const redo = useCallback(() => {
+    const id = useAppStore.getState().selectedId;
+    if (id === null) return;
+    const st = useDevelopStore.getState();
+    if (st.redoStack.length === 0) return;
+    const nextP = st.redoStack[st.redoStack.length - 1];
+    useDevelopStore.setState({
+      redoStack: st.redoStack.slice(0, -1),
+      undoStack: [...st.undoStack, st.params],
+    });
+    lastCommitAt.current = 0;
+    persistAndRender(id, nextP);
+  }, [persistAndRender]);
+
+  // Revert to the state the image had when it was opened (one undoable step).
+  const revertToOpened = useCallback(() => {
+    const id = useAppStore.getState().selectedId;
+    if (id === null || openedParams.current === null) return;
+    commit(id, openedParams.current);
+  }, [commit]);
 
   // Histogram: live updates via event.
   useEffect(() => {
@@ -323,6 +381,10 @@ export function useDevelop() {
       }
       if (cancelled) return;
       useDevelopStore.setState({ params: p });
+      // New image: reset session history; remember the opened state for "Revert to opened".
+      openedParams.current = p;
+      lastCommitAt.current = 0;
+      useDevelopStore.getState().clearHistory();
       // Re-render at current view (canvas may already have a lastDerived from the previous image).
       rerenderCurrent();
       try {
@@ -617,6 +679,9 @@ export function useDevelop() {
 
   const reset = useCallback(() => {
     if (selectedId === null) return;
+    // Make the reset one undoable step (snapshot the pre-reset state).
+    useDevelopStore.getState().pushUndo(useDevelopStore.getState().params);
+    lastCommitAt.current = 0;
     debouncedPersist.cancel();
     debouncedRerender.cancel();
     touchCount.current = 0;
@@ -640,6 +705,26 @@ export function useDevelop() {
     rerenderCurrent,
   ]);
 
+  // Apply a complete params set (from a preset / paste / snapshot restore): commit + persist.
+  const applyDevelopParams = useCallback(
+    (next: DevelopParams) => {
+      if (selectedId === null) return;
+      commit(selectedId, next);
+    },
+    [selectedId, commit],
+  );
+
+  // Transient apply for hover-preview: update the store + re-render WITHOUT persisting. The caller
+  // restores the prior params on hover-end (also via this, no persist), so the edit on disk is never
+  // touched by a hover.
+  const previewDevelopParams = useCallback(
+    (next: DevelopParams) => {
+      useDevelopStore.setState({ params: next });
+      if (!useDevelopStore.getState().showBefore) rerenderCurrent();
+    },
+    [rerenderCurrent],
+  );
+
   // Re-render when the crop tool opens/closes.
   const cropMode = useDevelopStore((s) => s.cropMode);
   useEffect(() => {
@@ -662,6 +747,11 @@ export function useDevelop() {
     onColorBalanceChange,
     resetKeys,
     reset,
+    applyDevelopParams,
+    previewDevelopParams,
+    undo,
+    redo,
+    revertToOpened,
     addMask,
     updateMask,
     updateMaskAdjust,

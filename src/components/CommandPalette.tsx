@@ -18,6 +18,9 @@ export default function CommandPalette() {
   const selectedId = useAppStore((s) => s.selectedId);
   const onImport = useAppStore((s) => s.onImport);
   const onOpenSettings = useAppStore((s) => s.onOpenSettings);
+  const onSavePreset = useAppStore((s) => s.onSavePreset);
+  const onCopySettings = useAppStore((s) => s.onCopySettings);
+  const onPasteSettings = useAppStore((s) => s.onPasteSettings);
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
 
@@ -65,6 +68,24 @@ export default function CommandPalette() {
 
   const developRows: PaletteRow[] = [
     { icon: "split", label: "Toggle before / after", shortcut: "\\" },
+    {
+      icon: "star",
+      label: "Save as preset…",
+      shortcut: "⌘⇧N",
+      run: () => onSavePreset?.(),
+    },
+    {
+      icon: "copy",
+      label: "Copy settings",
+      shortcut: "⌘⇧C",
+      run: () => onCopySettings?.(),
+    },
+    {
+      icon: "copy",
+      label: "Paste settings",
+      shortcut: "⌘⇧V",
+      run: () => onPasteSettings?.(),
+    },
     {
       icon: "export",
       label: "Export this photo…",
