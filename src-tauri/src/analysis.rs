@@ -62,6 +62,9 @@ pub struct AnalysisStatus {
     pub pending: i64,
     pub models_ready: bool,
     pub running: bool,
+    /// Configured AI accelerator (CoreML / DirectML / CPU). A runtime CPU fallback shows as an ort
+    /// `warn` in the log rather than changing this value.
+    pub accelerator: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -280,6 +283,11 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<RunStats,
         running: &st.analysis_running,
         cancel: &st.analysis_cancel,
     };
+    tracing::info!(
+        accelerator = core_analyze::accelerator(),
+        force,
+        "AI analysis pass starting"
+    );
 
     // Phase-A analyzers (object detection / animals / presence). The captioner is built lazily in
     // Phase B via `build_captioner`, so it is not part of this registry.
@@ -560,5 +568,6 @@ pub fn status(st: &AppState) -> Result<AnalysisStatus, String> {
         pending: total - analyzed,
         models_ready: models_ready(st),
         running: st.analysis_running.load(Ordering::SeqCst),
+        accelerator: core_analyze::accelerator().to_string(),
     })
 }

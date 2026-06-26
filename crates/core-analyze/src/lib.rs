@@ -37,6 +37,19 @@ pub use verify::Verifier;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// The accelerated execution provider this build is configured to use. Best-effort: ort falls back
+/// to CPU at runtime if the EP can't register, so this reports the *configured* accelerator (a
+/// fallback then shows as an ort `warn` in the log). Surfaced in the UI / `AnalysisStatus`.
+pub fn accelerator() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "DirectML"
+    } else if cfg!(target_os = "macos") {
+        "CoreML"
+    } else {
+        "CPU"
+    }
+}
+
 /// Stable analyzer ids (also the `analyzer_id` stored per result row).
 pub const OBJECT_DETECTION_ID: &str = "object_detection";
 pub const ANIMAL_DETECTION_ID: &str = "animal_detection";

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../store/app";
 import { runExport } from "../lib/export";
+import { fmtShortcut } from "../lib/platform";
 import Icon, { IconName } from "./Icon";
 
 interface PaletteRow {
@@ -195,7 +196,7 @@ export default function CommandPalette() {
                 color: "var(--color-t3)",
               }}
             >
-              {row.shortcut}
+              {fmtShortcut(row.shortcut)}
             </span>
           </div>
         ))}

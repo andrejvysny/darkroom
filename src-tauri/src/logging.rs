@@ -333,7 +333,7 @@ fn filter_for(level: &str) -> Result<EnvFilter, String> {
     Ok(EnvFilter::new(format!(
         "darkroom={level},darkroom_lib={level},frontend={level},\
          core_pipeline={level},core_raw={level},core_library={level},\
-         core_import={level},core_dedup={level},core_db={level},warn"
+         core_import={level},core_dedup={level},core_db={level},core_analyze={level},warn"
     )))
 }
 

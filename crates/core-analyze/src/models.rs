@@ -65,6 +65,18 @@ pub fn build_session(
     // Other targets register no accelerated EP and run on CPU.
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = mlprogram;
+    // DirectML requires sequential execution with memory-pattern planning disabled; onnxruntime
+    // otherwise disables mem-pattern itself (with a warning) when the DML EP registers. Set it
+    // explicitly so the Windows path is deterministic. (Per-session `Run` is already serialized by
+    // the `Mutex<Session>` each analyzer holds, satisfying DirectML's single-thread-Run rule.)
+    #[cfg(target_os = "windows")]
+    {
+        b = b
+            .with_memory_pattern(false)
+            .map_err(AnalyzeError::inference)?
+            .with_parallel_execution(false)
+            .map_err(AnalyzeError::inference)?;
+    }
     b = b
         .with_execution_providers(eps)
         .map_err(AnalyzeError::inference)?;

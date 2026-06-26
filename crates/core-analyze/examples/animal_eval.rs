@@ -23,8 +23,11 @@ const DEFAULT_FRAMES: &[&str] = &[
 ];
 
 fn models_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/com.andrejvysny.darkroom/models")
+    // Matches Tauri's `app_data_dir` on every OS (macOS: ~/Library/Application Support).
+    dirs::data_dir()
+        .expect("no data dir")
+        .join("com.andrejvysny.darkroom")
+        .join("models")
 }
 
 fn is_raw(p: &Path) -> bool {

@@ -38,6 +38,8 @@ ort = { version = "=2.0.0-rc.12", features = ["directml"] }
 
 [dev-dependencies]
 anyhow = "1"
+# Eval/tuning harnesses resolve the app-data dir cross-platform (matches Tauri's app_data_dir).
+dirs = "5"
 core-raw = { path = "../core-raw" }
 # Label-driven eval/tuning harnesses read the catalog directly. core-db re-exports the shared rusqlite.
 core-db = { path = "../core-db" }
