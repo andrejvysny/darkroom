@@ -2419,3 +2419,589 @@ pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(),
     .await
     .map_err(|e| e.to_string())?
 }
+
+// ---------- Presets ----------
+
+/// Portable preset file envelope (export/import) and the format of the bundled built-ins. `params` is
+/// the sparse DevelopParams object (only the touched top-level fields). `schema_version` is REQUIRED
+/// for a file to be treated as our native preset on import (its presence disambiguates our envelope
+/// from an arbitrary `.json` that merely happens to have `params`/`fieldKeys`).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresetEnvelope {
+    #[serde(default)]
+    schema_version: Option<i64>,
+    name: String,
+    #[serde(default)]
+    group_name: Option<String>,
+    #[serde(default)]
+    field_keys: Vec<String>,
+    #[serde(default)]
+    process_version: Option<i64>,
+    params: serde_json::Value,
+}
+
+/// Result of importing a preset file: the new preset id + an honest conversion report.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetImportResult {
+    preset_id: i64,
+    report: core_preset::ImportReport,
+}
+
+const BUILTIN_PRESETS: &[&str] = &[
+    include_str!("../resources/presets/punchy.json"),
+    include_str!("../resources/presets/soft_matte.json"),
+    include_str!("../resources/presets/bw_contrast.json"),
+    include_str!("../resources/presets/warm_golden.json"),
+    include_str!("../resources/presets/cool_shadows.json"),
+];
+
+/// Seed the bundled built-in presets (idempotent — `INSERT OR IGNORE`). Called once at setup.
+pub fn seed_builtin_presets(conn: &core_db::rusqlite::Connection) {
+    for raw in BUILTIN_PRESETS {
+        match serde_json::from_str::<PresetEnvelope>(raw) {
+            Ok(env) => {
+                let group = env.group_name.as_deref().unwrap_or("Built-in");
+                let keys = serde_json::to_string(&env.field_keys).unwrap_or_else(|_| "[]".into());
+                let params = env.params.to_string();
+                let pv = env.process_version.unwrap_or(PROCESS_VERSION);
+                if let Err(e) = core_library::seed_builtin_preset(
+                    conn,
+                    &env.name,
+                    group,
+                    &keys,
+                    &params,
+                    pv,
+                    core_library::now_epoch(),
+                ) {
+                    tracing::warn!(error = %crate::logging::safe_error(&e), "builtin preset seed failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "builtin preset parse failed"),
+        }
+    }
+}
+
+/// Parse the current stored edit (or defaults) as the JSON base to overlay a preset onto.
+/// `replace_all` ⇒ start from `DevelopParams::default()` (preset becomes the complete look).
+fn merge_base(
+    conn: &core_db::rusqlite::Connection,
+    image_id: i64,
+    replace_all: bool,
+) -> Result<serde_json::Value, String> {
+    if replace_all {
+        return serde_json::to_value(DevelopParams::default()).map_err(|e| e.to_string());
+    }
+    match core_library::get_edit(conn, image_id).map_err(|e| e.to_string())? {
+        Some(json) => serde_json::from_str::<serde_json::Value>(&json).map_err(|e| e.to_string()),
+        None => serde_json::to_value(DevelopParams::default()).map_err(|e| e.to_string()),
+    }
+}
+
+fn sparse_map(params_json: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let v: serde_json::Value = serde_json::from_str(params_json).map_err(|e| e.to_string())?;
+    v.as_object()
+        .cloned()
+        .ok_or_else(|| "preset params must be a JSON object".to_string())
+}
+
+/// Validate that a sparse params object overlays cleanly onto defaults and deserializes into a typed
+/// `DevelopParams` — so a buggy importer / hand-edited preset fails at WRITE time (save/import) with a
+/// clear error, instead of silently storing junk that only blows up later at apply.
+fn validate_sparse_params(
+    sparse: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let base = serde_json::to_value(DevelopParams::default()).map_err(|e| e.to_string())?;
+    let merged = core_preset::apply_sparse(&base, sparse, 1.0);
+    serde_json::from_value::<DevelopParams>(merged)
+        .map(|_| ())
+        .map_err(|e| format!("preset params are not valid develop settings: {e}"))
+}
+
+/// All presets (summaries) for the panel.
+#[tauri::command]
+pub async fn presets_list(app: AppHandle) -> Result<Vec<core_library::PresetSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::list_presets(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One preset with its sparse params.
+#[tauri::command]
+pub async fn presets_get(
+    app: AppHandle,
+    preset_id: i64,
+) -> Result<Option<core_library::PresetFull>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::get_preset(&db.conn, preset_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Save the current edit (restricted to the checked `field_keys`) as a new user preset.
+#[tauri::command]
+pub async fn presets_save(
+    app: AppHandle,
+    name: String,
+    group_name: Option<String>,
+    field_keys: Vec<String>,
+    is_favorite: Option<bool>,
+    params: DevelopParams,
+) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let full = serde_json::to_value(&params).map_err(|e| e.to_string())?;
+        let sparse = core_preset::subset(&full, &field_keys);
+        validate_sparse_params(&sparse)?;
+        let sparse_json =
+            serde_json::to_string(&serde_json::Value::Object(sparse)).map_err(|e| e.to_string())?;
+        let keys_json = serde_json::to_string(&field_keys).map_err(|e| e.to_string())?;
+        let group = group_name.unwrap_or_else(|| "My Presets".into());
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let name = core_library::unique_name(&db.conn, &group, &name).map_err(|e| e.to_string())?;
+        core_library::insert_preset(
+            &db.conn,
+            &name,
+            &group,
+            is_favorite.unwrap_or(false),
+            &keys_json,
+            &sparse_json,
+            PROCESS_VERSION,
+            core_library::now_epoch(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Update a preset's mutable metadata. Built-ins may be favorited/reordered but not renamed/moved.
+#[tauri::command]
+pub async fn presets_update(
+    app: AppHandle,
+    preset_id: i64,
+    name: Option<String>,
+    group_name: Option<String>,
+    is_favorite: Option<bool>,
+    sort_order: Option<i64>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        if (name.is_some() || group_name.is_some())
+            && core_library::is_builtin(&db.conn, preset_id).map_err(|e| e.to_string())?
+        {
+            return Err("built-in presets cannot be renamed or moved".to_string());
+        }
+        core_library::update_preset(
+            &db.conn,
+            preset_id,
+            name.as_deref(),
+            group_name.as_deref(),
+            is_favorite,
+            sort_order,
+            core_library::now_epoch(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Delete a user preset (built-ins are refused).
+#[tauri::command]
+pub async fn presets_delete(app: AppHandle, preset_id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        if core_library::is_builtin(&db.conn, preset_id).map_err(|e| e.to_string())? {
+            return Err("built-in presets cannot be deleted".to_string());
+        }
+        core_library::delete_preset(&db.conn, preset_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Duplicate a preset (including a built-in) as a new editable user preset.
+#[tauri::command]
+pub async fn presets_duplicate(app: AppHandle, preset_id: i64) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let p = core_library::get_preset(&db.conn, preset_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "preset not found".to_string())?;
+        let group = if p.builtin {
+            "My Presets".to_string()
+        } else {
+            p.group_name
+        };
+        let name = core_library::unique_name(&db.conn, &group, &format!("{} copy", p.name))
+            .map_err(|e| e.to_string())?;
+        let keys_json = serde_json::to_string(&p.field_keys).map_err(|e| e.to_string())?;
+        core_library::insert_preset(
+            &db.conn,
+            &name,
+            &group,
+            false,
+            &keys_json,
+            &p.params,
+            PROCESS_VERSION,
+            core_library::now_epoch(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Apply a preset onto an image's current edit (or onto defaults when `replace_all`), blended by
+/// `amount` (0..1, default 1). Returns the merged params — NOT persisted; the frontend commits.
+#[tauri::command]
+pub async fn presets_apply(
+    app: AppHandle,
+    image_id: i64,
+    preset_id: i64,
+    amount: Option<f32>,
+    replace_all: Option<bool>,
+) -> Result<DevelopParams, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let preset = core_library::get_preset(&db.conn, preset_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "preset not found".to_string())?;
+        let mut overlay = sparse_map(&preset.params)?;
+        core_preset::migrate_sparse(&mut overlay, preset.process_version);
+        let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
+        let merged = core_preset::apply_sparse(&base, &overlay, amount.unwrap_or(1.0));
+        serde_json::from_value::<DevelopParams>(merged).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Apply a copied source edit (subset to `field_keys`) onto an image — powers Copy/Paste settings.
+/// Returns the merged params (not persisted).
+#[tauri::command]
+pub async fn develop_apply_settings(
+    app: AppHandle,
+    image_id: i64,
+    params: DevelopParams,
+    field_keys: Vec<String>,
+    amount: Option<f32>,
+    replace_all: Option<bool>,
+) -> Result<DevelopParams, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let full = serde_json::to_value(&params).map_err(|e| e.to_string())?;
+        let overlay = core_preset::subset(&full, &field_keys);
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
+        let merged = core_preset::apply_sparse(&base, &overlay, amount.unwrap_or(1.0));
+        serde_json::from_value::<DevelopParams>(merged).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Export a preset to a portable JSON file at `dest_path`.
+#[tauri::command]
+pub async fn presets_export(
+    app: AppHandle,
+    preset_id: i64,
+    dest_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let p = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::get_preset(&db.conn, preset_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "preset not found".to_string())?
+        };
+        let env = PresetEnvelope {
+            schema_version: Some(1),
+            name: p.name,
+            group_name: Some(p.group_name),
+            field_keys: p.field_keys,
+            process_version: Some(p.process_version),
+            params: serde_json::from_str(&p.params).map_err(|e| e.to_string())?,
+        };
+        let json = serde_json::to_string_pretty(&env).map_err(|e| e.to_string())?;
+        std::fs::write(&dest_path, json).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Parse an import file into `(name, group, field_keys, sparse_params_json, report)`. Tries our native
+/// envelope first, then the external-format registry (Lightroom etc., populated from Phase 3).
+fn parse_import(
+    bytes: &[u8],
+    src_path: &str,
+) -> Result<
+    (
+        String,
+        String,
+        Vec<String>,
+        String,
+        core_preset::ImportReport,
+    ),
+    String,
+> {
+    if let Ok(env) = serde_json::from_slice::<PresetEnvelope>(bytes) {
+        // Require an explicit schemaVersion so an arbitrary `.json` that merely has `params`/`fieldKeys`
+        // isn't mistaken for our native envelope (it falls through to the external-format registry).
+        if env.schema_version.is_some() && env.params.is_object() && !env.field_keys.is_empty() {
+            let mut report = core_preset::ImportReport {
+                source_format: "native-json".into(),
+                ..Default::default()
+            };
+            for k in &env.field_keys {
+                report.mark_clean(k);
+            }
+            let group = env.group_name.unwrap_or_else(|| "Imported".into());
+            let sparse_json = env.params.to_string();
+            return Ok((env.name, group, env.field_keys, sparse_json, report));
+        }
+    }
+    let registry = core_preset::Registry::with_defaults();
+    let parsed = registry
+        .import(bytes, Some(std::path::Path::new(src_path)))
+        .map_err(|e| e.to_string())?;
+    let name = std::path::Path::new(src_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Imported preset")
+        .to_string();
+    let sparse_json = serde_json::to_string(&serde_json::Value::Object(parsed.params))
+        .map_err(|e| e.to_string())?;
+    Ok((
+        name,
+        "Imported".into(),
+        parsed.field_keys,
+        sparse_json,
+        parsed.report,
+    ))
+}
+
+/// Import a preset file (native JSON now; Lightroom `.xmp`/`.lrtemplate` once Phase 3 registers them).
+#[tauri::command]
+pub async fn presets_import_file(
+    app: AppHandle,
+    src_path: String,
+) -> Result<PresetImportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Bound the read before pulling the file into memory (a hostile/huge file can't be slurped).
+        let size = std::fs::metadata(&src_path)
+            .map_err(|e| e.to_string())?
+            .len();
+        if size > core_preset::MAX_IMPORT_BYTES as u64 {
+            return Err(format!(
+                "preset file too large ({size} bytes; max {})",
+                core_preset::MAX_IMPORT_BYTES
+            ));
+        }
+        let bytes = std::fs::read(&src_path).map_err(|e| e.to_string())?;
+        let (name, group, field_keys, sparse_json, report) = parse_import(&bytes, &src_path)?;
+        // Validate before storing so a buggy importer surfaces here, not at apply.
+        validate_sparse_params(&sparse_map(&sparse_json)?)?;
+        let keys_json = serde_json::to_string(&field_keys).map_err(|e| e.to_string())?;
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let name = core_library::unique_name(&db.conn, &group, &name).map_err(|e| e.to_string())?;
+        let preset_id = core_library::insert_preset(
+            &db.conn,
+            &name,
+            &group,
+            false,
+            &keys_json,
+            &sparse_json,
+            PROCESS_VERSION,
+            core_library::now_epoch(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(PresetImportResult { preset_id, report })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------- Develop snapshots (persistent history) ----------
+
+/// Named snapshots for an image (newest first).
+#[tauri::command]
+pub async fn snapshots_list(
+    app: AppHandle,
+    image_id: i64,
+) -> Result<Vec<core_library::SnapshotSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::list_snapshots(&db.conn, image_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Create a named snapshot of `params` for an image; returns the new id.
+#[tauri::command]
+pub async fn snapshot_create(
+    app: AppHandle,
+    image_id: i64,
+    name: String,
+    params: DevelopParams,
+) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let name = core_library::unique_snapshot_name(&db.conn, image_id, &name)
+            .map_err(|e| e.to_string())?;
+        core_library::create_snapshot(
+            &db.conn,
+            image_id,
+            &name,
+            &json,
+            PROCESS_VERSION,
+            core_library::now_epoch(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Restore a snapshot's params (validated through the current schema). NOT persisted — the frontend
+/// commits the returned params so the restore becomes an undoable step.
+#[tauri::command]
+pub async fn snapshot_restore(app: AppHandle, snapshot_id: i64) -> Result<DevelopParams, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let (json, pv) = core_library::get_snapshot_params(&db.conn, snapshot_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "snapshot not found".to_string())?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        core_preset::migrate_full(&mut value, pv);
+        serde_json::from_value::<DevelopParams>(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Rename a snapshot.
+#[tauri::command]
+pub async fn snapshot_rename(app: AppHandle, snapshot_id: i64, name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::rename_snapshot(&db.conn, snapshot_id, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Delete a snapshot.
+#[tauri::command]
+pub async fn snapshot_delete(app: AppHandle, snapshot_id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::delete_snapshot(&db.conn, snapshot_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod preset_tests {
+    /// The `core-preset` ModuleScope owns a copy of the DevelopParams field-key list (it must not
+    /// depend on the GPU crate). This guards that copy against drift from the real struct.
+    #[test]
+    fn module_scope_covers_all_develop_params_fields() {
+        let v = serde_json::to_value(core_pipeline::DevelopParams::default()).unwrap();
+        let mut actual: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        actual.sort();
+        let mut scoped: Vec<String> = core_preset::all_field_keys()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        scoped.sort();
+        assert_eq!(
+            actual, scoped,
+            "core-preset ModuleScope drifted from DevelopParams fields"
+        );
+    }
+
+    /// Every bundled built-in preset must be self-consistent: its `params` keys ⊆ `fieldKeys` ⊆ the
+    /// real DevelopParams fields, and the sparse params must overlay onto defaults and deserialize
+    /// into a typed `DevelopParams`. Catches a hand-edited typo in a `resources/presets/*.json`.
+    #[test]
+    fn builtin_presets_are_valid() {
+        use std::collections::HashSet;
+        let all: HashSet<String> = core_preset::all_field_keys()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let base = serde_json::to_value(core_pipeline::DevelopParams::default()).unwrap();
+        for raw in super::BUILTIN_PRESETS {
+            let env: super::PresetEnvelope =
+                serde_json::from_str(raw).expect("built-in preset must parse");
+            let obj = env
+                .params
+                .as_object()
+                .unwrap_or_else(|| panic!("{}: params must be an object", env.name));
+            for k in obj.keys() {
+                assert!(
+                    env.field_keys.contains(k),
+                    "{}: param key '{k}' is not listed in fieldKeys",
+                    env.name
+                );
+            }
+            for k in &env.field_keys {
+                assert!(
+                    all.contains(k),
+                    "{}: fieldKey '{k}' is not a real DevelopParams field",
+                    env.name
+                );
+            }
+            let merged = core_preset::apply_sparse(&base, obj, 1.0);
+            serde_json::from_value::<core_pipeline::DevelopParams>(merged).unwrap_or_else(|e| {
+                panic!(
+                    "{}: params do not form valid develop settings: {e}",
+                    env.name
+                )
+            });
+        }
+    }
+
+    /// Applying a sparse preset must overlay ONLY its own fields — an untouched edit field survives.
+    /// This is the core sparse-merge guarantee that lets a preset land on an already-edited image.
+    #[test]
+    fn applying_a_sparse_preset_leaves_untouched_fields_intact() {
+        let edit = core_pipeline::DevelopParams {
+            exposure: 1.5, // an existing user edit
+            ..Default::default()
+        };
+        let base = serde_json::to_value(&edit).unwrap();
+        let mut overlay = serde_json::Map::new();
+        overlay.insert("contrast".into(), serde_json::json!(30.0)); // preset touches only contrast
+        let merged = core_preset::apply_sparse(&base, &overlay, 1.0);
+        let out: core_pipeline::DevelopParams = serde_json::from_value(merged).unwrap();
+        assert_eq!(out.contrast, 30.0, "preset field must be applied");
+        assert_eq!(out.exposure, 1.5, "untouched edit field must be preserved");
+    }
+}

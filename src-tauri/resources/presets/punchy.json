@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "Punchy",
+  "groupName": "Built-in",
+  "fieldKeys": ["contrast", "saturation", "blacks", "whites", "sharpen"],
+  "processVersion": 4,
+  "params": {
+    "contrast": 24,
+    "saturation": 12,
+    "blacks": -10,
+    "whites": 8,
+    "sharpen": 40
+  }
+}

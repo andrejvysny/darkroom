@@ -9,6 +9,7 @@ members = [
     "crates/core-dedup",
     "crates/core-import",
     "crates/core-analyze",
+    "crates/core-preset",
 ]
 
 [workspace.package]

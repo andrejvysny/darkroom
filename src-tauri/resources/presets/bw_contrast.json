@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "name": "B&W Contrast",
+  "groupName": "Built-in",
+  "fieldKeys": ["saturation", "contrast", "sharpen", "blacks"],
+  "processVersion": 4,
+  "params": {
+    "saturation": -100,
+    "contrast": 30,
+    "sharpen": 35,
+    "blacks": -8
+  }
+}

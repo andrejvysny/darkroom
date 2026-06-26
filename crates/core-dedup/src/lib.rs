@@ -389,12 +389,10 @@ fn add_temporal_edges(
 ) {
     let max_window = time_window_secs(threshold);
     for i in 0..rows.len() {
-        let mut checked = 0usize;
-        for j in (0..i).rev() {
+        for (checked, j) in (0..i).rev().enumerate() {
             if capture_delta(&rows[i], &rows[j]) > max_window || checked >= 256 {
                 break;
             }
-            checked += 1;
             maybe_add_edge(rows, threshold, i, j, seen, edges);
         }
     }

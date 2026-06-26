@@ -40,6 +40,13 @@ interface AppState {
   setOnSearch: (fn: ((query: string) => void) | null) => void;
   onDevelopReset: (() => void) | null;
   setOnDevelopReset: (fn: (() => void) | null) => void;
+  // Develop preset / settings callbacks registered by DevelopView (for the command palette).
+  onSavePreset: (() => void) | null;
+  setOnSavePreset: (fn: (() => void) | null) => void;
+  onCopySettings: (() => void) | null;
+  setOnCopySettings: (fn: (() => void) | null) => void;
+  onPasteSettings: (() => void) | null;
+  setOnPasteSettings: (fn: (() => void) | null) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -83,4 +90,10 @@ export const useAppStore = create<AppState>((set) => ({
   setOnSearch: (fn) => set({ onSearch: fn }),
   onDevelopReset: null,
   setOnDevelopReset: (fn) => set({ onDevelopReset: fn }),
+  onSavePreset: null,
+  setOnSavePreset: (fn) => set({ onSavePreset: fn }),
+  onCopySettings: null,
+  setOnCopySettings: (fn) => set({ onCopySettings: fn }),
+  onPasteSettings: null,
+  setOnPasteSettings: (fn) => set({ onPasteSettings: fn }),
 }));

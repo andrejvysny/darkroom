@@ -60,6 +60,15 @@ pub fn run() {
                 }
             }
 
+            // Seed the bundled built-in develop presets (idempotent).
+            {
+                let st = app.state::<AppState>();
+                let lock = st.db.lock();
+                if let Ok(db) = lock {
+                    commands::seed_builtin_presets(&db.conn);
+                }
+            }
+
             // Mark the start of a usage session in the behavioral-signal log (best-effort).
             {
                 let st = app.state::<AppState>();
@@ -113,6 +122,21 @@ pub fn run() {
             commands::develop_session,
             commands::develop_get_histogram,
             commands::develop_histogram,
+            commands::develop_apply_settings,
+            commands::presets_list,
+            commands::presets_get,
+            commands::presets_save,
+            commands::presets_update,
+            commands::presets_delete,
+            commands::presets_duplicate,
+            commands::presets_apply,
+            commands::presets_export,
+            commands::presets_import_file,
+            commands::snapshots_list,
+            commands::snapshot_create,
+            commands::snapshot_restore,
+            commands::snapshot_rename,
+            commands::snapshot_delete,
             commands::export_image,
             commands::cull_set_rating,
             commands::cull_set_flag,

@@ -1069,6 +1069,162 @@ export function exportImage(
   return invoke<void>("export_image", { imageId, params, format, dest });
 }
 
+// ── Presets + copy/paste settings ────────────────────────────────────────────
+
+/** A preset row for the list panel (no params blob). Mirrors Rust `PresetSummary`. */
+export type PresetSummary = {
+  id: number;
+  name: string;
+  groupName: string;
+  builtin: boolean;
+  isFavorite: boolean;
+  /** Touched top-level DevelopParams fields the preset sets. */
+  fieldKeys: string[];
+  sortOrder: number;
+};
+
+/** A full preset including its sparse params JSON string. Mirrors Rust `PresetFull`. */
+export type PresetFull = PresetSummary & {
+  params: string;
+  processVersion: number;
+};
+
+/** One reported setting from an import (key + optional note). Mirrors Rust `ReportItem`. */
+export type ReportItem = { key: string; note: string };
+
+/** Honest conversion report for an imported preset. Mirrors Rust `ImportReport`. */
+export type ImportReport = {
+  sourceFormat: string;
+  sourceProcessVersion: string | null;
+  mapped: ReportItem[];
+  approximated: ReportItem[];
+  dropped: ReportItem[];
+};
+
+export type PresetImportResult = { presetId: number; report: ImportReport };
+
+export function presetsList(): Promise<PresetSummary[]> {
+  return invoke<PresetSummary[]>("presets_list", {});
+}
+
+export function presetsGet(presetId: number): Promise<PresetFull | null> {
+  return invoke<PresetFull | null>("presets_get", { presetId });
+}
+
+/** Save the current edit (restricted to `fieldKeys`) as a new user preset; returns the new id. */
+export function presetsSave(
+  name: string,
+  groupName: string | undefined,
+  fieldKeys: string[],
+  isFavorite: boolean,
+  params: DevelopParams,
+): Promise<number> {
+  return invoke<number>("presets_save", {
+    name,
+    groupName,
+    fieldKeys,
+    isFavorite,
+    params,
+  });
+}
+
+export function presetsUpdate(
+  presetId: number,
+  patch: {
+    name?: string;
+    groupName?: string;
+    isFavorite?: boolean;
+    sortOrder?: number;
+  },
+): Promise<void> {
+  return invoke<void>("presets_update", { presetId, ...patch });
+}
+
+export function presetsDelete(presetId: number): Promise<void> {
+  return invoke<void>("presets_delete", { presetId });
+}
+
+export function presetsDuplicate(presetId: number): Promise<number> {
+  return invoke<number>("presets_duplicate", { presetId });
+}
+
+/** Apply a preset onto an image's edit, blended by `amount` (0..1). Returns merged params (unsaved). */
+export function presetsApply(
+  imageId: number,
+  presetId: number,
+  amount: number,
+  replaceAll: boolean,
+): Promise<DevelopParams> {
+  return invoke<DevelopParams>("presets_apply", {
+    imageId,
+    presetId,
+    amount,
+    replaceAll,
+  });
+}
+
+export function presetsExport(
+  presetId: number,
+  destPath: string,
+): Promise<void> {
+  return invoke<void>("presets_export", { presetId, destPath });
+}
+
+export function presetsImportFile(
+  srcPath: string,
+): Promise<PresetImportResult> {
+  return invoke<PresetImportResult>("presets_import_file", { srcPath });
+}
+
+/** Apply a copied source edit (subset to `fieldKeys`) onto an image. Returns merged params (unsaved). */
+export function developApplySettings(
+  imageId: number,
+  params: DevelopParams,
+  fieldKeys: string[],
+  amount: number,
+  replaceAll: boolean,
+): Promise<DevelopParams> {
+  return invoke<DevelopParams>("develop_apply_settings", {
+    imageId,
+    params,
+    fieldKeys,
+    amount,
+    replaceAll,
+  });
+}
+
+// ── Develop snapshots (persistent history) ───────────────────────────────────
+
+export type SnapshotSummary = { id: number; name: string; createdAt: number };
+
+export function snapshotsList(imageId: number): Promise<SnapshotSummary[]> {
+  return invoke<SnapshotSummary[]>("snapshots_list", { imageId });
+}
+
+export function snapshotCreate(
+  imageId: number,
+  name: string,
+  params: DevelopParams,
+): Promise<number> {
+  return invoke<number>("snapshot_create", { imageId, name, params });
+}
+
+/** Restore a snapshot's params (validated to the current schema). Caller commits to make it undoable. */
+export function snapshotRestore(snapshotId: number): Promise<DevelopParams> {
+  return invoke<DevelopParams>("snapshot_restore", { snapshotId });
+}
+
+export function snapshotRename(
+  snapshotId: number,
+  name: string,
+): Promise<void> {
+  return invoke<void>("snapshot_rename", { snapshotId, name });
+}
+
+export function snapshotDelete(snapshotId: number): Promise<void> {
+  return invoke<void>("snapshot_delete", { snapshotId });
+}
+
 // ── AI scan analysis (object detection + caption) ────────────────────────────
 
 /** The three detected-object buckets, in display order. */

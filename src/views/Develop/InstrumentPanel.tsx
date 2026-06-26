@@ -424,7 +424,7 @@ export default function InstrumentPanel({
             cursor: "pointer",
           }}
         >
-          Reset all
+          Reset to default
         </button>
       </div>
     </aside>

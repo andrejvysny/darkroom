@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "name": "Cool Shadows",
+  "groupName": "Built-in",
+  "fieldKeys": ["temp", "tint", "shadows", "contrast"],
+  "processVersion": 4,
+  "params": {
+    "temp": -22,
+    "tint": -4,
+    "shadows": 12,
+    "contrast": 8
+  }
+}
