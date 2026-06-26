@@ -144,5 +144,6 @@ jobs:
             - macOS Apple Silicon and Intel DMGs are ad-hoc signed and not notarized.
             - Intel macOS build ships with AI analysis disabled because ONNX Runtime has no x86_64 macOS prebuilt for the pinned ort runtime.
             - Windows x64 NSIS installer is unsigned.
-          releaseDraft: true
+          # Publish beta-* tags directly as pre-releases; keep stable v* tags as drafts for review.
+          releaseDraft: ${{ !startsWith(env.RELEASE_TAG, 'beta-') }}
           prerelease: true
