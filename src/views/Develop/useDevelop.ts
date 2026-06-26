@@ -88,7 +88,10 @@ export function useDevelop() {
           const st = useDevelopStore.getState();
           const p = st.showBefore ? freshDefaults() : st.params;
           developHistogram(id, p).catch((e) =>
-            log.warn("develop", "histogram failed", { imageId: id, ...log.errorSummary(e) }),
+            log.warn("develop", "histogram failed", {
+              imageId: id,
+              ...log.errorSummary(e),
+            }),
           );
         }, HISTOGRAM_DEBOUNCE_MS);
       };
@@ -144,7 +147,10 @@ export function useDevelop() {
         }
         return frame;
       } catch (err) {
-        log.warn("develop", "render failed", { imageId: id, ...log.errorSummary(err) });
+        log.warn("develop", "render failed", {
+          imageId: id,
+          ...log.errorSummary(err),
+        });
         return null;
       } finally {
         if (seq === renderSeq.current) setRendering(false);
@@ -188,7 +194,12 @@ export function useDevelop() {
           touchCount.current = 0;
           developSetEdit(id, p, tc)
             .then(() => developRegenThumb(id))
-            .catch((e) => log.warn("develop", "set edit failed", { imageId: id, ...log.errorSummary(e) }));
+            .catch((e) =>
+              log.warn("develop", "set edit failed", {
+                imageId: id,
+                ...log.errorSummary(e),
+              }),
+            );
         }, 500);
       };
       return Object.assign(run, {
@@ -273,6 +284,9 @@ export function useDevelop() {
     const row = useAppStore.getState().libraryImages.find((r) => r.id === id);
     if (row) {
       const v = useAppStore.getState().thumbVersions[id];
+      // Instant: the cached 512px thumb (same URL the grid used) paints before the sharp preview /
+      // GPU render lands, so switching images never flashes blank.
+      setPreview(thumbUrl(row.contentHash, 512, row.editedAt, v));
       void effectivePreviewEdge().then((edge) => {
         if (cancelled) return;
         setPreview(thumbUrl(row.contentHash, 1024, row.editedAt, v, edge));
@@ -286,7 +300,12 @@ export function useDevelop() {
           }
           setPreview(url);
         })
-        .catch((e) => log.warn("develop", "preview jpeg failed", { imageId: id, ...log.errorSummary(e) }));
+        .catch((e) =>
+          log.warn("develop", "preview jpeg failed", {
+            imageId: id,
+            ...log.errorSummary(e),
+          }),
+        );
     }
     void thumbPrioritize([id]);
 
@@ -296,7 +315,10 @@ export function useDevelop() {
       try {
         p = await developGetEdit(id);
       } catch (err) {
-        log.warn("develop", "get edit failed", { imageId: id, ...log.errorSummary(err) });
+        log.warn("develop", "get edit failed", {
+          imageId: id,
+          ...log.errorSummary(err),
+        });
         p = freshDefaults();
       }
       if (cancelled) return;
@@ -307,7 +329,10 @@ export function useDevelop() {
         const h = await developGetHistogram();
         if (!cancelled && h) setHistogram(h);
       } catch (e) {
-        log.warn("develop", "get histogram failed", { imageId: id, ...log.errorSummary(e) });
+        log.warn("develop", "get histogram failed", {
+          imageId: id,
+          ...log.errorSummary(e),
+        });
       }
     })();
 

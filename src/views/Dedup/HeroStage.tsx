@@ -129,7 +129,8 @@ export default function HeroStage({
           borderRadius: 9,
           overflow: "hidden",
           minWidth: 0,
-          background: "var(--color-stage)",
+          // Instant low-res backdrop (cached 512 thumb) so the sharp preview fades in over a fill.
+          background: `var(--color-stage) url(${thumbUrl(img.contentHash, 512, null, tokenOf(img.id))}) center/contain no-repeat`,
           cursor: opts.onClick ? "pointer" : "default",
         }}
       >
@@ -211,7 +212,8 @@ export default function HeroStage({
               borderRadius: 9,
               overflow: "hidden",
               minWidth: 0,
-              background: "var(--color-stage)",
+              // Instant low-res backdrop (cached 512 thumb) under the sharp preview.
+              background: `var(--color-stage) url(${thumbUrl(focus.contentHash, 512, null, tokenOf(focus.id))}) center/contain no-repeat`,
               cursor: zoom ? "zoom-out" : "zoom-in",
             }}
           >

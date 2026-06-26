@@ -22,6 +22,9 @@ export default function Loupe({ image }: LoupeProps) {
   // zoom past its resolution falls back to the full-res `develop_render`.
   const thumbToken = useAppStore((s) => s.thumbVersions[image.id]);
   const previewImgRef = useRef<HTMLImageElement | null>(null);
+  // The 512px grid thumb — already in the browser cache (the grid just painted the same URL), so it
+  // fills the canvas in ~1 frame as a soft bootstrap while the display-sharp preview is still loading.
+  const bootstrapImgRef = useRef<HTMLImageElement | null>(null);
   const [previewDims, setPreviewDims] = useState<{
     w: number;
     h: number;
@@ -45,7 +48,8 @@ export default function Loupe({ image }: LoupeProps) {
   // hit the backend). The preview is crop-applied, so view-uv [0,1] maps directly to its pixels.
   const drawPreview = useCallback(
     (d: DerivedView, canvas: HTMLCanvasElement) => {
-      const img = previewImgRef.current;
+      // Prefer the sharp preview; fall back to the instant bootstrap so the canvas is never blank.
+      const img = previewImgRef.current ?? bootstrapImgRef.current;
       if (!img) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
@@ -83,12 +87,15 @@ export default function Loupe({ image }: LoupeProps) {
       }
       // Decide tier: the preview supplies enough detail when it has ≥1 source pixel per output
       // pixel across the visible window. Hysteresis (0.85×) avoids thrash at the boundary.
+      // Gate on the SHARP preview only — while it's still loading we draw the bootstrap and never
+      // fire develop_render (a cold full-res render at fit-zoom is exactly the blank we're killing).
       const img = previewImgRef.current;
       const previewPxAcross = img ? d.view.sx * img.naturalWidth : 0;
-      let useDecode = decodeModeRef.current
-        ? previewPxAcross < d.outW * 0.85
-        : previewPxAcross < d.outW;
-      if (!img) useDecode = true; // no preview yet → must decode
+      let useDecode = img
+        ? decodeModeRef.current
+          ? previewPxAcross < d.outW * 0.85
+          : previewPxAcross < d.outW
+        : false; // no sharp preview yet → draw best available, wait
       decodeModeRef.current = useDecode;
 
       if (!useDecode) {
@@ -122,6 +129,7 @@ export default function Loupe({ image }: LoupeProps) {
   useEffect(() => {
     let cancelled = false;
     previewImgRef.current = null;
+    bootstrapImgRef.current = null;
     setPreviewDims(null);
     decodeModeRef.current = false;
     lastFrameRef.current = null;
@@ -132,6 +140,17 @@ export default function Loupe({ image }: LoupeProps) {
         if (!cancelled) savedParamsRef.current = p;
       })
       .catch(() => {});
+
+    // Bootstrap: the same 512px URL the grid used → served from browser cache, paints near-instantly.
+    {
+      const boot = new Image();
+      boot.onload = () => {
+        if (cancelled) return;
+        bootstrapImgRef.current = boot;
+        scheduleRender();
+      };
+      boot.src = thumbUrl(image.contentHash, 512, image.editedAt, thumbToken);
+    }
 
     void effectivePreviewEdge().then((edge) => {
       if (cancelled) return;

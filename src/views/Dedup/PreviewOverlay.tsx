@@ -28,18 +28,40 @@ export default function PreviewOverlay({
         padding: 20,
       }}
     >
-      <img
-        src={thumbUrl(img.contentHash, 512, null, null, previewEdge)}
-        alt={img.filename}
+      <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          maxWidth: "95vw",
-          maxHeight: "88vh",
-          objectFit: "contain",
+          position: "relative",
+          display: "inline-flex",
           borderRadius: 4,
+          overflow: "hidden",
           boxShadow: "0 8px 64px rgba(0,0,0,.7)",
         }}
-      />
+      >
+        {/* Instant low-res thumb (cached 512) sizes the box and shows immediately. */}
+        <img
+          src={thumbUrl(img.contentHash, 512, null, null)}
+          alt={img.filename}
+          style={{
+            display: "block",
+            maxWidth: "95vw",
+            maxHeight: "88vh",
+            objectFit: "contain",
+          }}
+        />
+        {/* Sharp preview overlays the thumb and replaces it once decoded. */}
+        <img
+          src={thumbUrl(img.contentHash, 512, null, null, previewEdge)}
+          alt=""
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+          }}
+        />
+      </div>
       <div
         style={{
           marginTop: 14,
