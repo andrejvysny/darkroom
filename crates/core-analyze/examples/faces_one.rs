@@ -62,10 +62,10 @@ fn models_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("DARKROOM_MODELS_DIR") {
         return PathBuf::from(d);
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join("Library/Application Support/com.andrejvysny.darkroom/models")
+    dirs::data_dir()
+        .expect("no data dir")
+        .join("com.andrejvysny.darkroom")
+        .join("models")
 }
 
 fn main() -> Result<()> {

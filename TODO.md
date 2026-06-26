@@ -118,6 +118,32 @@ clippy gate — unrelated to presets; commit it separately if desired.
       cache and re-render when ready. Full-res/export/canonical output remains authoritative.
 - [x] Validate with `cargo fmt --all`, `cargo test --workspace`, clippy, `npx tsc --noEmit`, build.
 
+### Hardening pass — branch `feat/windows-hardening` (DONE headless, in-app Windows QA pending)
+
+> Audit (3 explore agents + Windows best-practice research) found the Windows build already largely
+> correct (GPU DX12/Vulkan + adapter tier-sort, ort feature-gating, `Mutex<Session>` serializes `Run`
+> → satisfies DirectML's single-thread rule, trash gating, `app_data_dir`). Remaining gaps fixed:
+
+- [x] **Frontend platform util** `src/lib/platform.ts` (`isWindows`/`fmtShortcut`) — Command palette +
+      TopBar render **Ctrl+…** instead of `⌘` on Windows; TopBar `paddingLeft` 82→12 (no traffic lights).
+- [x] **DirectML defensive config** (`core-analyze/src/models.rs`, `#[cfg(windows)]`):
+      `with_memory_pattern(false)` + `with_parallel_execution(false)` (ORT_SEQUENTIAL) before EP register.
+- [x] **Surface AI accelerator** — `core_analyze::accelerator()` → `AnalysisStatus.accelerator`
+      (real + Intel stub) → Settings "AI acceleration" readout; `run_pass` logs it; `core_analyze`
+      added to the logging EnvFilter so an ort DirectML→CPU fallback `warn` is captured.
+- [x] **WebView2** `downloadBootstrapper` → `embedBootstrapper` (offline-friendly, +~1.8 MB).
+- [x] **Dev examples** (5 in `core-analyze/examples`) use `dirs::data_dir()` (dev-dep) not hardcoded
+      `~/Library/Application Support` — runnable on a Windows dev box.
+- [x] Headless gates green: `fmt --check`, `tsc`, `npm run build`, `clippy --workspace`(+`--examples`),
+      `cargo test --workspace`. (Pre-existing `core-pipeline` `#[cfg(test)]` `needless_range_loop` debt
+      surfaces only under `clippy --all-targets`; untouched, out of scope.)
+- [ ] **In-app Windows QA** (user has a box): (1) check `target/release/` for any `onnxruntime*.dll`
+      next to the exe → if present add to `bundle.resources` (memory says static, so expect none);
+      (2) NSIS install + launch; (3) GPU develop on NVIDIA discrete (log shows Dx12, max_tex 16384) +
+      iGPU fallback; (4) AI scan → Settings reads **DirectML** (not CPU), no fallback `warn` in log;
+      (5) thumbnails via `http://thumb.localhost`; (6) recycle-bin delete; (7) Ctrl shortcuts render.
+- [ ] Out of scope (chose Recommended, not Comprehensive): code-signing, CSP hardening, CI runtime smoke.
+
 ## DONE (MERGED `01a7b84`): Cleanups & tech-debt — branch `chore/cleanups-viewport-histogram`
 
 > Plan: `~/.claude/plans/do-thorough-analysis-of-velvety-hollerith.md`. `npx tsc --noEmit` +

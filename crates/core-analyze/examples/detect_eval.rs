@@ -32,9 +32,11 @@ fn model_path() -> PathBuf {
     if let Ok(p) = std::env::var("MODEL") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join("Library/Application Support/com.andrejvysny.darkroom/models/dfine_m.onnx")
+    dirs::data_dir()
+        .expect("no data dir")
+        .join("com.andrejvysny.darkroom")
+        .join("models")
+        .join("dfine_m.onnx")
 }
 
 fn is_raw(path: &Path) -> bool {

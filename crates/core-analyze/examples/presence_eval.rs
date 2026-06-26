@@ -31,8 +31,10 @@ use serde::Serialize;
 const ANALYZE_EDGE: u32 = 1024; // mirror src-tauri/src/analysis.rs
 
 fn app_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/com.andrejvysny.darkroom")
+    // Matches Tauri's `app_data_dir` on every OS (macOS: ~/Library/Application Support).
+    dirs::data_dir()
+        .expect("no data dir")
+        .join("com.andrejvysny.darkroom")
 }
 
 fn models_dir() -> PathBuf {

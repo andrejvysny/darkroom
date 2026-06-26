@@ -1256,6 +1256,8 @@ export type AnalysisStatus = {
   pending: number;
   modelsReady: boolean;
   running: boolean;
+  /** Configured AI accelerator: "CoreML" | "DirectML" | "CPU" | "Unavailable". */
+  accelerator: string;
 };
 
 export type AnalysisRunStats = {

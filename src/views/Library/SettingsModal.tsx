@@ -4,6 +4,7 @@ import {
   thumbCacheCap,
   thumbCacheSize,
   setThumbCacheCap,
+  analysisStatus,
   analysisDetectorSize,
   setAnalysisDetectorSize,
   faceStageEnabled,
@@ -95,6 +96,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [status, setStatus] = useState<string | null>(null);
   const [mdSize, setMdSize] = useState(1280);
   const [faceStage, setFaceStage] = useState(true);
+  const [accelerator, setAccelerator] = useState<string | null>(null);
   const [pEdge, setPEdge] = useState(0);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -132,8 +134,9 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       previewEdge(),
       faceStageEnabled(),
       logsStatus(),
+      analysisStatus(),
     ])
-      .then(([cap, used, size, root, pe, fse, logStatus]) => {
+      .then(([cap, used, size, root, pe, fse, logStatus, aStatus]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
         setMdSize(size);
@@ -141,6 +144,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
         setPEdge(pe);
         setFaceStage(fse);
         setLogs(logStatus);
+        setAccelerator(aStatus.accelerator);
         initializedRef.current = true;
       })
       .catch(() => showStatus("Failed to load settings"));
@@ -523,6 +527,25 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
             </div>
           </div>
 
+          {/* AI acceleration (read-only) */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>AI acceleration</div>
+            <div style={descStyle}>
+              Hardware used for on-device detection, faces, and captions. Falls
+              back to CPU automatically if the GPU provider can’t initialize
+              (check the diagnostic log if scans are unexpectedly slow).
+            </div>
+            <div
+              style={{
+                fontSize: 13,
+                fontFamily: "var(--font-mono)",
+                color: "var(--color-t1)",
+              }}
+            >
+              {accelerator ?? "—"}
+            </div>
+          </div>
+
           {/* Preview resolution */}
           <div style={sectionStyle}>
             <div style={labelStyle}>Preview resolution</div>
@@ -603,10 +626,18 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
           <div style={sectionStyle}>
             <div style={labelStyle}>Diagnostics logs</div>
             <div style={descStyle}>
-              Detailed local logs help debug production issues. Logs are redacted to avoid paths,
-              filenames, search text, captions, keywords, and people names.
+              Detailed local logs help debug production issues. Logs are
+              redacted to avoid paths, filenames, search text, captions,
+              keywords, and people names.
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: 8,
+              }}
+            >
               <div
                 title={logs?.directory}
                 style={{
@@ -635,11 +666,24 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
               </button>
             </div>
             <div style={{ ...descStyle, marginBottom: 8 }}>
-              Using {logs ? fmtBytes(logs.sizeBytes) : "…"} across {logs?.fileCount ?? "…"} log file(s).
+              Using {logs ? fmtBytes(logs.sizeBytes) : "…"} across{" "}
+              {logs?.fileCount ?? "…"} log file(s).
             </div>
             <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-              {(["error", "warn", "info", "debug", "trace"] as LogsStatus["level"][]).map((level) => (
-                <button key={level} onClick={() => handleLogLevel(level)} style={segmentBtn(logs?.level === level)}>
+              {(
+                [
+                  "error",
+                  "warn",
+                  "info",
+                  "debug",
+                  "trace",
+                ] as LogsStatus["level"][]
+              ).map((level) => (
+                <button
+                  key={level}
+                  onClick={() => handleLogLevel(level)}
+                  style={segmentBtn(logs?.level === level)}
+                >
                   {level}
                 </button>
               ))}
@@ -657,13 +701,21 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
                 disabled={logsBusy}
                 style={{
                   ...btnBase,
-                  background: confirmLogsDelete ? "#b3261e" : "var(--color-elev)",
-                  color: confirmLogsDelete ? "#fff" : "var(--color-danger, #e5685f)",
-                  borderColor: confirmLogsDelete ? "#b3261e" : "var(--color-line-2)",
+                  background: confirmLogsDelete
+                    ? "#b3261e"
+                    : "var(--color-elev)",
+                  color: confirmLogsDelete
+                    ? "#fff"
+                    : "var(--color-danger, #e5685f)",
+                  borderColor: confirmLogsDelete
+                    ? "#b3261e"
+                    : "var(--color-line-2)",
                   opacity: logsBusy ? 0.6 : 1,
                 }}
               >
-                {confirmLogsDelete ? "Click again to delete logs" : "Delete all logs…"}
+                {confirmLogsDelete
+                  ? "Click again to delete logs"
+                  : "Delete all logs…"}
               </button>
             </div>
           </div>

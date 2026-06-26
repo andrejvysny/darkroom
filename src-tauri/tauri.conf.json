@@ -42,7 +42,7 @@
       "signingIdentity": "-"
     },
     "windows": {
-      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "webviewInstallMode": { "type": "embedBootstrapper", "silent": true },
       "nsis": { "installMode": "currentUser" }
     }
   }

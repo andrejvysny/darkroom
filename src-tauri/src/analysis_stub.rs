@@ -11,6 +11,8 @@ pub struct AnalysisStatus {
     pub pending: i64,
     pub models_ready: bool,
     pub running: bool,
+    /// AI is not built on this target (Intel macOS); mirrors the real struct's shape for the IPC.
+    pub accelerator: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -29,6 +31,7 @@ pub fn status(st: &AppState) -> Result<AnalysisStatus, String> {
         pending: total,
         models_ready: false,
         running: false,
+        accelerator: "Unavailable".to_string(),
     })
 }
 

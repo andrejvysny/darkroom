@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "../store/app";
 import { useDevelopStore } from "../store/develop";
+import { isWindows, fmtShortcut } from "../lib/platform";
 import Icon from "./Icon";
 
 // Interactive controls (and anything opted out via [data-no-drag]) must NOT start a window drag.
@@ -48,7 +49,8 @@ export default function TopBar() {
         alignItems: "center",
         gap: 16,
         // Left pad clears the native macOS traffic lights (overlaid via titleBarStyle:"Overlay").
-        paddingLeft: 82,
+        // Windows uses native decorations, so that clearance is dead space.
+        paddingLeft: isWindows ? 12 : 82,
         paddingRight: 14,
         background: "var(--color-app)",
         borderBottom: "1px solid var(--color-line)",
@@ -221,7 +223,7 @@ export default function TopBar() {
             color: "var(--color-t2)",
           }}
         >
-          ⌘K
+          {fmtShortcut("⌘K")}
         </span>
       </button>
     </header>
