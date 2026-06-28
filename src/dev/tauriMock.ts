@@ -59,6 +59,7 @@ function makeRows(n: number): ImageRow[] {
       colorLabel: null,
       editedAt: null,
       importedAt: base - i * 3600,
+      format: "raw",
     };
   });
 }
@@ -392,6 +393,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
       mtime,
       // Fast list is metadata-only → always pending; import_dedup resolves the real status.
       status: "pending",
+      kind: "raw",
     });
     return [
       mk(1, day(2026, 6, 22)),

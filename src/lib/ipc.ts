@@ -86,6 +86,8 @@ export type QueryParams = {
   detectedCategory?: string | null;
   /** Restrict to images containing a (confirmed or suggested) face of this person. */
   personId?: number | null;
+  /** Source format bucket filter: "raw" | "jpeg" | "png". */
+  format?: string | null;
   search?: string | null;
   sort?: SortKey;
   limit?: number;
@@ -112,6 +114,7 @@ export const FILTER_DIMENSIONS: (keyof QueryParams)[] = [
   "captureDate",
   "detectedCategory",
   "personId",
+  "format",
 ];
 
 /** True when any filter dimension is active. Single source of truth for nav/footer state. */
@@ -133,6 +136,7 @@ export function clearedFilters(): Partial<QueryParams> {
     captureDate: null,
     detectedCategory: null,
     personId: null,
+    format: null,
   };
 }
 
@@ -160,6 +164,8 @@ export type ImageRow = {
   /** When the image was catalogued (epoch seconds): keyset cursor for import-date sorts + a live
    *  sorted-merge comparator key. */
   importedAt: number;
+  /** Source format bucket ("raw" | "jpeg" | "png"); null for legacy rows predating the column. */
+  format: string | null;
 };
 
 export type FolderRow = {
@@ -263,10 +269,7 @@ export type ImportStats = {
 /** Content-hash dedup status of a source file (matches Rust `SourceStatus`). "pending" = not yet
  *  hash-checked (the listing default; resolved by `importDedup` in the background). */
 export type SourceStatus =
-  | "pending"
-  | "new"
-  | "duplicateLibrary"
-  | "duplicateBatch";
+  "pending" | "new" | "duplicateLibrary" | "duplicateBatch";
 
 /** One source file in the fast import list — filesystem metadata only (matches Rust `SourceFile`).
  *  No thumbnail/hash up front; previews load lazily via `importThumb(path)`. */
@@ -278,6 +281,8 @@ export type SourceFile = {
   /** File modification time (epoch seconds) — fast stand-in for capture date in the list. */
   mtime: number;
   status: SourceStatus;
+  /** Source format bucket ("raw" | "jpeg" | "png") — drives the by-type filter chips. */
+  kind: string;
 };
 
 /** A resolved hash-dedup verdict for one path (matches Rust `DedupResult`). */

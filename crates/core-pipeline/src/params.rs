@@ -271,6 +271,13 @@ pub struct DevelopParams {
     /// Color-balance-RGB grading (4-way + scene-linear contrast/saturation). No-op by default.
     #[serde(default)]
     pub cb_rgb: CbRgb,
+    /// `true` when the source is an already-developed **display-referred** image (JPEG/PNG): the
+    /// scene-referred ACR base tone operator is bypassed so an unedited image round-trips to itself.
+    /// Intrinsic to the image and derived by the backend from the file format at render time — it is
+    /// NOT a user edit, so it is `#[serde(skip)]` (never persisted, transferred, or preset-able; it
+    /// stays out of the serialized edit, keeping every RAW render and the preset scope unchanged).
+    #[serde(skip)]
+    pub display_referred: bool,
 }
 
 impl Default for DevelopParams {
@@ -295,6 +302,7 @@ impl Default for DevelopParams {
             crop: Crop::default(),
             masks: Vec::new(),
             cb_rgb: CbRgb::default(),
+            display_referred: false,
         }
     }
 }
@@ -953,7 +961,14 @@ impl DevelopParams {
     /// `tone_amount` itself is baked into the LUT (CPU-side via `base_curve_lut`), not passed here.
     pub fn to_tone_op(&self) -> ToneOpUniform {
         ToneOpUniform {
-            params: [BASE_U_MIN, BASE_U_MAX, BASE_HUE_PROTECT, 0.0],
+            // params.w: display-referred bypass flag (1.0 ⇒ shader skips the scene-referred base
+            // tone operator, passing the already-developed image through). 0.0 for RAW (unchanged).
+            params: [
+                BASE_U_MIN,
+                BASE_U_MAX,
+                BASE_HUE_PROTECT,
+                if self.display_referred { 1.0 } else { 0.0 },
+            ],
         }
     }
 
@@ -1431,6 +1446,24 @@ mod geom_tests {
         assert!(
             touches,
             "at z_min at least one corner must touch the source edge"
+        );
+    }
+
+    #[test]
+    fn display_referred_toggles_tone_op_bypass_flag() {
+        // RAW default: scene-referred operator active (w == 0) — keeps every golden byte-identical.
+        let raw = DevelopParams::default();
+        assert_eq!(raw.to_tone_op().params[3], 0.0);
+        // Display-referred (JPEG/PNG): shader bypasses the base tone operator (w == 1).
+        let disp = DevelopParams {
+            display_referred: true,
+            ..Default::default()
+        };
+        assert_eq!(disp.to_tone_op().params[3], 1.0);
+        // The first three slots (log-exposure domain + hue protect) are unchanged either way.
+        assert_eq!(
+            &raw.to_tone_op().params[0..3],
+            &disp.to_tone_op().params[0..3]
         );
     }
 }

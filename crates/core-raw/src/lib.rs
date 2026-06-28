@@ -3,12 +3,14 @@
 //! All `rawler` calls are isolated in this crate (rawler's API is non-SemVer; pinned `=0.7.2`).
 
 pub mod develop;
+pub mod display;
 pub mod error;
 pub mod hash;
 pub mod meta;
 pub mod thumb;
 
 pub use develop::{as_shot_wb, develop_linear, develop_linear_preview, LinearImage};
+pub use display::{classify, is_display, ImageKind};
 pub use error::RawError;
 pub use hash::{content_hash, hash_file, hex};
 pub use meta::{capture_fingerprint, read_metadata, RawMeta};

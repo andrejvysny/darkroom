@@ -13,8 +13,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use walkdir::WalkDir;
 
-/// RAW extensions indexed in v1 (CR3 validated; others latent via rawler).
-pub const SUPPORTED_EXT: &[&str] = &["cr3", "cr2", "arw", "nef", "dng"];
+/// Extensions indexed: RAW (CR3 validated; others latent via rawler) + display-referred JPEG/PNG
+/// (decoded via the `image` crate in `core-raw::display`). Single source of truth for indexing,
+/// folder scan/watch, and import listing.
+pub const SUPPORTED_EXT: &[&str] = &["cr3", "cr2", "arw", "nef", "dng", "jpg", "jpeg", "png"];
+
+/// Catalog format bucket for a path (`"raw" | "jpeg" | "png"`), via `core_raw::classify`. The single
+/// extension→kind classifier used by the `images.format` column and the by-type filters.
+pub fn image_kind(path: &Path) -> &'static str {
+    core_raw::classify(path).as_str()
+}
 
 /// Default grid thumbnail longest-edge (px). 2× headroom for HiDPI cells.
 pub const THUMB_SIZE: u32 = 512;
@@ -38,6 +46,8 @@ pub struct ProcessedImage {
     pub width: i64,
     pub height: i64,
     pub capture_fingerprint: Option<[u8; 32]>,
+    /// Catalog format bucket (`"raw" | "jpeg" | "png"`), from the file extension.
+    pub format: &'static str,
 }
 
 pub fn now_epoch() -> i64 {
@@ -143,6 +153,7 @@ pub fn process_file(
         width: thumb.disp_width as i64,
         height: thumb.disp_height as i64,
         capture_fingerprint: fp,
+        format: image_kind(path),
     })
 }
 
@@ -172,8 +183,8 @@ pub fn insert_image(
         "INSERT INTO images(
             content_hash, capture_fingerprint, file_size, path, folder_id, original_filename,
             status, capture_date, camera_make, camera_model, body_serial, lens, iso, shutter,
-            aperture, focal_length, width, height, orientation, exif, imported_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,'present',?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            aperture, focal_length, width, height, orientation, exif, imported_at, format
+         ) VALUES (?1,?2,?3,?4,?5,?6,'present',?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             &p.content_hash[..],
             fp_slice,
@@ -195,6 +206,7 @@ pub fn insert_image(
             p.meta.orientation,
             exif_blob,
             imported_at,
+            p.format,
         ],
     )?;
     Ok(Some(conn.last_insert_rowid()))

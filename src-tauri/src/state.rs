@@ -36,6 +36,9 @@ pub struct AppState {
     /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
     /// newer request has already superseded it.
     pub latest_render: AtomicU64,
+    /// Memo of `(image_id, is_display_referred)` so the per-slider-move `develop_render` doesn't hit
+    /// the DB to learn whether the source is a JPEG/PNG (recomputed only on image change).
+    pub display_referred_memo: Mutex<Option<(i64, bool)>>,
     /// Histogram of the most recent successful render, for a reliable pull (the event can be missed).
     pub last_histogram: Mutex<Option<Histogram>>,
     /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
@@ -115,6 +118,7 @@ impl AppState {
             full_render_cache: Mutex::new(None),
             preview_render_cache: Mutex::new(None),
             latest_render: AtomicU64::new(0),
+            display_referred_memo: Mutex::new(None),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
             import_active: AtomicUsize::new(0),
