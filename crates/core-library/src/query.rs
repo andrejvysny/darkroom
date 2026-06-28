@@ -29,6 +29,8 @@ pub struct QueryParams {
     pub detected_category: Option<String>,
     /// Restrict to images containing a (confirmed or suggested) face of this person.
     pub person_id: Option<i64>,
+    /// Restrict to a source format bucket ("raw" | "jpeg" | "png").
+    pub format: Option<String>,
     pub search: Option<String>,
     /// "capture_desc" (default) | "capture_asc" | "filename" | "filename_desc"
     /// | "rating_desc" | "rating_asc" | "imported_desc" | "imported_asc".
@@ -71,12 +73,15 @@ pub struct ImageRow {
     /// When the image was catalogued (epoch seconds). The keyset cursor for imported-date sorts and a
     /// comparator key for the frontend live sorted-merge.
     pub imported_at: i64,
+    /// Source format bucket ("raw" | "jpeg" | "png"); null for legacy rows predating the column.
+    pub format: Option<String>,
 }
 
 const COLUMNS: &str = "i.id, i.content_hash, i.path, i.original_filename, i.capture_date,
     i.camera_make, i.camera_model, i.lens, i.iso, i.shutter, i.aperture, i.focal_length,
     i.width, i.height, i.orientation,
-    COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label, e.updated_at, i.imported_at";
+    COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label, e.updated_at, i.imported_at,
+    i.format";
 
 // Joined into every row-returning query so `edited_at` is populated.
 const EDIT_JOIN: &str = "LEFT JOIN edits e ON e.image_id = i.id";
@@ -117,6 +122,7 @@ const WHERE: &str = "i.status = 'present'
     AND (:person_id IS NULL OR EXISTS
          (SELECT 1 FROM face fa WHERE fa.asset_id = i.id AND fa.person_id = :person_id
             AND fa.status IN ('confirmed','unconfirmed')))
+    AND (:format IS NULL OR i.format = :format)
     AND (:search IS NULL OR i.original_filename LIKE :search
                          OR i.camera_model LIKE :search
                          OR i.lens LIKE :search
@@ -167,6 +173,7 @@ fn map_row(r: &Row<'_>) -> core_db::rusqlite::Result<ImageRow> {
         color_label: r.get(17)?,
         edited_at: r.get(18)?,
         imported_at: r.get(19)?,
+        format: r.get(20)?,
     })
 }
 
@@ -201,6 +208,7 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":capture_date": p.capture_date,
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
+            ":format": p.format,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,
@@ -271,6 +279,7 @@ fn run_seek_phase(
         (":capture_date", &p.capture_date),
         (":detected_category", &p.detected_category),
         (":person_id", &p.person_id),
+        (":format", &p.format),
         (":tau_person", &crate::analysis::PRESENCE_TAU_PERSON),
         (":tau_animal", &crate::analysis::PRESENCE_TAU_ANIMAL),
         (":search", search),
@@ -546,6 +555,7 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":capture_date": p.capture_date,
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
+            ":format": p.format,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,

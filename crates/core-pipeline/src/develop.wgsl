@@ -182,6 +182,9 @@ fn base_curve_lookup(x: f32) -> f32 {
 // blends toward a hue-preserving luminance-ratio variant (weight rises with chroma × highlight
 // excursion, gated by TO.params.z) to tame neon hue twists. Midtones/low-sat stay per-channel.
 fn apply_base_tone(c: vec3<f32>) -> vec3<f32> {
+  // Display-referred bypass (JPEG/PNG): the image is already tone-mapped, so skip the scene-referred
+  // operator and pass it through (clamped). pp_to_srgb + OETF then reproduce the source exactly.
+  if (TO.params.w > 0.5) { return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)); }
   let rgb = max(c, vec3<f32>(0.0));
   let pc = vec3<f32>(base_curve_lookup(rgb.r), base_curve_lookup(rgb.g), base_curve_lookup(rgb.b));
   let y = dot(rgb, LUMA);

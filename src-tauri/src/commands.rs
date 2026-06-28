@@ -399,6 +399,30 @@ pub struct DevelopRender {
 /// Decode an image to its full-resolution linear working buffer plus the develop params to apply —
 /// the image's stored edit, or `DevelopParams::default()` when unedited (the SAME default the Develop
 /// canvas uses, so every surface matches by construction). This is the expensive half (full
+/// Whether `image_id`'s source is a display-referred image (JPEG/PNG) → the develop pipeline must
+/// bypass the scene-referred base tone operator. Memoized per image so the hot `develop_render` path
+/// (one call per slider move) reads the DB only when the open image changes.
+pub(crate) fn image_display_referred(st: &AppState, image_id: i64) -> Result<bool, String> {
+    {
+        let memo = st.display_referred_memo.lock().map_err(|e| e.to_string())?;
+        if let Some((id, v)) = *memo {
+            if id == image_id {
+                return Ok(v);
+            }
+        }
+    }
+    let path = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::image_by_id(&db.conn, image_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "image not found".to_string())?
+            .path
+    };
+    let v = core_raw::is_display(Path::new(&path));
+    *st.display_referred_memo.lock().map_err(|e| e.to_string())? = Some((image_id, v));
+    Ok(v)
+}
+
 /// `develop_linear` demosaic, already `.oriented()`); callers render it to one or more sizes.
 pub(crate) fn decode_develop(
     st: &AppState,
@@ -415,13 +439,16 @@ pub(crate) fn decode_develop(
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::get_edit_with_version(&db.conn, image_id).map_err(|e| e.to_string())?
     };
-    let (params, edit_version) = match edit {
+    let (mut params, edit_version) = match edit {
         Some((json, version)) => (
             serde_json::from_str::<DevelopParams>(&json).map_err(|e| e.to_string())?,
             Some(version),
         ),
         None => (DevelopParams::default(), None),
     };
+    // Display-referred images (JPEG/PNG) bypass the scene-referred base tone operator so an unedited
+    // image renders as itself. Intrinsic to the file, so derive it here (never trust persisted edits).
+    params.display_referred = core_raw::is_display(Path::new(&path));
     let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
     let lin = core_raw::develop_linear(&src).map_err(|e| e.to_string())?;
     Ok((hash, params, edit_version, lin))
@@ -734,7 +761,7 @@ fn can_use_preview_source(view: &core_pipeline::ViewParams) -> bool {
 pub async fn develop_render(
     app: AppHandle,
     image_id: i64,
-    params: DevelopParams,
+    mut params: DevelopParams,
     view: ViewRect,
     out_w: u32,
     out_h: u32,
@@ -748,6 +775,9 @@ pub async fn develop_render(
             .gpu
             .as_ref()
             .ok_or_else(|| "GPU develop unavailable".to_string())?;
+
+        // Authoritative (intrinsic to the file): never trust the FE-sent value.
+        params.display_referred = image_display_referred(st.inner(), image_id)?;
 
         st.latest_render.fetch_max(request_id, Ordering::SeqCst);
         let superseded = || st.latest_render.load(Ordering::SeqCst) > request_id;
@@ -830,7 +860,7 @@ pub async fn develop_render(
 pub async fn develop_histogram(
     app: AppHandle,
     image_id: i64,
-    params: DevelopParams,
+    mut params: DevelopParams,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
@@ -838,6 +868,7 @@ pub async fn develop_histogram(
             .gpu
             .as_ref()
             .ok_or_else(|| "GPU develop unavailable".to_string())?;
+        params.display_referred = image_display_referred(st.inner(), image_id)?;
 
         let view = core_pipeline::ViewParams {
             origin: [0.0, 0.0],
@@ -882,7 +913,7 @@ pub async fn develop_histogram(
 pub async fn export_image(
     app: AppHandle,
     image_id: i64,
-    params: DevelopParams,
+    mut params: DevelopParams,
     format: String,
     dest: String,
 ) -> Result<(), String> {
@@ -900,6 +931,7 @@ pub async fn export_image(
                 .ok_or_else(|| "image not found".to_string())?
                 .path
         };
+        params.display_referred = core_raw::is_display(Path::new(&path));
 
         let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
         let lin = core_raw::develop_linear(&src).map_err(|e| e.to_string())?;

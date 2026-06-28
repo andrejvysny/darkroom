@@ -109,6 +109,9 @@ export default function ImportDialog({
   const [skipDuplicates, setSkipDuplicates] = useState(true);
   const skipDupRef = useRef(true);
   skipDupRef.current = skipDuplicates;
+  const [kindFilter, setKindFilter] = useState<"all" | "raw" | "jpeg" | "png">(
+    "all",
+  );
   const [mode, setMode] = useState<ImportMode>("copy");
   const [rating, setRating] = useState(0);
   const [flag, setFlag] = useState<"none" | "pick" | "reject">("none");
@@ -129,6 +132,7 @@ export default function ImportDialog({
     setSelected(new Set());
     setListing(false);
     setRecursive(true);
+    setKindFilter("all");
     setDedupProgress(null);
     setPreviewPath(null);
     setPreviewUrl(null);
@@ -240,12 +244,29 @@ export default function ImportDialog({
     }
   }
 
-  const groups = useMemo(() => groupByDay(files), [files]);
+  // File-type families present in this listing, in a stable order — drives which filter chips show.
+  const availableKinds = useMemo(() => {
+    const present = new Set(files.map((f) => f.kind));
+    return (["raw", "jpeg", "png"] as const).filter((k) => present.has(k));
+  }, [files]);
+  // Snap the active chip back to "all" if its family vanishes (e.g. after re-listing a new source).
+  useEffect(() => {
+    if (kindFilter !== "all" && !availableKinds.includes(kindFilter))
+      setKindFilter("all");
+  }, [availableKinds, kindFilter]);
+
+  const visibleFiles = useMemo(
+    () =>
+      kindFilter === "all" ? files : files.filter((f) => f.kind === kindFilter),
+    [files, kindFilter],
+  );
+
+  const groups = useMemo(() => groupByDay(visibleFiles), [visibleFiles]);
   const dupCount = useMemo(
     () => files.filter((f) => isDup(f.status)).length,
     [files],
   );
-  const selectableCount = files.filter((f) =>
+  const selectableCount = visibleFiles.filter((f) =>
     selectable(f, skipDuplicates),
   ).length;
 
@@ -268,8 +289,17 @@ export default function ImportDialog({
       });
   }
 
+  // Bulk-select over the *visible* (type-filtered) files, merging into the current selection so a
+  // filtered "Select all" never deselects files hidden by the active chip.
   const setAll = (pred: (f: SourceFile) => boolean) =>
-    setSelected(new Set(files.filter(pred).map((f) => f.path)));
+    setSelected((prev) => {
+      const next = new Set(prev);
+      const visible = new Set(visibleFiles.map((f) => f.path));
+      for (const f of visibleFiles) if (pred(f)) next.add(f.path);
+      for (const f of visibleFiles)
+        if (!pred(f) && visible.has(f.path)) next.delete(f.path);
+      return next;
+    });
 
   function doImport() {
     if (!source || selected.size === 0) return;
@@ -353,7 +383,7 @@ export default function ImportDialog({
             ) : listing ? (
               <Centered>Listing files…</Centered>
             ) : files.length === 0 ? (
-              <Centered>No RAW files found in this folder.</Centered>
+              <Centered>No supported photos found in this folder.</Centered>
             ) : (
               <>
                 <div style={toolbar()}>
@@ -368,6 +398,25 @@ export default function ImportDialog({
                   <ToolbarBtn onClick={() => setAll((f) => f.status === "new")}>
                     Only new
                   </ToolbarBtn>
+                  {availableKinds.length > 1 && (
+                    <div style={chipGroup()}>
+                      <KindChip
+                        active={kindFilter === "all"}
+                        onClick={() => setKindFilter("all")}
+                      >
+                        All
+                      </KindChip>
+                      {availableKinds.map((k) => (
+                        <KindChip
+                          key={k}
+                          active={kindFilter === k}
+                          onClick={() => setKindFilter(k)}
+                        >
+                          {KIND_LABEL[k]}
+                        </KindChip>
+                      ))}
+                    </div>
+                  )}
                   <span
                     style={{ marginLeft: "auto", color: "var(--color-t3)" }}
                   >
@@ -928,6 +977,51 @@ function iconToggle(): React.CSSProperties {
     padding: 1,
     cursor: "pointer",
   };
+}
+
+const KIND_LABEL: Record<"raw" | "jpeg" | "png", string> = {
+  raw: "RAW",
+  jpeg: "JPEG",
+  png: "PNG",
+};
+
+function chipGroup(): React.CSSProperties {
+  return {
+    display: "flex",
+    alignItems: "center",
+    gap: 4,
+    marginLeft: 6,
+    paddingLeft: 10,
+    borderLeft: "1px solid var(--color-line)",
+  };
+}
+
+/** A type-filter chip (All / RAW / JPEG / PNG). `active` highlights the current selection. */
+function KindChip({
+  children,
+  active,
+  onClick,
+}: {
+  children: React.ReactNode;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        fontSize: 11.5,
+        padding: "3px 8px",
+        borderRadius: "var(--radius-sm)",
+        border: `1px solid ${active ? "var(--color-accent)" : "var(--color-line)"}`,
+        background: active ? "var(--color-accent)" : "transparent",
+        color: active ? "#fff" : "var(--color-t2)",
+        cursor: "pointer",
+      }}
+    >
+      {children}
+    </button>
+  );
 }
 
 function ToolbarBtn({

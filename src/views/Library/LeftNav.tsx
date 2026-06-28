@@ -275,9 +275,33 @@ export default function LeftNav({
           );
         })}
       </div>
+
+      {/* File type section — filter the catalog by source format. */}
+      <div>
+        <SectionHeading>File type</SectionHeading>
+        {FILE_TYPES.map(({ kind, label }) => {
+          const active = params.format === kind;
+          return (
+            <NavRow
+              key={kind}
+              icon="photos"
+              label={label}
+              count=""
+              active={active}
+              onClick={() => patchParams({ format: active ? null : kind })}
+            />
+          );
+        })}
+      </div>
     </aside>
   );
 }
+
+const FILE_TYPES: { kind: string; label: string }[] = [
+  { kind: "raw", label: "RAW" },
+  { kind: "jpeg", label: "JPEG" },
+  { kind: "png", label: "PNG" },
+];
 
 function Empty({ children }: { children: React.ReactNode }) {
   return (

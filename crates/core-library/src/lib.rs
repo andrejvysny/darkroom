@@ -46,7 +46,7 @@ pub use features::{
     compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
 };
 pub use index::{
-    add_root, enumerate_raws, existing_paths, insert_image, now_epoch, process_file,
+    add_root, enumerate_raws, existing_paths, image_kind, insert_image, now_epoch, process_file,
     relink_missing_image, scan_root, IndexStats, ProcessedImage, SUPPORTED_EXT, THUMB_SIZE,
 };
 pub use keywords::{

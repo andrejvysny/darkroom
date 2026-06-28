@@ -35,7 +35,7 @@ fn non_empty(s: &str) -> Option<String> {
 }
 
 /// Parse "YYYY:MM:DD HH:MM:SS" → epoch seconds (naive interpreted as UTC).
-fn parse_exif_dt(s: &str) -> Option<i64> {
+pub(crate) fn parse_exif_dt(s: &str) -> Option<i64> {
     NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S")
         .ok()
         .map(|dt| dt.and_utc().timestamp())
@@ -85,6 +85,9 @@ impl RawMeta {
 
 /// Read metadata from an open [`RawSource`] WITHOUT decoding pixels (fast indexing path).
 pub fn read_metadata(src: &RawSource) -> Result<RawMeta, RawError> {
+    if crate::display::is_display(src.path()) {
+        return Ok(crate::display::read_display_meta(&src.as_vec()?));
+    }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let md = decoder
         .raw_metadata(src, &RawDecodeParams::default())

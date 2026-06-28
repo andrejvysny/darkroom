@@ -84,6 +84,8 @@ pub struct SourceFile {
     /// real EXIF capture date is read at commit time for on-disk date routing.
     pub mtime: i64,
     pub status: SourceStatus,
+    /// Source format bucket ("raw" | "jpeg" | "png") — drives the Import dialog's by-type filter.
+    pub kind: String,
 }
 
 /// A resolved dedup verdict for one path (the output of [`dedup_scan`]).
@@ -380,6 +382,7 @@ pub fn list_source(source: &Path, recursive: bool) -> Vec<SourceFile> {
                 .unwrap_or(0),
             mtime: file_mtime_epoch(&path),
             status: SourceStatus::Pending,
+            kind: core_library::image_kind(&path).to_string(),
             path: path.display().to_string(),
         })
         .collect()
