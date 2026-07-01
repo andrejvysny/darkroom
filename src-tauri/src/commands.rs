@@ -242,6 +242,9 @@ pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
         if let Ok(mut slot) = st.preview_render_cache.lock() {
             *slot = None;
         }
+        if let Ok(mut lru) = st.preview_linear_lru.lock() {
+            lru.clear();
+        }
         if let Ok(mut h) = st.last_histogram.lock() {
             *h = None;
         }
@@ -610,6 +613,61 @@ fn packed_overlay_layer(params: &DevelopParams, idx: i32) -> i32 {
     }
 }
 
+/// Outcome of claiming the decode slot for one `(image_id, tier)`.
+pub(crate) enum ClaimOutcome<'a> {
+    /// The cache became warm (another thread decoded it) — nothing to do.
+    Warm,
+    /// A newer request superseded this one while waiting.
+    Superseded,
+    /// This thread owns the decode; the guard releases the claim (and wakes waiters) on drop.
+    Decode(DecodeClaim<'a>),
+}
+
+/// RAII claim on `decode_inflight` — removed + waiters notified on drop (any exit path).
+pub(crate) struct DecodeClaim<'a> {
+    st: &'a AppState,
+    key: (i64, bool),
+}
+
+impl Drop for DecodeClaim<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.st.decode_inflight.lock() {
+            s.remove(&self.key);
+        }
+        self.st.decode_cv.notify_all();
+    }
+}
+
+/// Claim the decode for `key`, waiting while another thread decodes the same tier (so a slider
+/// burst / histogram right after open never duplicates the multi-second RAW decode). `present`
+/// re-checks the tier cache each wake.
+pub(crate) fn claim_decode<'a>(
+    st: &'a AppState,
+    key: (i64, bool),
+    present: impl Fn() -> Result<bool, String>,
+    superseded: &impl Fn() -> bool,
+) -> Result<ClaimOutcome<'a>, String> {
+    let mut inflight = st.decode_inflight.lock().map_err(|e| e.to_string())?;
+    loop {
+        if present()? {
+            return Ok(ClaimOutcome::Warm);
+        }
+        if superseded() {
+            return Ok(ClaimOutcome::Superseded);
+        }
+        if !inflight.contains(&key) {
+            inflight.insert(key);
+            return Ok(ClaimOutcome::Decode(DecodeClaim { st, key }));
+        }
+        // Timed wait: robust against a missed notify; the loop re-checks cache + supersede.
+        let (guard, _) = st
+            .decode_cv
+            .wait_timeout(inflight, std::time::Duration::from_millis(100))
+            .map_err(|e| e.to_string())?;
+        inflight = guard;
+    }
+}
+
 /// Ensure the full-resolution decoded + GPU-prepared source for `image_id` lives in
 /// `full_render_cache` (keyed by id). Evicts a different image's texture first, then decodes (lock
 /// released across the expensive decode) + prepares only when absent. Returns `false` WITHOUT
@@ -636,15 +694,16 @@ fn ensure_full_render_cache(
     }
 
     // --- Full-res source: decode the whole frame at full demosaic, cached in a single slot. ---
-    let present = {
+    let present = || -> Result<bool, String> {
         let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-        slot.as_ref().is_some_and(|(id, _)| *id == image_id)
+        Ok(slot.as_ref().is_some_and(|(id, _)| *id == image_id))
     };
-    if !present {
-        // Skip the expensive decode if a newer request already arrived.
-        if superseded() {
-            return Ok(false);
-        }
+    let _claim = match claim_decode(st, (image_id, false), present, &superseded)? {
+        ClaimOutcome::Warm => return Ok(true),
+        ClaimOutcome::Superseded => return Ok(false),
+        ClaimOutcome::Decode(claim) => claim,
+    };
+    {
         let path = {
             let db = st.db.lock().map_err(|e| e.to_string())?;
             core_library::image_by_id(&db.conn, image_id)
@@ -660,11 +719,18 @@ fn ensure_full_render_cache(
         if profiling() {
             tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "decode full profile");
         }
+        // Re-check AFTER the slow decode: if the user switched images meanwhile, DON'T store — a
+        // late store would clobber the newer image's prepared texture and force a re-decode.
+        // (Keyed on the image, not the request seq: slider moves on the same image must keep it.)
+        if st.current_image.load(Ordering::SeqCst) != image_id {
+            return Ok(false);
+        }
         let prepared = gpu
             .pipeline
             .prepare(&gpu.ctx, &lin)
             .map_err(|e| e.to_string())?;
-        *st.full_render_cache.lock().map_err(|e| e.to_string())? = Some((image_id, prepared));
+        *st.full_render_cache.lock().map_err(|e| e.to_string())? =
+            Some((image_id, std::sync::Arc::new(prepared)));
     }
     Ok(true)
 }
@@ -681,37 +747,77 @@ fn ensure_preview_render_cache(
             *slot = None;
         }
     }
-    let present = {
+    let present = || -> Result<bool, String> {
         let slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
-        slot.as_ref().is_some_and(|(id, _)| *id == image_id)
+        Ok(slot.as_ref().is_some_and(|(id, _)| *id == image_id))
     };
-    if !present {
-        if superseded() {
-            return Ok(false);
-        }
-        let path = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::image_by_id(&db.conn, image_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "image not found".to_string())?
-                .path
+    let _claim = match claim_decode(st, (image_id, true), present, &superseded)? {
+        ClaimOutcome::Warm => return Ok(true),
+        ClaimOutcome::Superseded => return Ok(false),
+        ClaimOutcome::Decode(claim) => claim,
+    };
+    {
+        // Warm-path: a prefetched (or previously decoded) linear preview skips the decode entirely
+        // — switching to a predicted neighbor is a GPU upload (~100 ms), not a multi-second decode.
+        let cached = st
+            .preview_linear_lru
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(image_id);
+        let lin = match cached {
+            Some(lin) => lin,
+            None => {
+                let path = {
+                    let db = st.db.lock().map_err(|e| e.to_string())?;
+                    core_library::image_by_id(&db.conn, image_id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "image not found".to_string())?
+                        .path
+                };
+                let src =
+                    core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+                let t = Instant::now();
+                let lin = std::sync::Arc::new(
+                    core_raw::develop_linear_preview(&src).map_err(|e| e.to_string())?,
+                );
+                if profiling() {
+                    tracing::debug!(
+                        elapsed_ms = t.elapsed().as_millis(),
+                        "decode preview profile"
+                    );
+                }
+                // Cache the decode so navigating BACK to this image is instant.
+                st.preview_linear_lru
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .insert(image_id, lin.clone());
+                lin
+            }
         };
-        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-        let t = Instant::now();
-        let lin = core_raw::develop_linear_preview(&src).map_err(|e| e.to_string())?;
-        if profiling() {
-            tracing::debug!(
-                elapsed_ms = t.elapsed().as_millis(),
-                "decode preview profile"
-            );
+        // Same late-store guard as the full cache (rapid image switching must not clobber).
+        if st.current_image.load(Ordering::SeqCst) != image_id {
+            return Ok(false);
         }
         let prepared = gpu
             .pipeline
             .prepare(&gpu.ctx, &lin)
             .map_err(|e| e.to_string())?;
-        *st.preview_render_cache.lock().map_err(|e| e.to_string())? = Some((image_id, prepared));
+        *st.preview_render_cache.lock().map_err(|e| e.to_string())? =
+            Some((image_id, std::sync::Arc::new(prepared)));
     }
     Ok(true)
+}
+
+/// Predictively decode the half-res previews of `image_ids` (the frontend's next/prev neighbors)
+/// into the CPU linear LRU, so stepping through a collection hits a warm buffer (GPU upload only,
+/// ~100 ms) instead of a multi-second decode. CPU-only — never touches the GPU queue. A newer call
+/// supersedes the previous set.
+#[tauri::command]
+pub async fn develop_prefetch(app: AppHandle, image_ids: Vec<i64>) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    let my_gen = st.prefetch_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::prefetch::run_prefetch(app.clone(), image_ids, my_gen);
+    Ok(())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -733,7 +839,10 @@ fn warm_full_render_cache(app: AppHandle, image_id: i64) {
         if already_full {
             return;
         }
-        let superseded = || false;
+        // Abort once the user has switched images: a late full-res store for the OLD image would
+        // clobber the new image's prepared texture and force a re-decode. Slider moves on the same
+        // image keep `current_image` stable, so the warm still completes for them.
+        let superseded = || st.current_image.load(Ordering::SeqCst) != image_id;
         if matches!(
             ensure_full_render_cache(st.inner(), gpu, image_id, superseded),
             Ok(true)
@@ -744,7 +853,10 @@ fn warm_full_render_cache(app: AppHandle, image_id: i64) {
 }
 
 fn can_use_preview_source(view: &core_pipeline::ViewParams) -> bool {
-    view.size[0] >= 0.90 && view.size[1] >= 0.90 && view.overlay_layer < 0
+    // The preview source is HALF resolution: any view showing ≥ ~45% of the frame per axis maps at
+    // ≤ ~2× minification on it, where the half-res source both looks correct and ALIASES LESS than
+    // an undersampled full-res source (the shader has no mips). Tighter zooms need full res.
+    view.size[0] >= 0.45 && view.size[1] >= 0.45 && view.overlay_layer < 0
 }
 
 /// Render a crop-local viewport window of `image_id` at the requested output size, returning raw
@@ -780,10 +892,19 @@ pub async fn develop_render(
         params.display_referred = image_display_referred(st.inner(), image_id)?;
 
         st.latest_render.fetch_max(request_id, Ordering::SeqCst);
+        st.current_image.store(image_id, Ordering::SeqCst);
         let superseded = || st.latest_render.load(Ordering::SeqCst) > request_id;
 
+        // Clamp to the device limit HERE so the response header always matches the rendered
+        // payload (render_view clamps internally with the same bound; a mismatch would misframe
+        // the pixel data and blank the canvas).
+        let max_edge = gpu.ctx.max_texture_dim;
+        let out_w = out_w.clamp(1, max_edge);
+        let out_h = out_h.clamp(1, max_edge);
+
         // Build the viewport descriptor and render the crop-local window into an out_w × out_h
-        // target. Lock held across render+readback so the slot can't be swapped mid-render.
+        // target. The cache lock is only held to clone the Arc handle; per-image serialization
+        // lives inside PreparedImage::render_lock.
         let view = core_pipeline::ViewParams {
             origin: [view.ox, view.oy],
             size: [view.sx, view.sy],
@@ -810,23 +931,26 @@ pub async fn develop_render(
         }
 
         let t = Instant::now();
-        let rgba = if use_preview {
+        // Clone the Arc handle and DROP the cache lock before rendering: the slot stays swappable
+        // while the GPU works (rapid image switches never queue behind a readback stall), and the
+        // id filter guarantees we never render a different image that raced into the slot.
+        let prepared = if use_preview {
             let slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
-            let (_, prepared) = slot
-                .as_ref()
-                .ok_or_else(|| "preview image evicted before render".to_string())?;
-            gpu.pipeline
-                .render_view(&gpu.ctx, prepared, &params, &view)
-                .map_err(|e| e.to_string())?
+            slot.as_ref()
+                .filter(|(id, _)| *id == image_id)
+                .map(|(_, p)| p.clone())
+                .ok_or_else(|| "preview image evicted before render".to_string())?
         } else {
             let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-            let (_, prepared) = slot
-                .as_ref()
-                .ok_or_else(|| "full-res image evicted before render".to_string())?;
-            gpu.pipeline
-                .render_view(&gpu.ctx, prepared, &params, &view)
-                .map_err(|e| e.to_string())?
+            slot.as_ref()
+                .filter(|(id, _)| *id == image_id)
+                .map(|(_, p)| p.clone())
+                .ok_or_else(|| "full-res image evicted before render".to_string())?
         };
+        let rgba = gpu
+            .pipeline
+            .render_view(&gpu.ctx, &prepared, &params, &view)
+            .map_err(|e| e.to_string())?;
         if prof {
             tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "gpu render profile");
         }
@@ -840,6 +964,16 @@ pub async fn develop_render(
 
         // Frame the raw RGBA8 with its dimensions and source tier:
         // [out_w LE][out_h LE][flags u8: bit0=preview-source][rgba8].
+        // Never frame a payload whose length disagrees with the header — the frontend would
+        // construct ImageData from misaligned bytes.
+        if rgba.len() != (out_w as usize) * (out_h as usize) * 4 {
+            return Err(format!(
+                "render size mismatch: got {} bytes, expected {}x{}x4",
+                rgba.len(),
+                out_w,
+                out_h
+            ));
+        }
         let mut buf = Vec::with_capacity(9 + rgba.len());
         buf.extend_from_slice(&out_w.to_le_bytes());
         buf.extend_from_slice(&out_h.to_le_bytes());
@@ -880,20 +1014,43 @@ pub async fn develop_histogram(
             overlay_color: [0.0, 0.0, 0.0],
             overlay_strength: 0.0,
         };
-        // Reuse the WARM full-res cache only — never decode here. If it's cold (decode for this image
-        // still in flight, or a different image is cached), skip: the frontend re-triggers this after
-        // the first viewport render warms the cache, so we avoid a duplicate full-res decode on open.
-        let rgba = {
+        // Order guard: two overlapping histogram calls (rapid slider + before/after) can finish out
+        // of order; only the newest may store/emit.
+        let seq = st.hist_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Reuse a WARM cache only — never decode here. Prefer the full-res slot; fall back to the
+        // half-res preview slot (at HIST_RENDER_EDGE the tiers are indistinguishable), so the panel
+        // has data while the full decode is still in flight. Skip only when BOTH are cold — the
+        // frontend re-triggers after the first viewport render warms a cache.
+        let prepared = {
             let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-            match slot.as_ref() {
-                Some((id, prepared)) if *id == image_id => gpu
-                    .pipeline
-                    .render_view(&gpu.ctx, prepared, &params, &view)
-                    .map_err(|e| e.to_string())?,
-                _ => return Ok(()),
+            slot.as_ref()
+                .filter(|(id, _)| *id == image_id)
+                .map(|(_, p)| p.clone())
+        };
+        let prepared = match prepared {
+            Some(p) => p,
+            None => {
+                let slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
+                match slot
+                    .as_ref()
+                    .filter(|(id, _)| *id == image_id)
+                    .map(|(_, p)| p.clone())
+                {
+                    Some(p) => p,
+                    None => return Ok(()),
+                }
             }
         };
+        // Cache locks dropped — the render serializes only on the per-image render_lock.
+        let rgba = gpu
+            .pipeline
+            .render_view(&gpu.ctx, &prepared, &params, &view)
+            .map_err(|e| e.to_string())?;
 
+        if st.hist_seq.load(Ordering::SeqCst) != seq {
+            return Ok(()); // superseded by a newer histogram request
+        }
         let hist = core_pipeline::histogram(&rgba);
         if let Ok(mut last) = st.last_histogram.lock() {
             *last = Some(hist.clone());
@@ -935,6 +1092,15 @@ pub async fn export_image(
 
         let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
         let lin = core_raw::develop_linear(&src).map_err(|e| e.to_string())?;
+        // Full-res export needs a source-sized GPU texture — fail with a clear message instead of
+        // an opaque pipeline error. (Tiled/downscaled export for oversized sources is a follow-up.)
+        let max_edge = gpu.ctx.max_texture_dim;
+        if lin.width > max_edge || lin.height > max_edge {
+            return Err(format!(
+                "image is {}×{} but this GPU supports at most {max_edge}px per side for export",
+                lin.width, lin.height
+            ));
+        }
         let rgba = gpu
             .pipeline
             .render_once(&gpu.ctx, &lin, &params)

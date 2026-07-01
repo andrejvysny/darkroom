@@ -12,6 +12,8 @@ import { usePresets } from "./usePresets";
 import { useHistory } from "./useHistory";
 import { useAppStore } from "../../store/app";
 import { useDevelopStore } from "../../store/develop";
+import { developPreviewJpeg } from "../../lib/ipc";
+import { log } from "../../lib/logger";
 
 export default function DevelopView() {
   const selectedId = useAppStore((s) => s.selectedId);
@@ -29,6 +31,8 @@ export default function DevelopView() {
     previewUrl,
     renderFrame,
     renderTick,
+    renderError,
+    retryRender,
     onParamChange,
     onCurveChange,
     onHslChange,
@@ -120,12 +124,25 @@ export default function DevelopView() {
     return () => window.removeEventListener("keydown", onKey);
   }, [undo, redo]);
 
-  // Natural sensor dims from the selected ImageRow (drives viewport math + readout).
+  // Natural sensor dims from the selected ImageRow (drives viewport math + readout). Until the row
+  // is available the aspect is unknown — GPU renders are suppressed (dimsKnown) so no wrong-aspect
+  // frame is ever issued; the 3:2 placeholder only sizes the empty canvas.
   const selectedRow = libraryImages.find((r) => r.id === selectedId) ?? null;
+  const dimsKnown = (selectedRow?.width ?? 0) > 0;
   const natural = {
     w: selectedRow?.width ?? 3,
     h: selectedRow?.height ?? 2,
   };
+
+  // Suppress GPU renders until the row's real dims are known (no wrong-aspect frame). Read through
+  // a ref so the gated callback stays referentially stable for Stage.
+  const dimsKnownRef = useRef(dimsKnown);
+  dimsKnownRef.current = dimsKnown;
+  const gatedRenderFrame = useCallback(
+    (d: Parameters<typeof renderFrame>[0]) =>
+      dimsKnownRef.current ? renderFrame(d) : Promise.resolve(null),
+    [renderFrame],
+  );
 
   // Embedded preview <img> for instant first paint on the canvas.
   const [previewImg, setPreviewImg] = useState<HTMLImageElement | null>(null);
@@ -139,6 +156,29 @@ export default function DevelopView() {
     }
     const img = new Image();
     img.onload = () => setPreviewImg(img);
+    img.onerror = () => {
+      // thumb:// / object URL failed to load — fall back to the embedded camera JPEG so the
+      // first paint is never silently blank.
+      log.warn("develop", "preview url failed to load", { url: previewUrl });
+      const id = useAppStore.getState().selectedId;
+      if (id === null) return;
+      developPreviewJpeg(id)
+        .then((url) => {
+          const fb = new Image();
+          fb.onload = () => {
+            setPreviewImg(fb);
+            URL.revokeObjectURL(url);
+          };
+          fb.onerror = () => URL.revokeObjectURL(url);
+          fb.src = url;
+        })
+        .catch((e) =>
+          log.warn("develop", "preview jpeg fallback failed", {
+            imageId: id,
+            ...log.errorSummary(e),
+          }),
+        );
+    };
     img.src = previewUrl;
   }, [previewUrl]);
 
@@ -223,9 +263,12 @@ export default function DevelopView() {
           onCropChange={onCropChange}
           onChangeMaskKind={updateMaskComponentKind}
           onCommitStroke={appendStroke}
-          renderFn={renderFrame}
+          renderFn={gatedRenderFrame}
           renderTick={renderTick}
+          renderGate={dimsKnown}
           previewImg={previewImg}
+          renderError={renderError}
+          onRetryRender={retryRender}
         />
         <InstrumentPanel
           params={params}

@@ -29,6 +29,13 @@ export default function Loupe({ image }: LoupeProps) {
     w: number;
     h: number;
   } | null>(null);
+  // CSS size of the PAINTED content. The canvas box follows this — never the live derived view —
+  // so pixels and box always agree in aspect (sizing from the live view while a paint lags is what
+  // stretched the image along one axis during fast zoom).
+  const [paintedCss, setPaintedCss] = useState<{
+    w: number;
+    h: number;
+  } | null>(null);
 
   // Frame dims drive the view rect. Use the preview's real (crop-applied) dims once loaded; before
   // that, the sensor dims are a close-enough fallback for the brief pre-load moment.
@@ -81,10 +88,19 @@ export default function Loupe({ image }: LoupeProps) {
     natural,
     resetKey: image.id,
     render: async (d, canvas) => {
-      if (canvas.width !== d.outW || canvas.height !== d.outH) {
-        canvas.width = d.outW;
-        canvas.height = d.outH;
-      }
+      // Size + draw + publish the matching CSS box as ONE atomic "painted state"; never resize the
+      // canvas when nothing will be drawn (that clears it → blink).
+      const sizeAndPublish = () => {
+        if (canvas.width !== d.outW || canvas.height !== d.outH) {
+          canvas.width = d.outW;
+          canvas.height = d.outH;
+        }
+        setPaintedCss((p) =>
+          p && p.w === d.visCssW && p.h === d.visCssH
+            ? p
+            : { w: d.visCssW, h: d.visCssH },
+        );
+      };
       // Decide tier: the preview supplies enough detail when it has ≥1 source pixel per output
       // pixel across the visible window. Hysteresis (0.85×) avoids thrash at the boundary.
       // Gate on the SHARP preview only — while it's still loading we draw the bootstrap and never
@@ -99,12 +115,16 @@ export default function Loupe({ image }: LoupeProps) {
       decodeModeRef.current = useDecode;
 
       if (!useDecode) {
-        drawPreview(d, canvas);
+        if (previewImgRef.current ?? bootstrapImgRef.current) {
+          sizeAndPublish();
+          drawPreview(d, canvas);
+        }
         return;
       }
 
       // Deep zoom → full-res render. Keep the (slightly soft) preview drawn underneath so there's
       // no blank flash while the decode runs; swap to the sharp frame when it lands.
+      sizeAndPublish();
       drawPreview(d, canvas);
       const p = savedParamsRef.current ?? freshDefaults();
       const frame = await developRender(
@@ -117,12 +137,21 @@ export default function Loupe({ image }: LoupeProps) {
       );
       if (frame) {
         lastFrameRef.current = frame;
+        // The async frame belongs to THIS d — repaint + republish the same box (no-op unless a
+        // newer sync paint happened meanwhile; the trailing scheduler then repaints anyway).
         paintFrame(canvas, frame);
+        setPaintedCss((prev) =>
+          prev && prev.w === d.visCssW && prev.h === d.visCssH
+            ? prev
+            : { w: d.visCssW, h: d.visCssH },
+        );
       }
     },
   });
 
   const { visCssW, visCssH } = derived;
+  const boxW = paintedCss?.w ?? visCssW;
+  const boxH = paintedCss?.h ?? visCssH;
 
   // ── Per-image load: saved params (for deep-zoom render) + the preview image ───────────────────
   // (viewState reset on image change is owned by useViewport via resetKey={image.id}.)
@@ -131,6 +160,7 @@ export default function Loupe({ image }: LoupeProps) {
     previewImgRef.current = null;
     bootstrapImgRef.current = null;
     setPreviewDims(null);
+    setPaintedCss(null);
     decodeModeRef.current = false;
     lastFrameRef.current = null;
 
@@ -197,8 +227,8 @@ export default function Loupe({ image }: LoupeProps) {
         onDoubleClick={resetView}
         style={{
           display: "block",
-          width: visCssW,
-          height: visCssH,
+          width: boxW,
+          height: boxH,
           cursor: "grab",
         }}
       />

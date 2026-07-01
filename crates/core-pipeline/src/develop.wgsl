@@ -361,6 +361,24 @@ fn sample_bilinear(uv: vec2<f32>) -> vec3<f32> {
   return mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);
 }
 
+// Same 4-tap bilinear, but at an explicit mip level. Used ONLY by the active-viewport minified
+// path (level ≥ 1) so the level-0 code above stays byte-identical for identity/legacy renders.
+fn sample_bilinear_lod(uv: vec2<f32>, level: i32) -> vec3<f32> {
+  let dims = vec2<f32>(textureDimensions(input_tex, level));
+  let p = uv * dims - vec2<f32>(0.5);
+  let i0 = floor(p);
+  let f = p - i0;
+  let lo = vec2<i32>(0, 0);
+  let hi = vec2<i32>(dims) - vec2<i32>(1, 1);
+  let c0 = clamp(vec2<i32>(i0), lo, hi);
+  let c1 = clamp(vec2<i32>(i0) + vec2<i32>(1, 1), lo, hi);
+  let t00 = textureLoad(input_tex, vec2<i32>(c0.x, c0.y), level).rgb;
+  let t10 = textureLoad(input_tex, vec2<i32>(c1.x, c0.y), level).rgb;
+  let t01 = textureLoad(input_tex, vec2<i32>(c0.x, c1.y), level).rgb;
+  let t11 = textureLoad(input_tex, vec2<i32>(c1.x, c1.y), level).rgb;
+  return mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);
+}
+
 struct GeomResult {
   u: vec2<f32>,       // crop-local output uv [0,1] (vignette/letterbox space)
   src_uv: vec2<f32>,  // source sampling uv
@@ -506,14 +524,35 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   } else {
     geo = geom_resolve(in.uv);
   }
+  // Mip selection for zoomed-OUT viewport renders: the geometry map is affine, so fwidth gives the
+  // exact source-texels-per-output-pixel rate. Nearest level, 4 taps (no trilinear). Gated to the
+  // active viewport with real minification — identity/legacy renders keep level 0 and stay
+  // byte-identical. Derivatives are taken BEFORE the non-uniform letterbox return (branching on
+  // VIEW.flags is uniform control flow, so fwidth is valid here).
+  let src_dims = vec2<f32>(textureDimensions(input_tex));
+  let texel_rate = fwidth(geo.src_uv) * src_dims;
+  var mip = 0;
+  if (VIEW.flags.x > 0.5) {
+    let minif = max(texel_rate.x, texel_rate.y);
+    if (minif > 1.5) {
+      let max_lv = i32(textureNumLevels(input_tex)) - 1;
+      mip = clamp(i32(round(log2(minif))), 0, max_lv);
+    }
+  }
   if (!geo.inside) {
     return vec4<f32>(LETTERBOX, 1.0);
   }
   let suv = geo.src_uv;
   // Detail stage (sharpen + NR) on the linear input at the geometry-remapped source uv, then global
   // white balance (chromatic adaptation), once, in linear ProPhoto. P.wb_gain is held at identity now
-  // that global WB rides this matrix; masks keep their gain delta.
-  let base_rgb = apply_detail(suv, sample_bilinear(suv));
+  // that global WB rides this matrix; masks keep their gain delta. Minified frames sample their mip
+  // and skip detail — sharpen/NR radii are sub-pixel at that scale (invisible, only aliasing).
+  var base_rgb: vec3<f32>;
+  if (mip > 0) {
+    base_rgb = sample_bilinear_lod(suv, mip);
+  } else {
+    base_rgb = apply_detail(suv, sample_bilinear(suv));
+  }
   // Scene-linear baseline gain (EX.texel.z, default 1.0) normalizes exposure so a correctly-exposed
   // mid-grey reaches the ACR base curve's 0.18 input. Applied once, before develop + the tone curve.
   let base_wb = wb_apply(base_rgb) * EX.texel.z;

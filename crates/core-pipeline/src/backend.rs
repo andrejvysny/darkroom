@@ -307,6 +307,76 @@ pub struct PreparedImage {
     // skip the pre-pass when a mask's coverage is unchanged. `Mutex` (not `RefCell`) keeps
     // `PreparedImage: Sync` so it can live in the shared develop caches.
     mask_layer_hash: std::sync::Mutex<Vec<Option<u64>>>,
+    // Serializes renders on THIS image: all uniforms/LUTs/targets above are shared, so two
+    // concurrent `render_to` calls would race on their contents. Held for the whole
+    // render+readback; callers may share `Arc<PreparedImage>` across threads freely.
+    render_lock: std::sync::Mutex<()>,
+    // Hash of the last-written payload per uniform/LUT (see `WriteSlot`): `render_to` skips the
+    // queue write when unchanged, so a pan/zoom frame rewrites ONLY the view uniform and a single
+    // slider move rewrites only the buffers it actually feeds. Guarded by `render_lock`.
+    write_hashes: std::sync::Mutex<[Option<u64>; WRITE_SLOTS]>,
+}
+
+/// Indices into `PreparedImage::write_hashes`.
+mod write_slot {
+    pub const PARAMS: usize = 0;
+    pub const FX: usize = 1;
+    pub const WB: usize = 2;
+    pub const EXTRA: usize = 3;
+    pub const MASKS: usize = 4;
+    pub const VIEW: usize = 5;
+    pub const TONE_LUT: usize = 6;
+    pub const TONE_OP: usize = 7;
+    pub const BASE_LUT: usize = 8;
+    pub const GEOM: usize = 9;
+    pub const CBRGB: usize = 10;
+}
+const WRITE_SLOTS: usize = 11;
+
+/// 2×2 box-average one RGBA f32 mip level into the next (odd trailing row/col clamp to the edge).
+fn downsample_rgba_f32(src: &[f32], w: u32, h: u32) -> Vec<f32> {
+    let (nw, nh) = ((w / 2).max(1) as usize, (h / 2).max(1) as usize);
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![0f32; nw * nh * 4];
+    for y in 0..nh {
+        let y0 = (y * 2).min(h - 1);
+        let y1 = (y * 2 + 1).min(h - 1);
+        for x in 0..nw {
+            let x0 = (x * 2).min(w - 1);
+            let x1 = (x * 2 + 1).min(w - 1);
+            let o = (y * nw + x) * 4;
+            for c in 0..4 {
+                out[o + c] = 0.25
+                    * (src[(y0 * w + x0) * 4 + c]
+                        + src[(y0 * w + x1) * 4 + c]
+                        + src[(y1 * w + x0) * 4 + c]
+                        + src[(y1 * w + x1) * 4 + c]);
+            }
+        }
+    }
+    out
+}
+
+fn payload_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Write `bytes` to `buf` only when they differ from the slot's last-written payload.
+fn write_buffer_if_changed(
+    queue: &wgpu::Queue,
+    buf: &wgpu::Buffer,
+    bytes: &[u8],
+    slot: &mut Option<u64>,
+) {
+    let h = payload_hash(bytes);
+    if *slot == Some(h) {
+        return;
+    }
+    *slot = Some(h);
+    queue.write_buffer(buf, 0, bytes);
 }
 
 struct ViewTarget {
@@ -642,10 +712,17 @@ impl DevelopPipeline {
             height: h,
             depth_or_array_layers: 1,
         };
+        // Mip chain (CPU box filter, built once per prepare): zoomed-OUT viewport renders sample a
+        // matching lower level instead of undersampling full res (aliasing/shimmer). Level 0 is the
+        // exact source; the shader picks level 0 for identity/legacy renders, so goldens are
+        // untouched. Capped at 5 levels — with the half-res preview source used for near-fit views,
+        // deeper levels are never selected.
+        let full_chain = 32 - w.max(h).leading_zeros();
+        let mip_count = full_chain.clamp(1, 5);
         let input = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("develop-input"),
             size,
-            mip_level_count: 1,
+            mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
@@ -667,6 +744,33 @@ impl DevelopPipeline {
             },
             size,
         );
+        let mut level_data = rgba;
+        let (mut lw, mut lh) = (w, h);
+        for level in 1..mip_count {
+            level_data = downsample_rgba_f32(&level_data, lw, lh);
+            lw = (lw / 2).max(1);
+            lh = (lh / 2).max(1);
+            ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &input,
+                    mip_level: level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&level_data),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lw * 16),
+                    rows_per_image: Some(lh),
+                },
+                wgpu::Extent3d {
+                    width: lw,
+                    height: lh,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        drop(level_data);
 
         let output = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("develop-output"),
@@ -990,6 +1094,8 @@ impl DevelopPipeline {
             mask_tex,
             view_target: std::sync::Mutex::new(None),
             mask_layer_hash: std::sync::Mutex::new(vec![None; crate::params::MASK_CAP]),
+            render_lock: std::sync::Mutex::new(()),
+            write_hashes: std::sync::Mutex::new([None; WRITE_SLOTS]),
         })
     }
 
@@ -1010,70 +1116,102 @@ impl DevelopPipeline {
         ow: u32,
         oh: u32,
     ) -> Result<Vec<u8>, PipelineError> {
+        // One render at a time per image — every uniform/LUT/target below is shared state.
+        let _render_guard = prepared.render_lock.lock().unwrap();
         let device = &ctx.device;
         let (w, h) = (prepared.width, prepared.height);
 
-        ctx.queue.write_buffer(
+        // Every write below is diffed against its last payload (write_hashes): a pan/zoom frame
+        // rewrites ONLY the view uniform; a slider move rewrites only what it feeds.
+        let mut hashes = prepared.write_hashes.lock().unwrap();
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.uniform,
-            0,
             bytemuck::bytes_of(&params.to_uniform()),
+            &mut hashes[write_slot::PARAMS],
         );
-        ctx.queue
-            .write_buffer(&prepared.fx_uniform, 0, bytemuck::bytes_of(&params.to_fx()));
-        ctx.queue.write_buffer(
+        write_buffer_if_changed(
+            &ctx.queue,
+            &prepared.fx_uniform,
+            bytemuck::bytes_of(&params.to_fx()),
+            &mut hashes[write_slot::FX],
+        );
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.wb_uniform,
-            0,
             bytemuck::bytes_of(&params.to_wb_uniform()),
+            &mut hashes[write_slot::WB],
         );
         let texel = [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32];
-        ctx.queue.write_buffer(
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.extra_uniform,
-            0,
             bytemuck::bytes_of(&params.to_extra(texel)),
+            &mut hashes[write_slot::EXTRA],
         );
-        ctx.queue.write_buffer(
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.mask_buffer,
-            0,
             bytemuck::bytes_of(&params.to_mask_buffer()),
+            &mut hashes[write_slot::MASKS],
         );
-        ctx.queue.write_buffer(
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.view_uniform,
-            0,
             bytemuck::bytes_of(&view.to_uniform()),
+            &mut hashes[write_slot::VIEW],
         );
 
         // Refresh the tone-curve LUT (identity is cheap; skips spline work when no curve set).
+        // The GPU upload is skipped when the LUT bytes are unchanged.
         let lut = if params.tone_curve.is_identity() {
             crate::curve::identity_lut()
         } else {
             crate::curve::build_lut(&params.tone_curve)
         };
-        write_lut(ctx, &prepared.lut, &lut);
+        {
+            let h = payload_hash(&lut);
+            if hashes[write_slot::TONE_LUT] != Some(h) {
+                hashes[write_slot::TONE_LUT] = Some(h);
+                write_lut(ctx, &prepared.lut, &lut);
+            }
+        }
 
         // Refresh the scene-referred base tone operator (uniform + log-exposure LUT). Always on
         // (mandatory base render transform); cheap to rebuild (BASE_LUT_SIZE f32 entries).
-        ctx.queue.write_buffer(
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.tone_op_uniform,
-            0,
             bytemuck::bytes_of(&params.to_tone_op()),
+            &mut hashes[write_slot::TONE_OP],
         );
-        write_base_lut(ctx, &prepared.base_lut, &params.base_curve_lut());
+        {
+            let base = params.base_curve_lut();
+            let h = payload_hash(bytemuck::cast_slice(&base));
+            if hashes[write_slot::BASE_LUT] != Some(h) {
+                hashes[write_slot::BASE_LUT] = Some(h);
+                write_base_lut(ctx, &prepared.base_lut, &base);
+            }
+        }
 
         // Crop + straighten geometry. `src_aspect` from the source; `out_aspect` from the render
         // target. For the legacy/identity path (out == source dims) these are equal, so the geom is
         // unchanged. In the active viewport path `crop_to_source` ignores `out_aspect` anyway.
         let src_aspect = w.max(1) as f32 / h.max(1) as f32;
         let out_aspect = ow.max(1) as f32 / oh.max(1) as f32;
-        ctx.queue.write_buffer(
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.geom_uniform,
-            0,
             bytemuck::bytes_of(&params.to_geom(src_aspect, out_aspect)),
+            &mut hashes[write_slot::GEOM],
         );
-        ctx.queue.write_buffer(
+        write_buffer_if_changed(
+            &ctx.queue,
             &prepared.cbrgb_uniform,
-            0,
             bytemuck::bytes_of(&params.to_cbrgb()),
+            &mut hashes[write_slot::CBRGB],
         );
+        drop(hashes);
 
         // Mask pre-pass: compute each enabled mask's composited alpha into its alpha layer. Same
         // order as `to_mask_buffer` (enabled masks, dense 0..count). One submit per mask so the
@@ -1253,10 +1391,16 @@ impl DevelopPipeline {
         let data = readback.slice(..).get_mapped_range();
         let mut out = vec![0u8; (ow * oh * 4) as usize];
         let row = (ow * 4) as usize;
-        for y in 0..oh as usize {
-            let src = y * out_bpr as usize;
-            let dst = y * row;
-            out[dst..dst + row].copy_from_slice(&data[src..src + row]);
+        if out_bpr as usize == row {
+            // Rows already tightly packed (width divisible by the 256-byte alignment) — one copy.
+            let len = out.len();
+            out.copy_from_slice(&data[..len]);
+        } else {
+            for y in 0..oh as usize {
+                let src = y * out_bpr as usize;
+                let dst = y * row;
+                out[dst..dst + row].copy_from_slice(&data[src..src + row]);
+            }
         }
         drop(data);
         readback.unmap();

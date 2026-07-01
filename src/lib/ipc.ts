@@ -1018,19 +1018,31 @@ export async function developRender(
     overlayMaskIndex,
     requestId,
   });
-  if (buf.byteLength < 8) return null; // superseded or error
+  if (buf.byteLength === 0) return null; // superseded
+  if (buf.byteLength < 9) {
+    log.error("develop", "render response too short", {
+      byteLength: buf.byteLength,
+    });
+    return null;
+  }
   const header = new DataView(buf, 0, 8);
   const w = header.getUint32(0, true); // little-endian
   const h = header.getUint32(4, true);
-  const payloadBytes = w * h * 4;
-  const hasFlags = buf.byteLength === 9 + payloadBytes;
-  const offset = hasFlags ? 9 : 8;
-  const pixels = new Uint8ClampedArray(buf, offset);
+  // Strict framing: [w u32][h u32][flags u8][rgba w*h*4]. Never build ImageData from a
+  // misaligned view — a mismatch means a backend framing bug, not a renderable frame.
+  if (buf.byteLength !== 9 + w * h * 4) {
+    log.error("develop", "render response size mismatch", {
+      byteLength: buf.byteLength,
+      w,
+      h,
+    });
+    return null;
+  }
   return {
-    data: pixels,
+    data: new Uint8ClampedArray(buf, 9),
     w,
     h,
-    previewSource: hasFlags && new Uint8Array(buf, 8, 1)[0] !== 0,
+    previewSource: new Uint8Array(buf, 8, 1)[0] !== 0,
   };
 }
 
@@ -1041,6 +1053,15 @@ export async function developRender(
 export async function developPreviewJpeg(imageId: number): Promise<string> {
   const buf = await invoke<ArrayBuffer>("develop_preview_jpeg", { imageId });
   return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+}
+
+/**
+ * Predictively decode the half-res previews of `imageIds` (next/prev neighbors of the current
+ * selection) into the backend's CPU cache, so stepping through a collection is instant.
+ * Fire-and-forget; a newer call supersedes the previous set.
+ */
+export function developPrefetch(imageIds: number[]): Promise<void> {
+  return invoke<void>("develop_prefetch", { imageIds });
 }
 
 /** Pull the most recent render's histogram (reliable fallback for the fire-and-forget event). */

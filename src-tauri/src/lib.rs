@@ -2,6 +2,7 @@ mod commands;
 mod events;
 mod features;
 mod logging;
+mod prefetch;
 mod protocol;
 mod state;
 mod thumb_queue;
@@ -120,6 +121,7 @@ pub fn run() {
             commands::develop_preview_jpeg,
             commands::thumb_prioritize,
             commands::develop_session,
+            commands::develop_prefetch,
             commands::develop_get_histogram,
             commands::develop_histogram,
             commands::develop_apply_settings,

@@ -286,3 +286,24 @@ fn overlay_tints_packed_selected_layer() {
         .unwrap();
     assert_eq!(odd.len(), (641 * 359 * 4) as usize, "odd-dim length");
 }
+
+// 6. Oversized output request: render_view clamps to the device max texture edge and returns a
+//    buffer sized to the CLAMPED dims (callers must clamp identically before framing headers).
+#[test]
+fn oversized_view_clamps_to_device_max() {
+    let Some(ctx) = gpu() else { return };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = ramp(64, 48);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let p = DevelopParams::default();
+
+    let max = ctx.max_texture_dim;
+    let mut v = view_full(max.saturating_add(1000), 32);
+    v.size = [0.5, 0.5];
+    let out = pipe.render_view(&ctx, &prep, &p, &v).unwrap();
+    assert_eq!(
+        out.len(),
+        (max as usize) * 32 * 4,
+        "oversized out_w must clamp to max_texture_dim"
+    );
+}

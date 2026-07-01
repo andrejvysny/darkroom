@@ -91,7 +91,7 @@ pub fn handle_thumb<R: Runtime>(
         None => {
             // Silent misses make protocol regressions (e.g. a wrong scheme on a platform)
             // invisible in the log. Record host/path/hash so they're diagnosable.
-            tracing::debug!(
+            tracing::warn!(
                 host = uri.host(),
                 path = uri.path(),
                 %hash,

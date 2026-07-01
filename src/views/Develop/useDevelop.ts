@@ -6,6 +6,7 @@ import {
   developGetEdit,
   developGetHistogram,
   developHistogram,
+  developPrefetch,
   developPreviewJpeg,
   developRegenThumb,
   developRender,
@@ -76,6 +77,11 @@ export function useDevelop() {
   // the canvas at the current view. (Slider edits don't change the view, so without this they'd only
   // appear on the next zoom/pan.)
   const [renderTick, setRenderTick] = useState(0);
+  // Set when a render threw (not when superseded). One automatic retry per failure streak; after
+  // that the Stage overlay offers a manual retry. Cleared by any successful frame.
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const retryUsed = useRef(false);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function setPreview(url: string | null) {
     if (previewObjUrl.current) URL.revokeObjectURL(previewObjUrl.current);
@@ -146,11 +152,27 @@ export function useDevelop() {
           overlayIdx,
         );
         if (seq !== renderSeq.current) return null; // superseded
+        if (frame) {
+          retryUsed.current = false;
+          setRenderError(null);
+        }
         // The full-res cache is now warm for `id`. Seed the whole-crop histogram once per image open
-        // (param edits / before-after toggle trigger their own refresh; pan/zoom must not).
+        // (param edits / before-after toggle trigger their own refresh; pan/zoom must not), and
+        // prefetch the filmstrip neighbors — AFTER the first frame so the predictive decodes never
+        // compete with this image's own decode.
         if (frame && histogramSeededFor.current !== id) {
           histogramSeededFor.current = id;
           debouncedHistogram(id);
+          const order = useAppStore.getState().libraryImages;
+          const i = order.findIndex((r) => r.id === id);
+          if (i >= 0) {
+            const neighbors = [i + 1, i - 1, i + 2]
+              .filter((j) => j >= 0 && j < order.length)
+              .map((j) => order[j].id);
+            if (neighbors.length > 0) {
+              developPrefetch(neighbors).catch(() => {});
+            }
+          }
         }
         return frame;
       } catch (err) {
@@ -158,6 +180,19 @@ export function useDevelop() {
           imageId: id,
           ...log.errorSummary(err),
         });
+        if (seq === renderSeq.current) {
+          setRenderError(String(err));
+          // One automatic retry per failure streak (transient GPU/cache races self-heal); a newer
+          // render supersedes the pending retry via the seq check at fire time.
+          if (!retryUsed.current) {
+            retryUsed.current = true;
+            if (retryTimer.current !== null) clearTimeout(retryTimer.current);
+            retryTimer.current = setTimeout(() => {
+              retryTimer.current = null;
+              if (seq === renderSeq.current) setRenderTick((t) => t + 1);
+            }, 300);
+          }
+        }
         return null;
       } finally {
         if (seq === renderSeq.current) setRendering(false);
@@ -325,8 +360,14 @@ export function useDevelop() {
 
     const id = selectedId;
     let cancelled = false;
-    // New image: the first warm render reseeds the whole-crop histogram.
+    // New image: the first warm render reseeds the whole-crop histogram; error/retry state resets.
     histogramSeededFor.current = null;
+    retryUsed.current = false;
+    setRenderError(null);
+    if (retryTimer.current !== null) {
+      clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
 
     useDevelopStore.setState({
       selectedMaskIndex: null,
@@ -433,8 +474,19 @@ export function useDevelop() {
         URL.revokeObjectURL(previewObjUrl.current);
         previewObjUrl.current = null;
       }
+      if (retryTimer.current !== null) {
+        clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+      }
     };
   }, []);
+
+  // Manual retry from the Stage error overlay: reset the retry budget and re-render.
+  const retryRender = useCallback(() => {
+    retryUsed.current = false;
+    setRenderError(null);
+    rerenderCurrent();
+  }, [rerenderCurrent]);
 
   // On leaving an image (navigate away / close Develop), enqueue it so the background queue fills its
   // display-sharp preview tier. Edited previews are generated lazily here — NOT on every slider settle
@@ -740,6 +792,8 @@ export function useDevelop() {
     previewUrl,
     renderFrame,
     renderTick,
+    renderError,
+    retryRender,
     onParamChange,
     onCurveChange,
     onHslChange,

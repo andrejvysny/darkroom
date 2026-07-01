@@ -5,12 +5,11 @@ use core_db::Db;
 use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
+use std::collections::HashSet;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
+use std::sync::{Arc, Condvar, Mutex};
 use tauri::{AppHandle, Manager, Runtime};
 
 /// GPU device + the compiled develop pipeline. Optional — the library works without a GPU.
@@ -29,13 +28,35 @@ pub struct AppState {
     pub thumb_queue: ThumbQueue,
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
     /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
-    pub full_render_cache: Mutex<Option<(i64, PreparedImage)>>,
+    /// `Arc` so renders clone the handle and DROP this lock before the GPU render+readback —
+    /// the per-image serialization lives inside `PreparedImage` (`render_lock`). An evicted image
+    /// stays alive until its in-flight render finishes (one transient extra texture).
+    pub full_render_cache: Mutex<Option<(i64, Arc<PreparedImage>)>>,
     /// Single half-resolution prepared image used for fast first paint on fit/whole-crop views,
     /// especially useful on Windows where full-res upload/readback is expensive.
-    pub preview_render_cache: Mutex<Option<(i64, PreparedImage)>>,
+    pub preview_render_cache: Mutex<Option<(i64, Arc<PreparedImage>)>>,
     /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
     /// newer request has already superseded it.
     pub latest_render: AtomicU64,
+    /// Monotonic id of the latest whole-crop histogram request; a stale (out-of-order) histogram
+    /// result must not overwrite / emit over a newer one.
+    pub hist_seq: AtomicU64,
+    /// Image id of the most recent interactive develop render. Lets the background full-res warm
+    /// thread abort (and never clobber the caches) once the user has switched images, while staying
+    /// insensitive to slider moves on the SAME image.
+    pub current_image: AtomicI64,
+    /// Keys `(image_id, is_preview_tier)` of decodes currently in flight. Concurrent requests for
+    /// the same tier wait on `decode_cv` for the first decode instead of duplicating the multi-
+    /// second RAW decode (slider burst / histogram right after open).
+    pub decode_inflight: Mutex<HashSet<(i64, bool)>>,
+    pub decode_cv: Condvar,
+    /// Byte-capped LRU of decoded half-res linear previews (the multi-second decode result; the GPU
+    /// upload from it is ~100 ms). Filled by the interactive preview decode AND the predictive
+    /// prefetch worker, so stepping through a collection hits warm CPU buffers instead of decoding.
+    pub preview_linear_lru: Mutex<crate::prefetch::PreviewLru>,
+    /// Generation of the newest `develop_prefetch` request; the worker aborts a stale set as soon
+    /// as a newer one (or an image switch) arrives.
+    pub prefetch_gen: AtomicU64,
     /// Memo of `(image_id, is_display_referred)` so the per-slider-move `develop_render` doesn't hit
     /// the DB to learn whether the source is a JPEG/PNG (recomputed only on image change).
     pub display_referred_memo: Mutex<Option<(i64, bool)>>,
@@ -118,6 +139,12 @@ impl AppState {
             full_render_cache: Mutex::new(None),
             preview_render_cache: Mutex::new(None),
             latest_render: AtomicU64::new(0),
+            hist_seq: AtomicU64::new(0),
+            current_image: AtomicI64::new(-1),
+            decode_inflight: Mutex::new(HashSet::new()),
+            decode_cv: Condvar::new(),
+            preview_linear_lru: Mutex::new(crate::prefetch::PreviewLru::default()),
+            prefetch_gen: AtomicU64::new(0),
             display_referred_memo: Mutex::new(None),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
