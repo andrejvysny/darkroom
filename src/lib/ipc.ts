@@ -914,6 +914,20 @@ export type DevelopParams = {
   nrLuma: number;
   nrColor: number;
   vignette: number;
+  /** Lens distortion primary radial coefficient (k1), -100..100. 0 = off. */
+  distK1: number;
+  /** Lens distortion secondary radial coefficient (k2), -100..100. 0 = off. */
+  distK2: number;
+  /** Lateral chromatic-aberration correction, red/cyan radial scale, -100..100. 0 = off. */
+  caRed: number;
+  /** Lateral chromatic-aberration correction, blue/yellow radial scale, -100..100. 0 = off. */
+  caBlue: number;
+  /** Clarity (mid-tone local contrast), -100..100. 0 = off. */
+  clarity: number;
+  /** Texture (fine local contrast), -100..100. 0 = off. */
+  texture: number;
+  /** Dehaze (coarse local contrast + black-point pull), -100..100. 0 = off. */
+  dehaze: number;
   /** Scene-referred base tone operator strength, 0..100 (0 = flat, 100 = full ACR look). */
   toneAmount: number;
   toneCurve: ToneCurve;
@@ -945,6 +959,13 @@ export const DEFAULT_PARAMS: DevelopParams = {
   nrLuma: 0,
   nrColor: 0,
   vignette: 0,
+  distK1: 0,
+  distK2: 0,
+  caRed: 0,
+  caBlue: 0,
+  clarity: 0,
+  texture: 0,
+  dehaze: 0,
   toneAmount: 100,
   toneCurve: { rgb: [], r: [], g: [], b: [] },
   hsl: Array.from({ length: HSL_BANDS }, () => ({ h: 0, s: 0, l: 0 })),

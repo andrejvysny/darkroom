@@ -255,6 +255,21 @@ pub struct DevelopParams {
     pub nr_color: f32,
     /// Lens vignette, -100..100 (negative darkens corners, positive brightens).
     pub vignette: f32,
+    /// Manual lens distortion, primary radial coefficient (k1), -100..100. Positive = pincushion
+    /// correction of barrel (pulls corners in); negative = barrel. 0 = off.
+    pub dist_k1: f32,
+    /// Manual lens distortion, secondary radial coefficient (k2), -100..100. Fine higher-order term.
+    pub dist_k2: f32,
+    /// Lateral chromatic-aberration correction, red/cyan radial scale, -100..100. 0 = off.
+    pub ca_red: f32,
+    /// Lateral chromatic-aberration correction, blue/yellow radial scale, -100..100. 0 = off.
+    pub ca_blue: f32,
+    /// Clarity (mid-tone local contrast), -100..100. 0 = off.
+    pub clarity: f32,
+    /// Texture (fine local contrast), -100..100. 0 = off.
+    pub texture: f32,
+    /// Dehaze (coarse local contrast + black-point pull), -100..100. 0 = off.
+    pub dehaze: f32,
     /// Scene-referred base tone operator strength, 0..100. 0 = neutral soft-clip (flat), 100 = full
     /// ACR-matched contrast curve. Defaults to 100 so unedited images render with the ACR look.
     pub tone_amount: f32,
@@ -296,6 +311,13 @@ impl Default for DevelopParams {
             nr_luma: 0.0,
             nr_color: 0.0,
             vignette: 0.0,
+            dist_k1: 0.0,
+            dist_k2: 0.0,
+            ca_red: 0.0,
+            ca_blue: 0.0,
+            clarity: 0.0,
+            texture: 0.0,
+            dehaze: 0.0,
             tone_amount: 100.0,
             tone_curve: ToneCurve::default(),
             hsl: [HslBand::default(); HSL_BANDS],
@@ -666,6 +688,13 @@ const BASE_HUE_PROTECT: f32 = 0.6;
 /// otherwise-unused `ExtraUniform.texel.z` (no new GPU binding).
 pub const BASELINE_GAIN: f32 = 1.0;
 
+/// Lens-correction slider→coefficient scales (the single tuning knob for how strong the modules feel
+/// at full ±100). `K1`/`K2` scale the radial displacement (`r2`, `r2²`); `CA` is the per-channel
+/// radial magnitude for lateral chromatic-aberration correction.
+pub const LENS_K1_SCALE: f32 = 0.15;
+pub const LENS_K2_SCALE: f32 = 0.05;
+pub const LENS_CA_SCALE: f32 = 0.02;
+
 // Highlight-shoulder joint: above this scene-linear input we leave the reference table and follow an
 // asymptotic shoulder. (X0,Y0) is the Adobe reference value there; A makes the shoulder C¹ (its slope
 // at X0 equals the reference's central-difference slope 0.2406, so A = 0.2406/(1−Y0)).
@@ -857,6 +886,17 @@ pub fn geom_src_uv(c: &Crop, src_aspect: f32, z: f32, u: [f32; 2]) -> [f32; 2] {
     [c.cx + disp[0], c.cy + disp[1]]
 }
 
+/// Apply the radial lens-distortion remap to a source UV about the image center (0.5, 0.5), in
+/// aspect-correct space. `lens = (k1, k2, _, _)` (see `DevelopParams::lens_coeffs`). Mirrors
+/// `lens_remap` in develop.wgsl exactly so it is unit-testable on the CPU. Center maps to itself;
+/// displacement grows radially. `src_aspect` = source W/H.
+pub fn geom_lens_uv(lens: [f32; 4], src_aspect: f32, uv: [f32; 2]) -> [f32; 2] {
+    let d = [(uv[0] - 0.5) * src_aspect, uv[1] - 0.5];
+    let r2 = d[0] * d[0] + d[1] * d[1];
+    let s = 1.0 + lens[0] * r2 + lens[1] * r2 * r2;
+    [0.5 + d[0] * s / src_aspect, 0.5 + d[1] * s]
+}
+
 impl DevelopParams {
     pub fn to_uniform(&self) -> ParamsUniform {
         ParamsUniform {
@@ -888,7 +928,20 @@ impl DevelopParams {
             ],
             // texel.z carries the scene-linear baseline gain (ACR-brightness calibration); .w spare.
             texel: [texel[0], texel[1], BASELINE_GAIN, 0.0],
+            // Presence (clarity/texture/dehaze). local.w = active flag ⇒ the shader skips the whole
+            // multi-scale sample at defaults (byte-identical render).
+            local: [
+                (self.clarity / 100.0).clamp(-1.0, 1.0),
+                (self.texture / 100.0).clamp(-1.0, 1.0),
+                (self.dehaze / 100.0).clamp(-1.0, 1.0),
+                if self.local_is_active() { 1.0 } else { 0.0 },
+            ],
         }
+    }
+
+    /// True when any Presence (clarity/texture/dehaze) control is engaged.
+    pub fn local_is_active(&self) -> bool {
+        self.clarity != 0.0 || self.texture != 0.0 || self.dehaze != 0.0
     }
 
     /// Pack the global white-balance CAT matrix for the GPU (std140 mat3 = 3 × `vec4` columns).
@@ -991,8 +1044,34 @@ impl DevelopParams {
                 geom_autozoom(c, src_aspect),
                 if c.is_identity() { 0.0 } else { 1.0 },
             ],
-            aspect: [src_aspect, out_aspect, 0.0, 0.0],
+            // aspect.z = lens-correction active flag (independent of crop/straighten in rot.w). At
+            // defaults it is 0.0 so `lens_sample` in the shader falls through to a plain bilinear
+            // fetch, keeping the render byte-identical to a pre-lens build.
+            aspect: [
+                src_aspect,
+                out_aspect,
+                if self.lens_is_active() { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            lens: self.lens_coeffs(),
         }
+    }
+
+    /// True when any lens distortion / chromatic-aberration control is engaged.
+    pub fn lens_is_active(&self) -> bool {
+        self.dist_k1 != 0.0 || self.dist_k2 != 0.0 || self.ca_red != 0.0 || self.ca_blue != 0.0
+    }
+
+    /// Physical lens coefficients for the GPU: `(k1, k2, ca_red, ca_blue)`. UI sliders are -100..100;
+    /// the `LENS_*` scales convert them to sane radial magnitudes (the single tuning knob for the
+    /// look). `k1/k2` scale the radial displacement `r2`/`r2²`; `ca_*` are per-channel radial scales.
+    pub fn lens_coeffs(&self) -> [f32; 4] {
+        [
+            (self.dist_k1 / 100.0).clamp(-1.0, 1.0) * LENS_K1_SCALE,
+            (self.dist_k2 / 100.0).clamp(-1.0, 1.0) * LENS_K2_SCALE,
+            (self.ca_red / 100.0).clamp(-1.0, 1.0) * LENS_CA_SCALE,
+            (self.ca_blue / 100.0).clamp(-1.0, 1.0) * LENS_CA_SCALE,
+        ]
     }
 
     /// Pack the Color-balance-RGB grading for the GPU (`@binding(14)`). Ships the verified ProPhoto⇄
@@ -1092,15 +1171,17 @@ impl Default for WbUniform {
     }
 }
 
-/// Detail (sharpen / luma+color NR) + Lens (vignette) scalars + the image texel size, for the GPU.
-/// std140-clean: two `vec4` rows (32 bytes). `@binding(9)` in `develop.wgsl`.
+/// Detail (sharpen / luma+color NR) + Lens (vignette) scalars + the image texel size + Presence
+/// (clarity/texture/dehaze), for the GPU. std140-clean: three `vec4` rows (48 bytes). `@binding(9)`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ExtraUniform {
     /// (sharpen 0..1.5, nr_luma 0..1, nr_color 0..1, vignette -1..1).
     pub detail: [f32; 4],
-    /// (1/width, 1/height, _, _).
+    /// (1/width, 1/height, baseline_gain, _).
     pub texel: [f32; 4],
+    /// (clarity -1..1, texture -1..1, dehaze -1..1, active 0/1).
+    pub local: [f32; 4],
 }
 
 impl Default for ExtraUniform {
@@ -1124,15 +1205,17 @@ impl Default for ToneOpUniform {
     }
 }
 
-/// Crop + straighten geometry uniform (`@binding(12)`). std140-clean: three `vec4` (48 bytes).
+/// Crop + straighten geometry uniform (`@binding(12)`). std140-clean: four `vec4` (64 bytes).
 /// `crop` = (cx, cy, hw, hh); `rot` = (cos θ, sin θ, autozoom, active); `aspect` = (src W/H, out W/H,
-/// _, _). See `to_geom` / `geom_src_uv` and `geom_resolve` in develop.wgsl.
+/// lens-active, _); `lens` = (k1, k2, ca_red, ca_blue). See `to_geom` / `geom_src_uv` / `geom_lens_uv`
+/// and `geom_resolve` / `lens_sample` in develop.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GeomUniform {
     pub crop: [f32; 4],
     pub rot: [f32; 4],
     pub aspect: [f32; 4],
+    pub lens: [f32; 4],
 }
 
 impl Default for GeomUniform {
@@ -1357,6 +1440,40 @@ mod geom_tests {
 
     fn close(a: [f32; 2], b: [f32; 2], eps: f32) -> bool {
         (a[0] - b[0]).abs() < eps && (a[1] - b[1]).abs() < eps
+    }
+
+    #[test]
+    fn lens_active_flag_and_geom_packing() {
+        let d = DevelopParams::default();
+        assert!(!d.lens_is_active());
+        assert_eq!(d.to_geom(1.5, 1.5).aspect[2], 0.0);
+        assert_eq!(d.lens_coeffs(), [0.0; 4]);
+
+        let warped = DevelopParams {
+            dist_k1: 100.0,
+            ..Default::default()
+        };
+        assert!(warped.lens_is_active());
+        assert_eq!(warped.to_geom(1.5, 1.5).aspect[2], 1.0);
+        assert_eq!(warped.lens_coeffs()[0], LENS_K1_SCALE);
+    }
+
+    #[test]
+    fn lens_remap_center_fixed_and_radially_monotone() {
+        let lens = [LENS_K1_SCALE, 0.0, 0.0, 0.0]; // pincushion-ish k1 > 0
+        let sa = 1.5;
+        // Center maps to itself.
+        assert!(close(geom_lens_uv(lens, sa, [0.5, 0.5]), [0.5, 0.5], 1e-6));
+        // Displacement grows with radius (k1 > 0 pushes points outward).
+        let near = geom_lens_uv(lens, sa, [0.6, 0.5]);
+        let far = geom_lens_uv(lens, sa, [0.8, 0.5]);
+        let dnear = near[0] - 0.5;
+        let dfar = far[0] - 0.5;
+        assert!(dnear > 0.1 && dfar > 0.3);
+        assert!(
+            dfar / 0.3 > dnear / 0.1,
+            "outer point displaced proportionally more"
+        );
     }
 
     #[test]

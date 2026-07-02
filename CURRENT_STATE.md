@@ -3,6 +3,11 @@
 > Snapshot for resuming in a new session. Pairs with `TODO.md` (what's next + leftovers), `README.md`
 > (overview), `SPEC_V1.md` (full spec).
 
+> **2026-07-02 — READ `TODO.md` top "Repo state sync (2026-07-02)" FIRST.** `main` is now `8c1072c`
+> (0.2.0 released; presets-history / windows-hardening / jpeg-png all merged; render overhaul landed).
+> Branch `feat/lens-corrections` (in progress) adds lens distortion/CA + pre-release signing scaffolding.
+> Everything below dated 2026-06-26 predates those merges.
+
 ## Repo state sync (2026-06-26)
 
 `main` = **`f7445df`**, `origin/main` = **`1cbb3e3` (v0.1.1)**, **2 unpushed** (`e880fda` GPU hardening,

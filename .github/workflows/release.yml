@@ -128,12 +128,52 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      # Code-signing is ENV-GATED: it only activates when the corresponding GitHub Actions secrets are
+      # set. With no secrets (the default today) the macOS DMG stays ad-hoc signed and Windows stays
+      # unsigned — the build still succeeds. To ship signed installers later, add these repo secrets:
+      #   macOS Developer ID + notarization: APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+      #     APPLE_SIGNING_IDENTITY ("Developer ID Application: Name (TEAMID)"), APPLE_ID,
+      #     APPLE_PASSWORD (app-specific), APPLE_TEAM_ID, KEYCHAIN_PASSWORD (any random string).
+      #   Windows Authenticode: WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD.
+      # When APPLE_SIGNING_IDENTITY is present this step flips tauri.conf.json off ad-hoc ("-") to the
+      # real identity + hardened runtime + entitlements so tauri-action notarizes; otherwise it is a no-op.
+      - name: Enable macOS signing (only when secrets present)
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const p = "src-tauri/tauri.conf.json";
+          const c = JSON.parse(fs.readFileSync(p, "utf8"));
+          c.bundle = c.bundle || {};
+          c.bundle.macOS = c.bundle.macOS || {};
+          c.bundle.macOS.signingIdentity = process.env.APPLE_SIGNING_IDENTITY;
+          c.bundle.macOS.hardenedRuntime = true;
+          c.bundle.macOS.entitlements = "Darkroom.entitlements";
+          fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
+          console.log("Enabled Developer ID signing + hardened runtime for", process.env.APPLE_SIGNING_IDENTITY);
+          NODE
+
       # tauri-action runs beforeBuildCommand (npm run build), bundles, and uploads to the release.
       # Pinned from tauri-apps/tauri-action v0.6.2.
       - name: Build app + create release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS signing + notarization (tauri-action consumes these automatically when non-empty).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          # Windows Authenticode (consumed by the Tauri NSIS bundler when non-empty).
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         with:
           args: ${{ matrix.args }}
           tauriScript: npm run tauri
@@ -141,9 +181,9 @@ jobs:
           releaseName: "Darkroom ${{ env.RELEASE_TAG }}"
           releaseBody: |
             Release artifacts:
-            - macOS Apple Silicon and Intel DMGs are ad-hoc signed and not notarized.
+            - macOS Apple Silicon and Intel DMGs are ad-hoc signed and not notarized unless Developer ID signing secrets are configured.
             - Intel macOS build ships with AI analysis disabled because ONNX Runtime has no x86_64 macOS prebuilt for the pinned ort runtime.
-            - Windows x64 NSIS installer is unsigned.
+            - Windows x64 NSIS installer is unsigned unless an Authenticode certificate is configured.
           # Publish beta-* tags directly as pre-releases; keep stable v* tags as drafts for review.
           releaseDraft: ${{ !startsWith(env.RELEASE_TAG, 'beta-') }}
           prerelease: true

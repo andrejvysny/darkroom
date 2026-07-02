@@ -23,6 +23,7 @@ import {
   collectionDelete,
   collectionRename,
   smartQueryFromParams,
+  hasActiveFilters,
 } from "../../lib/ipc";
 import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
@@ -622,7 +623,8 @@ export default function LibraryView() {
           {!lib.loading &&
             !lib.indexing &&
             !lib.importing &&
-            gridImages.length === 0 && (
+            gridImages.length === 0 &&
+            (hasActiveFilters(lib.params) || lib.params.search ? (
               <div
                 style={{
                   display: "flex",
@@ -633,9 +635,49 @@ export default function LibraryView() {
                   fontSize: 13,
                 }}
               >
-                No photos found
+                No photos match the current filters
               </div>
-            )}
+            ) : (
+              // Genuinely-empty library (fresh install): give a clear call to action rather than a
+              // dead-end. Reuses the same Import dialog the TopBar button opens.
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 14,
+                  height: "100%",
+                  color: "var(--color-t3)",
+                  textAlign: "center",
+                  padding: 24,
+                }}
+              >
+                <div style={{ fontSize: 15, color: "var(--color-t2)" }}>
+                  Your library is empty
+                </div>
+                <div style={{ fontSize: 13, maxWidth: 340, lineHeight: 1.5 }}>
+                  Add a folder of photos to get started — Darkroom imports RAW,
+                  JPEG and PNG files and never modifies your originals.
+                </div>
+                <button
+                  onClick={() => setImportOpen(true)}
+                  style={{
+                    marginTop: 4,
+                    border: "1px solid var(--color-accent, var(--color-line))",
+                    borderRadius: "var(--radius-sm)",
+                    background: "var(--color-accent, var(--color-hover))",
+                    color: "var(--color-t1)",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    padding: "8px 18px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Add photos…
+                </button>
+              </div>
+            ))}
           <ThumbGrid
             images={gridImages}
             thumbSize={thumbSize}

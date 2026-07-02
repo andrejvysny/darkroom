@@ -2,6 +2,33 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## Repo state sync (2026-07-02) — CURRENT
+
+- **`main` = `8c1072c`** (unpushed to origin), version **`0.2.0` (beta-2.0) RELEASED**. Since the
+  2026-06-26 note below: `feat/presets-history` (MERGED `c8e37bd`), `feat/windows-hardening`
+  (`4fd90dc`), `feat/jpeg-png-support` (`b283caf`), release `0.2.0` (`99dc448`), and the develop-render
+  overhaul `8c1072c` (blank-canvas + zoom-distortion fixes; memory `darkroom-render-pipeline-fixes`) are
+  all on `main`. Real-backend e2e = **39/39** green (`e2e/VERIFICATION.md`); the old fake-histogram
+  finding is fixed. Bindings 0–14 used; next free = **@binding(15)**. PROCESS_VERSION = 4.
+- **Branch `feat/lens-corrections` (IN PROGRESS, headless-green):** Module 1 of the "absent develop
+  modules" plan (`~/.claude/plans/do-thorouhg-analysis-of-synthetic-yao.md`). DONE:
+  - **Lens distortion (k1/k2) + lateral CA** — extends `GeomUniform` @12 (`lens:[f32;4]` + `aspect.z`
+    active flag; byte-identical at defaults, so **no PV bump**), new `lens_sample` in `develop.wgsl`,
+    `dist_k1/dist_k2/ca_red/ca_blue` on `DevelopParams` + 4 sliders in the "Lens corrections" panel +
+    `presetScope` "lens" group. Tests: `param_effects::{lens_distortion_remaps_nonflat_image,
+    ca_separates_channels_on_grayscale_edge}` + `params::geom_tests::{lens_active_flag_and_geom_packing,
+    lens_remap_center_fixed_and_radially_monotone}`. `LENS_K1/K2/CA_SCALE` in `params.rs` = tuning knobs.
+  - **Track A pre-release/signing scaffolding:** empty-library **onboarding CTA** (`LibraryView.tsx`,
+    filtered-empty vs truly-empty), **scoped CSP** (`tauri.conf.json`, was `null` — NEEDS in-app + built-
+    bundle verification), **env-gated macOS notarization + Windows signing** in `release.yml` (+ new
+    `src-tauri/Darkroom.entitlements`; inactive until repo secrets set — stays ad-hoc today).
+  - **NOT done:** CI browser-e2e job — every `e2e/tests/*` uses the real-backend `tauriPage` bridge
+    (needs the app + CR3 fixtures + socket), so a headless "mocked browser" CI job would run no
+    meaningful tests; gating e2e in CI needs a headless-app launch harness (larger than planned).
+  - **PENDING:** in-app visual QA (lens/CA look + tune `LENS_*`; CSP renders thumbs+canvas in dev AND a
+    built dmg) · **Module 2** (clarity/texture/dehaze, `@binding 15/16`) · commit the branch.
+- Gates green on the branch: `cargo test --workspace`, `cargo clippy --workspace`, `npx tsc`, `npm run build`.
+
 ## Repo state sync (2026-06-26) — docs had drifted from `main`
 
 - **`main` = `f7445df`; `origin/main` = `1cbb3e3` (v0.1.1 released); 2 commits unpushed** (`e880fda`
