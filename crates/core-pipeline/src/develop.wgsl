@@ -72,7 +72,8 @@ fn wb_apply(v: vec3<f32>) -> vec3<f32> {
 // Detail (sharpen / luma+color NR) + lens vignette + image texel size. @binding(9).
 struct Extra {
   detail: vec4<f32>, // sharpen (0..1.5), nr_luma (0..1), nr_color (0..1), vignette (-1..1)
-  texel: vec4<f32>,  // 1/width, 1/height, _, _
+  texel: vec4<f32>,  // 1/width, 1/height, baseline_gain, _
+  local: vec4<f32>,  // clarity (-1..1), texture (-1..1), dehaze (0..1), active (0/1)
 };
 @group(0) @binding(9) var<uniform> EX: Extra;
 
@@ -86,11 +87,13 @@ struct ToneOp {
 @group(0) @binding(11) var base_lut: texture_2d<f32>;
 
 // Crop + straighten geometry. crop=(cx,cy,hw,hh); rot=(cos θ, sin θ, autozoom, active);
-// aspect=(src W/H, out W/H, _, _). Inverse-maps output uv → source uv; mirrors params.rs geom_src_uv.
+// aspect=(src W/H, out W/H, lens-active, _); lens=(k1, k2, ca_red, ca_blue). Inverse-maps output uv →
+// source uv; mirrors params.rs geom_src_uv / geom_lens_uv.
 struct Geom {
   crop: vec4<f32>,
   rot: vec4<f32>,
   aspect: vec4<f32>,
+  lens: vec4<f32>,
 };
 @group(0) @binding(12) var<uniform> GEO: Geom;
 
@@ -300,6 +303,42 @@ fn apply_detail(uv: vec2<f32>, base: vec3<f32>) -> vec3<f32> {
   return max(rgb, vec3<f32>(0.0));
 }
 
+// Presence: clarity / texture / dehaze — multi-scale local contrast on the linear input. The blur
+// references come from the input's own mip chain (built in prepare()), sampled at the geometry-remapped
+// source uv, so no extra passes/textures are needed. Works on luma and rescales RGB by the luma ratio
+// to preserve chroma. Gated by EX.local.w (0 at defaults ⇒ byte-identical). Runs alongside apply_detail
+// on the linear input, before WB/develop. Coarse mip ≈ a box blur — a separable Gaussian is the
+// documented quality upgrade (see plan), but the mip approximation is cheap and reuses existing data.
+const LC_K_TEXTURE = 1.2;   // fine-band gain (high frequency)
+const LC_K_CLARITY = 0.8;   // mid-band gain
+const LC_K_DEHAZE  = 1.0;   // coarse-band gain (adds contrast) …
+const LC_K_HAZE_LIFT = 0.25; // … plus a local black-point pull to cut atmospheric veiling
+fn apply_local_contrast(base: vec3<f32>, suv: vec2<f32>) -> vec3<f32> {
+  if (EX.local.w < 0.5) { return base; }
+  let clarity = EX.local.x;
+  let texture = EX.local.y;
+  let dehaze = EX.local.z;
+  let max_lv = i32(textureNumLevels(input_tex)) - 1;
+  let fine_lv = clamp(1, 0, max_lv);
+  let coarse_lv = clamp(4, 0, max_lv);
+  let y = dot(base, LUMA);
+  let y_fine = dot(sample_bilinear_lod(suv, fine_lv), LUMA);
+  let y_coarse = dot(sample_bilinear_lod(suv, coarse_lv), LUMA);
+  // Midtone weight: suppress the effect in deep shadows / bright highlights to limit halos.
+  let m = smoothstep(0.0, 0.08, y) * (1.0 - smoothstep(0.55, 1.1, y));
+  let d_tex = y - y_fine;         // high-frequency detail
+  let d_mid = y - y_coarse;       // low-frequency local contrast
+  var y_new = y
+    + texture * LC_K_TEXTURE * d_tex
+    + clarity * LC_K_CLARITY * d_mid * m
+    + dehaze * LC_K_DEHAZE * d_mid * m;
+  // Dehaze also pulls the local black point down (deepens the veiled coarse background).
+  y_new = y_new - dehaze * LC_K_HAZE_LIFT * max(min(y_coarse, y_new), 0.0);
+  y_new = max(y_new, 0.0);
+  let ratio = select(1.0, y_new / y, y > 1e-5);
+  return base * ratio;
+}
+
 // Scene-linear local adjustments (WB, exposure, highlights/shadows, saturation), parameterized so
 // the base develop and every per-mask variant share identical math. Masking happens in linear light.
 fn apply_local_linear(
@@ -377,6 +416,30 @@ fn sample_bilinear_lod(uv: vec2<f32>, level: i32) -> vec3<f32> {
   let t01 = textureLoad(input_tex, vec2<i32>(c0.x, c1.y), level).rgb;
   let t11 = textureLoad(input_tex, vec2<i32>(c1.x, c1.y), level).rgb;
   return mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);
+}
+
+// Radial lens distortion (k1/k2) + lateral chromatic-aberration correction, sampled at the
+// geometry-remapped source uv. Distortion is measured about the source-image center (0.5) in
+// aspect-correct space; CA re-scales the per-channel radial displacement (green = reference).
+// aspect.z is the active flag: at defaults (0.0) this is a plain bilinear fetch → byte-identical.
+fn lens_sample(suv: vec2<f32>) -> vec3<f32> {
+  if (GEO.aspect.z < 0.5) {
+    return sample_bilinear(suv);
+  }
+  let sa = GEO.aspect.x;                     // src W/H
+  let d = vec2<f32>((suv.x - 0.5) * sa, suv.y - 0.5);
+  let r2 = dot(d, d);
+  let s = 1.0 + GEO.lens.x * r2 + GEO.lens.y * r2 * r2;
+  let dd = d * s;                            // distorted displacement (aspect space)
+  let cr = 1.0 + GEO.lens.z * r2;            // red/cyan radial scale
+  let cb = 1.0 + GEO.lens.w * r2;            // blue/yellow radial scale
+  let base = vec2<f32>(0.5 + dd.x / sa, 0.5 + dd.y);            // green / no-CA reference
+  let ruv  = vec2<f32>(0.5 + dd.x * cr / sa, 0.5 + dd.y * cr);
+  let buv  = vec2<f32>(0.5 + dd.x * cb / sa, 0.5 + dd.y * cb);
+  let g = sample_bilinear(base).g;
+  let r = sample_bilinear(ruv).r;
+  let b = sample_bilinear(buv).b;
+  return vec3<f32>(r, g, b);
 }
 
 struct GeomResult {
@@ -551,7 +614,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   if (mip > 0) {
     base_rgb = sample_bilinear_lod(suv, mip);
   } else {
-    base_rgb = apply_detail(suv, sample_bilinear(suv));
+    base_rgb = apply_local_contrast(apply_detail(suv, lens_sample(suv)), suv);
   }
   // Scene-linear baseline gain (EX.texel.z, default 1.0) normalizes exposure so a correctly-exposed
   // mid-grey reaches the ACR base curve's 0.18 input. Applied once, before develop + the tone curve.

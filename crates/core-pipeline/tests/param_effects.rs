@@ -276,6 +276,23 @@ fn straighten_solid_has_no_center_artifacts() {
     );
 }
 
+/// A smooth 2D diagonal gray gradient: every pixel is unique, so ANY geometry remap changes many
+/// pixels (unlike a single centerline edge, which a radial remap leaves invariant on the axis).
+fn ramp(w: u32, h: u32) -> LinearImage {
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let v = 0.15 + 0.3 * (x as f32 / w as f32 + y as f32 / h as f32);
+            data.extend_from_slice(&[v, v, v]);
+        }
+    }
+    LinearImage {
+        width: w,
+        height: h,
+        data,
+    }
+}
+
 /// Two vertical halves (dark | bright) — a hard edge down the middle, for sharpen tests.
 fn edge(w: u32, h: u32) -> LinearImage {
     let mut data = Vec::with_capacity((w * h * 3) as usize);
@@ -441,5 +458,205 @@ fn color_balance_saturation_neutralizes() {
     assert!(
         spread < spread_base * 0.25,
         "saturation -1 must neutralize (r-b {spread_base} -> {spread})"
+    );
+}
+
+#[test]
+fn lens_distortion_remaps_nonflat_image() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+
+    // A uniform image has nothing to warp: a geometry remap must leave it byte-identical. This is
+    // also the byte-identity guard for the inactive lens path vs. strong distortion on a flat.
+    let flat = solid(32, 32, [0.4, 0.4, 0.4]);
+    let pf = pipe.prepare(&ctx, &flat).unwrap();
+    let base_flat = pipe.render(&ctx, &pf, &DevelopParams::default()).unwrap();
+    let warp_flat = pipe
+        .render(
+            &ctx,
+            &pf,
+            &DevelopParams {
+                dist_k1: 100.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        base_flat, warp_flat,
+        "distortion cannot change a uniform image"
+    );
+
+    // A non-flat (gradient) image DOES move under distortion — off-center pixels resample.
+    let img = ramp(64, 64);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let warped = pipe
+        .render(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                dist_k1: 100.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(base, warped, "distortion must remap a non-flat image");
+}
+
+#[test]
+fn ca_separates_channels_on_grayscale_edge() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+
+    // A grayscale gradient has r==g==b per pixel. Lateral CA rescales the red/blue radial sampling,
+    // so off-center red and blue fetch different source locations → channels diverge.
+    let img = ramp(64, 64);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let ca = pipe
+        .render(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                ca_red: 100.0,
+                ca_blue: -100.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(
+        base, ca,
+        "chromatic-aberration correction must alter the render"
+    );
+
+    let max_rb = |buf: &[u8]| {
+        buf.chunks_exact(4)
+            .map(|px| (px[0] as i32 - px[2] as i32).abs())
+            .max()
+            .unwrap_or(0)
+    };
+    assert!(
+        max_rb(&base) <= 1,
+        "grayscale edge must start with r≈b (got {})",
+        max_rb(&base)
+    );
+    assert!(
+        max_rb(&ca) > 3,
+        "CA must split red vs blue off-center (got {}, base ≤ 1)",
+        max_rb(&ca)
+    );
+}
+
+#[test]
+fn presence_clarity_texture_noop_on_flat() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    // A uniform image has zero local contrast at every scale → clarity/texture are a no-op. This is
+    // the byte-identity guard for the Presence stage vs. a flat input.
+    let flat = solid(32, 32, [0.4, 0.4, 0.4]);
+    let pf = pipe.prepare(&ctx, &flat).unwrap();
+    let base = pipe.render(&ctx, &pf, &DevelopParams::default()).unwrap();
+    let presence = pipe
+        .render(
+            &ctx,
+            &pf,
+            &DevelopParams {
+                clarity: 100.0,
+                texture: 100.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(base, presence, "clarity/texture must not touch a flat image");
+}
+
+#[test]
+fn presence_boosts_local_contrast_on_edge() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = edge(64, 16);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+
+    let range = |buf: &[u8]| {
+        let (mut lo, mut hi) = (255i32, 0i32);
+        for px in buf.chunks_exact(4) {
+            lo = lo.min(px[0] as i32);
+            hi = hi.max(px[0] as i32);
+        }
+        hi - lo
+    };
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let clar = pipe
+        .render(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                clarity: 100.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        range(&clar) > range(&base),
+        "clarity must widen local contrast across an edge ({} -> {})",
+        range(&base),
+        range(&clar)
+    );
+}
+
+#[test]
+fn dehaze_darkens_and_contrasts_flat_midtone() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    // Dehaze pulls the local black point down (veiling removal) — visible even on a flat midtone.
+    let flat = solid(32, 32, [0.4, 0.4, 0.4]);
+    let pf = pipe.prepare(&ctx, &flat).unwrap();
+    let base = mean_channel(&pipe.render(&ctx, &pf, &DevelopParams::default()).unwrap(), 0);
+    let dehazed = mean_channel(
+        &pipe
+            .render(
+                &ctx,
+                &pf,
+                &DevelopParams {
+                    dehaze: 100.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        0,
+    );
+    assert!(
+        dehazed < base - 3.0,
+        "dehaze must darken the veiled midtone (base {base}, got {dehazed})"
     );
 }

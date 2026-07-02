@@ -314,11 +314,48 @@ export default function InstrumentPanel({
         />
       </Module>
 
+      {/* Presence */}
+      <Module
+        title="Presence"
+        defaultCollapsed
+        onReset={() => resetKeys(["clarity", "texture", "dehaze"])}
+      >
+        <Slider
+          label="Texture"
+          min={-100}
+          max={100}
+          defaultValue={0}
+          bipolar
+          value={params.texture}
+          onChange={(v) => onParamChange("texture", v)}
+        />
+        <Slider
+          label="Clarity"
+          min={-100}
+          max={100}
+          defaultValue={0}
+          bipolar
+          value={params.clarity}
+          onChange={(v) => onParamChange("clarity", v)}
+        />
+        <Slider
+          label="Dehaze"
+          min={-100}
+          max={100}
+          defaultValue={0}
+          bipolar
+          value={params.dehaze}
+          onChange={(v) => onParamChange("dehaze", v)}
+        />
+      </Module>
+
       {/* Lens Corrections */}
       <Module
         title="Lens corrections"
         defaultCollapsed
-        onReset={() => resetKeys(["vignette"])}
+        onReset={() =>
+          resetKeys(["vignette", "distK1", "distK2", "caRed", "caBlue"])
+        }
       >
         <Slider
           label="Vignette"
@@ -328,6 +365,42 @@ export default function InstrumentPanel({
           bipolar
           value={params.vignette}
           onChange={(v) => onParamChange("vignette", v)}
+        />
+        <Slider
+          label="Distortion"
+          min={-100}
+          max={100}
+          defaultValue={0}
+          bipolar
+          value={params.distK1}
+          onChange={(v) => onParamChange("distK1", v)}
+        />
+        <Slider
+          label="Distortion · fine"
+          min={-100}
+          max={100}
+          defaultValue={0}
+          bipolar
+          value={params.distK2}
+          onChange={(v) => onParamChange("distK2", v)}
+        />
+        <Slider
+          label="Defringe · red/cyan"
+          min={-100}
+          max={100}
+          defaultValue={0}
+          bipolar
+          value={params.caRed}
+          onChange={(v) => onParamChange("caRed", v)}
+        />
+        <Slider
+          label="Defringe · blue/yellow"
+          min={-100}
+          max={100}
+          defaultValue={0}
+          bipolar
+          value={params.caBlue}
+          onChange={(v) => onParamChange("caBlue", v)}
         />
       </Module>
 

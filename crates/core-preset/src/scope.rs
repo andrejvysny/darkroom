@@ -56,9 +56,14 @@ pub const GROUPS: &[ScopeGroup] = &[
         fields: &["sharpen", "nrLuma", "nrColor"],
     },
     ScopeGroup {
+        key: "presence",
+        label: "Presence",
+        fields: &["clarity", "texture", "dehaze"],
+    },
+    ScopeGroup {
         key: "lens",
         label: "Lens",
-        fields: &["vignette"],
+        fields: &["vignette", "distK1", "distK2", "caRed", "caBlue"],
     },
     ScopeGroup {
         key: "crop",

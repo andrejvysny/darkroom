@@ -25,7 +25,12 @@ export const SCOPE_GROUPS: ScopeGroup[] = [
   { key: "colorMixer", label: "Color Mixer", fields: ["saturation", "hsl"] },
   { key: "colorBalance", label: "Color Balance", fields: ["cbRgb"] },
   { key: "detail", label: "Detail", fields: ["sharpen", "nrLuma", "nrColor"] },
-  { key: "lens", label: "Lens", fields: ["vignette"] },
+  { key: "presence", label: "Presence", fields: ["clarity", "texture", "dehaze"] },
+  {
+    key: "lens",
+    label: "Lens",
+    fields: ["vignette", "distK1", "distK2", "caRed", "caBlue"],
+  },
   { key: "crop", label: "Crop", fields: ["crop"] },
   { key: "masks", label: "Masks", fields: ["masks"] },
 ];
