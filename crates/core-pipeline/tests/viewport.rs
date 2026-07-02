@@ -307,3 +307,60 @@ fn oversized_view_clamps_to_device_max() {
         "oversized out_w must clamp to max_texture_dim"
     );
 }
+
+/// Regression: the spatial stages (detail sharpen, lens distortion, presence) must apply in a
+/// MINIFIED viewport render (the fit-view preview path, mip > 0), not only at 1:1. Before the fix
+/// the `mip > 0` branch fetched a plain mip and skipped all three, so slider moves did nothing in
+/// the preview. A large source into a small target forces minification.
+#[test]
+fn spatial_effects_apply_when_minified() {
+    let Some(ctx) = gpu() else { return };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = ramp(512, 512); // 512 → 64 target ⇒ ~8× minification ⇒ mip > 0
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let view = view_full(64, 64);
+
+    let base = pipe
+        .render_view(&ctx, &prep, &DevelopParams::default(), &view)
+        .unwrap();
+
+    let sharp = pipe
+        .render_view(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                sharpen: 150.0,
+                ..Default::default()
+            },
+            &view,
+        )
+        .unwrap();
+    assert_ne!(base, sharp, "sharpen must affect a minified preview");
+
+    let warped = pipe
+        .render_view(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                dist_k1: 100.0,
+                ..Default::default()
+            },
+            &view,
+        )
+        .unwrap();
+    assert_ne!(base, warped, "lens distortion must affect a minified preview");
+
+    let clarity = pipe
+        .render_view(
+            &ctx,
+            &prep,
+            &DevelopParams {
+                clarity: 100.0,
+                texture: 100.0,
+                ..Default::default()
+            },
+            &view,
+        )
+        .unwrap();
+    assert_ne!(base, clarity, "presence must affect a minified preview");
+}

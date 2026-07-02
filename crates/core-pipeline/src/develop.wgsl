@@ -264,31 +264,33 @@ fn curve_ch(x: f32, sel: vec3<f32>) -> f32 {
   return dot(mix(v0, v1, f), sel);
 }
 
-// Exact texel fetch at uv + pixel offset (input is non-filterable Rgba32Float — textureLoad only).
-fn load_px(uv: vec2<f32>, off: vec2<f32>) -> vec3<f32> {
-  let dims = vec2<f32>(textureDimensions(input_tex));
-  let p = clamp((uv + off) * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0));
-  return textureLoad(input_tex, vec2<i32>(p), 0).rgb;
+// Exact texel fetch at uv + texel offset, at an explicit mip level (input is non-filterable
+// Rgba32Float — textureLoad only). `off` is in texels of `level`.
+fn load_px_lod(uv: vec2<f32>, off: vec2<f32>, level: i32) -> vec3<f32> {
+  let dims = vec2<f32>(textureDimensions(input_tex, level));
+  let p = clamp((uv + off / dims) * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0));
+  return textureLoad(input_tex, vec2<i32>(p), level).rgb;
 }
 
-// 3×3 Gaussian blur (1-2-1) of the input at uv — shared by NR and unsharp sharpening.
-fn blur3(uv: vec2<f32>) -> vec3<f32> {
-  let t = EX.texel.xy;
+// 3×3 Gaussian blur (1-2-1) of the input at uv, at an explicit mip level — shared by NR and unsharp
+// sharpening. `level` = the viewport's effective mip so the neighborhood matches the displayed scale.
+fn blur3_lod(uv: vec2<f32>, level: i32) -> vec3<f32> {
   let s =
-      load_px(uv, vec2<f32>(-t.x, -t.y)) + load_px(uv, vec2<f32>(0.0, -t.y)) * 2.0 + load_px(uv, vec2<f32>(t.x, -t.y))
-    + load_px(uv, vec2<f32>(-t.x, 0.0)) * 2.0 + load_px(uv, vec2<f32>(0.0, 0.0)) * 4.0 + load_px(uv, vec2<f32>(t.x, 0.0)) * 2.0
-    + load_px(uv, vec2<f32>(-t.x, t.y)) + load_px(uv, vec2<f32>(0.0, t.y)) * 2.0 + load_px(uv, vec2<f32>(t.x, t.y));
+      load_px_lod(uv, vec2<f32>(-1.0, -1.0), level) + load_px_lod(uv, vec2<f32>(0.0, -1.0), level) * 2.0 + load_px_lod(uv, vec2<f32>(1.0, -1.0), level)
+    + load_px_lod(uv, vec2<f32>(-1.0, 0.0), level) * 2.0 + load_px_lod(uv, vec2<f32>(0.0, 0.0), level) * 4.0 + load_px_lod(uv, vec2<f32>(1.0, 0.0), level) * 2.0
+    + load_px_lod(uv, vec2<f32>(-1.0, 1.0), level) + load_px_lod(uv, vec2<f32>(0.0, 1.0), level) * 2.0 + load_px_lod(uv, vec2<f32>(1.0, 1.0), level);
   return s / 16.0;
 }
 
 // Detail stage: luma/color noise reduction (blend toward the blurred neighborhood, independently per
-// luminance + chroma) then unsharp-mask sharpening. Operates on the linear input before WB/develop.
-fn apply_detail(uv: vec2<f32>, base: vec3<f32>) -> vec3<f32> {
+// luminance + chroma) then unsharp-mask sharpening. Operates on the linear input before WB/develop, at
+// the viewport's effective mip `level` (so it is visible in a minified fit-view preview, not only 1:1).
+fn apply_detail(uv: vec2<f32>, base: vec3<f32>, level: i32) -> vec3<f32> {
   let sharpen = EX.detail.x;
   let nr_l = EX.detail.y;
   let nr_c = EX.detail.z;
   if (sharpen < 1e-4 && nr_l < 1e-4 && nr_c < 1e-4) { return base; }
-  let b = blur3(uv);
+  let b = blur3_lod(uv, level);
   var rgb = base;
   if (nr_l > 1e-4 || nr_c > 1e-4) {
     let yl = dot(rgb, LUMA);
@@ -313,14 +315,16 @@ const LC_K_TEXTURE = 1.2;   // fine-band gain (high frequency)
 const LC_K_CLARITY = 0.8;   // mid-band gain
 const LC_K_DEHAZE  = 1.0;   // coarse-band gain (adds contrast) …
 const LC_K_HAZE_LIFT = 0.25; // … plus a local black-point pull to cut atmospheric veiling
-fn apply_local_contrast(base: vec3<f32>, suv: vec2<f32>) -> vec3<f32> {
+fn apply_local_contrast(base: vec3<f32>, suv: vec2<f32>, level: i32) -> vec3<f32> {
   if (EX.local.w < 0.5) { return base; }
   let clarity = EX.local.x;
   let texture = EX.local.y;
   let dehaze = EX.local.z;
+  // Fine/coarse bands are RELATIVE to the base mip so the local contrast tracks the displayed scale
+  // (level 0 at 1:1/export → fine=1, coarse=4, unchanged; a minified preview shifts both up together).
   let max_lv = i32(textureNumLevels(input_tex)) - 1;
-  let fine_lv = clamp(1, 0, max_lv);
-  let coarse_lv = clamp(4, 0, max_lv);
+  let fine_lv = clamp(level + 1, 0, max_lv);
+  let coarse_lv = clamp(level + 4, 0, max_lv);
   let y = dot(base, LUMA);
   let y_fine = dot(sample_bilinear_lod(suv, fine_lv), LUMA);
   let y_coarse = dot(sample_bilinear_lod(suv, coarse_lv), LUMA);
@@ -422,9 +426,12 @@ fn sample_bilinear_lod(uv: vec2<f32>, level: i32) -> vec3<f32> {
 // geometry-remapped source uv. Distortion is measured about the source-image center (0.5) in
 // aspect-correct space; CA re-scales the per-channel radial displacement (green = reference).
 // aspect.z is the active flag: at defaults (0.0) this is a plain bilinear fetch → byte-identical.
-fn lens_sample(suv: vec2<f32>) -> vec3<f32> {
+// Applies lens distortion + CA and fetches the base color at the viewport's mip `level` (0 = full-res
+// / identity, byte-identical to a plain fetch when the lens is inactive). Used at every zoom so the
+// geometry warp + colour fringing show in a minified fit-view preview, not only at 1:1.
+fn lens_ca_sample(suv: vec2<f32>, level: i32) -> vec3<f32> {
   if (GEO.aspect.z < 0.5) {
-    return sample_bilinear(suv);
+    return sample_bilinear_lod(suv, level);
   }
   let sa = GEO.aspect.x;                     // src W/H
   let d = vec2<f32>((suv.x - 0.5) * sa, suv.y - 0.5);
@@ -436,9 +443,9 @@ fn lens_sample(suv: vec2<f32>) -> vec3<f32> {
   let base = vec2<f32>(0.5 + dd.x / sa, 0.5 + dd.y);            // green / no-CA reference
   let ruv  = vec2<f32>(0.5 + dd.x * cr / sa, 0.5 + dd.y * cr);
   let buv  = vec2<f32>(0.5 + dd.x * cb / sa, 0.5 + dd.y * cb);
-  let g = sample_bilinear(base).g;
-  let r = sample_bilinear(ruv).r;
-  let b = sample_bilinear(buv).b;
+  let g = sample_bilinear_lod(base, level).g;
+  let r = sample_bilinear_lod(ruv, level).r;
+  let b = sample_bilinear_lod(buv, level).b;
   return vec3<f32>(r, g, b);
 }
 
@@ -606,16 +613,15 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(LETTERBOX, 1.0);
   }
   let suv = geo.src_uv;
-  // Detail stage (sharpen + NR) on the linear input at the geometry-remapped source uv, then global
+  // Spatial stages (lens distortion/CA → detail sharpen/NR → presence local contrast) on the linear
+  // input at the geometry-remapped source uv AND the viewport's effective mip `level`, then global
   // white balance (chromatic adaptation), once, in linear ProPhoto. P.wb_gain is held at identity now
-  // that global WB rides this matrix; masks keep their gain delta. Minified frames sample their mip
-  // and skip detail — sharpen/NR radii are sub-pixel at that scale (invisible, only aliasing).
-  var base_rgb: vec3<f32>;
-  if (mip > 0) {
-    base_rgb = sample_bilinear_lod(suv, mip);
-  } else {
-    base_rgb = apply_local_contrast(apply_detail(suv, lens_sample(suv)), suv);
-  }
+  // that global WB rides this matrix; masks keep their gain delta. Running these at `mip` (not only at
+  // level 0) is what makes them visible in a minified fit-view preview — at level 0 (1:1 / export) the
+  // math is unchanged. Defaults are inactive (guards return the plain fetch) ⇒ byte-identical render.
+  var base_rgb = lens_ca_sample(suv, mip);
+  base_rgb = apply_detail(suv, base_rgb, mip);
+  base_rgb = apply_local_contrast(base_rgb, suv, mip);
   // Scene-linear baseline gain (EX.texel.z, default 1.0) normalizes exposure so a correctly-exposed
   // mid-grey reaches the ACR base curve's 0.18 input. Applied once, before develop + the tone curve.
   let base_wb = wb_apply(base_rgb) * EX.texel.z;

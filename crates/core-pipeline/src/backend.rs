@@ -713,12 +713,13 @@ impl DevelopPipeline {
             depth_or_array_layers: 1,
         };
         // Mip chain (CPU box filter, built once per prepare): zoomed-OUT viewport renders sample a
-        // matching lower level instead of undersampling full res (aliasing/shimmer). Level 0 is the
-        // exact source; the shader picks level 0 for identity/legacy renders, so goldens are
-        // untouched. Capped at 5 levels — with the half-res preview source used for near-fit views,
-        // deeper levels are never selected.
+        // matching lower level instead of undersampling full res (aliasing/shimmer), and the Presence
+        // (clarity/texture/dehaze) local-contrast stage reads coarser levels relative to the display
+        // mip. Level 0 is the exact source; the shader picks level 0 for identity/legacy renders, so
+        // goldens are untouched. Build the FULL chain (down to 1×1) so the coarse local-contrast band
+        // has headroom even in a minified fit-view preview (the extra levels are ~⅓ more memory, cheap).
         let full_chain = 32 - w.max(h).leading_zeros();
-        let mip_count = full_chain.clamp(1, 5);
+        let mip_count = full_chain.clamp(1, 14);
         let input = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("develop-input"),
             size,
