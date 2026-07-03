@@ -159,11 +159,13 @@ jobs:
 
       # tauri-action runs beforeBuildCommand (npm run build), bundles, and uploads to the release.
       # Pinned from tauri-apps/tauri-action v0.6.2.
-      - name: Build app + create release
+      # NOTE: We only pass signing secrets if configured; otherwise tauri-action tries to import empty
+      # certs and fails. tauri.conf.json has signingIdentity="-" for ad-hoc signing as fallback.
+      - name: Build app + create release (with signing)
+        if: secrets.APPLE_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE != ''
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS signing + notarization (tauri-action consumes these automatically when non-empty).
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -171,9 +173,26 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          # Windows Authenticode (consumed by the Tauri NSIS bundler when non-empty).
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        with:
+          args: ${{ matrix.args }}
+          tauriScript: npm run tauri
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: "Darkroom ${{ env.RELEASE_TAG }}"
+          releaseBody: |
+            Release artifacts:
+            - macOS Apple Silicon and Intel DMGs are ad-hoc signed (signed with real cert if APPLE_CERTIFICATE secret configured).
+            - Intel macOS build ships with AI analysis disabled because ONNX Runtime has no x86_64 macOS prebuilt for the pinned ort runtime.
+            - Windows x64 NSIS installer is unsigned (signed if WINDOWS_CERTIFICATE secret configured).
+          releaseDraft: ${{ !startsWith(env.RELEASE_TAG, 'beta-') }}
+          prerelease: true
+
+      - name: Build app + create release (ad-hoc signed)
+        if: secrets.APPLE_CERTIFICATE == '' || secrets.WINDOWS_CERTIFICATE == ''
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: ${{ matrix.args }}
           tauriScript: npm run tauri
