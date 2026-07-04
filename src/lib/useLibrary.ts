@@ -68,7 +68,7 @@ export interface LibraryActions {
 const PAGE_SIZE = 500;
 
 const DEFAULT_PARAMS: QueryParams = {
-  sort: "capture_desc",
+  sort: "capture_asc",
   limit: PAGE_SIZE,
   offset: 0,
 };

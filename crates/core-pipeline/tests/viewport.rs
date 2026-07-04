@@ -54,6 +54,7 @@ fn view_full(out_w: u32, out_h: u32) -> ViewParams {
         overlay_layer: -1,
         overlay_color: [0.85, 0.10, 0.10],
         overlay_strength: 0.5,
+        crop_preview: false,
     }
 }
 
@@ -135,6 +136,7 @@ fn fit_letterbox_side_bars() {
             hw: 0.375,
             hh: 0.5,
             angle: 0.0,
+            rot90: 0,
         },
         ..Default::default()
     };
@@ -172,6 +174,7 @@ fn crop_straighten_zoom_window_consistent() {
             hw: 0.32,
             hh: 0.28,
             angle: 12.0,
+            rot90: 0,
         },
         ..Default::default()
     };
@@ -197,6 +200,41 @@ fn crop_straighten_zoom_window_consistent() {
     assert!(
         worst <= 3,
         "crop+straighten zoom sub-window diff {worst} > 3 LSB"
+    );
+}
+
+// 4b. 90° rotate: on a square ramp (R grows →right, G grows →down), a clockwise quarter-turn must
+//     make the R gradient run top→bottom (the source horizontal axis becomes vertical), staying
+//     ~constant across a row. Locks the shader `rot90_uv` direction against params.rs.
+#[test]
+fn rot90_rotates_content_cw() {
+    let Some(ctx) = gpu() else { return };
+    let pipe = DevelopPipeline::new(&ctx);
+    let img = ramp(64, 64); // square ⇒ no letterbox, a clean permutation
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+    let p = DevelopParams {
+        crop: Crop {
+            rot90: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let flat = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    let out = pipe.render(&ctx, &prep, &p).unwrap();
+    let r = |b: &[u8], x, y| px(b, 64, x, y, 0);
+    // Identity: R runs left→right (horizontal gradient dominates the vertical one).
+    let h_flat = r(&flat, 58, 32) - r(&flat, 6, 32);
+    let v_flat = (r(&flat, 32, 58) - r(&flat, 32, 4)).abs();
+    assert!(
+        h_flat > 60 && h_flat > 3 * v_flat,
+        "identity R must run horizontal (h {h_flat} v {v_flat})"
+    );
+    // After a 90° CW turn that same axis becomes vertical (R runs top→bottom).
+    let v_rot = r(&out, 32, 58) - r(&out, 32, 4);
+    let h_rot = (r(&out, 58, 32) - r(&out, 6, 32)).abs();
+    assert!(
+        v_rot > 60 && v_rot > 3 * h_rot,
+        "rotated R must run vertical (v {v_rot} h {h_rot})"
     );
 }
 
@@ -348,7 +386,10 @@ fn spatial_effects_apply_when_minified() {
             &view,
         )
         .unwrap();
-    assert_ne!(base, warped, "lens distortion must affect a minified preview");
+    assert_ne!(
+        base, warped,
+        "lens distortion must affect a minified preview"
+    );
 
     let clarity = pipe
         .render_view(

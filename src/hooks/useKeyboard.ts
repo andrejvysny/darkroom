@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useAppStore } from "../store/app";
-import { runExport } from "../lib/export";
+import { openExport } from "../lib/export";
 
 export function useKeyboard() {
   const setPaletteOpen = useAppStore((s) => s.setPaletteOpen);
@@ -21,8 +21,10 @@ export function useKeyboard() {
       // exports it (kept off the bare chord since E is now the edit shortcut).
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "e") {
         e.preventDefault();
-        if (e.shiftKey) void runExport(useAppStore.getState().selectedId);
-        else setView("develop");
+        if (e.shiftKey) {
+          const id = useAppStore.getState().selectedId;
+          openExport(id == null ? [] : [id]);
+        } else setView("develop");
         return;
       }
       if (e.key === "Escape") {

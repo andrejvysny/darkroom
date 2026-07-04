@@ -77,6 +77,8 @@ export default function Loupe({ image }: LoupeProps) {
     [],
   );
 
+  const setGridMode = useAppStore((s) => s.setGridMode);
+
   const {
     containerRef,
     canvasRef,
@@ -84,6 +86,7 @@ export default function Loupe({ image }: LoupeProps) {
     scheduleRender,
     resetView,
     onPointerDown,
+    viewState,
   } = useViewport<HTMLDivElement>({
     natural,
     resetKey: image.id,
@@ -224,7 +227,10 @@ export default function Loupe({ image }: LoupeProps) {
       <canvas
         ref={canvasRef}
         onPointerDown={onPointerDown}
-        onDoubleClick={resetView}
+        // Double-click toggles: reset to fit when zoomed in, else close back to the grid.
+        onDoubleClick={() =>
+          viewState.zoom > 1 ? resetView() : setGridMode("grid")
+        }
         style={{
           display: "block",
           width: boxW,

@@ -78,11 +78,14 @@ export default function Stage({
   // The rendered frame's pixel dims. In crop mode the backend renders the FULL frame (so the crop
   // overlay maps 1:1); otherwise it renders the cropped frame, whose aspect = sensor × crop extent.
   // Using sensor dims here when a crop is applied would distort the view rect + misalign overlays.
+  // 90° rotation swaps the displayed frame's W↔H; crop hw/hh are measured in that rotated frame.
+  const q = ((crop.rot90 % 4) + 4) % 4;
+  const rotated = q % 2 === 1 ? { w: natural.h, h: natural.w } : natural;
   const effNatural = cropMode
-    ? natural
+    ? rotated
     : {
-        w: Math.max(1, natural.w * crop.hw * 2),
-        h: Math.max(1, natural.h * crop.hh * 2),
+        w: Math.max(1, rotated.w * crop.hw * 2),
+        h: Math.max(1, rotated.h * crop.hh * 2),
       };
 
   // Last successfully painted frame (preview-gate + image-change reset).

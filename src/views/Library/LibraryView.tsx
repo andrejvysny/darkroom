@@ -27,7 +27,7 @@ import {
 } from "../../lib/ipc";
 import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
-import { runBatchExport } from "../../lib/export";
+import { openExport } from "../../lib/export";
 import { useAnalysis } from "../../lib/useAnalysis";
 import LeftNav from "./LeftNav";
 import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
@@ -451,11 +451,8 @@ export default function LibraryView() {
   );
 
   const batchExport = useCallback(() => {
-    const items = lib.images
-      .filter((i) => selectedIds.includes(i.id))
-      .map((i) => ({ id: i.id, filename: i.filename }));
-    void runBatchExport(items);
-  }, [lib.images, selectedIds]);
+    openExport(selectedIds);
+  }, [selectedIds]);
 
   const collapseSelection = useCallback(() => {
     setSelectedId(selectedId);

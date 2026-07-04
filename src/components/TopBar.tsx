@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "../store/app";
 import { useDevelopStore } from "../store/develop";
+import { openExport } from "../lib/export";
 import { isWindows, fmtShortcut } from "../lib/platform";
 import Icon from "./Icon";
 
@@ -206,6 +207,16 @@ export default function TopBar() {
           <button className="tbtn ghost" onClick={() => onDevelopReset?.()}>
             <Icon name="reset" />
             Reset
+          </button>
+          <button
+            className="tbtn ghost"
+            onClick={() => {
+              const id = useAppStore.getState().selectedId;
+              openExport(id == null ? [] : [id]);
+            }}
+          >
+            <Icon name="export" />
+            Export
           </button>
         </>
       )}

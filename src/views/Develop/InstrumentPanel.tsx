@@ -466,6 +466,42 @@ export default function InstrumentPanel({
             </button>
           ))}
         </div>
+        {/* Whole-image 90° rotation (works in or out of crop mode). */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: 6,
+            marginBottom: 12,
+          }}
+        >
+          {(
+            [
+              ["⟲ Rotate left", 3],
+              ["⟳ Rotate right", 1],
+            ] as [string, number][]
+          ).map(([label, delta]) => (
+            <button
+              key={label}
+              onClick={() =>
+                onCropChange({
+                  rot90: (((params.crop.rot90 + delta) % 4) + 4) % 4,
+                })
+              }
+              style={{
+                padding: "5px 0",
+                border: "1px solid var(--color-line)",
+                borderRadius: "var(--radius-sm)",
+                fontSize: 11,
+                color: "var(--color-t2)",
+                background: "transparent",
+                cursor: "pointer",
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <Slider
           label="Straighten"
           min={-45}

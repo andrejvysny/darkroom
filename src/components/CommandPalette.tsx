@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../store/app";
-import { runExport } from "../lib/export";
+import { openExport } from "../lib/export";
 import { fmtShortcut } from "../lib/platform";
 import Icon, { IconName } from "./Icon";
 
@@ -57,7 +57,7 @@ export default function CommandPalette() {
       icon: "export",
       label: "Export selected…",
       shortcut: "⌘E",
-      run: () => void runExport(selectedId),
+      run: () => openExport(selectedId == null ? [] : [selectedId]),
     },
     {
       icon: "bolt",
@@ -91,7 +91,7 @@ export default function CommandPalette() {
       icon: "export",
       label: "Export this photo…",
       shortcut: "⌘E",
-      run: () => void runExport(selectedId),
+      run: () => openExport(selectedId == null ? [] : [selectedId]),
     },
     {
       icon: "grid",

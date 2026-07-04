@@ -59,7 +59,7 @@ export default function BottomBar({
   const gridMode = useAppStore((s) => s.gridMode);
   const setGridMode = useAppStore((s) => s.setGridMode);
 
-  const currentSort = params.sort ?? "capture_desc";
+  const currentSort = params.sort ?? "capture_asc";
   const minStars = params.minStars ?? null;
   const flag = params.flag ?? null;
   const label = params.colorLabel ?? null;

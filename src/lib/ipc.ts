@@ -866,6 +866,9 @@ export type Crop = {
   hw: number;
   hh: number;
   angle: number;
+  /** Whole-image 90° rotation in clockwise quarter-turns (0..3). Applied as the outermost
+   *  transform; cx/cy/hw/hh/angle are defined in the rotated (displayed) frame. */
+  rot90: number;
 };
 
 export const DEFAULT_CROP: Crop = {
@@ -874,6 +877,7 @@ export const DEFAULT_CROP: Crop = {
   hw: 0.5,
   hh: 0.5,
   angle: 0,
+  rot90: 0,
 };
 
 /** A grading-RGB color offset (per-channel). Mirrors Rust `[f32; 3]`. */
@@ -1028,6 +1032,7 @@ export async function developRender(
   outW: number,
   outH: number,
   overlayMaskIndex: number,
+  cropPreview = false,
 ): Promise<RenderedFrame | null> {
   const requestId = ++renderRequestSeq;
   const buf = await invoke<ArrayBuffer>("develop_render", {
@@ -1037,6 +1042,7 @@ export async function developRender(
     outW,
     outH,
     overlayMaskIndex,
+    cropPreview,
     requestId,
   });
   if (buf.byteLength === 0) return null; // superseded
@@ -1112,8 +1118,9 @@ export function exportImage(
   params: DevelopParams,
   format: "png" | "jpeg",
   dest: string,
+  quality?: number,
 ): Promise<void> {
-  return invoke<void>("export_image", { imageId, params, format, dest });
+  return invoke<void>("export_image", { imageId, params, format, dest, quality });
 }
 
 // ── Presets + copy/paste settings ────────────────────────────────────────────

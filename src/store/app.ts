@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ImageRow } from "../lib/ipc";
+import type { ExportTarget } from "../lib/export";
 
 interface AppState {
   view: "library" | "develop" | "dedup";
@@ -31,6 +32,9 @@ interface AppState {
   setToast: (t: string | null) => void;
   gridMode: "grid" | "loupe";
   setGridMode: (m: "grid" | "loupe") => void;
+  /** Images queued in the Export modal; null = modal closed. */
+  exportTargets: ExportTarget[] | null;
+  setExportTargets: (t: ExportTarget[] | null) => void;
   // Library action callbacks registered by LibraryView
   onImport: (() => void) | null;
   setOnImport: (fn: (() => void) | null) => void;
@@ -82,6 +86,8 @@ export const useAppStore = create<AppState>((set) => ({
   setToast: (t) => set({ toast: t }),
   gridMode: "grid",
   setGridMode: (m) => set({ gridMode: m }),
+  exportTargets: null,
+  setExportTargets: (t) => set({ exportTargets: t }),
   onImport: null,
   setOnImport: (fn) => set({ onImport: fn }),
   onOpenSettings: null,

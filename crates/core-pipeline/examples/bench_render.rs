@@ -221,6 +221,7 @@ fn main() -> anyhow::Result<()> {
         overlay_layer: -1,
         overlay_color: [0.85, 0.10, 0.10],
         overlay_strength: 0.5,
+        crop_preview: false,
     };
     println!("\ncache-cold viewport r+rb (mask geometry changes every render):");
     for n in [1usize, 3, 8] {

@@ -134,6 +134,17 @@ export default function DevelopView() {
     h: selectedRow?.height ?? 2,
   };
 
+  // Publish the DISPLAYED-frame aspect so the crop tool's ratio presets can size hw/hh (useDevelop
+  // resets it to 0 on image switch; this re-sets it once the row's real dims are known). 90°
+  // rotation swaps W↔H. Without this the presets are gated off and silently do nothing.
+  const setImageAspect = useDevelopStore((s) => s.setImageAspect);
+  const rot90 = params.crop.rot90;
+  useEffect(() => {
+    if (!dimsKnown) return;
+    const odd = (((rot90 % 4) + 4) % 4) % 2 === 1;
+    setImageAspect(odd ? natural.h / natural.w : natural.w / natural.h);
+  }, [dimsKnown, natural.w, natural.h, rot90, setImageAspect]);
+
   // Suppress GPU renders until the row's real dims are known (no wrong-aspect frame). Read through
   // a ref so the gated callback stays referentially stable for Stage.
   const dimsKnownRef = useRef(dimsKnown);

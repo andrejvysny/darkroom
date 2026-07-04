@@ -224,6 +224,7 @@ fn crop_selects_region() {
         hw: 0.25,
         hh: 0.5,
         angle: 0.0,
+        rot90: 0,
     });
     let left = center(core_pipeline::Crop {
         cx: 0.25,
@@ -231,6 +232,7 @@ fn crop_selects_region() {
         hw: 0.25,
         hh: 0.5,
         angle: 0.0,
+        rot90: 0,
     });
     assert!(
         right > left + 20,
@@ -585,7 +587,10 @@ fn presence_clarity_texture_noop_on_flat() {
             },
         )
         .unwrap();
-    assert_eq!(base, presence, "clarity/texture must not touch a flat image");
+    assert_eq!(
+        base, presence,
+        "clarity/texture must not touch a flat image"
+    );
 }
 
 #[test]
@@ -641,7 +646,10 @@ fn dehaze_darkens_and_contrasts_flat_midtone() {
     // Dehaze pulls the local black point down (veiling removal) — visible even on a flat midtone.
     let flat = solid(32, 32, [0.4, 0.4, 0.4]);
     let pf = pipe.prepare(&ctx, &flat).unwrap();
-    let base = mean_channel(&pipe.render(&ctx, &pf, &DevelopParams::default()).unwrap(), 0);
+    let base = mean_channel(
+        &pipe.render(&ctx, &pf, &DevelopParams::default()).unwrap(),
+        0,
+    );
     let dehazed = mean_channel(
         &pipe
             .render(

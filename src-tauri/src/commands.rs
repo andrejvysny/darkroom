@@ -878,6 +878,7 @@ pub async fn develop_render(
     out_w: u32,
     out_h: u32,
     overlay_mask_index: i32,
+    crop_preview: bool,
     request_id: u64,
 ) -> Result<tauri::ipc::Response, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -914,6 +915,7 @@ pub async fn develop_render(
             overlay_layer: packed_overlay_layer(&params, overlay_mask_index),
             overlay_color: [0.85, 0.10, 0.10],
             overlay_strength: 0.5,
+            crop_preview,
         };
 
         let have_full = {
@@ -1013,6 +1015,7 @@ pub async fn develop_histogram(
             overlay_layer: -1,
             overlay_color: [0.0, 0.0, 0.0],
             overlay_strength: 0.0,
+            crop_preview: false,
         };
         // Order guard: two overlapping histogram calls (rapid slider + before/after) can finish out
         // of order; only the newest may store/emit.
@@ -1073,7 +1076,10 @@ pub async fn export_image(
     mut params: DevelopParams,
     format: String,
     dest: String,
+    quality: Option<u8>,
 ) -> Result<(), String> {
+    // JPEG encoder quality (1..=100); default 92 when unset. Ignored for PNG.
+    let quality = quality.unwrap_or(92).clamp(1, 100);
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let gpu = st
@@ -1117,7 +1123,7 @@ pub async fn export_image(
 
         let bytes = match format.to_lowercase().as_str() {
             "png" => core_pipeline::rgba8_to_png(&rgba, cw, ch),
-            "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, cw, ch, 92),
+            "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, cw, ch, quality),
             other => return Err(format!("unsupported export format: {other}")),
         }
         .map_err(|e| e.to_string())?;
@@ -1131,7 +1137,9 @@ pub async fn export_image(
                 image_id: Some(image_id),
                 process_version: Some(PROCESS_VERSION),
                 params_after: serde_json::to_string(&params).ok(),
-                context: Some(serde_json::json!({ "format": format }).to_string()),
+                context: Some(
+                    serde_json::json!({ "format": format, "quality": quality }).to_string(),
+                ),
                 ..Default::default()
             },
         );

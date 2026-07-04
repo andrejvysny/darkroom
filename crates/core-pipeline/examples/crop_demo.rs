@@ -59,6 +59,7 @@ fn main() -> anyhow::Result<()> {
         hw: if k >= 1.0 { 0.5 } else { 0.5 * k },
         hh: if k >= 1.0 { 0.5 / k } else { 0.5 },
         angle: 3.0,
+        rot90: 0,
     };
     let params = DevelopParams {
         crop,

@@ -135,8 +135,19 @@ export function useDevelop() {
       try {
         const st = useDevelopStore.getState();
         const p = st.showBefore ? freshDefaults() : st.params;
-        // Crop mode: render full frame so crop overlay maps 1:1
-        const rp = st.cropMode ? { ...p, crop: { ...DEFAULT_CROP } } : p;
+        // Crop mode: render the FULL frame (so the overlay maps 1:1) but keep the straighten angle +
+        // 90° rotation so the whole image visibly rotates under the crop box (Lightroom-style). The
+        // cropPreview flag forces auto-zoom off + dims the exposed corners.
+        const rp = st.cropMode
+          ? {
+              ...p,
+              crop: {
+                ...DEFAULT_CROP,
+                angle: p.crop.angle,
+                rot90: p.crop.rot90,
+              },
+            }
+          : p;
 
         const overlayIdx =
           st.maskOverlayVisible && st.selectedMaskIndex !== null
@@ -150,6 +161,7 @@ export function useDevelop() {
           derived.outW,
           derived.outH,
           overlayIdx,
+          st.cropMode,
         );
         if (seq !== renderSeq.current) return null; // superseded
         if (frame) {

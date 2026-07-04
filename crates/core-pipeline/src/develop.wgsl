@@ -455,6 +455,16 @@ struct GeomResult {
   inside: bool,       // false ⇒ this output pixel is letterbox (outside the cropped frame)
 };
 
+// Permute a DISPLAYED-frame UV back to the un-rotated source UV for `q` clockwise quarter-turns.
+// Mirrors params.rs `rot90_uv`. q0:(x,y) q1:(y,1-x) q2:(1-x,1-y) q3:(1-y,x).
+fn rot90_uv(q: f32, e: vec2<f32>) -> vec2<f32> {
+  let qi = i32(round(q)) % 4;
+  if (qi == 1) { return vec2<f32>(e.y, 1.0 - e.x); }
+  if (qi == 2) { return vec2<f32>(1.0 - e.x, 1.0 - e.y); }
+  if (qi == 3) { return vec2<f32>(1.0 - e.y, e.x); }
+  return e;
+}
+
 // Map a fullscreen output uv → (crop-local u, source uv). Letterbox-fits the crop into the output
 // frame (preserve aspect) for preview; for export out_aspect == crop aspect so it fills. Rotation is
 // in pixel space (rotating normalized uv would shear a non-square image).
@@ -492,7 +502,8 @@ fn geom_resolve(out_uv: vec2<f32>) -> GeomResult {
   let dpx = vec2<f32>(d.x * src_aspect, d.y);
   let rot = vec2<f32>(ct * dpx.x + st * dpx.y, -st * dpx.x + ct * dpx.y); // inverse rotation R(-θ)
   let disp = vec2<f32>(rot.x / src_aspect / z, rot.y / z);
-  r.src_uv = vec2<f32>(GEO.crop.x, GEO.crop.y) + disp;
+  // Displayed-frame UV, then permute back to the source for the 90° rotation.
+  r.src_uv = rot90_uv(GEO.aspect.w, vec2<f32>(GEO.crop.x, GEO.crop.y) + disp);
   r.inside = true;
   return r;
 }
@@ -518,13 +529,19 @@ fn crop_to_source(cuv: vec2<f32>) -> GeomResult {
   let hh = GEO.crop.w;
   let ct = GEO.rot.x;
   let st = GEO.rot.y;
-  let z = GEO.rot.z;
+  // Crop-tool preview forces auto-zoom off so the whole straightened/rotated frame is visible and
+  // the overlay maps 1:1; the empty corners it exposes are dimmed below.
+  let crop_preview = VIEW.flags.w > 0.5;
+  let z = select(GEO.rot.z, 1.0, crop_preview);
   let d = vec2<f32>((2.0 * cuv.x - 1.0) * hw, (2.0 * cuv.y - 1.0) * hh);
   let dpx = vec2<f32>(d.x * src_aspect, d.y);
   let rot = vec2<f32>(ct * dpx.x + st * dpx.y, -st * dpx.x + ct * dpx.y); // inverse rotation R(-θ)
   let disp = vec2<f32>(rot.x / src_aspect / z, rot.y / z);
-  r.src_uv = vec2<f32>(GEO.crop.x, GEO.crop.y) + disp;
-  r.inside = true;
+  // Displayed-frame UV, then permute back to the source for the 90° rotation.
+  let s = rot90_uv(GEO.aspect.w, vec2<f32>(GEO.crop.x, GEO.crop.y) + disp);
+  r.src_uv = s;
+  // In the crop preview, source samples outside the image are the rotated frame's empty corners.
+  r.inside = !(crop_preview && (s.x < 0.0 || s.x > 1.0 || s.y < 0.0 || s.y > 1.0));
   return r;
 }
 

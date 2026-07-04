@@ -1,80 +1,133 @@
-import { save, open } from "@tauri-apps/plugin-dialog";
-import { developGetEdit, exportImage } from "./ipc";
+import { developGetEdit, exportImage, type ImageRow } from "./ipc";
 import { useAppStore } from "../store/app";
 
-/**
- * Export a single image: load its saved develop params, prompt for a destination,
- * render full-resolution on the GPU, and write PNG/JPEG (inferred from the chosen extension).
- */
-export async function runExport(
-  imageId: number | null,
-  filename?: string,
-): Promise<void> {
-  if (imageId == null) {
-    useAppStore.getState().setToast("Select a photo to export");
-    return;
-  }
-  const setToast = useAppStore.getState().setToast;
-  try {
-    const params = await developGetEdit(imageId);
-    const base = (filename ?? `image-${imageId}`).replace(/\.[^.]+$/, "");
-    const dest = await save({
-      defaultPath: `${base}.jpg`,
-      filters: [
-        { name: "JPEG", extensions: ["jpg", "jpeg"] },
-        { name: "PNG", extensions: ["png"] },
-      ],
-    });
-    if (!dest) return;
-    const format: "png" | "jpeg" = dest.toLowerCase().endsWith(".png")
-      ? "png"
-      : "jpeg";
-    setToast("Exporting…");
-    await exportImage(imageId, params, format, dest);
-    setToast(`Exported → ${dest.split("/").pop()}`);
-  } catch (err) {
-    setToast(`Export failed: ${String(err)}`);
-  }
+/** One image queued for export. `captureDate`/`importedAt` feed the `{date}` token. */
+export interface ExportTarget {
+  id: number;
+  filename: string;
+  captureDate: number | null;
+  importedAt: number;
+}
+
+export type ExportFormat = "jpeg" | "png";
+
+export interface ExportOptions {
+  /** Destination folder (absolute). */
+  dir: string;
+  /** Filename template with {original} {date} {seq} tokens (no extension). */
+  template: string;
+  format: ExportFormat;
+  /** JPEG quality 1..100 (ignored for PNG). */
+  quality: number;
+}
+
+export function toExportTarget(row: ImageRow): ExportTarget {
+  return {
+    id: row.id,
+    filename: row.filename,
+    captureDate: row.captureDate,
+    importedAt: row.importedAt,
+  };
 }
 
 /**
- * Batch-export several images as full-resolution JPEGs into a chosen folder, named after each
- * original file. Each runs through its saved develop params on the GPU.
+ * Open the Export modal for the given image ids (resolved against the shared library set). Used by
+ * the TopBar button, command palette, ⌘⇧E and the Library selection bar. No-op toast if none resolve.
  */
-export async function runBatchExport(
-  items: { id: number; filename: string }[],
+export function openExport(ids: number[]): void {
+  const st = useAppStore.getState();
+  const byId = new Map(st.libraryImages.map((r) => [r.id, r]));
+  const targets = ids
+    .map((id) => byId.get(id))
+    .filter((r): r is ImageRow => r != null)
+    .map(toExportTarget);
+  if (targets.length === 0) {
+    st.setToast("Select a photo to export");
+    return;
+  }
+  st.setExportTargets(targets);
+}
+
+/** epoch seconds → local `YYYY-MM-DD`. */
+function ymd(epochSec: number): string {
+  const d = new Date(epochSec * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// Characters illegal in a filename on macOS/Windows → replaced with '_'.
+const ILLEGAL = /[/\\:*?"<>|]/g;
+
+/**
+ * Resolve a filename template against one image's tokens, returning the base name (no extension),
+ * sanitized. `{original}` = source basename sans ext, `{date}` = YYYY-MM-DD, `{seq}` = 1-based
+ * zero-padded index.
+ */
+export function applyTemplate(
+  template: string,
+  vars: { original: string; dateStr: string; seq: number },
+): string {
+  const base = vars.original.replace(/\.[^.]+$/, "");
+  const out = template
+    .replace(/\{original\}/g, base)
+    .replace(/\{date\}/g, vars.dateStr)
+    .replace(/\{seq\}/g, String(vars.seq).padStart(3, "0"))
+    .replace(ILLEGAL, "_")
+    .trim();
+  return out || base || "image";
+}
+
+/** The base name a target resolves to under `template` at position `seq` (1-based). For live preview. */
+export function previewName(
+  target: ExportTarget,
+  template: string,
+  seq: number,
+): string {
+  return applyTemplate(template, {
+    original: target.filename,
+    dateStr: ymd(target.captureDate ?? target.importedAt),
+    seq,
+  });
+}
+
+/**
+ * Export a batch of images (1 or many) to `opts.dir` using their saved develop params. Names come
+ * from the template; collisions are de-duplicated case-insensitively (macOS APFS default) with a
+ * `-N` suffix. Toasts progress + result.
+ */
+export async function runExportBatch(
+  targets: ExportTarget[],
+  opts: ExportOptions,
 ): Promise<void> {
   const setToast = useAppStore.getState().setToast;
-  if (items.length === 0) {
+  if (targets.length === 0) {
     setToast("Select photos to export");
     return;
   }
-  const dir = await open({ directory: true, title: "Export selected to folder" });
-  if (!dir) return;
-
+  const ext = opts.format === "png" ? "png" : "jpg";
+  const used = new Set<string>();
   let done = 0;
   let failed = 0;
-  // De-duplicate destination basenames so two sources sharing a name (common across cards)
-  // don't silently clobber each other. Compare case-insensitively (macOS APFS default).
-  const used = new Set<string>();
-  for (const { id, filename } of items) {
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
     try {
-      const params = await developGetEdit(id);
-      const base = filename.replace(/\.[^.]+$/, "");
-      let name = base;
-      for (let n = 1; used.has(name.toLowerCase()); n++) name = `${base}-${n}`;
-      used.add(name.toLowerCase());
-      const dest = `${dir}/${name}.jpg`;
-      await exportImage(id, params, "jpeg", dest);
+      const params = await developGetEdit(t.id);
+      const name = previewName(t, opts.template, i + 1);
+      let unique = name;
+      for (let n = 1; used.has(unique.toLowerCase()); n++) unique = `${name}-${n}`;
+      used.add(unique.toLowerCase());
+      const dest = `${opts.dir}/${unique}.${ext}`;
+      await exportImage(t.id, params, opts.format, dest, opts.quality);
       done += 1;
     } catch {
       failed += 1;
     }
-    setToast(`Exporting ${done + failed} / ${items.length}…`);
+    setToast(`Exporting ${done + failed} / ${targets.length}…`);
   }
+  const where = opts.dir.split("/").pop();
   setToast(
     failed > 0
-      ? `Exported ${done}, ${failed} failed → ${String(dir).split("/").pop()}`
-      : `Exported ${done} → ${String(dir).split("/").pop()}`,
+      ? `Exported ${done}, ${failed} failed → ${where}`
+      : `Exported ${done} → ${where}`,
   );
 }

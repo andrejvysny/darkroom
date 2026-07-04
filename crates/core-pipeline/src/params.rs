@@ -183,6 +183,11 @@ pub struct Crop {
     pub hw: f32,
     pub hh: f32,
     pub angle: f32,
+    /// Whole-image 90° rotation, in clockwise quarter-turns (0..3). Applied as the OUTERMOST
+    /// transform: the crop rect (`cx,cy,hw,hh`) and straighten `angle` are defined in the ROTATED
+    /// (displayed) frame; the shader permutes the resolved UV back to the un-rotated source.
+    #[serde(default)]
+    pub rot90: i32,
 }
 
 impl Default for Crop {
@@ -193,6 +198,7 @@ impl Default for Crop {
             hw: 0.5,
             hh: 0.5,
             angle: 0.0,
+            rot90: 0,
         }
     }
 }
@@ -200,7 +206,26 @@ impl Default for Crop {
 impl Crop {
     /// True when the crop is the full frame with no rotation (shader takes the identity fast-path).
     pub fn is_identity(&self) -> bool {
-        self.cx == 0.5 && self.cy == 0.5 && self.hw >= 0.5 && self.hh >= 0.5 && self.angle == 0.0
+        self.cx == 0.5
+            && self.cy == 0.5
+            && self.hw >= 0.5
+            && self.hh >= 0.5
+            && self.angle == 0.0
+            && self.rot_q() == 0
+    }
+
+    /// Normalized quarter-turn count 0..3 (handles negative / out-of-range `rot90`).
+    pub fn rot_q(&self) -> i32 {
+        self.rot90.rem_euclid(4)
+    }
+
+    /// The DISPLAYED-frame aspect (W/H) given the source aspect: odd quarter-turns swap W↔H.
+    pub fn eff_aspect(&self, src_aspect: f32) -> f32 {
+        if self.rot_q() % 2 == 1 {
+            1.0 / src_aspect
+        } else {
+            src_aspect
+        }
     }
 
     /// The cropped content's pixel rect `(x, y, w, h)` within an input-sized (`w`×`h`) render. The
@@ -213,7 +238,9 @@ impl Crop {
             return (0, 0, w, h);
         }
         let src_aspect = w as f32 / h as f32;
-        let ac = (self.hw / self.hh) * src_aspect;
+        // Crop pixel-aspect is measured in the DISPLAYED (rot90) frame, then letterboxed into the
+        // source-sized render (out_aspect == src_aspect), so a 90° rotation swaps the content rect.
+        let ac = (self.hw / self.hh) * self.eff_aspect(src_aspect);
         let (cwf, chf) = if src_aspect > ac {
             (ac / src_aspect, 1.0)
         } else {
@@ -863,27 +890,42 @@ mod acr_fit_tests {
 /// Auto-zoom factor (≥1) that keeps the rotated crop rectangle fully inside the source [0,1]², so a
 /// straighten never samples past the image edge. Closed form from the Codex review.
 pub fn geom_autozoom(c: &Crop, src_aspect: f32) -> f32 {
+    let eff = c.eff_aspect(src_aspect);
     let theta = c.angle.to_radians();
     let (ct, st) = (theta.cos().abs(), theta.sin().abs());
     // Max normalized displacement of the rotated footprint (hh·H/W = hh/aspect; hw·W/H = hw·aspect).
-    let ax = ct * c.hw + st * c.hh / src_aspect;
-    let ay = st * c.hw * src_aspect + ct * c.hh;
+    let ax = ct * c.hw + st * c.hh / eff;
+    let ay = st * c.hw * eff + ct * c.hh;
     let mx = c.cx.min(1.0 - c.cx).max(1e-6);
     let my = c.cy.min(1.0 - c.cy).max(1e-6);
     1.0_f32.max(ax / mx).max(ay / my)
 }
 
-/// Map a crop-local output UV `u` ∈ [0,1]² to a source UV (inverse rotation about the crop center,
-/// pixel-space, then auto-zoom). Mirrors `geom_resolve` in develop.wgsl. `z` = `geom_autozoom`.
+/// Permute a DISPLAYED-frame UV back to the un-rotated source UV for `q` clockwise quarter-turns.
+/// q0: (x,y); q1(90° CW): (y, 1−x); q2(180°): (1−x, 1−y); q3(270° CW): (1−y, x).
+pub fn rot90_uv(q: i32, e: [f32; 2]) -> [f32; 2] {
+    match q.rem_euclid(4) {
+        1 => [e[1], 1.0 - e[0]],
+        2 => [1.0 - e[0], 1.0 - e[1]],
+        3 => [1.0 - e[1], e[0]],
+        _ => e,
+    }
+}
+
+/// Map a crop-local output UV `u` ∈ [0,1]² to a source UV: inverse straighten (about the crop
+/// center, pixel-space) + auto-zoom in the DISPLAYED frame, then the 90° permutation back to the
+/// source. Mirrors `geom_resolve` / `crop_to_source` in develop.wgsl. `z` = `geom_autozoom`.
 pub fn geom_src_uv(c: &Crop, src_aspect: f32, z: f32, u: [f32; 2]) -> [f32; 2] {
+    let eff = c.eff_aspect(src_aspect);
     let theta = c.angle.to_radians();
     let (ct, st) = (theta.cos(), theta.sin());
     let d = [(2.0 * u[0] - 1.0) * c.hw, (2.0 * u[1] - 1.0) * c.hh];
-    let dpx = [d[0] * src_aspect, d[1]];
+    let dpx = [d[0] * eff, d[1]];
     // Inverse rotation R(-θ) in pixel space.
     let r = [ct * dpx[0] + st * dpx[1], -st * dpx[0] + ct * dpx[1]];
-    let disp = [r[0] / src_aspect / z, r[1] / z];
-    [c.cx + disp[0], c.cy + disp[1]]
+    let disp = [r[0] / eff / z, r[1] / z];
+    // Displayed-frame UV, then permute back to the source for the 90° rotation.
+    rot90_uv(c.rot_q(), [c.cx + disp[0], c.cy + disp[1]])
 }
 
 /// Apply the radial lens-distortion remap to a source UV about the image center (0.5, 0.5), in
@@ -1044,14 +1086,15 @@ impl DevelopParams {
                 geom_autozoom(c, src_aspect),
                 if c.is_identity() { 0.0 } else { 1.0 },
             ],
+            // aspect.x = DISPLAYED-frame aspect (rot90 swaps W↔H); aspect.w = quarter-turn count.
             // aspect.z = lens-correction active flag (independent of crop/straighten in rot.w). At
             // defaults it is 0.0 so `lens_sample` in the shader falls through to a plain bilinear
             // fetch, keeping the render byte-identical to a pre-lens build.
             aspect: [
-                src_aspect,
+                c.eff_aspect(src_aspect),
                 out_aspect,
                 if self.lens_is_active() { 1.0 } else { 0.0 },
-                0.0,
+                c.rot_q() as f32,
             ],
             lens: self.lens_coeffs(),
         }
@@ -1227,7 +1270,7 @@ impl Default for GeomUniform {
 /// Viewport + mask-overlay uniform (`@binding(13)`). std140-clean: three `vec4` (48 bytes).
 /// `rect`  = (origin.x, origin.y, size.x, size.y) — the visible window in **crop-local uv** [0,1]
 ///           (zoom/pan); `flags` = (active 0/1, overlay_layer as f32 (-1 = off), overlay_strength,
-///           _pad); `color` = (overlay r, g, b, _pad) in display sRGB.
+///           crop-preview 0/1); `color` = (overlay r, g, b, _pad) in display sRGB.
 ///
 /// `active = 0` (the `ViewParams::full` identity) makes the shader take the legacy `geom_resolve`
 /// path and leaves the overlay branch dead, so a full-frame render is **byte-identical** to one
@@ -1285,6 +1328,9 @@ pub struct ViewParams {
     pub overlay_layer: i32,
     pub overlay_color: [f32; 3],
     pub overlay_strength: f32,
+    /// Crop-tool preview: force auto-zoom off (show the whole straightened/rotated frame) and dim
+    /// the out-of-image corners, so the crop overlay maps 1:1 to the displayed frame.
+    pub crop_preview: bool,
 }
 
 impl ViewParams {
@@ -1300,6 +1346,7 @@ impl ViewParams {
             overlay_layer: -1,
             overlay_color: [0.85, 0.10, 0.10],
             overlay_strength: 0.5,
+            crop_preview: false,
         }
     }
 
@@ -1310,7 +1357,7 @@ impl ViewParams {
                 if self.active { 1.0 } else { 0.0 },
                 self.overlay_layer as f32,
                 self.overlay_strength,
-                0.0,
+                if self.crop_preview { 1.0 } else { 0.0 },
             ],
             color: [
                 self.overlay_color[0],
@@ -1497,6 +1544,7 @@ mod geom_tests {
             hw: 0.25,
             hh: 0.2,
             angle: 0.0,
+            rot90: 0,
         };
         let a = 2.0;
         let z = 1.0;
@@ -1527,6 +1575,7 @@ mod geom_tests {
             hw: 0.5,
             hh: 0.5 / ((16.0 / 9.0) / 1.5),
             angle: 0.0,
+            rot90: 0,
         };
         let (_x, y, w, h) = c.export_rect(3000, 2000);
         assert_eq!(w, 3000, "16:9 of 3:2 keeps full width");
@@ -1564,6 +1613,35 @@ mod geom_tests {
             touches,
             "at z_min at least one corner must touch the source edge"
         );
+    }
+
+    #[test]
+    fn rot90_permutation_maps_corners() {
+        // Displayed-frame corners permute to the un-rotated source per the CW quarter-turn table.
+        assert!(close(rot90_uv(1, [1.0, 0.0]), [0.0, 0.0], 1e-6));
+        assert!(close(rot90_uv(1, [0.0, 0.0]), [0.0, 1.0], 1e-6));
+        assert!(close(rot90_uv(2, [0.2, 0.3]), [0.8, 0.7], 1e-6));
+        assert!(close(rot90_uv(3, [1.0, 0.0]), [1.0, 1.0], 1e-6));
+        assert!(close(
+            rot90_uv(-1, [1.0, 0.0]),
+            rot90_uv(3, [1.0, 0.0]),
+            1e-6
+        ));
+    }
+
+    #[test]
+    fn rot90_identity_crop_rotates_whole_frame() {
+        // 90° CW on a full-frame identity crop: the displayed frame IS the source rotated, so a
+        // display point maps straight through the permutation (eff-aspect cancels at full extent).
+        let c = Crop {
+            rot90: 1,
+            ..Default::default()
+        };
+        let a = 2.0; // landscape source; displayed frame is portrait
+        assert!(!c.is_identity(), "a quarter-turn is not identity");
+        assert!(close(geom_src_uv(&c, a, 1.0, [0.5, 0.5]), [0.5, 0.5], 1e-6));
+        assert!(close(geom_src_uv(&c, a, 1.0, [1.0, 0.0]), [0.0, 0.0], 1e-6));
+        assert!(close(geom_src_uv(&c, a, 1.0, [0.0, 0.0]), [0.0, 1.0], 1e-6));
     }
 
     #[test]

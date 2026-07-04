@@ -5,6 +5,7 @@ import { useEditSync } from "./hooks/useEditSync";
 import { effectivePreviewEdge } from "./lib/ipc";
 import TopBar from "./components/TopBar";
 import CommandPalette from "./components/CommandPalette";
+import ExportModal from "./views/Export/ExportModal";
 import Toast from "./components/Toast";
 import LibraryView from "./views/Library/LibraryView";
 import DevelopView from "./views/Develop/DevelopView";
@@ -34,6 +35,7 @@ export default function App() {
       {view === "develop" && <DevelopView />}
       {view === "dedup" && <DedupView />}
       <CommandPalette />
+      <ExportModal />
       <Toast />
     </div>
   );
