@@ -12,6 +12,8 @@ import {
   developRender,
   developSession,
   developSetEdit,
+  denoiseApply,
+  denoiseClear,
   effectivePreviewEdge,
   maskAiEncode,
   maskAiPrompt,
@@ -34,6 +36,7 @@ import {
   type CbRgb,
   type ChannelMix,
   type Border,
+  type Denoise,
   DEFAULT_CROP,
 } from "../../lib/ipc";
 import type { DerivedView } from "../../lib/viewport";
@@ -444,6 +447,17 @@ export function useDevelop() {
       useDevelopStore.getState().clearHistory();
       // Re-render at current view (canvas may already have a lastDerived from the previous image).
       rerenderCurrent();
+      // Denoise buffers are in-memory only — if this image was left with denoise enabled, recompute
+      // it now so the canvas shows the denoised result (not the clean decode) on open.
+      if (p.denoise.enabled && p.denoise.amount > 0) {
+        useDevelopStore.getState().setDenoiseBusy(true);
+        void denoiseApply(id, p.denoise.amount)
+          .then(() => {
+            if (useAppStore.getState().selectedId === id) rerenderCurrent();
+          })
+          .catch((e) => log.warn("develop", `denoise on open failed: ${String(e)}`))
+          .finally(() => useDevelopStore.getState().setDenoiseBusy(false));
+      }
       try {
         const h = await developGetHistogram();
         if (!cancelled && h) setHistogram(h);
@@ -600,6 +614,38 @@ export function useDevelop() {
       commit(selectedId, { ...cur, border: { ...cur.border, ...patch } });
     },
     [selectedId, commit],
+  );
+
+  // Denoise is heavy + on-demand: persist the param (undoable) as usual, then drive the raw-domain
+  // compute over IPC. Enabling/changing amount runs `denoise_apply` (swaps the denoised source into the
+  // render cache, re-blending cached buffers on an amount change → no re-inference); disabling runs
+  // `denoise_clear`. Either way we re-render once the backend has updated the cache.
+  const onDenoiseChange = useCallback(
+    (patch: Partial<Denoise>) => {
+      if (selectedId === null) return;
+      const id = selectedId;
+      const cur = useDevelopStore.getState().params;
+      const next = { ...cur, denoise: { ...cur.denoise, ...patch } };
+      commit(id, next);
+      const d = next.denoise;
+      const stillCurrent = () => useAppStore.getState().selectedId === id;
+      if (d.enabled && d.amount > 0) {
+        useDevelopStore.getState().setDenoiseBusy(true);
+        void denoiseApply(id, d.amount)
+          .then(() => {
+            if (stillCurrent()) rerenderCurrent();
+          })
+          .catch((e) => log.warn("develop", `denoise failed: ${String(e)}`))
+          .finally(() => useDevelopStore.getState().setDenoiseBusy(false));
+      } else {
+        void denoiseClear(id)
+          .then(() => {
+            if (stillCurrent()) rerenderCurrent();
+          })
+          .catch((e) => log.warn("develop", `denoise clear failed: ${String(e)}`));
+      }
+    },
+    [selectedId, commit, rerenderCurrent],
   );
 
   // ── Mask operations ───────────────────────────────────────────────────────
@@ -889,6 +935,7 @@ export function useDevelop() {
     onColorBalanceChange,
     onChannelMixChange,
     onBorderChange,
+    onDenoiseChange,
     resetKeys,
     reset,
     applyDevelopParams,

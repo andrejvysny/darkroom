@@ -40,6 +40,7 @@ export default function DevelopView() {
     onColorBalanceChange,
     onChannelMixChange,
     onBorderChange,
+    onDenoiseChange,
     resetKeys,
     reset,
     applyDevelopParams,
@@ -294,6 +295,7 @@ export default function DevelopView() {
           onColorBalanceChange={onColorBalanceChange}
           onChannelMixChange={onChannelMixChange}
           onBorderChange={onBorderChange}
+          onDenoiseChange={onDenoiseChange}
           resetKeys={resetKeys}
           onReset={reset}
           onAddMask={addMask}

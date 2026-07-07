@@ -27,6 +27,7 @@ export const SCOPE_GROUPS: ScopeGroup[] = [
   { key: "channelMixer", label: "Channel Mixer", fields: ["channelMix"] },
   { key: "detail", label: "Detail", fields: ["sharpen", "nrLuma", "nrColor"] },
   { key: "presence", label: "Presence", fields: ["clarity", "texture", "dehaze"] },
+  { key: "denoise", label: "Denoise", fields: ["denoise"] },
   {
     key: "lens",
     label: "Lens",

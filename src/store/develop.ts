@@ -59,6 +59,9 @@ interface DevelopState {
   /** True while an AI (SAM) mask is downloading/encoding/segmenting — drives the Stage loader. */
   aiMaskBusy: boolean;
   setAiMaskBusy: (b: boolean) => void;
+  /** True while the on-demand denoise compute is running — drives the Denoise panel + Stage loader. */
+  denoiseBusy: boolean;
+  setDenoiseBusy: (b: boolean) => void;
   /** Current brush settings used when painting new strokes. */
   brush: BrushSettings;
   setBrush: (patch: Partial<BrushSettings>) => void;
@@ -131,6 +134,8 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setMaskOverlayVisible: (b) => set({ maskOverlayVisible: b }),
   aiMaskBusy: false,
   setAiMaskBusy: (b) => set({ aiMaskBusy: b }),
+  denoiseBusy: false,
+  setDenoiseBusy: (b) => set({ denoiseBusy: b }),
   brush: DEFAULT_BRUSH,
   setBrush: (patch) => set((s) => ({ brush: { ...s.brush, ...patch } })),
   pickingColor: false,

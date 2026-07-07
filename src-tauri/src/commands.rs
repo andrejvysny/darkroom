@@ -352,7 +352,7 @@ pub async fn develop_set_edit(
 
 /// Hard cap on the full-res texture's long edge — keeps it within the GPU max texture dimension
 /// (8192 on the wgpu defaults). A no-op for the validated EOS R7 (6960 px).
-const FULL_MAX_EDGE: u32 = 8192;
+pub(crate) const FULL_MAX_EDGE: u32 = 8192;
 
 /// Output edge for the whole-crop histogram render. Small + square: a histogram is invariant to the
 /// (anisotropic) resample, and `{0,0,1,1}` fills the whole output with the entire developed crop.
@@ -1104,7 +1104,13 @@ pub async fn export_image(
         params.display_referred = core_raw::is_display(Path::new(&path));
 
         let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-        let lin = core_raw::develop_linear(&src).map_err(|e| e.to_string())?;
+        // When denoise is enabled for this image, export from the full-res denoised source (raw-domain
+        // denoise + amount blend) instead of the plain develop.
+        let lin = if params.denoise.is_off() {
+            core_raw::develop_linear(&src).map_err(|e| e.to_string())?
+        } else {
+            crate::denoise::denoised_full(st.inner(), &src, params.denoise.amount)?
+        };
         // Full-res export needs a source-sized GPU texture — fail with a clear message instead of
         // an opaque pipeline error. (Tiled/downscaled export for oversized sources is a follow-up.)
         let max_edge = gpu.ctx.max_texture_dim;
@@ -2191,6 +2197,50 @@ pub fn analysis_cancel(app: AppHandle) {
     let st = app.state::<AppState>();
     if st.analysis_running.load(Ordering::SeqCst) {
         st.analysis_cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+// ---------- AI denoise ----------
+
+/// Denoise availability + running state (drives the Develop "Denoise" panel).
+#[tauri::command]
+pub async fn denoise_status(app: AppHandle) -> Result<crate::denoise::DenoiseStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        Ok(crate::denoise::status(&st))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Apply raw-domain denoise to `image_id` at `amount` (0..100), swapping the denoised source into the
+/// render cache. Re-blends cached buffers on an amount change (no re-inference). Emits
+/// `denoise:progress` / `denoise:done`; the frontend re-renders on `denoise:done`.
+#[tauri::command]
+pub async fn denoise_apply(app: AppHandle, image_id: i64, amount: f32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::denoise::apply(&app, image_id, amount))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Turn denoise off for `image_id`: drops cached buffers + evicts the denoised render caches so the
+/// next render re-decodes the clean image.
+#[tauri::command]
+pub async fn denoise_clear(app: AppHandle, image_id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        crate::denoise::clear(&st, image_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Request the running denoise compute to stop. No-op if idle.
+#[tauri::command]
+pub fn denoise_cancel(app: AppHandle) {
+    let st = app.state::<AppState>();
+    if st.denoise_running.load(Ordering::SeqCst) {
+        st.denoise_cancel.store(true, Ordering::SeqCst);
     }
 }
 

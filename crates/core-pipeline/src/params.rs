@@ -363,6 +363,11 @@ pub struct DevelopParams {
     /// GPU shader never sees — applied only by export + the develop-stage preview. No-op by default.
     #[serde(default)]
     pub border: Border,
+    /// AI raw-domain denoise (Lightroom "Denoise"). Applied on-demand to the raw mosaic BEFORE the
+    /// develop pipeline — NOT a GPU uniform; it selects which linear buffer (clean vs denoised) the
+    /// backend feeds to `prepare()`, and `amount` blends between them. No-op (disabled) by default.
+    #[serde(default)]
+    pub denoise: Denoise,
     /// `true` when the source is an already-developed **display-referred** image (JPEG/PNG): the
     /// scene-referred ACR base tone operator is bypassed so an unedited image round-trips to itself.
     /// Intrinsic to the image and derived by the backend from the file format at render time — it is
@@ -403,8 +408,42 @@ impl Default for DevelopParams {
             cb_rgb: CbRgb::default(),
             channel_mix: ChannelMix::default(),
             border: Border::default(),
+            denoise: Denoise::default(),
             display_referred: false,
         }
+    }
+}
+
+/// AI raw-domain denoise settings. `enabled` gates whether the backend renders from the denoised
+/// linear buffer; `amount` (0..100) blends the denoised result over the original (100 = full). The
+/// heavy inference runs once on demand and is cached — `amount` only re-blends two cached buffers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Denoise {
+    pub enabled: bool,
+    /// Blend amount, 0..100 of the denoised result over the original.
+    pub amount: f32,
+}
+
+impl Default for Denoise {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            amount: 50.0,
+        }
+    }
+}
+
+impl Denoise {
+    /// True when denoise contributes nothing (disabled or zero amount) — the backend then renders
+    /// from the clean linear buffer, skipping the denoise decode/inference entirely.
+    pub fn is_off(&self) -> bool {
+        !self.enabled || self.amount <= 0.0
+    }
+
+    /// Blend fraction in 0..1 (`amount/100`, clamped).
+    pub fn blend(&self) -> f32 {
+        (self.amount / 100.0).clamp(0.0, 1.0)
     }
 }
 

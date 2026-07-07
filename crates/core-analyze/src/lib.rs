@@ -9,6 +9,7 @@
 
 pub mod caption;
 pub mod coco;
+pub mod denoise;
 pub mod detector;
 pub mod error;
 pub mod face;

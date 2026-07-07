@@ -5,12 +5,16 @@ use core_db::Db;
 use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
+use core_raw::LinearImage;
 use std::collections::HashSet;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex};
 use tauri::{AppHandle, Manager, Runtime};
+
+/// Cached `(image_id, clean, denoised)` full-res linear buffers backing fast denoise amount re-blends.
+type DenoiseBuffers = (i64, Arc<LinearImage>, Arc<LinearImage>);
 
 /// GPU device + the compiled develop pipeline. Optional — the library works without a GPU.
 pub struct GpuRender {
@@ -35,6 +39,20 @@ pub struct AppState {
     /// Single half-resolution prepared image used for fast first paint on fit/whole-crop views,
     /// especially useful on Windows where full-res upload/readback is expensive.
     pub preview_render_cache: Mutex<Option<(i64, Arc<PreparedImage>)>>,
+    /// Cached full-res `(clean, denoised)` linear buffers for the currently-denoised image, so changing
+    /// the blend amount re-lerps (+ re-uploads) instead of re-running the seconds-long denoise. Single
+    /// entry (mirrors `full_render_cache`); cleared on image switch / `denoise_clear`. The applied
+    /// denoised `PreparedImage` is swapped straight into `full_render_cache`, so the render path is
+    /// unchanged — this only backs fast amount re-blends.
+    pub denoise_cache: Mutex<Option<DenoiseBuffers>>,
+    /// Lazily-built PMRID neural denoiser (its ort Session is reused across applies). `None` until the
+    /// first denoise; stays `None` on builds without the embedded model (→ `CpuDenoiser` fallback).
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub denoiser: Mutex<Option<Arc<core_analyze::denoise::PmridDenoiser>>>,
+    /// Guards against two denoise computes running at once.
+    pub denoise_running: AtomicBool,
+    /// Set by `denoise_cancel` to abort the running compute (checked between phases).
+    pub denoise_cancel: AtomicBool,
     /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
     /// newer request has already superseded it.
     pub latest_render: AtomicU64,
@@ -176,6 +194,11 @@ impl AppState {
             thumb_queue: ThumbQueue::new(),
             full_render_cache: Mutex::new(None),
             preview_render_cache: Mutex::new(None),
+            denoise_cache: Mutex::new(None),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            denoiser: Mutex::new(None),
+            denoise_running: AtomicBool::new(false),
+            denoise_cancel: AtomicBool::new(false),
             latest_render: AtomicU64::new(0),
             hist_seq: AtomicU64::new(0),
             current_image: AtomicI64::new(-1),

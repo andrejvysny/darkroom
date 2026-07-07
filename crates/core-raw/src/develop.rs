@@ -21,7 +21,7 @@ use rawler::imgop::sensor::bayer::superpixel::Superpixel3Channel;
 use rawler::imgop::sensor::bayer::Demosaic;
 use rawler::imgop::xyz::{Illuminant, XYZ_TO_PROFOTORGB_D50};
 use rawler::pixarray::{Color2D, PixF32, RgbF32};
-use rawler::rawimage::RawPhotometricInterpretation;
+use rawler::rawimage::{RawImageData, RawPhotometricInterpretation};
 use rawler::rawsource::RawSource;
 use rawler::RawImage;
 
@@ -145,6 +145,130 @@ pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
         .and_then(|md| md.exif.orientation);
     let raw = decoder.raw_image(src, &params, false).map_err(de)?;
     Ok(develop_linear_from(&raw)?.oriented(orientation))
+}
+
+/// Plain-typed view of a decoded Bayer mosaic handed to a [`MosaicDenoiser`]. Carries everything a
+/// raw-domain (pre-demosaic) denoiser needs — the mosaic samples, per-CFA-position black/white
+/// levels, the CFA phase pattern, and capture ISO — WITHOUT exposing any rawler type, so the
+/// ort-based denoiser can live in `core-analyze` while every rawler call stays in this crate.
+pub struct MosaicInfo<'a> {
+    /// `width * height` single-channel (cpp=1) mosaic samples, in the raw sensor domain (black
+    /// level NOT yet subtracted — `black`/`white` describe that domain).
+    pub data: &'a [u16],
+    pub width: usize,
+    pub height: usize,
+    /// Black levels per CFA tile position, sensor scan order (see `cfa_pattern`).
+    pub black: [f32; 4],
+    /// White (saturation) levels per CFA tile position.
+    pub white: [f32; 4],
+    /// CFA tile dimensions (2×2 for standard Bayer).
+    pub cfa_width: usize,
+    pub cfa_height: usize,
+    /// Row-major CFA color index per tile position (0=R, 1=G, 2=B), length `cfa_width * cfa_height`.
+    pub cfa_pattern: Vec<u8>,
+    /// Capture ISO for noise-level conditioning, if the file reported one.
+    pub iso: Option<u32>,
+}
+
+/// A raw-domain (Bayer mosaic) denoiser. Implemented in `core-analyze` over ONNX Runtime and passed
+/// in as a trait object, so `core-raw` (and its pinned rawler dependency) never links `ort`.
+pub trait MosaicDenoiser {
+    /// Denoise the mosaic in `info`, returning a NEW buffer of the SAME length and layout
+    /// (`info.width * info.height`, cpp=1, identical CFA phase, same raw-value domain). A returned
+    /// buffer of the wrong length is treated as a failure and the denoise is skipped.
+    fn denoise(&self, info: &MosaicInfo) -> Vec<u16>;
+}
+
+/// Result of [`develop_linear_denoised`]: the ordinary clean develop, plus — only for supported RGB
+/// Bayer sensors — the denoised develop. `denoised` is `None` for X-Trans / 4-colour / monochrome /
+/// linear-raw / float-encoded / display images (the caller falls back to `clean`).
+pub struct DenoiseOutput {
+    pub clean: LinearImage,
+    pub denoised: Option<LinearImage>,
+}
+
+/// Decode ONCE, then produce both the clean linear develop and — for supported RGB Bayer sensors — a
+/// denoised develop. The denoised path runs `denoiser` over the raw mosaic, writes the result back
+/// into the sensor buffer, and re-develops through the **unchanged** color pipeline (`develop_linear_from`):
+/// only the mosaic samples differ, so demosaic, white-balance, camera→ProPhoto matrix, and every GPU
+/// binding downstream are byte-for-byte the normal path. Both outputs are EXIF-uprighted.
+pub fn develop_linear_denoised(
+    src: &RawSource,
+    denoiser: &dyn MosaicDenoiser,
+) -> Result<DenoiseOutput, RawError> {
+    // Already-developed display images have no mosaic; return the clean decode only.
+    if crate::display::is_display(src.path()) {
+        return Ok(DenoiseOutput {
+            clean: develop_linear(src)?,
+            denoised: None,
+        });
+    }
+    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let params = RawDecodeParams::default();
+    let md = decoder.raw_metadata(src, &params).ok();
+    // `RawImage.orientation` is hardcoded Normal in rawler 0.7.2 — take it from EXIF (as elsewhere).
+    let orientation = md.as_ref().and_then(|m| m.exif.orientation);
+    let iso = md.as_ref().and_then(|m| {
+        m.exif
+            .iso_speed_ratings
+            .map(|v| v as u32)
+            .or(m.exif.iso_speed)
+    });
+    let mut raw = decoder.raw_image(src, &params, false).map_err(de)?;
+
+    // Clean develop FIRST — the denoised path mutates the mosaic in place below.
+    let clean = develop_linear_from(&raw)?.oriented(orientation);
+
+    // Raw-domain denoise is only defined for standard RGB Bayer CFA with integer (cpp=1) samples.
+    // Everything else (X-Trans, 4-colour, monochrome, linear-raw, float DNG) falls back to clean.
+    let cfa = match &raw.photometric {
+        RawPhotometricInterpretation::Cfa(c) if c.cfa.is_rgb() && !raw.is_monochrome() => {
+            c.cfa.clone()
+        }
+        _ => {
+            return Ok(DenoiseOutput {
+                clean,
+                denoised: None,
+            })
+        }
+    };
+    if raw.cpp != 1 || !matches!(raw.data, RawImageData::Integer(_)) {
+        return Ok(DenoiseOutput {
+            clean,
+            denoised: None,
+        });
+    }
+
+    // Scope the immutable mosaic borrow so it ends before the write-back below.
+    let denoised_mosaic = {
+        let info = MosaicInfo {
+            data: raw.pixels_u16(),
+            width: raw.width,
+            height: raw.height,
+            black: raw.blacklevel.as_bayer_array(),
+            white: raw.whitelevel.as_bayer_array(),
+            cfa_width: cfa.width,
+            cfa_height: cfa.height,
+            cfa_pattern: cfa.flat_pattern(),
+            iso,
+        };
+        denoiser.denoise(&info)
+    };
+
+    // A denoiser returning the wrong length would panic in `copy_from_slice`; guard → fall back.
+    if denoised_mosaic.len() != raw.pixels_u16().len() {
+        return Ok(DenoiseOutput {
+            clean,
+            denoised: None,
+        });
+    }
+    raw.pixels_u16_mut().copy_from_slice(&denoised_mosaic);
+    let denoised = develop_linear_from(&raw)?.oriented(orientation);
+
+    Ok(DenoiseOutput {
+        clean,
+        denoised: Some(denoised),
+    })
 }
 
 /// As-shot white-balance coefficients `[r, g, b, g2]` from the camera (neutral `[1;4]` if absent).

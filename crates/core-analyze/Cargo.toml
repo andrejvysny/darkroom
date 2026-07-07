@@ -27,6 +27,10 @@ fs4 = "0.13"
 nalgebra = "0.33"
 # Affine warp of the aligned 112x112 face crop (image-0.25 compatible).
 imageproc = "0.25"
+# Raw-domain denoise: the `MosaicDenoiser` trait + `MosaicInfo` seam live in core-raw (which owns all
+# rawler access); core-analyze implements the trait over ort. One-directional dep (core-raw never
+# links core-analyze), so no cycle.
+core-raw = { path = "../core-raw" }
 
 # Accelerated execution providers, selected per platform (Cargo unions features for the same
 # crate across these tables). CoreML (ANE/GPU) on Apple Silicon; DirectML (any DX12 GPU) on
@@ -42,7 +46,6 @@ ort = { version = "=2.0.0-rc.12", features = ["directml"] }
 anyhow = "1"
 # Eval/tuning harnesses resolve the app-data dir cross-platform (matches Tauri's app_data_dir).
 dirs = "5"
-core-raw = { path = "../core-raw" }
 # Label-driven eval/tuning harnesses read the catalog directly. core-db re-exports the shared rusqlite.
 core-db = { path = "../core-db" }
 core-library = { path = "../core-library" }

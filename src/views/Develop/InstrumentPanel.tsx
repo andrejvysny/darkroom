@@ -6,6 +6,7 @@ import ColorMixer from "./ColorMixer";
 import ColorBalance from "./ColorBalance";
 import ChannelMixer from "./ChannelMixer";
 import Border from "./Border";
+import DenoisePanel from "./Denoise";
 import MaskPanel from "./MaskPanel";
 import Icon from "../../components/Icon";
 import { useDevelopStore } from "../../store/develop";
@@ -23,6 +24,7 @@ import {
   type CbRgb,
   type ChannelMix,
   type Border as BorderData,
+  type Denoise,
   DEFAULT_CB_RGB,
   DEFAULT_CHANNEL_MIX,
   DEFAULT_BORDER,
@@ -37,6 +39,7 @@ interface InstrumentPanelProps {
   onColorBalanceChange: (patch: Partial<CbRgb>) => void;
   onChannelMixChange: (patch: Partial<ChannelMix>) => void;
   onBorderChange: (patch: Partial<BorderData>) => void;
+  onDenoiseChange: (patch: Partial<Denoise>) => void;
   resetKeys: (keys: ScalarParamKey[]) => void;
   onReset: () => void;
   onAddMask: (mask: Mask) => void;
@@ -61,6 +64,7 @@ export default function InstrumentPanel({
   onColorBalanceChange,
   onChannelMixChange,
   onBorderChange,
+  onDenoiseChange,
   resetKeys,
   onReset,
   onAddMask,
@@ -74,6 +78,7 @@ export default function InstrumentPanel({
   const cropMode = useDevelopStore((s) => s.cropMode);
   const setCropMode = useDevelopStore((s) => s.setCropMode);
   const imageAspect = useDevelopStore((s) => s.imageAspect);
+  const denoiseBusy = useDevelopStore((s) => s.denoiseBusy);
 
   // Centered crop rect of a target pixel aspect ratio that fills the frame. `target<=0` ⇒ full frame.
   // imageAspect is 0 until the Stage measures the loaded image; in that brief window a ratio preset
@@ -330,6 +335,19 @@ export default function InstrumentPanel({
           defaultValue={0}
           value={params.nrColor}
           onChange={(v) => onParamChange("nrColor", v)}
+        />
+      </Module>
+
+      {/* Denoise (AI, raw-domain, on-demand) */}
+      <Module
+        title="Denoise"
+        defaultCollapsed
+        onReset={() => onDenoiseChange({ enabled: false })}
+      >
+        <DenoisePanel
+          value={params.denoise}
+          busy={denoiseBusy}
+          onChange={onDenoiseChange}
         />
       </Module>
 

@@ -9,7 +9,10 @@ pub mod hash;
 pub mod meta;
 pub mod thumb;
 
-pub use develop::{as_shot_wb, develop_linear, develop_linear_preview, LinearImage};
+pub use develop::{
+    as_shot_wb, develop_linear, develop_linear_denoised, develop_linear_preview, DenoiseOutput,
+    LinearImage, MosaicDenoiser, MosaicInfo,
+};
 pub use display::{classify, is_display, ImageKind};
 pub use error::RawError;
 pub use hash::{content_hash, hash_file, hex};

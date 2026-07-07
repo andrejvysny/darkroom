@@ -66,6 +66,11 @@ pub const GROUPS: &[ScopeGroup] = &[
         fields: &["clarity", "texture", "dehaze"],
     },
     ScopeGroup {
+        key: "denoise",
+        label: "Denoise",
+        fields: &["denoise"],
+    },
+    ScopeGroup {
         key: "lens",
         label: "Lens",
         fields: &["vignette", "distK1", "distK2", "caRed", "caBlue"],

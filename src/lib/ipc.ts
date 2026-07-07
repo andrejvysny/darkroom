@@ -944,6 +944,14 @@ export function borderIsActive(b: Border): boolean {
   return b.size > 0 || (b.aspectW > 0 && b.aspectH > 0);
 }
 
+/** AI raw-domain denoise settings (mirror of Rust `Denoise`). */
+export type Denoise = {
+  /** Whether denoise is applied to this image. */
+  enabled: boolean;
+  /** Blend amount, 0..100 of the denoised result over the original. */
+  amount: number;
+};
+
 export type DevelopParams = {
   exposure: number;
   temp: number;
@@ -981,12 +989,20 @@ export type DevelopParams = {
   cbRgb: CbRgb;
   channelMix: ChannelMix;
   border: Border;
+  denoise: Denoise;
 };
 
 /** The numeric (scalar) develop params — everything except the structured fields. */
 export type ScalarParamKey = Exclude<
   keyof DevelopParams,
-  "toneCurve" | "hsl" | "crop" | "masks" | "cbRgb" | "channelMix" | "border"
+  | "toneCurve"
+  | "hsl"
+  | "crop"
+  | "masks"
+  | "cbRgb"
+  | "channelMix"
+  | "border"
+  | "denoise"
 >;
 
 export const EMPTY_TONE_CURVE: ToneCurve = { rgb: [], r: [], g: [], b: [] };
@@ -1024,6 +1040,7 @@ export const DEFAULT_PARAMS: DevelopParams = {
     blue: [...DEFAULT_CHANNEL_MIX.blue],
   },
   border: { ...DEFAULT_BORDER, color: [...DEFAULT_BORDER.color] },
+  denoise: { enabled: false, amount: 50 },
 };
 
 export function developGetEdit(imageId: number): Promise<DevelopParams> {
@@ -1385,6 +1402,36 @@ export function analysisRun(force = false): Promise<AnalysisRunStats> {
 /** Request the running pass to stop after the current batch (keeps work already committed). */
 export function analysisCancel(): Promise<void> {
   return invoke<void>("analysis_cancel", {});
+}
+
+// ── AI denoise ───────────────────────────────────────────────────────────────
+
+export type DenoiseStatus = {
+  running: boolean;
+  /** false on the Intel-macOS build (no inference stack). */
+  available: boolean;
+  accelerator: string;
+};
+
+export function denoiseStatus(): Promise<DenoiseStatus> {
+  return invoke<DenoiseStatus>("denoise_status", {});
+}
+
+/** Apply raw-domain denoise to `imageId` at `amount` (0..100). Swaps the denoised source into the
+ *  render cache. Re-blends cached buffers on an amount change (no re-inference). Emits
+ *  `denoise:progress` `{phase}` then `denoise:done` `{imageId}`; resolves when done. */
+export function denoiseApply(imageId: number, amount: number): Promise<void> {
+  return invoke<void>("denoise_apply", { imageId, amount });
+}
+
+/** Turn denoise off for `imageId` (drop cached buffers + evict the denoised render caches). */
+export function denoiseClear(imageId: number): Promise<void> {
+  return invoke<void>("denoise_clear", { imageId });
+}
+
+/** Request the running denoise compute to stop. */
+export function denoiseCancel(): Promise<void> {
+  return invoke<void>("denoise_cancel", {});
 }
 
 // ── AI model management ──────────────────────────────────────────────────────

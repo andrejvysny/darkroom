@@ -24,6 +24,11 @@ mod segment;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[path = "segment_stub.rs"]
 mod segment;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+mod denoise;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[path = "denoise_stub.rs"]
+mod denoise;
 
 use state::AppState;
 use tauri::Manager;
@@ -184,6 +189,10 @@ pub fn run() {
             commands::analysis_models_ensure,
             commands::analysis_run,
             commands::analysis_cancel,
+            commands::denoise_status,
+            commands::denoise_apply,
+            commands::denoise_clear,
+            commands::denoise_cancel,
             commands::mask_ai_models_ensure,
             commands::mask_ai_ready,
             commands::mask_ai_encode,

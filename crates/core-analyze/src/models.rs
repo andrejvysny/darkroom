@@ -98,6 +98,54 @@ pub fn build_session_cpu(model_path: &Path) -> Result<Session, AnalyzeError> {
         .map_err(AnalyzeError::inference)
 }
 
+/// Build an `ort` Session from an in-memory ONNX (for a model embedded via `include_bytes!` — the
+/// PMRID denoiser), with the same accelerated EP config as [`build_session`]. `mlprogram` selects
+/// CoreML's MLProgram format with static input shapes (our denoise tiles are a fixed 256×256), which
+/// keeps a pure-conv graph on the ANE/GPU.
+pub fn build_session_from_memory(
+    model_bytes: &[u8],
+    level1: bool,
+    mlprogram: bool,
+) -> Result<Session, AnalyzeError> {
+    let mut b = Session::builder().map_err(AnalyzeError::inference)?;
+    if level1 {
+        b = b
+            .with_optimization_level(GraphOptimizationLevel::Level1)
+            .map_err(AnalyzeError::inference)?;
+    }
+    #[allow(unused_mut)]
+    let mut eps: Vec<ort::ep::ExecutionProviderDispatch> = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let mut coreml = ort::ep::CoreML::default().with_compute_units(ComputeUnits::All);
+        if mlprogram {
+            coreml = coreml
+                .with_model_format(ModelFormat::MLProgram)
+                .with_static_input_shapes(true);
+        }
+        eps.push(coreml.build());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = mlprogram;
+        eps.push(ort::ep::DirectML::default().build());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = mlprogram;
+    #[cfg(target_os = "windows")]
+    {
+        b = b
+            .with_memory_pattern(false)
+            .map_err(AnalyzeError::inference)?
+            .with_parallel_execution(false)
+            .map_err(AnalyzeError::inference)?;
+    }
+    b.with_execution_providers(eps)
+        .map_err(AnalyzeError::inference)?
+        .commit_from_memory(model_bytes)
+        .map_err(AnalyzeError::inference)
+}
+
 /// A remote model file fetched on first run. `min_size` is a cheap pre-filter against truncated /
 /// HTML-error bodies; `sha256` is the authoritative integrity check (lowercase hex, verified before
 /// the atomic rename so a truncated / redirected / tampered body is never committed). `approx_size` is
