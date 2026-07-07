@@ -4,14 +4,6 @@ import {
   thumbCacheCap,
   thumbCacheSize,
   setThumbCacheCap,
-  analysisStatus,
-  analysisDetectorSize,
-  setAnalysisDetectorSize,
-  faceStageEnabled,
-  setFaceStageEnabled,
-  maskAiTierGet,
-  maskAiTierSet,
-  type MaskAiTier,
   previewEdge,
   updatePreviewEdge,
   appLibraryRoot,
@@ -29,6 +21,7 @@ import {
   type LogsStatus,
 } from "../../lib/ipc";
 import { pickFolder } from "../../lib/importFlow";
+import { useAppStore } from "../../store/app";
 
 const GB = 1024 * 1024 * 1024;
 
@@ -97,11 +90,8 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [libRoot, setLibRoot] = useState<string | null>(null);
   const [pickingRoot, setPickingRoot] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
-  const [mdSize, setMdSize] = useState(1280);
-  const [faceStage, setFaceStage] = useState(true);
-  const [maskTier, setMaskTier] = useState<MaskAiTier>("realtime");
-  const [accelerator, setAccelerator] = useState<string | null>(null);
   const [pEdge, setPEdge] = useState(0);
+  const setModelManagerOpen = useAppStore((s) => s.setModelManagerOpen);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
@@ -133,24 +123,16 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     void Promise.all([
       thumbCacheCap(),
       thumbCacheSize(),
-      analysisDetectorSize(),
       appLibraryRoot(),
       previewEdge(),
-      faceStageEnabled(),
       logsStatus(),
-      analysisStatus(),
-      maskAiTierGet(),
     ])
-      .then(([cap, used, size, root, pe, fse, logStatus, aStatus, tier]) => {
+      .then(([cap, used, root, pe, logStatus]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
-        setMdSize(size);
         setLibRoot(root);
         setPEdge(pe);
-        setFaceStage(fse);
-        setMaskTier(tier);
         setLogs(logStatus);
-        setAccelerator(aStatus.accelerator);
         initializedRef.current = true;
       })
       .catch(() => showStatus("Failed to load settings"));
@@ -199,31 +181,6 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     } finally {
       setPickingRoot(false);
     }
-  };
-
-  const handleMdSize = (size: number) => {
-    setMdSize(size);
-    void setAnalysisDetectorSize(size)
-      .then(() => showStatus(`Animal detection set to ${size}px`))
-      .catch(() => showStatus("Failed to save resolution"));
-  };
-
-  const handleMaskTier = (tier: MaskAiTier) => {
-    setMaskTier(tier);
-    void maskAiTierSet(tier)
-      .then(() => showStatus(`AI mask quality: ${tier}`))
-      .catch(() => showStatus("Failed to save AI mask quality"));
-  };
-
-  const handleFaceStage = (enabled: boolean) => {
-    setFaceStage(enabled);
-    void setFaceStageEnabled(enabled)
-      .then(() =>
-        showStatus(
-          enabled ? "Face detection enabled" : "Face detection disabled",
-        ),
-      )
-      .catch(() => showStatus("Failed to save face setting"));
   };
 
   const handleBackfill = () => {
@@ -489,102 +446,24 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
             </div>
           </div>
 
-          {/* Animal detection resolution */}
+          {/* AI models */}
           <div style={sectionStyle}>
-            <div style={labelStyle}>Animal detection resolution</div>
+            <div style={labelStyle}>AI &amp; Models</div>
             <div style={descStyle}>
-              MegaDetector input size. Higher = better recall on small/distant
-              animals but slower. Re-analyze to apply.
+              Manage on-device AI models — object &amp; scene detection, People
+              (faces), and AI object-select masks. Download or remove models,
+              watch download progress, pick the animal-detection resolution, face
+              stage, and AI-mask quality tier.
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {(
-                [
-                  [1280, "1280px — best recall"],
-                  [640, "640px — faster"],
-                ] as [number, string][]
-              ).map(([size, label]) => (
-                <button
-                  key={size}
-                  onClick={() => handleMdSize(size)}
-                  style={segmentBtn(mdSize === size)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Face detection during scan */}
-          <div style={sectionStyle}>
-            <div style={labelStyle}>Detect people (faces)</div>
-            <div style={descStyle}>
-              Find and group faces as part of the AI scan. Uses on-device,
-              non-commercial models (~190 MB, downloaded on first use). Turn off
-              to skip the face stage entirely.
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {(
-                [
-                  [true, "On"],
-                  [false, "Off"],
-                ] as [boolean, string][]
-              ).map(([on, label]) => (
-                <button
-                  key={label}
-                  onClick={() => handleFaceStage(on)}
-                  style={segmentBtn(faceStage === on)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* AI mask quality (interactive segmentation tier) */}
-          <div style={sectionStyle}>
-            <div style={labelStyle}>AI mask quality</div>
-            <div style={descStyle}>
-              Model for AI object-select masks in Develop, downloaded on first
-              use. Higher tiers give cleaner edges but are larger and slower to
-              encode. Realtime = MobileSAM (~44 MB); Balanced = SAM ViT-B
-              (~360 MB); Max = SAM ViT-L (~1.2 GB).
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {(
-                [
-                  ["realtime", "Realtime"],
-                  ["balanced", "Balanced"],
-                  ["max", "Max quality"],
-                ] as [MaskAiTier, string][]
-              ).map(([tier, label]) => (
-                <button
-                  key={tier}
-                  onClick={() => handleMaskTier(tier)}
-                  style={segmentBtn(maskTier === tier)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* AI acceleration (read-only) */}
-          <div style={sectionStyle}>
-            <div style={labelStyle}>AI acceleration</div>
-            <div style={descStyle}>
-              Hardware used for on-device detection, faces, and captions. Falls
-              back to CPU automatically if the GPU provider can’t initialize
-              (check the diagnostic log if scans are unexpectedly slow).
-            </div>
-            <div
-              style={{
-                fontSize: 13,
-                fontFamily: "var(--font-mono)",
-                color: "var(--color-t1)",
+            <button
+              style={btnSecondary}
+              onClick={() => {
+                onClose();
+                setModelManagerOpen(true);
               }}
             >
-              {accelerator ?? "—"}
-            </div>
+              Manage models…
+            </button>
           </div>
 
           {/* Preview resolution */}

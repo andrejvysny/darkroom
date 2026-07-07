@@ -21,6 +21,8 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 ureq = "3"
 # Integrity verification of downloaded model files (pinned SHA-256 per file).
 sha2 = "0.10"
+# Free-space precheck before a (multi-GB) model-group download. Cross-platform statvfs.
+fs4 = "0.13"
 # Face alignment: 2D similarity (Umeyama) transform via SVD — pure Rust, no opencv.
 nalgebra = "0.33"
 # Affine warp of the aligned 112x112 face crop (image-0.25 compatible).

@@ -2,10 +2,13 @@ import { useEffect } from "react";
 import { useAppStore } from "./store/app";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useEditSync } from "./hooks/useEditSync";
+import { useModelDownloadListeners } from "./lib/useModelDownloads";
 import { effectivePreviewEdge } from "./lib/ipc";
 import TopBar from "./components/TopBar";
 import CommandPalette from "./components/CommandPalette";
 import ExportModal from "./views/Export/ExportModal";
+import ModelManagerModal from "./views/Library/ModelManagerModal";
+import DownloadPill from "./components/DownloadPill";
 import Toast from "./components/Toast";
 import LibraryView from "./views/Library/LibraryView";
 import DevelopView from "./views/Develop/DevelopView";
@@ -14,6 +17,8 @@ import DedupView from "./views/Dedup/DedupView";
 export default function App() {
   useKeyboard();
   useEditSync();
+  // Subscribe once to all AI-model download progress streams (drives the manager + the global pill).
+  useModelDownloadListeners();
   // Resolve (and on first launch, persist) the display-sharp preview edge early, so the background
   // queue starts rendering previews at the right size before the first loupe open.
   useEffect(() => {
@@ -36,6 +41,8 @@ export default function App() {
       {view === "dedup" && <DedupView />}
       <CommandPalette />
       <ExportModal />
+      <ModelManagerModal />
+      <DownloadPill />
       <Toast />
     </div>
   );

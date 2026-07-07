@@ -14,6 +14,16 @@ pub enum AnalyzeError {
     Tokenizer(String),
     #[error("download: {0}")]
     Download(String),
+    /// Integrity failure (sha256 mismatch) — deterministic, never retried.
+    #[error("integrity: {0}")]
+    Integrity(String),
+    /// User-requested cancellation of a download. Mapped to a stable string the frontend
+    /// distinguishes from a real error (a Stop must not surface as an error toast).
+    #[error("cancelled")]
+    Cancelled,
+    /// Not enough free disk space to download a model group.
+    #[error("insufficient disk space: need {needed} bytes, {available} available")]
+    InsufficientSpace { needed: u64, available: u64 },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import Icon from "../../components/Icon";
+import { ProgressBar as Bar } from "../../components/ProgressBar";
 import {
   clearedFilters,
   faceCropStyle,
@@ -356,22 +357,7 @@ function ProgressBar({
       >
         {label} {done}/{total}
       </div>
-      <div
-        style={{
-          height: 3,
-          borderRadius: 2,
-          background: "var(--color-line)",
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            height: "100%",
-            width: `${pct}%`,
-            background: "var(--color-accent)",
-          }}
-        />
-      </div>
+      <Bar pct={pct} />
     </div>
   );
 }

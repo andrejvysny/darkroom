@@ -82,6 +82,13 @@ pub struct AppState {
     pub analysis_running: AtomicBool,
     /// Set by `analysis_cancel` to request the running pass stop between batches.
     pub analysis_cancel: AtomicBool,
+    /// Set by `models_cancel("analysis")` to abort an in-flight Detection & Scene model download
+    /// (checked between read chunks). Reset at the start of each ensure.
+    pub analysis_dl_cancel: AtomicBool,
+    /// Set by `models_cancel("faces")` to abort an in-flight face-model download.
+    pub faces_dl_cancel: AtomicBool,
+    /// Set by `models_cancel("mask_ai")` to abort an in-flight SAM model download.
+    pub mask_ai_dl_cancel: AtomicBool,
     /// Face detector + embedder (SCRFD + ArcFace, ~190 MB ONNX), lazily built on first scan with faces
     /// enabled. The face stage runs inside the unified scan, guarded by `analysis_running`.
     #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
@@ -110,6 +117,13 @@ pub struct AppState {
     /// present and skips.
     #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub sam_download_lock: Mutex<()>,
+    /// Serializes Detection & Scene model downloads (double-trigger safety, matching
+    /// `sam_download_lock`): the second caller finds the files present and returns.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub analysis_download_lock: Mutex<()>,
+    /// Serializes face-model downloads.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub faces_download_lock: Mutex<()>,
     /// Per-launch id stamped on every captured user-event (groups a usage session).
     pub session_id: String,
     /// App version stamped on events (label provenance / pipeline isolation).
@@ -180,6 +194,9 @@ impl AppState {
             analyzers: Mutex::new(None),
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),
+            analysis_dl_cancel: AtomicBool::new(false),
+            faces_dl_cancel: AtomicBool::new(false),
+            mask_ai_dl_cancel: AtomicBool::new(false),
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             face_analyzer: Mutex::new(None),
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
@@ -192,6 +209,10 @@ impl AppState {
             sam_encode_lock: Mutex::new(()),
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             sam_download_lock: Mutex::new(()),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            analysis_download_lock: Mutex::new(()),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            faces_download_lock: Mutex::new(()),
             session_id,
             app_version: env!("CARGO_PKG_VERSION"),
         })

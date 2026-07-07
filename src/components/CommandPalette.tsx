@@ -19,6 +19,7 @@ export default function CommandPalette() {
   const selectedId = useAppStore((s) => s.selectedId);
   const onImport = useAppStore((s) => s.onImport);
   const onOpenSettings = useAppStore((s) => s.onOpenSettings);
+  const setModelManagerOpen = useAppStore((s) => s.setModelManagerOpen);
   const onSavePreset = useAppStore((s) => s.onSavePreset);
   const onCopySettings = useAppStore((s) => s.onCopySettings);
   const onPasteSettings = useAppStore((s) => s.onPasteSettings);
@@ -64,6 +65,12 @@ export default function CommandPalette() {
       label: "Settings…",
       shortcut: "⌘,",
       run: () => onOpenSettings?.(),
+    },
+    {
+      icon: "scan",
+      label: "AI Models…",
+      shortcut: "",
+      run: () => setModelManagerOpen(true),
     },
   ];
 

@@ -35,6 +35,18 @@ pub fn coverages_for(_st: &AppState, _image_id: i64, _params: &DevelopParams) ->
     Vec::new()
 }
 
+pub fn overview(_st: &AppState) -> crate::model_mgmt::ModelGroup {
+    crate::model_mgmt::ModelGroup::unavailable(
+        "mask_ai",
+        "AI Masking",
+        "Click a subject in Develop to auto-select it as a mask (SAM).",
+    )
+}
+
+pub fn remove(_st: &AppState, _tier: &str) -> Result<(), String> {
+    Err(unavailable())
+}
+
 fn unavailable() -> String {
     "AI masking is unavailable in the Intel macOS build".to_string()
 }

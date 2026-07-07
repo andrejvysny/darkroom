@@ -9,12 +9,13 @@
 //! stored points so AI masks survive a session restart.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use core_analyze::models::{ModelStore, SamTier};
 use core_analyze::sam::{Prompt, SamEmbedding, Segmenter};
 use core_pipeline::{AiCoverage, AiPoint, ComponentKind, DevelopParams};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::state::AppState;
 
@@ -35,25 +36,98 @@ pub fn models_ready(st: &AppState) -> bool {
     ModelStore::new(st.models_dir.clone()).has_all(active_tier(st).files())
 }
 
-/// Download the active tier's SAM weights, emitting `mask_ai:models` `{done,total}` progress.
+/// Download the active tier's SAM weights with byte-level `mask_ai:models` progress + cancellation.
 /// Serialized so a background warm + a first click don't each start the same (up to 1.2 GB) download;
 /// the second caller finds the files present and returns immediately.
 pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let st = app.state::<AppState>();
     let _dl_guard = st.sam_download_lock.lock().map_err(|e| e.to_string())?;
+    st.mask_ai_dl_cancel.store(false, Ordering::SeqCst);
     let store = ModelStore::new(st.models_dir.clone());
     let files = active_tier(&st).files();
-    let total = files.len();
-    let emit = |done: usize| {
-        let _ = app.emit(
-            "mask_ai:models",
-            serde_json::json!({"done": done, "total": total}),
-        );
-    };
-    emit(0);
+    let cancel = || st.mask_ai_dl_cancel.load(Ordering::SeqCst);
     store
-        .ensure(files, |i, _| emit(i))
+        .ensure_with(
+            files,
+            |p| crate::model_mgmt::emit_dl(app, "mask_ai:models", &p),
+            &cancel,
+        )
         .map_err(|e| e.to_string())
+}
+
+/// Human label for a SAM tier, shown in the manager's per-tier detail.
+fn tier_label(t: SamTier) -> &'static str {
+    match t {
+        SamTier::Realtime => "Realtime · MobileSAM",
+        SamTier::Balanced => "Balanced · SAM ViT-B",
+        SamTier::Max => "Max · SAM ViT-L",
+    }
+}
+
+/// Manager overview for the AI Masking capability. `installed`/size reflect the ACTIVE tier; `tiers`
+/// carries the per-tier install state so a stale non-active tier can be reclaimed independently.
+pub fn overview(st: &AppState) -> crate::model_mgmt::ModelGroup {
+    use crate::model_mgmt::{file_info, ModelGroup, ModelTierInfo};
+    let store = ModelStore::new(st.models_dir.clone());
+    let active = active_tier(st);
+    let tiers: Vec<ModelTierInfo> = SamTier::all()
+        .iter()
+        .map(|&t| {
+            let installed = store.has_all(t.files());
+            let approx: u64 = t.files().iter().map(|f| f.approx_size).sum();
+            ModelTierInfo {
+                tier: t.as_str().to_string(),
+                label: tier_label(t).to_string(),
+                installed,
+                size_bytes: if installed {
+                    store.installed_bytes(t.files())
+                } else {
+                    approx
+                },
+                files: t.files().iter().map(|f| file_info(&store, f)).collect(),
+            }
+        })
+        .collect();
+    let installed = store.has_all(active.files());
+    let approx_total: u64 = active.files().iter().map(|f| f.approx_size).sum();
+    ModelGroup {
+        id: "mask_ai".into(),
+        name: "AI Masking".into(),
+        description: "Click a subject in Develop to auto-select it as a mask (SAM).".into(),
+        available: true,
+        installed,
+        size_bytes: if installed {
+            store.installed_bytes(active.files())
+        } else {
+            approx_total
+        },
+        approx_total_bytes: approx_total,
+        license: None,
+        files: active
+            .files()
+            .iter()
+            .map(|f| file_info(&store, f))
+            .collect(),
+        tiers,
+        active_tier: Some(active.as_str().to_string()),
+        accelerator: core_analyze::accelerator().to_string(),
+    }
+}
+
+/// Remove one SAM tier's files and clear the cached segmenter/embedding/masks (they rebuild lazily).
+/// `tier` is a tag (`"realtime"`/`"balanced"`/`"max"`); empty falls back to the active tier.
+pub fn remove(st: &AppState, tier: &str) -> Result<(), String> {
+    let tier = if tier.is_empty() {
+        active_tier(st)
+    } else {
+        SamTier::from_tag(tier)
+    };
+    let store = ModelStore::new(st.models_dir.clone());
+    store.remove(tier.files()).map_err(|e| e.to_string())?;
+    *st.segmenter.lock().map_err(|e| e.to_string())? = None;
+    *st.sam_embedding.lock().map_err(|e| e.to_string())? = None;
+    st.sam_masks.lock().map_err(|e| e.to_string())?.clear();
+    Ok(())
 }
 
 /// Build (once) and cache the segmenter for the active tier. A tier change rebuilds it and clears the

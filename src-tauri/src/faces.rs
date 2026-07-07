@@ -14,7 +14,7 @@ use core_analyze::models::{ModelStore, FACE_DETECTOR_FILES, FACE_EMBEDDER_FILES}
 use core_analyze::{FaceAnalyzer, FaceRecord};
 use core_library::{existing_analysis, present_images, ClusterStats, FaceInput};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::state::AppState;
 
@@ -54,25 +54,65 @@ pub fn faces_models_ready(st: &AppState) -> bool {
     store.has_all(FACE_DETECTOR_FILES) && store.has_all(FACE_EMBEDDER_FILES)
 }
 
-/// Download any missing face model files (~190 MB on first run). Emits `faces:models` `{done,total}`.
+/// Both face model files (detector + embedder), in download order.
+fn faces_files() -> Vec<core_analyze::models::RemoteFile> {
+    FACE_DETECTOR_FILES
+        .iter()
+        .chain(FACE_EMBEDDER_FILES)
+        .copied()
+        .collect()
+}
+
+/// Download any missing face model files (~190 MB) with byte-level `faces:models` progress + cancel.
 pub fn ensure_face_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let st = app.state::<AppState>();
+    let _guard = st.faces_download_lock.lock().map_err(|e| e.to_string())?;
+    st.faces_dl_cancel.store(false, Ordering::SeqCst);
     let store = ModelStore::new(st.models_dir.clone());
-    let total = FACE_DETECTOR_FILES.len() + FACE_EMBEDDER_FILES.len();
-    let emit = |done: usize| {
-        let _ = app.emit(
-            "faces:models",
-            serde_json::json!({ "done": done, "total": total }),
-        );
-    };
-    emit(0);
+    let files = faces_files();
+    let cancel = || st.faces_dl_cancel.load(Ordering::SeqCst);
     store
-        .ensure(FACE_DETECTOR_FILES, |i, _| emit(i))
-        .map_err(|e| e.to_string())?;
-    let off = FACE_DETECTOR_FILES.len();
-    store
-        .ensure(FACE_EMBEDDER_FILES, |i, _| emit(off + i))
-        .map_err(|e| e.to_string())?;
+        .ensure_with(
+            &files,
+            |p| crate::model_mgmt::emit_dl(app, "faces:models", &p),
+            &cancel,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Manager overview for the People (Faces) capability.
+pub fn overview(st: &AppState) -> crate::model_mgmt::ModelGroup {
+    use crate::model_mgmt::{file_info, ModelGroup};
+    let store = ModelStore::new(st.models_dir.clone());
+    let files = faces_files();
+    let installed = faces_models_ready(st);
+    let approx_total: u64 = files.iter().map(|f| f.approx_size).sum();
+    let installed_bytes = store.installed_bytes(&files);
+    ModelGroup {
+        id: "faces".into(),
+        name: "People (Faces)".into(),
+        description: "Detects and groups faces so you can browse and name People.".into(),
+        available: true,
+        installed,
+        size_bytes: if installed {
+            installed_bytes
+        } else {
+            approx_total
+        },
+        approx_total_bytes: approx_total,
+        license: Some("Uses InsightFace buffalo_l weights — non-commercial use only.".into()),
+        files: files.iter().map(|f| file_info(&store, f)).collect(),
+        tiers: Vec::new(),
+        active_tier: None,
+        accelerator: core_analyze::accelerator().to_string(),
+    }
+}
+
+/// Delete the face model files and drop the cached face analyzer.
+pub fn remove(st: &AppState) -> Result<(), String> {
+    let store = ModelStore::new(st.models_dir.clone());
+    store.remove(&faces_files()).map_err(|e| e.to_string())?;
+    *st.face_analyzer.lock().map_err(|e| e.to_string())? = None;
     Ok(())
 }
 

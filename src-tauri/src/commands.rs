@@ -2194,6 +2194,60 @@ pub fn analysis_cancel(app: AppHandle) {
     }
 }
 
+/// Manager overview of every AI model capability (Detection & Scene / People / AI Masking): install
+/// state, on-disk size, and per-file + per-tier detail. Drives the AI Models manager UI.
+#[tauri::command]
+pub async fn models_overview(app: AppHandle) -> Result<Vec<crate::model_mgmt::ModelGroup>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        Ok(vec![
+            crate::analysis::overview(&st),
+            crate::faces::overview(&st),
+            crate::segment::overview(&st),
+        ])
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Request an in-flight model download for `group` (`"analysis"`|`"faces"`|`"mask_ai"`) to stop. The
+/// partially-written temp file is discarded; already-completed files stay. No-op if idle.
+#[tauri::command]
+pub fn models_cancel(app: AppHandle, group: String) {
+    let st = app.state::<AppState>();
+    match group.as_str() {
+        "analysis" => st.analysis_dl_cancel.store(true, Ordering::SeqCst),
+        "faces" => st.faces_dl_cancel.store(true, Ordering::SeqCst),
+        "mask_ai" => st.mask_ai_dl_cancel.store(true, Ordering::SeqCst),
+        _ => {}
+    }
+}
+
+/// Delete a capability's downloaded model files to reclaim disk. For `"mask_ai"`, `tier` selects the
+/// SAM tier (`"realtime"`|`"balanced"`|`"max"`; empty = active). Refuses while a scan is running so it
+/// can't race a pass that's loading those weights.
+#[tauri::command]
+pub async fn models_remove(
+    app: AppHandle,
+    group: String,
+    tier: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        if st.analysis_running.load(Ordering::SeqCst) {
+            return Err("an AI scan is running — stop it before removing models".into());
+        }
+        match group.as_str() {
+            "analysis" => crate::analysis::remove(&st),
+            "faces" => crate::faces::remove(&st),
+            "mask_ai" => crate::segment::remove(&st, tier.as_deref().unwrap_or("")),
+            other => Err(format!("unknown model group: {other}")),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Download the interactive-segmentation (AI masking) model weights. Emits `mask_ai:models` progress.
 #[tauri::command]
 pub async fn mask_ai_models_ensure(app: AppHandle) -> Result<(), String> {

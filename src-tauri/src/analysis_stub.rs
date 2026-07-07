@@ -45,6 +45,18 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, _force: bool) -> Result<RunStats
     Err(unavailable())
 }
 
+pub fn overview(_st: &AppState) -> crate::model_mgmt::ModelGroup {
+    crate::model_mgmt::ModelGroup::unavailable(
+        "analysis",
+        "Detection & Scene",
+        "Detects objects, animals & scenes and writes captions/keywords for search.",
+    )
+}
+
+pub fn remove(_st: &AppState) -> Result<(), String> {
+    Err(unavailable())
+}
+
 fn unavailable() -> String {
     "AI analysis is unavailable in the Intel macOS build".to_string()
 }

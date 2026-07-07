@@ -2,6 +2,7 @@ mod commands;
 mod events;
 mod features;
 mod logging;
+mod model_mgmt;
 mod prefetch;
 mod protocol;
 mod state;
@@ -198,6 +199,9 @@ pub fn run() {
             commands::set_image_user_label_many,
             commands::analysis_detector_size,
             commands::set_analysis_detector_size,
+            commands::models_overview,
+            commands::models_cancel,
+            commands::models_remove,
             commands::faces_status,
             commands::faces_models_ensure,
             commands::faces_run,

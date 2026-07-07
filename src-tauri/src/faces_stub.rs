@@ -48,6 +48,18 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, _force: bool) -> Result<FacesRun
     Err(unavailable())
 }
 
+pub fn overview(_st: &AppState) -> crate::model_mgmt::ModelGroup {
+    crate::model_mgmt::ModelGroup::unavailable(
+        "faces",
+        "People (Faces)",
+        "Detects and groups faces so you can browse and name People.",
+    )
+}
+
+pub fn remove(_st: &AppState) -> Result<(), String> {
+    Err(unavailable())
+}
+
 fn unavailable() -> String {
     "Face analysis is unavailable in the Intel macOS build".to_string()
 }

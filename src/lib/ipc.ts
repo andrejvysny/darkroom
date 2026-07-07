@@ -1387,6 +1387,79 @@ export function analysisCancel(): Promise<void> {
   return invoke<void>("analysis_cancel", {});
 }
 
+// ── AI model management ──────────────────────────────────────────────────────
+
+/** Capability id shared by the manager IPC + `<id>:models` progress events. */
+export type ModelGroupId = "analysis" | "faces" | "mask_ai";
+
+/** One downloadable model file within a capability (or SAM tier). Mirrors Rust `ModelFileInfo`. */
+export type ModelFileInfo = {
+  rel: string;
+  present: boolean;
+  sizeBytes: number;
+};
+
+/** One SAM quality tier (AI Masking only). Mirrors Rust `ModelTierInfo`. */
+export type ModelTierInfo = {
+  tier: MaskAiTier;
+  label: string;
+  installed: boolean;
+  sizeBytes: number;
+  files: ModelFileInfo[];
+};
+
+/** One AI capability for the model manager. Mirrors Rust `model_mgmt::ModelGroup`. */
+export type ModelGroup = {
+  id: ModelGroupId;
+  name: string;
+  description: string;
+  /** False on the Intel-macOS build (AI compiled out). */
+  available: boolean;
+  /** Ready to use (active tier for AI Masking). */
+  installed: boolean;
+  /** Installed on-disk bytes, else estimated download total. */
+  sizeBytes: number;
+  approxTotalBytes: number;
+  license: string | null;
+  files: ModelFileInfo[];
+  /** Per-tier detail — AI Masking only; empty otherwise. */
+  tiers: ModelTierInfo[];
+  activeTier: MaskAiTier | null;
+  accelerator: string;
+};
+
+/** Enriched `<id>:models` download-progress event payload: byte-level fields + legacy file counts. */
+export type ModelDownloadEvent = {
+  /** Legacy file index (1-based). */
+  done: number;
+  /** Legacy file count. */
+  total: number;
+  fileName: string;
+  phase: "downloading" | "done";
+  bytesDone: number;
+  bytesTotal: number;
+  fileBytesDone: number;
+  fileBytesTotal: number;
+};
+
+/** Overview of all AI model capabilities: install state, sizes, per-file/per-tier detail. */
+export function modelsOverview(): Promise<ModelGroup[]> {
+  return invoke<ModelGroup[]>("models_overview", {});
+}
+
+/** Request an in-flight download for `group` to stop (discards the partial file). */
+export function modelsCancel(group: ModelGroupId): Promise<void> {
+  return invoke<void>("models_cancel", { group });
+}
+
+/** Delete a capability's model files. For `"mask_ai"`, `tier` picks the SAM tier (default active). */
+export function modelsRemove(
+  group: ModelGroupId,
+  tier?: MaskAiTier,
+): Promise<void> {
+  return invoke<void>("models_remove", { group, tier: tier ?? null });
+}
+
 /** Result of an AI (SAM) mask prompt. Mirrors Rust `segment::PromptResult`. */
 export type MaskAiResult = {
   /** Component key to store in the mask's `ai` component `hash`. */

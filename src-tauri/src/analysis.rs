@@ -83,36 +83,72 @@ pub fn models_ready(st: &AppState) -> bool {
         && store.has_all(VERIFIER_FILES)
 }
 
-/// Download any missing model files, emitting `analysis:models` `{done,total}` progress.
+/// Every model file across all Detection & Scene analyzers, in download order.
+fn analysis_files() -> Vec<core_analyze::models::RemoteFile> {
+    DETECTOR_FILES
+        .iter()
+        .chain(ANIMAL_DETECTOR_FILES)
+        .chain(CAPTION_FILES)
+        .chain(VERIFIER_FILES)
+        .copied()
+        .collect()
+}
+
+/// Download any missing model files with byte-level `analysis:models` progress + cancellation.
 pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let st = app.state::<AppState>();
+    let _guard = st
+        .analysis_download_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    st.analysis_dl_cancel.store(false, Ordering::SeqCst);
     let store = ModelStore::new(st.models_dir.clone());
-    let total = DETECTOR_FILES.len()
-        + ANIMAL_DETECTOR_FILES.len()
-        + CAPTION_FILES.len()
-        + VERIFIER_FILES.len();
-    let emit = |done: usize| {
-        let _ = app.emit(
-            "analysis:models",
-            serde_json::json!({ "done": done, "total": total }),
-        );
-    };
-    emit(0);
+    let files = analysis_files();
+    let cancel = || st.analysis_dl_cancel.load(Ordering::SeqCst);
     store
-        .ensure(DETECTOR_FILES, |i, _| emit(i))
-        .map_err(|e| e.to_string())?;
-    let off1 = DETECTOR_FILES.len();
-    store
-        .ensure(ANIMAL_DETECTOR_FILES, |i, _| emit(off1 + i))
-        .map_err(|e| e.to_string())?;
-    let off2 = off1 + ANIMAL_DETECTOR_FILES.len();
-    store
-        .ensure(CAPTION_FILES, |i, _| emit(off2 + i))
-        .map_err(|e| e.to_string())?;
-    let off3 = off2 + CAPTION_FILES.len();
-    store
-        .ensure(VERIFIER_FILES, |i, _| emit(off3 + i))
-        .map_err(|e| e.to_string())?;
+        .ensure_with(
+            &files,
+            |p| crate::model_mgmt::emit_dl(app, "analysis:models", &p),
+            &cancel,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Manager overview for the Detection & Scene capability.
+pub fn overview(st: &AppState) -> crate::model_mgmt::ModelGroup {
+    use crate::model_mgmt::{file_info, ModelGroup};
+    let store = ModelStore::new(st.models_dir.clone());
+    let files = analysis_files();
+    let installed = models_ready(st);
+    let approx_total: u64 = files.iter().map(|f| f.approx_size).sum();
+    let installed_bytes = store.installed_bytes(&files);
+    ModelGroup {
+        id: "analysis".into(),
+        name: "Detection & Scene".into(),
+        description: "Detects objects, animals & scenes and writes captions/keywords for search."
+            .into(),
+        available: true,
+        installed,
+        size_bytes: if installed {
+            installed_bytes
+        } else {
+            approx_total
+        },
+        approx_total_bytes: approx_total,
+        license: None,
+        files: files.iter().map(|f| file_info(&store, f)).collect(),
+        tiers: Vec::new(),
+        active_tier: None,
+        accelerator: core_analyze::accelerator().to_string(),
+    }
+}
+
+/// Delete the Detection & Scene model files and drop the cached analyzer registry so a re-download
+/// rebuilds cleanly.
+pub fn remove(st: &AppState) -> Result<(), String> {
+    let store = ModelStore::new(st.models_dir.clone());
+    store.remove(&analysis_files()).map_err(|e| e.to_string())?;
+    *st.analyzers.lock().map_err(|e| e.to_string())? = None;
     Ok(())
 }
 

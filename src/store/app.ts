@@ -35,6 +35,9 @@ interface AppState {
   /** Images queued in the Export modal; null = modal closed. */
   exportTargets: ExportTarget[] | null;
   setExportTargets: (t: ExportTarget[] | null) => void;
+  /** AI Models manager modal open state. */
+  modelManagerOpen: boolean;
+  setModelManagerOpen: (b: boolean) => void;
   // Library action callbacks registered by LibraryView
   onImport: (() => void) | null;
   setOnImport: (fn: (() => void) | null) => void;
@@ -88,6 +91,8 @@ export const useAppStore = create<AppState>((set) => ({
   setGridMode: (m) => set({ gridMode: m }),
   exportTargets: null,
   setExportTargets: (t) => set({ exportTargets: t }),
+  modelManagerOpen: false,
+  setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
   onImport: null,
   setOnImport: (fn) => set({ onImport: fn }),
   onOpenSettings: null,
