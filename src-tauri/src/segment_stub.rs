@@ -31,6 +31,10 @@ pub fn prompt(
     Err(unavailable())
 }
 
+pub fn warm(_st: &AppState, _image_id: i64) -> Result<(), String> {
+    Err(unavailable())
+}
+
 pub fn coverages_for(_st: &AppState, _image_id: i64, _params: &DevelopParams) -> Vec<AiCoverage> {
     Vec::new()
 }
