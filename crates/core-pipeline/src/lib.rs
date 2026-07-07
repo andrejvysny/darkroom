@@ -13,14 +13,16 @@ pub mod histogram;
 pub mod mask;
 pub mod params;
 
+pub use backend::AI_TEX_EDGE;
 pub use backend::{DevelopPipeline, GpuAdapterInfo, GpuContext};
 pub use curve::build_lut;
-pub use encode::{crop_rgba8, resize_rgba8, rgba8_to_jpeg, rgba8_to_png};
+pub use encode::{crop_rgba8, frame_rgba8, resize_rgba8, rgba8_to_jpeg, rgba8_to_png};
 pub use error::PipelineError;
 pub use histogram::{histogram, histogram_from_jpeg, Histogram};
 pub use params::{
-    BrushStroke, CbRgb, ComponentKind, Crop, CurvePoint, DevelopParams, HslBand, LocalAdjust, Mask,
-    MaskComponent, MaskOp, ToneCurve, ViewParams, MASK_CAP,
+    AiCoverage, AiPoint, Border, BrushStroke, CbRgb, ChannelMix, ComponentKind, Crop, CurvePoint,
+    DevelopParams, HslBand, LocalAdjust, Mask, MaskComponent, MaskOp, ToneCurve, ViewParams,
+    MASK_CAP,
 };
 
 // Re-export the linear buffer type for convenience.

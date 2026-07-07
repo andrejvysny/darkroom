@@ -22,6 +22,15 @@ export function freshDefaults(): DevelopParams {
       contrast: DEFAULT_PARAMS.cbRgb.contrast,
       saturation: DEFAULT_PARAMS.cbRgb.saturation,
     },
+    channelMix: {
+      red: [...DEFAULT_PARAMS.channelMix.red],
+      green: [...DEFAULT_PARAMS.channelMix.green],
+      blue: [...DEFAULT_PARAMS.channelMix.blue],
+    },
+    border: {
+      ...DEFAULT_PARAMS.border,
+      color: [...DEFAULT_PARAMS.border.color],
+    },
   };
 }
 
@@ -47,6 +56,9 @@ interface DevelopState {
   /** Whether the mask coverage/handle overlay is shown on the stage. */
   maskOverlayVisible: boolean;
   setMaskOverlayVisible: (b: boolean) => void;
+  /** True while an AI (SAM) mask is downloading/encoding/segmenting — drives the Stage loader. */
+  aiMaskBusy: boolean;
+  setAiMaskBusy: (b: boolean) => void;
   /** Current brush settings used when painting new strokes. */
   brush: BrushSettings;
   setBrush: (patch: Partial<BrushSettings>) => void;
@@ -117,6 +129,8 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setSelectedComponentIndex: (i) => set({ selectedComponentIndex: i }),
   maskOverlayVisible: true,
   setMaskOverlayVisible: (b) => set({ maskOverlayVisible: b }),
+  aiMaskBusy: false,
+  setAiMaskBusy: (b) => set({ aiMaskBusy: b }),
   brush: DEFAULT_BRUSH,
   setBrush: (patch) => set((s) => ({ brush: { ...s.brush, ...patch } })),
   pickingColor: false,

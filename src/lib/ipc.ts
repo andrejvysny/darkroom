@@ -832,7 +832,10 @@ export type ComponentKind =
       tol: number;
       feather: number;
     }
-  | { type: "ai"; model: string };
+  | { type: "ai"; model: string; points: AiPoint[]; hash: string };
+
+/** One prompt point for an AI (SAM) mask, normalized [0,1]. `positive=false` subtracts. Mirrors Rust `AiPoint`. */
+export type AiPoint = { x: number; y: number; positive: boolean };
 
 /** How a component combines with the running mask alpha. Mirrors Rust `MaskOp`. */
 export type MaskOp = "add" | "subtract" | "intersect";
@@ -904,6 +907,43 @@ export const DEFAULT_CB_RGB: CbRgb = {
   saturation: 0,
 };
 
+/** Channel mixer (Photoshop/GIMP-style 3×3 remix on display sRGB). Mirrors Rust `ChannelMix`. Each
+ * output channel is a weighted sum of the source R/G/B (1.0 = 100%). Identity = no-op; a pure swap
+ * (e.g. green↔blue) is a permutation of the identity rows. */
+export type ChannelMix = {
+  red: Rgb3;
+  green: Rgb3;
+  blue: Rgb3;
+};
+
+export const DEFAULT_CHANNEL_MIX: ChannelMix = {
+  red: [1, 0, 0],
+  green: [0, 1, 0],
+  blue: [0, 0, 1],
+};
+
+/** Border / frame around the image (solid color + optional pad-to-aspect). Mirrors Rust `Border`.
+ * `size` = thickness as % of the long edge; `color` = sRGB 0..1; `aspectW/aspectH` = target output
+ * ratio (0,0 = keep the photo's aspect). No-op at the default. */
+export type Border = {
+  size: number;
+  color: Rgb3;
+  aspectW: number;
+  aspectH: number;
+};
+
+export const DEFAULT_BORDER: Border = {
+  size: 0,
+  color: [1, 1, 1],
+  aspectW: 0,
+  aspectH: 0,
+};
+
+/** True when the border would change the output (a margin, or a target aspect). */
+export function borderIsActive(b: Border): boolean {
+  return b.size > 0 || (b.aspectW > 0 && b.aspectH > 0);
+}
+
 export type DevelopParams = {
   exposure: number;
   temp: number;
@@ -939,12 +979,14 @@ export type DevelopParams = {
   crop: Crop;
   masks: Mask[];
   cbRgb: CbRgb;
+  channelMix: ChannelMix;
+  border: Border;
 };
 
 /** The numeric (scalar) develop params — everything except the structured fields. */
 export type ScalarParamKey = Exclude<
   keyof DevelopParams,
-  "toneCurve" | "hsl" | "crop" | "masks" | "cbRgb"
+  "toneCurve" | "hsl" | "crop" | "masks" | "cbRgb" | "channelMix" | "border"
 >;
 
 export const EMPTY_TONE_CURVE: ToneCurve = { rgb: [], r: [], g: [], b: [] };
@@ -976,6 +1018,12 @@ export const DEFAULT_PARAMS: DevelopParams = {
   crop: { ...DEFAULT_CROP },
   masks: [],
   cbRgb: { ...DEFAULT_CB_RGB },
+  channelMix: {
+    red: [...DEFAULT_CHANNEL_MIX.red],
+    green: [...DEFAULT_CHANNEL_MIX.green],
+    blue: [...DEFAULT_CHANNEL_MIX.blue],
+  },
+  border: { ...DEFAULT_BORDER, color: [...DEFAULT_BORDER.color] },
 };
 
 export function developGetEdit(imageId: number): Promise<DevelopParams> {
@@ -1339,6 +1387,39 @@ export function analysisCancel(): Promise<void> {
   return invoke<void>("analysis_cancel", {});
 }
 
+/** Result of an AI (SAM) mask prompt. Mirrors Rust `segment::PromptResult`. */
+export type MaskAiResult = {
+  /** Component key to store in the mask's `ai` component `hash`. */
+  hash: string;
+  width: number;
+  height: number;
+  iou: number;
+};
+
+/** Whether the AI-masking (SAM) models are downloaded and ready. */
+export function maskAiReady(): Promise<boolean> {
+  return invoke<boolean>("mask_ai_ready", {});
+}
+
+/** Download the AI-masking model weights (first use). Emits `mask_ai:models` `{done,total}`. */
+export function maskAiModelsEnsure(): Promise<void> {
+  return invoke<void>("mask_ai_models_ensure", {});
+}
+
+/** Warm the SAM embedding for an image (background encode) so the first click is instant. */
+export function maskAiEncode(imageId: number): Promise<void> {
+  return invoke<void>("mask_ai_encode", { imageId });
+}
+
+/** Segment an object on `imageId` from prompt `points` (normalized [0,1]). Returns the component
+ *  key + mask dims + IoU; the caller writes `hash`/`points` into the mask's `ai` component. */
+export function maskAiPrompt(
+  imageId: number,
+  points: AiPoint[],
+): Promise<MaskAiResult> {
+  return invoke<MaskAiResult>("mask_ai_prompt", { imageId, points });
+}
+
 /** Backfill per-image feature vectors (lighting/best-shot/dedup model inputs) for images missing
  *  them. Emits `features:progress` `{done,total}` then `features:done`. Resolves to count computed. */
 export function featuresBackfill(): Promise<number> {
@@ -1421,6 +1502,19 @@ export function analysisDetectorSize(): Promise<number> {
 
 export function setAnalysisDetectorSize(size: number): Promise<void> {
   return invoke<void>("set_analysis_detector_size", { size });
+}
+
+/** AI-masking (SAM) quality tier. Only "realtime" is functional today. */
+export type MaskAiTier = "realtime" | "balanced" | "max";
+
+/** Configured AI-masking tier. */
+export function maskAiTierGet(): Promise<MaskAiTier> {
+  return invoke<MaskAiTier>("mask_ai_tier_get", {});
+}
+
+/** Persist the AI-masking tier (clears the SAM embedding so the next prompt re-encodes). */
+export function maskAiTierSet(tier: MaskAiTier): Promise<void> {
+  return invoke<void>("mask_ai_tier_set", { tier });
 }
 
 /** Whether the face stage runs as part of the unified AI scan (default on; needs face models). */

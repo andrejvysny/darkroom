@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod models;
 mod preprocess;
 pub mod presence;
+pub mod sam;
 pub mod verify;
 
 use std::sync::Arc;
@@ -32,6 +33,7 @@ pub use megadetector::MegaDetector;
 /// Re-export so downstream crates link the exact same `ort`.
 pub use ort;
 pub use presence::PresenceProbe;
+pub use sam::{Prompt, SamEmbedding, SamMask, SamPreproc, Segmenter, SAM_EDGE};
 pub use verify::Verifier;
 
 use serde::de::DeserializeOwned;

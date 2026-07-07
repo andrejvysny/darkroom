@@ -69,6 +69,54 @@ pub fn to_scrfd_chw(img: &RgbImage, size: u32) -> (Vec<f32>, f32) {
     (out, scale)
 }
 
+/// MobileSAM image-encoder preprocessing (Acly ONNX export). The encoder graph itself normalizes
+/// (`(x−mean)/std`), permutes HWC→CHW and zero-pads to 1024², so the caller only has to hand it an
+/// **HWC RGB f32 buffer in the 0–255 range with the longest side resized to `edge` (=1024)**. Returns
+/// the flattened buffer plus the resized `(w, h)` — those dims are the SAM working-image size
+/// (`orig_im_size`), and prompt points are given as `normalized × (w, h)` in this same frame. Aspect
+/// is preserved; no padding here (the graph pads internally, matching SAM's post-normalize zero pad).
+pub fn to_sam_hwc(img: &RgbImage, edge: u32) -> (Vec<f32>, u32, u32) {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let scale = edge as f32 / w.max(h) as f32;
+    let nw = ((w as f32 * scale).round() as u32).clamp(1, edge);
+    let nh = ((h as f32 * scale).round() as u32).clamp(1, edge);
+    let resized = image::imageops::resize(img, nw, nh, FilterType::Triangle);
+    let mut out = vec![0f32; (nw * nh * 3) as usize];
+    for (x, y, px) in resized.enumerate_pixels() {
+        let i = ((y * nw + x) * 3) as usize;
+        out[i] = px[0] as f32;
+        out[i + 1] = px[1] as f32;
+        out[i + 2] = px[2] as f32;
+    }
+    (out, nw, nh)
+}
+
+/// Standard SAM image-encoder preprocessing (ViT-B/L samexporter exports, whose ONNX encoder takes a
+/// **pre-processed** `[1,3,edge,edge]` CHW tensor — unlike the Acly MobileSAM export which bakes this
+/// into the graph, see [`to_sam_hwc`]). Resizes the longest side to `edge`, normalizes with SAM's
+/// ImageNet mean/std on 0–255 values, zero-pads the bottom/right to `edge²` **after** normalization
+/// (matching SAM's post-normalize pad), and lays out planar CHW. Returns the buffer plus the resized
+/// `(w, h)` (the working-image size = `orig_im_size`; prompt points are `normalized × (w, h)`).
+pub fn to_sam_chw(img: &RgbImage, edge: u32) -> (Vec<f32>, u32, u32) {
+    const MEAN: [f32; 3] = [123.675, 116.28, 103.53];
+    const STD: [f32; 3] = [58.395, 57.12, 57.375];
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let scale = edge as f32 / w.max(h) as f32;
+    let nw = ((w as f32 * scale).round() as u32).clamp(1, edge);
+    let nh = ((h as f32 * scale).round() as u32).clamp(1, edge);
+    let resized = image::imageops::resize(img, nw, nh, FilterType::Triangle);
+    let plane = (edge * edge) as usize;
+    // Init 0 ⇒ the padded region is 0 in normalized space (SAM pads with zeros after normalize).
+    let mut out = vec![0f32; 3 * plane];
+    for (x, y, px) in resized.enumerate_pixels() {
+        let i = (y * edge + x) as usize;
+        out[i] = (px[0] as f32 - MEAN[0]) / STD[0];
+        out[plane + i] = (px[1] as f32 - MEAN[1]) / STD[1];
+        out[2 * plane + i] = (px[2] as f32 - MEAN[2]) / STD[2];
+    }
+    (out, nw, nh)
+}
+
 /// CLIP-style preprocessing for MobileCLIP-S1: resize the shortest edge to `size` (aspect-preserving),
 /// center-crop to `size`×`size`, `÷255`, RGB, planar CHW. MobileCLIP S0–S2 use identity normalization
 /// (`do_normalize=false`), unlike OpenAI CLIP — see the `Xenova/mobileclip_s1` preprocessor config.

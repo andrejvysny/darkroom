@@ -122,6 +122,24 @@ struct CbRgb {
 };
 @group(0) @binding(14) var<uniform> CB: CbRgb;
 
+// Channel mixer (@binding(15)). r/g/b hold each output channel's source-RGB weights in .xyz; the
+// output is a per-channel dot(weights, color). params = (active 0/1, _, _, _). active=0 ⇒ passthrough
+// (byte-identical to a pre-binding-15 render). Applied on display sRGB (Photoshop/GIMP semantics).
+struct ChanMix {
+  r: vec4<f32>,
+  g: vec4<f32>,
+  b: vec4<f32>,
+  params: vec4<f32>,
+};
+@group(0) @binding(15) var<uniform> CM: ChanMix;
+
+fn apply_channel_mix(c: vec3<f32>) -> vec3<f32> {
+  if (CM.params.x < 0.5) { return c; }  // identity ⇒ byte-exact passthrough
+  return clamp(
+    vec3<f32>(dot(CM.r.xyz, c), dot(CM.g.xyz, c), dot(CM.b.xyz, c)),
+    vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
@@ -668,6 +686,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   // The base operator maps scene-linear→display-linear in ProPhoto (covering >1.0 headroom), then the
   // matrix + OETF take it to display-encoded sRGB. Out-of-sRGB-gamut colors clamp at the final step.
   var d = srgb_encode(pp_to_srgb(apply_base_tone(lin)));
+  // Channel mixer / swap on display sRGB (Photoshop/GIMP semantics), before HSL + tone curve.
+  d = apply_channel_mix(d);
   d = apply_hsl(d);
   d = vec3<f32>(
     curve_ch(d.r, vec3<f32>(1.0, 0.0, 0.0)),

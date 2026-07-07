@@ -3,7 +3,10 @@
 //! (`vec3 wb_gain` + scalars) — a misalignment would make exposure/saturation/etc. no-ops.
 //! Skips gracefully when no GPU adapter is available.
 
-use core_pipeline::{CbRgb, DevelopParams, DevelopPipeline, GpuContext};
+use core_pipeline::{
+    AiCoverage, AiPoint, CbRgb, ChannelMix, ComponentKind, DevelopParams, DevelopPipeline,
+    GpuContext, LocalAdjust, Mask, MaskComponent, MaskOp,
+};
 use core_raw::LinearImage;
 
 fn solid(w: u32, h: u32, rgb: [f32; 3]) -> LinearImage {
@@ -110,6 +113,91 @@ fn develop_params_have_correct_effects() {
     assert!(
         spread1 > spread0,
         "saturation+ must increase R-B spread ({spread0} -> {spread1})"
+    );
+}
+
+/// Mean of channel `ch` over the column band `[x0, x1)` of a `w`-wide RGBA8 buffer.
+fn mean_band(rgba: &[u8], w: u32, x0: u32, x1: u32, ch: usize) -> f64 {
+    let (mut sum, mut n) = (0u64, 0u64);
+    let stride = (w * 4) as usize;
+    for row in rgba.chunks_exact(stride) {
+        for x in x0..x1 {
+            sum += row[(x * 4) as usize + ch] as u64;
+            n += 1;
+        }
+    }
+    sum as f64 / n.max(1) as f64
+}
+
+/// AI-mask (kind==5) coverage: a baked alpha stashed on the prepared image must brighten only the
+/// region it covers. Feeds a left-half=255 / right-half=0 alpha (like a SAM result) into the mask
+/// pre-pass via `PreparedImage::ai_coverages`, keyed by the `ComponentKind::Ai.hash`, with a +2 EV
+/// local exposure. Guards the whole kind-5 path: ai_tex upload + `ai_scale` valid-region sampling +
+/// per-mask local adjust. Deliberately `feather=false` so the boundary stays a hard half/half split.
+#[test]
+fn ai_mask_coverage_applies_locally() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    let gray = solid(64, 64, [0.2, 0.2, 0.2]);
+    let prep = pipe.prepare(&ctx, &gray).unwrap();
+
+    // Left half of the coverage selected, right half not. Sampled by normalized UV, so it splits the
+    // rendered image down the middle regardless of the alpha's own resolution.
+    let (aw, ah) = (64u32, 48u32);
+    let mut alpha = vec![0u8; (aw * ah) as usize];
+    for y in 0..ah {
+        for x in 0..aw / 2 {
+            alpha[(y * aw + x) as usize] = 255;
+        }
+    }
+    *prep.ai_coverages.lock().unwrap() = vec![AiCoverage {
+        hash: "test-ai".into(),
+        width: aw,
+        height: ah,
+        alpha,
+    }];
+
+    let params = DevelopParams {
+        masks: vec![Mask {
+            name: "ai".into(),
+            components: vec![MaskComponent {
+                kind: ComponentKind::Ai {
+                    model: "mobile_sam".into(),
+                    points: vec![AiPoint {
+                        x: 0.25,
+                        y: 0.5,
+                        positive: true,
+                    }],
+                    hash: "test-ai".into(),
+                },
+                op: MaskOp::Add,
+                invert: false,
+                feather: false,
+            }],
+            adjust: LocalAdjust {
+                exposure: 2.0,
+                ..Default::default()
+            },
+            opacity: 1.0,
+            enabled: true,
+        }],
+        ..Default::default()
+    };
+    let out = pipe.render(&ctx, &prep, &params).unwrap();
+
+    // Left band (covered) must be clearly brighter than the right band (untouched); sample away from
+    // the seam to avoid the one-column boundary ramp.
+    let left = mean_band(&out, 64, 4, 24, 0);
+    let right = mean_band(&out, 64, 40, 60, 0);
+    assert!(
+        left > right + 25.0,
+        "AI mask must brighten only the covered (left) half (left {left}, right {right})"
     );
 }
 
@@ -460,6 +548,55 @@ fn color_balance_saturation_neutralizes() {
     assert!(
         spread < spread_base * 0.25,
         "saturation -1 must neutralize (r-b {spread_base} -> {spread})"
+    );
+}
+
+/// Channel mixer (binding 15): swapping the green↔blue rows turns a green-dominant pixel
+/// blue-dominant, and the identity default renders byte-identical to a pre-binding-15 build.
+#[test]
+fn channel_mix_swaps_green_blue() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no GPU adapter — skipping");
+            return;
+        }
+    };
+    let pipe = DevelopPipeline::new(&ctx);
+    // A clearly green pixel (G ≫ B).
+    let img = solid(8, 8, [0.12, 0.5, 0.12]);
+    let prep = pipe.prepare(&ctx, &img).unwrap();
+
+    let base = pipe.render(&ctx, &prep, &DevelopParams::default()).unwrap();
+    assert!(
+        mean_channel(&base, 1) > mean_channel(&base, 2) + 20.0,
+        "fixture must start green-dominant (g>b)"
+    );
+
+    // Identity mixer is a no-op ⇒ byte-identical to the default render.
+    let identity = DevelopParams {
+        channel_mix: ChannelMix::default(),
+        ..DevelopParams::default()
+    };
+    let ident_out = pipe.render(&ctx, &prep, &identity).unwrap();
+    assert_eq!(base, ident_out, "identity mixer must not change the render");
+
+    // Swap green↔blue: output-green takes the source blue, output-blue takes the source green.
+    let swapped = DevelopParams {
+        channel_mix: ChannelMix {
+            green: [0.0, 0.0, 1.0],
+            blue: [0.0, 1.0, 0.0],
+            ..ChannelMix::default()
+        },
+        ..DevelopParams::default()
+    };
+    let out = pipe.render(&ctx, &prep, &swapped).unwrap();
+    // Now blue must dominate green (the swap moved the green energy into the blue channel).
+    assert!(
+        mean_channel(&out, 2) > mean_channel(&out, 1) + 20.0,
+        "swap G/B must make the pixel blue-dominant (g={}, b={})",
+        mean_channel(&out, 1),
+        mean_channel(&out, 2)
     );
 }
 

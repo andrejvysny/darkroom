@@ -258,6 +258,10 @@ fn write_base_lut(ctx: &GpuContext, tex: &wgpu::Texture, lut: &[f32]) {
 }
 
 /// Per-image GPU resources, reused across many `render()` calls (one per slider change).
+/// Edge of the square AI-alpha texture (`ai_tex`). MUST match `core_analyze::sam::SAM_EDGE` — the
+/// SAM working resolution, so a baked alpha (longest side = SAM_EDGE) fits without downscaling.
+pub const AI_TEX_EDGE: u32 = 1024;
+
 pub struct PreparedImage {
     pub width: u32,
     pub height: u32,
@@ -282,11 +286,22 @@ pub struct PreparedImage {
     view_uniform: wgpu::Buffer,
     // Color-balance-RGB grading uniform (@binding(14)), rewritten per render().
     cbrgb_uniform: wgpu::Buffer,
+    // Channel-mixer uniform (@binding(15)), rewritten per render().
+    chanmix_uniform: wgpu::Buffer,
     // Per-mask scalar deltas, rewritten per render() from the current params.
     mask_buffer: wgpu::Buffer,
     // Pre-pass uniform (one mask's components), rewritten per mask per render().
     prepass_uniform: wgpu::Buffer,
     prepass_bind: wgpu::BindGroup,
+    // Baked AI (SAM) alpha for the current mask being pre-passed (fixed AI_TEX_EDGE² R8Unorm, valid
+    // region top-left). Content rewritten per-mask in the bake loop from `ai_coverages`; the view is
+    // bound once in `prepass_bind`.
+    ai_tex: wgpu::Texture,
+    /// Baked AI-mask coverages for THIS image, keyed by the `ComponentKind::Ai` component `hash`.
+    /// Set by `develop_render` (resolved from the backend SAM cache) before a render; read in the
+    /// mask bake loop. Public so the IPC layer can stash freshly computed coverage on the prepared
+    /// image without a re-decode. Mutex keeps `PreparedImage: Sync` for the shared develop caches.
+    pub ai_coverages: std::sync::Mutex<Vec<crate::params::AiCoverage>>,
     // Brush bake: per-mask scratch coverage (R16Float) + the size→uv-radius uniform/bind.
     brush_tex: wgpu::Texture,
     // Kept alive for the bake bind group.
@@ -330,8 +345,9 @@ mod write_slot {
     pub const BASE_LUT: usize = 8;
     pub const GEOM: usize = 9;
     pub const CBRGB: usize = 10;
+    pub const CHANMIX: usize = 11;
 }
-const WRITE_SLOTS: usize = 11;
+const WRITE_SLOTS: usize = 12;
 
 /// 2×2 box-average one RGBA f32 mip level into the next (odd trailing row/col clamp to the edge).
 fn downsample_rgba_f32(src: &[f32], w: u32, h: u32) -> Vec<f32> {
@@ -600,6 +616,17 @@ impl DevelopPipeline {
                     },
                     count: None,
                 },
+                // Channel mixer (uniform).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -824,6 +851,11 @@ impl DevelopPipeline {
             contents: bytemuck::bytes_of(&crate::params::CbRgbUniform::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let chanmix_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("develop-chanmix-uniform"),
+            contents: bytemuck::bytes_of(&crate::params::ChanMixUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         // Tone-curve LUT: 256x1 RGBA8, seeded with identity (overwritten each render()).
         let lut_size = wgpu::Extent3d {
@@ -915,6 +947,26 @@ impl DevelopPipeline {
         });
         let brush_scratch_view = brush_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // AI (SAM) alpha for the current mask: fixed AI_TEX_EDGE² R8Unorm, valid region top-left. The
+        // baked mask (≤ AI_TEX_EDGE longest side, same aspect as the image) is uploaded per-mask in the
+        // bake loop and sampled by normalized UV (GPU-upscaled). Fixed size ⇒ the view stays valid in
+        // `prepass_bind` across images/masks (only the CONTENT changes via write_texture).
+        let ai_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("develop-ai-alpha"),
+            size: wgpu::Extent3d {
+                width: AI_TEX_EDGE,
+                height: AI_TEX_EDGE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let ai_tex_view = ai_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
         // Mask-alpha scratch ping-pong (single-layer R16Float) for the pre-pass + refine.
         let r16_scratch = |label: &str| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -974,6 +1026,10 @@ impl DevelopPipeline {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&input_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&ai_tex_view),
                 },
             ],
         });
@@ -1049,6 +1105,10 @@ impl DevelopPipeline {
                     binding: 14,
                     resource: cbrgb_uniform.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: chanmix_uniform.as_entire_binding(),
+                },
             ],
         });
 
@@ -1082,9 +1142,12 @@ impl DevelopPipeline {
             geom_uniform,
             view_uniform,
             cbrgb_uniform,
+            chanmix_uniform,
             mask_buffer,
             prepass_uniform,
             prepass_bind,
+            ai_tex,
+            ai_coverages: std::sync::Mutex::new(Vec::new()),
             brush_tex,
             _bake_uniform: bake_uniform,
             bake_bind,
@@ -1212,6 +1275,12 @@ impl DevelopPipeline {
             bytemuck::bytes_of(&params.to_cbrgb()),
             &mut hashes[write_slot::CBRGB],
         );
+        write_buffer_if_changed(
+            &ctx.queue,
+            &prepared.chanmix_uniform,
+            bytemuck::bytes_of(&params.to_chanmix()),
+            &mut hashes[write_slot::CHANMIX],
+        );
         drop(hashes);
 
         // Mask pre-pass: compute each enabled mask's composited alpha into its alpha layer. Same
@@ -1221,6 +1290,7 @@ impl DevelopPipeline {
         // global/local SCALAR edits leave geometry untouched, so they reuse the persistent mask_tex
         // layer and skip the (full-res) pre-pass entirely.
         let mut layer_hashes = prepared.mask_layer_hash.lock().unwrap();
+        let ai_covs = prepared.ai_coverages.lock().unwrap();
         let mut enabled_count = 0usize;
         for (layer, mask) in params
             .masks
@@ -1241,7 +1311,44 @@ impl DevelopPipeline {
                 self.bake_brush(ctx, prepared, mask);
             }
 
-            let pre = crate::mask::PrepassUniform::from_mask(mask);
+            let mut pre = crate::mask::PrepassUniform::from_mask(mask);
+            // AI (SAM) coverage: upload this mask's baked alpha into `ai_tex` (top-left) and set the
+            // valid-region scale so the pre-pass samples only the written region. Missing coverage
+            // (not yet computed / cache miss) leaves ai_scale=[0,0] ⇒ kind==5 reads 0 (empty mask).
+            if let Some(hash) = crate::mask::mask_ai_hash(mask) {
+                if let Some(cov) = ai_covs
+                    .iter()
+                    .find(|c| c.hash == hash && !c.alpha.is_empty())
+                {
+                    let cw = cov.width.min(AI_TEX_EDGE);
+                    let ch = cov.height.min(AI_TEX_EDGE);
+                    if cov.alpha.len() >= (cw as usize) * (ch as usize) {
+                        ctx.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &prepared.ai_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            &cov.alpha,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(cov.width),
+                                rows_per_image: Some(ch),
+                            },
+                            wgpu::Extent3d {
+                                width: cw,
+                                height: ch,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        pre.ai_scale = [
+                            cw as f32 / AI_TEX_EDGE as f32,
+                            ch as f32 / AI_TEX_EDGE as f32,
+                        ];
+                    }
+                }
+            }
             ctx.queue
                 .write_buffer(&prepared.prepass_uniform, 0, bytemuck::bytes_of(&pre));
             let layer_view = prepared.mask_tex.create_view(&wgpu::TextureViewDescriptor {

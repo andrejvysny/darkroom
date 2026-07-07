@@ -24,6 +24,7 @@ export const SCOPE_GROUPS: ScopeGroup[] = [
   { key: "toneCurve", label: "Tone Curve", fields: ["toneCurve"] },
   { key: "colorMixer", label: "Color Mixer", fields: ["saturation", "hsl"] },
   { key: "colorBalance", label: "Color Balance", fields: ["cbRgb"] },
+  { key: "channelMixer", label: "Channel Mixer", fields: ["channelMix"] },
   { key: "detail", label: "Detail", fields: ["sharpen", "nrLuma", "nrColor"] },
   { key: "presence", label: "Presence", fields: ["clarity", "texture", "dehaze"] },
   {
@@ -32,6 +33,7 @@ export const SCOPE_GROUPS: ScopeGroup[] = [
     fields: ["vignette", "distK1", "distK2", "caRed", "caBlue"],
   },
   { key: "crop", label: "Crop", fields: ["crop"] },
+  { key: "border", label: "Border", fields: ["border"] },
   { key: "masks", label: "Masks", fields: ["masks"] },
 ];
 
@@ -52,6 +54,7 @@ export const DEFAULT_PRESET_GROUPS: string[] = [
   "toneCurve",
   "colorMixer",
   "colorBalance",
+  "channelMixer",
   "detail",
   "lens",
 ];

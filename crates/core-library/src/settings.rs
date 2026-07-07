@@ -88,6 +88,28 @@ pub fn set_animal_detector_size(conn: &Connection, size: u32) -> Result<(), LibE
     set_meta(conn, KEY_ANIMAL_DETECTOR_SIZE, &size.to_string())
 }
 
+/// Interactive-segmentation (AI masking) quality tier: `"realtime"` (MobileSAM, the only functional
+/// tier today) | `"balanced"` | `"max"` (reserved for SAM2-tiny / SAM-HQ once their single-image ONNX
+/// exports are validated). Default `"realtime"`.
+const KEY_MASK_AI_TIER: &str = "mask_ai_tier";
+
+/// Configured AI-masking tier tag, or `"realtime"` when unset/invalid.
+pub fn mask_ai_tier(conn: &Connection) -> Result<String, LibError> {
+    Ok(get_meta(conn, KEY_MASK_AI_TIER)?
+        .filter(|v| matches!(v.as_str(), "realtime" | "balanced" | "max"))
+        .unwrap_or_else(|| "realtime".to_string()))
+}
+
+/// Persist the AI-masking tier (unknown tags coerce to `"realtime"`).
+pub fn set_mask_ai_tier(conn: &Connection, tier: &str) -> Result<(), LibError> {
+    let tier = match tier {
+        "balanced" => "balanced",
+        "max" => "max",
+        _ => "realtime",
+    };
+    set_meta(conn, KEY_MASK_AI_TIER, tier)
+}
+
 /// Whether the face stage runs in the unified scan (defaults ON — see [`KEY_FACE_STAGE_ENABLED`]).
 pub fn face_stage_enabled(conn: &Connection) -> Result<bool, LibError> {
     Ok(get_meta(conn, KEY_FACE_STAGE_ENABLED)?

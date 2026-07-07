@@ -8,7 +8,9 @@ import {
   type ComponentKind,
   type Crop,
   type Mask,
+  borderIsActive,
 } from "../../lib/ipc";
+import { computeFrame, rgb3ToCss } from "../../lib/frame";
 import {
   fitViewState,
   zoom1to1,
@@ -36,6 +38,13 @@ interface StageProps {
     kind: ComponentKind,
   ) => void;
   onCommitStroke: (index: number, stroke: BrushStroke) => void;
+  /** Add an AI (SAM) prompt point (normalized [0,1]) to the mask's ai component. */
+  onAiPoint: (
+    index: number,
+    nx: number,
+    ny: number,
+    positive: boolean,
+  ) => void;
   /** Render function: receives current derived view, returns frame or null. */
   renderFn: (derived: DerivedView) => Promise<RenderedFrame | null>;
   /** Bumped by useDevelop on every param/overlay/before-after change to force a canvas re-render. */
@@ -59,6 +68,7 @@ export default function Stage({
   onCropChange,
   onChangeMaskKind,
   onCommitStroke,
+  onAiPoint,
   renderFn,
   renderTick,
   renderGate = true,
@@ -71,6 +81,7 @@ export default function Stage({
     (s) => s.selectedComponentIndex,
   );
   const maskOverlayVisible = useDevelopStore((s) => s.maskOverlayVisible);
+  const aiMaskBusy = useDevelopStore((s) => s.aiMaskBusy);
   const cropMode = useDevelopStore((s) => s.cropMode);
   const brush = useDevelopStore((s) => s.brush);
   const selectedId = useAppStore((s) => s.selectedId);
@@ -158,6 +169,47 @@ export default function Stage({
   const boxH = painted?.cssH ?? visCssH;
   const paintedView = painted?.view ?? derived.view;
 
+  // Live border/frame preview: a display-layer frame around the fitted image (fit view only, no crop,
+  // not the BEFORE render). The canvas backing store / render path are untouched — the image is just
+  // CSS-scaled to sit inside the colored frame. Geometry mirrors the Rust `frame_rgba8` export.
+  const border = useDevelopStore((s) => s.params.border);
+  const fv = derived.view;
+  const isFitView =
+    Math.abs(fv.ox) < 1e-6 &&
+    Math.abs(fv.oy) < 1e-6 &&
+    Math.abs(fv.sx - 1) < 1e-6 &&
+    Math.abs(fv.sy - 1) < 1e-6;
+  const showFrame =
+    borderIsActive(border) && isFitView && !cropMode && !showBefore;
+  const frame = showFrame
+    ? computeFrame(effNatural.w, effNatural.h, border)
+    : null;
+  let frameBox: {
+    w: number;
+    h: number;
+    offL: number;
+    offT: number;
+    imgW: number;
+    imgH: number;
+  } | null = null;
+  if (frame) {
+    const s = Math.min(
+      Math.max(1, containerCss.w - 2 * PAD) / frame.ow,
+      Math.max(1, containerCss.h - 2 * PAD) / frame.oh,
+    );
+    frameBox = {
+      w: frame.ow * s,
+      h: frame.oh * s,
+      offL: frame.offX * s,
+      offT: frame.offY * s,
+      imgW: effNatural.w * s,
+      imgH: effNatural.h * s,
+    };
+  }
+  // Displayed image-box size: shrinks to make room for the frame when one is shown.
+  const dispW = frameBox ? frameBox.imgW : boxW;
+  const dispH = frameBox ? frameBox.imgH : boxH;
+
   // Paint preview image when it arrives (instant first paint before the GPU render lands).
   // Gated: only before any GPU frame exists AND only at the fit view with no crop — the preview is
   // the WHOLE (uncropped) image, so stretch-blitting it into a zoomed/panned sub-window or a
@@ -213,33 +265,55 @@ export default function Stage({
         overflow: "hidden",
       }}
     >
-      {/* Canvas wrapper — sized to the PAINTED frame so box and pixels always agree in aspect
-          (sizing from the live view while the async frame lags stretched the image during zoom). */}
+      {/* Border/frame box (fit view only) wrapping the canvas. `display:contents` when off so the
+          normal centered layout is unchanged. */}
       <div
-        style={{
-          position: "relative",
-          width: boxW,
-          height: boxH,
-          flexShrink: 0,
-          boxShadow:
-            "0 10px 50px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06)",
-          borderRadius: 3,
-          overflow: "hidden",
-        }}
+        style={
+          frameBox
+            ? {
+                position: "relative",
+                width: frameBox.w,
+                height: frameBox.h,
+                background: rgb3ToCss(border.color),
+                boxShadow:
+                  "0 10px 50px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06)",
+                borderRadius: 3,
+                flexShrink: 0,
+                overflow: "hidden",
+              }
+            : { display: "contents" }
+        }
       >
-        <canvas
-          ref={canvasRef}
-          onPointerDown={onPointerDown}
-          onDoubleClick={resetView}
+        {/* Canvas wrapper — sized to the PAINTED frame so box and pixels always agree in aspect
+            (sizing from the live view while the async frame lags stretched the image during zoom). */}
+        <div
           style={{
-            display: "block",
-            width: boxW,
-            height: boxH,
+            position: frameBox ? "absolute" : "relative",
+            left: frameBox ? frameBox.offL : undefined,
+            top: frameBox ? frameBox.offT : undefined,
+            width: dispW,
+            height: dispH,
+            flexShrink: 0,
+            boxShadow: frameBox
+              ? "none"
+              : "0 10px 50px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06)",
             borderRadius: 3,
-            userSelect: "none",
-            cursor: cropMode ? "default" : "grab",
+            overflow: "hidden",
           }}
-        />
+        >
+          <canvas
+            ref={canvasRef}
+            onPointerDown={onPointerDown}
+            onDoubleClick={resetView}
+            style={{
+              display: "block",
+              width: dispW,
+              height: dispH,
+              borderRadius: 3,
+              userSelect: "none",
+              cursor: cropMode ? "default" : "grab",
+            }}
+          />
 
         {/* Overlays sit above canvas, sized + view-mapped to the PAINTED frame (matching pixels) */}
         {showOverlay && (
@@ -247,8 +321,8 @@ export default function Stage({
             style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
           >
             <MaskOverlay
-              width={boxW}
-              height={boxH}
+              width={dispW}
+              height={dispH}
               viewRect={paintedView}
               mask={selectedMask}
               compIndex={Math.min(
@@ -269,6 +343,9 @@ export default function Stage({
               onCommitStroke={(stroke) =>
                 onCommitStroke(selectedMaskIndex!, stroke)
               }
+              onAiPoint={(nx, ny, positive) =>
+                onAiPoint(selectedMaskIndex!, nx, ny, positive)
+              }
             />
           </div>
         )}
@@ -277,13 +354,14 @@ export default function Stage({
             style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
           >
             <CropOverlay
-              width={boxW}
-              height={boxH}
+              width={dispW}
+              height={dispH}
               crop={crop}
               onChange={onCropChange}
             />
           </div>
         )}
+        </div>
       </div>
 
       {/* BEFORE badge */}
@@ -345,6 +423,40 @@ export default function Stage({
             opacity: 0.8,
           }}
         />
+      )}
+
+      {/* AI-mask busy loader (download / encode / segment) — visible over the whole stage. */}
+      {aiMaskBusy && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 30,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 12,
+            background: "rgba(0,0,0,0.4)",
+            backdropFilter: "blur(1px)",
+            pointerEvents: "none",
+          }}
+        >
+          <style>{"@keyframes darkroom-spin{to{transform:rotate(360deg)}}"}</style>
+          <div
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: "50%",
+              border: "3px solid rgba(255,255,255,0.22)",
+              borderTopColor: "var(--color-accent)",
+              animation: "darkroom-spin 0.8s linear infinite",
+            }}
+          />
+          <div style={{ fontSize: 12.5, fontWeight: 500, color: "#fff" }}>
+            Segmenting…
+          </div>
+        </div>
       )}
 
       {/* Status bar */}

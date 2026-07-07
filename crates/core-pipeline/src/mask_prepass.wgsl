@@ -18,8 +18,9 @@ struct Comp {
 struct Pre {
   count: u32,
   _p0: u32,
-  _p1: u32,
-  _p2: u32,
+  // AI coverage sampling: fraction of ai_tex holding the valid alpha (valid_w/EDGE, valid_h/EDGE).
+  // (0,0) ⇒ no AI coverage bound for this mask, so kind==5 reads 0.
+  ai_scale: vec2<f32>,
   comps: array<Comp, 8>,
 };
 
@@ -27,6 +28,8 @@ struct Pre {
 @group(0) @binding(1) var brush_tex: texture_2d<f32>;
 @group(0) @binding(2) var brush_smp: sampler;
 @group(0) @binding(3) var input_tex: texture_2d<f32>;
+// Baked AI (SAM) alpha for this mask, valid region in the top-left (see PRE.ai_scale), R8.
+@group(0) @binding(4) var ai_tex: texture_2d<f32>;
 
 const LUMA = vec3<f32>(0.2126, 0.7152, 0.0722);
 
@@ -142,8 +145,12 @@ fn fs_prepass(in: VsOut) -> @location(0) vec4<f32> {
       cov = luma_cov(in.uv, c.a.x, c.a.y, c.a.z);
     } else if (c.kind == 4u) {
       cov = color_cov(in.uv, c.a.x, c.a.y, c.a.z, c.a.w);
+    } else if (c.kind == 5u) {
+      // AI (SAM) mask: sample the baked alpha over its valid top-left region (GPU-upscaled).
+      if (PRE.ai_scale.x > 0.0 && PRE.ai_scale.y > 0.0) {
+        cov = textureSampleLevel(ai_tex, brush_smp, in.uv * PRE.ai_scale, 0.0).r;
+      }
     }
-    // kind 5 (ai): 0 coverage for now.
     if (c.invert == 1u) { cov = 1.0 - cov; }
 
     // The first component seeds the running coverage regardless of its op — there is no prior alpha

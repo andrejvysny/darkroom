@@ -18,6 +18,11 @@ mod faces;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[path = "faces_stub.rs"]
 mod faces;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+mod segment;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[path = "segment_stub.rs"]
+mod segment;
 
 use state::AppState;
 use tauri::Manager;
@@ -178,6 +183,12 @@ pub fn run() {
             commands::analysis_models_ensure,
             commands::analysis_run,
             commands::analysis_cancel,
+            commands::mask_ai_models_ensure,
+            commands::mask_ai_ready,
+            commands::mask_ai_encode,
+            commands::mask_ai_prompt,
+            commands::mask_ai_tier_get,
+            commands::mask_ai_tier_set,
             commands::analysis_facets,
             commands::image_detections,
             commands::image_caption,

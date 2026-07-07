@@ -51,6 +51,11 @@ pub const GROUPS: &[ScopeGroup] = &[
         fields: &["cbRgb"],
     },
     ScopeGroup {
+        key: "channelMixer",
+        label: "Channel Mixer",
+        fields: &["channelMix"],
+    },
+    ScopeGroup {
         key: "detail",
         label: "Detail",
         fields: &["sharpen", "nrLuma", "nrColor"],
@@ -69,6 +74,11 @@ pub const GROUPS: &[ScopeGroup] = &[
         key: "crop",
         label: "Crop",
         fields: &["crop"],
+    },
+    ScopeGroup {
+        key: "border",
+        label: "Border",
+        fields: &["border"],
     },
     ScopeGroup {
         key: "masks",

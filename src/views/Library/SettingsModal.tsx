@@ -9,6 +9,9 @@ import {
   setAnalysisDetectorSize,
   faceStageEnabled,
   setFaceStageEnabled,
+  maskAiTierGet,
+  maskAiTierSet,
+  type MaskAiTier,
   previewEdge,
   updatePreviewEdge,
   appLibraryRoot,
@@ -96,6 +99,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [status, setStatus] = useState<string | null>(null);
   const [mdSize, setMdSize] = useState(1280);
   const [faceStage, setFaceStage] = useState(true);
+  const [maskTier, setMaskTier] = useState<MaskAiTier>("realtime");
   const [accelerator, setAccelerator] = useState<string | null>(null);
   const [pEdge, setPEdge] = useState(0);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -135,14 +139,16 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       faceStageEnabled(),
       logsStatus(),
       analysisStatus(),
+      maskAiTierGet(),
     ])
-      .then(([cap, used, size, root, pe, fse, logStatus, aStatus]) => {
+      .then(([cap, used, size, root, pe, fse, logStatus, aStatus, tier]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
         setMdSize(size);
         setLibRoot(root);
         setPEdge(pe);
         setFaceStage(fse);
+        setMaskTier(tier);
         setLogs(logStatus);
         setAccelerator(aStatus.accelerator);
         initializedRef.current = true;
@@ -200,6 +206,13 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     void setAnalysisDetectorSize(size)
       .then(() => showStatus(`Animal detection set to ${size}px`))
       .catch(() => showStatus("Failed to save resolution"));
+  };
+
+  const handleMaskTier = (tier: MaskAiTier) => {
+    setMaskTier(tier);
+    void maskAiTierSet(tier)
+      .then(() => showStatus(`AI mask quality: ${tier}`))
+      .catch(() => showStatus("Failed to save AI mask quality"));
   };
 
   const handleFaceStage = (enabled: boolean) => {
@@ -520,6 +533,34 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
                   key={label}
                   onClick={() => handleFaceStage(on)}
                   style={segmentBtn(faceStage === on)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* AI mask quality (interactive segmentation tier) */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>AI mask quality</div>
+            <div style={descStyle}>
+              Model for AI object-select masks in Develop, downloaded on first
+              use. Higher tiers give cleaner edges but are larger and slower to
+              encode. Realtime = MobileSAM (~44 MB); Balanced = SAM ViT-B
+              (~360 MB); Max = SAM ViT-L (~1.2 GB).
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {(
+                [
+                  ["realtime", "Realtime"],
+                  ["balanced", "Balanced"],
+                  ["max", "Max quality"],
+                ] as [MaskAiTier, string][]
+              ).map(([tier, label]) => (
+                <button
+                  key={tier}
+                  onClick={() => handleMaskTier(tier)}
+                  style={segmentBtn(maskTier === tier)}
                 >
                   {label}
                 </button>

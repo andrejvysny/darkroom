@@ -93,9 +93,30 @@ pub enum MaskOp {
     Intersect, // alpha = alpha * a
 }
 
+/// One prompt point for an AI (SAM) mask, in normalized `[0,1]` image coords. `positive=false` is a
+/// subtract/background click. The point list is the persisted, re-editable definition of the
+/// selection (Lightroom keeps AI selections editable); the baked alpha is cached out-of-band.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AiPoint {
+    pub x: f32,
+    pub y: f32,
+    pub positive: bool,
+}
+
+impl Default for AiPoint {
+    fn default() -> Self {
+        Self {
+            x: 0.5,
+            y: 0.5,
+            positive: true,
+        }
+    }
+}
+
 /// The shape/source of a mask component. Coverage is computed in the mask pre-pass; only the
-/// per-mask scalar deltas reach the develop shader. `Ai` is schema-only groundwork (not implemented):
-/// it shares the Brush sampling path, so a future model just writes the alpha layer.
+/// per-mask scalar deltas reach the develop shader. `Ai` coverage is supplied out-of-band as a baked
+/// alpha ([`AiCoverage`]) keyed by the component's `hash`; the pre-pass samples it for kind==5.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ComponentKind {
@@ -119,8 +140,29 @@ pub enum ComponentKind {
         tol: f32,
         feather: f32,
     },
-    /// Future AI/semantic mask (Select Subject/Sky, SAM, …). Schema only; no coverage yet.
-    Ai { model: String },
+    /// AI/promptable mask (interactive object select via SAM; later Subject/Sky/…). `model` names the
+    /// producing model; `points` are the re-editable prompt clicks; `hash` keys the baked [`AiCoverage`]
+    /// the backend computed for these prompts (empty until first computed).
+    Ai {
+        model: String,
+        #[serde(default)]
+        points: Vec<AiPoint>,
+        #[serde(default)]
+        hash: String,
+    },
+}
+
+/// A baked AI-mask alpha, supplied to the pipeline out-of-band (never serialized / never over IPC as
+/// JSON) and stashed on the [`crate::backend::PreparedImage`] before a render. `alpha` is `width *
+/// height` bytes (0..255), row-major, at the SAM working resolution (≤1024 longest side); the pre-pass
+/// samples it by normalized UV (GPU-upscaled) and edge-refines it. Keyed to its `ComponentKind::Ai`
+/// component by `hash`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AiCoverage {
+    pub hash: String,
+    pub width: u32,
+    pub height: u32,
+    pub alpha: Vec<u8>,
 }
 
 /// One component of a mask: a shape/source, how it combines, and whether it's inverted.
@@ -313,6 +355,14 @@ pub struct DevelopParams {
     /// Color-balance-RGB grading (4-way + scene-linear contrast/saturation). No-op by default.
     #[serde(default)]
     pub cb_rgb: CbRgb,
+    /// Channel mixer (Photoshop/GIMP-style 3×3 remix on display sRGB). Identity by default; a pure
+    /// channel swap (e.g. green↔blue) is a permutation of the identity rows.
+    #[serde(default)]
+    pub channel_mix: ChannelMix,
+    /// Border / frame around the image (solid color + optional pad-to-aspect). A post-composite the
+    /// GPU shader never sees — applied only by export + the develop-stage preview. No-op by default.
+    #[serde(default)]
+    pub border: Border,
     /// `true` when the source is an already-developed **display-referred** image (JPEG/PNG): the
     /// scene-referred ACR base tone operator is bypassed so an unedited image round-trips to itself.
     /// Intrinsic to the image and derived by the backend from the file format at render time — it is
@@ -351,6 +401,8 @@ impl Default for DevelopParams {
             crop: Crop::default(),
             masks: Vec::new(),
             cb_rgb: CbRgb::default(),
+            channel_mix: ChannelMix::default(),
+            border: Border::default(),
             display_referred: false,
         }
     }
@@ -402,6 +454,91 @@ impl CbRgb {
             && self.highlights == [0.0; 3]
             && self.contrast == 0.0
             && self.saturation == 0.0
+    }
+}
+
+/// Channel mixer (Photoshop/GIMP-style). Each output channel is a weighted sum of the source R/G/B:
+/// `out.R = red·[R,G,B]`, etc. Applied on **display-encoded sRGB** (matching Photoshop/GIMP, so a
+/// green↔blue swap does what the user expects). Default = identity ⇒ the shader skips the stage
+/// (byte-identical render). A pure swap is a permutation of the identity rows. Weights are 1.0 = 100%.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ChannelMix {
+    /// Output-red weights over source (R, G, B). Identity = [1, 0, 0].
+    pub red: [f32; 3],
+    /// Output-green weights over source (R, G, B). Identity = [0, 1, 0].
+    pub green: [f32; 3],
+    /// Output-blue weights over source (R, G, B). Identity = [0, 0, 1].
+    pub blue: [f32; 3],
+}
+
+impl Default for ChannelMix {
+    fn default() -> Self {
+        Self {
+            red: [1.0, 0.0, 0.0],
+            green: [0.0, 1.0, 0.0],
+            blue: [0.0, 0.0, 1.0],
+        }
+    }
+}
+
+impl ChannelMix {
+    /// True when the matrix is identity (no-op) ⇒ the shader skips the mix, keeping the default
+    /// render byte-identical to a pre-`channel_mix` build.
+    pub fn is_identity(&self) -> bool {
+        self.red == [1.0, 0.0, 0.0] && self.green == [0.0, 1.0, 0.0] && self.blue == [0.0, 0.0, 1.0]
+    }
+}
+
+/// Border / frame around the exported (and previewed) image. A solid-color margin sized as a percent
+/// of the image's long edge, plus an optional target aspect ratio the image is centered/padded into
+/// (e.g. a square 1:1 with a white border). Applied as a CPU post-composite (see `frame_rgba8`), NOT
+/// in the GPU shader — so it never touches the develop pipeline, histogram, or thumbnails. No-op by
+/// default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Border {
+    /// Border thickness as a percentage of the image's long edge (0 = none).
+    pub size: f32,
+    /// Border fill color, sRGB 0..1. Default white.
+    pub color: [f32; 3],
+    /// Target output aspect numerator (0 = keep the photo's aspect).
+    pub aspect_w: f32,
+    /// Target output aspect denominator (0 = keep the photo's aspect).
+    pub aspect_h: f32,
+}
+
+impl Default for Border {
+    fn default() -> Self {
+        Self {
+            size: 0.0,
+            color: [1.0, 1.0, 1.0],
+            aspect_w: 0.0,
+            aspect_h: 0.0,
+        }
+    }
+}
+
+impl Border {
+    /// True when the border would change the output (a margin, or a target aspect). At the default
+    /// (no margin, no aspect) it is inactive and export/preview skip the composite entirely.
+    pub fn is_active(&self) -> bool {
+        self.size > 0.0 || (self.aspect_w > 0.0 && self.aspect_h > 0.0)
+    }
+
+    /// Target aspect as `(w, h)` when both are positive, else `None` (keep the photo's aspect).
+    pub fn aspect(&self) -> Option<(f32, f32)> {
+        if self.aspect_w > 0.0 && self.aspect_h > 0.0 {
+            Some((self.aspect_w, self.aspect_h))
+        } else {
+            None
+        }
+    }
+
+    /// Border color as opaque RGBA8 (for the CPU compositor).
+    pub fn color_rgba8(&self) -> [u8; 4] {
+        let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        [q(self.color[0]), q(self.color[1]), q(self.color[2]), 255]
     }
 }
 
@@ -674,6 +811,27 @@ mod grading_space_tests {
         assert_eq!(u.params[2], 1.0, "nonzero cb must be active");
         // std140 column packing: u.fwd[col][row]; fwd[0][0] = M[0][0] (GPT-5.5-verified).
         assert!((u.fwd[0][0] - 0.4605891).abs() < 1e-5);
+    }
+
+    #[test]
+    fn channel_mix_active_flag_and_identity() {
+        // Default is identity ⇒ inactive (shader passes color through → byte-identical render).
+        let d = DevelopParams::default();
+        assert!(d.channel_mix.is_identity());
+        assert_eq!(
+            d.to_chanmix().params[0],
+            0.0,
+            "default mixer must be inactive"
+        );
+        // Swap green↔blue: rows are permuted, active flag flips, packed rows match.
+        let mut p = DevelopParams::default();
+        p.channel_mix.green = [0.0, 0.0, 1.0];
+        p.channel_mix.blue = [0.0, 1.0, 0.0];
+        assert!(!p.channel_mix.is_identity());
+        let u = p.to_chanmix();
+        assert_eq!(u.params[0], 1.0, "swapped mixer must be active");
+        assert_eq!(u.g, [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(u.b, [0.0, 1.0, 0.0, 0.0]);
     }
 }
 
@@ -1148,6 +1306,21 @@ impl DevelopParams {
             ],
         }
     }
+
+    /// Pack the channel mixer for the GPU (`@binding(15)`). Rows go straight in (`.w` = 0.0); the
+    /// shader does a per-output `dot(row.xyz, color)`, so no std140 column transpose is needed.
+    /// `params.x` is the active flag so the shader skips the mix at the identity default (keeping the
+    /// render byte-identical to a pre-binding-15 build).
+    pub fn to_chanmix(&self) -> ChanMixUniform {
+        let c = &self.channel_mix;
+        let row = |a: [f32; 3]| [a[0], a[1], a[2], 0.0];
+        ChanMixUniform {
+            r: row(c.red),
+            g: row(c.green),
+            b: row(c.blue),
+            params: [if c.is_identity() { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0],
+        }
+    }
 }
 
 /// One mask's scalar deltas, packed for the develop storage buffer. std430-clean: 48 bytes
@@ -1311,6 +1484,25 @@ pub struct CbRgbUniform {
 impl Default for CbRgbUniform {
     fn default() -> Self {
         DevelopParams::default().to_cbrgb()
+    }
+}
+
+/// Channel-mixer uniform (`@binding(15)`). std140-clean: four `vec4` (64 bytes). `r/g/b` hold each
+/// output channel's source-RGB weights in `.xyz` (`.w` spare); `params` = (active 0/1, _, _, _).
+/// `active = 0` ⇒ the shader passes the color through untouched, so a default render is
+/// **byte-identical** to a pre-binding-15 build (golden + export rely on it).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ChanMixUniform {
+    pub r: [f32; 4],
+    pub g: [f32; 4],
+    pub b: [f32; 4],
+    pub params: [f32; 4],
+}
+
+impl Default for ChanMixUniform {
+    fn default() -> Self {
+        DevelopParams::default().to_chanmix()
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::thumb_queue::ThumbQueue;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-use core_analyze::{AnalyzerRegistry, FaceAnalyzer};
+use core_analyze::{AnalyzerRegistry, FaceAnalyzer, SamEmbedding, Segmenter};
 use core_db::Db;
 use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
@@ -86,6 +86,30 @@ pub struct AppState {
     /// enabled. The face stage runs inside the unified scan, guarded by `analysis_running`.
     #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub face_analyzer: Mutex<Option<Arc<FaceAnalyzer>>>,
+    /// Interactive-segmentation (AI masking) MobileSAM encoder+decoder, lazily built on first AI-mask
+    /// use. Paired with the tier its weights were loaded for so a Settings tier change rebuilds it.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub segmenter: Mutex<Option<(core_analyze::models::SamTier, Arc<Segmenter>)>>,
+    /// Single cached SAM image embedding for the current develop image `(image_id, embedding)` — the
+    /// heavy encode is reused across every click; recomputed on image switch (mirrors the single-entry
+    /// `full_render_cache`). Cleared when the segmenter (tier) is rebuilt.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub sam_embedding: Mutex<Option<(i64, Arc<SamEmbedding>)>>,
+    /// Baked AI-mask alpha coverages for the current image, keyed by the `ComponentKind::Ai` component
+    /// `hash`. Populated by `mask_ai_prompt`; read by `develop_render` to feed the GPU pre-pass.
+    /// Cleared on image switch (with `sam_embedding`) so stale masks from another image never leak.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub sam_masks: Mutex<std::collections::HashMap<String, core_pipeline::AiCoverage>>,
+    /// Serializes SAM image encodes and dedups them: a background warm and a first click on the same
+    /// image would otherwise both run the (multi-second) encoder. Holders re-check `sam_embedding`
+    /// after acquiring, so the second caller returns the first's cached result instead of re-encoding.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub sam_encode_lock: Mutex<()>,
+    /// Serializes SAM model downloads so a background warm and a first click don't each kick off the
+    /// same (up to 1.2 GB) fetch concurrently. The first downloads; the second then sees the files
+    /// present and skips.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub sam_download_lock: Mutex<()>,
     /// Per-launch id stamped on every captured user-event (groups a usage session).
     pub session_id: String,
     /// App version stamped on events (label provenance / pipeline isolation).
@@ -158,6 +182,16 @@ impl AppState {
             analysis_cancel: AtomicBool::new(false),
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             face_analyzer: Mutex::new(None),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            segmenter: Mutex::new(None),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            sam_embedding: Mutex::new(None),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            sam_masks: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            sam_encode_lock: Mutex::new(()),
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            sam_download_lock: Mutex::new(()),
             session_id,
             app_version: env!("CARGO_PKG_VERSION"),
         })

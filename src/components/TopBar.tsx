@@ -152,6 +152,13 @@ export default function TopBar() {
             />
           </label>
           <div style={{ flex: 1 }} />
+          <button
+            className="tbtn ghost"
+            onClick={() => openExport(useAppStore.getState().selectedIds)}
+          >
+            <Icon name="export" />
+            Export
+          </button>
           <button className="tbtn ghost" onClick={() => onImport?.()}>
             <Icon name="import" />
             Import

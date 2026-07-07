@@ -38,6 +38,8 @@ export default function DevelopView() {
     onHslChange,
     onCropChange,
     onColorBalanceChange,
+    onChannelMixChange,
+    onBorderChange,
     resetKeys,
     reset,
     applyDevelopParams,
@@ -53,6 +55,7 @@ export default function DevelopView() {
     updateComponent,
     deleteComponent,
     appendStroke,
+    appendAiPoint,
     deleteMask,
   } = useDevelop();
 
@@ -274,6 +277,7 @@ export default function DevelopView() {
           onCropChange={onCropChange}
           onChangeMaskKind={updateMaskComponentKind}
           onCommitStroke={appendStroke}
+          onAiPoint={appendAiPoint}
           renderFn={gatedRenderFrame}
           renderTick={renderTick}
           renderGate={dimsKnown}
@@ -288,6 +292,8 @@ export default function DevelopView() {
           onHslChange={onHslChange}
           onCropChange={onCropChange}
           onColorBalanceChange={onColorBalanceChange}
+          onChannelMixChange={onChannelMixChange}
+          onBorderChange={onBorderChange}
           resetKeys={resetKeys}
           onReset={reset}
           onAddMask={addMask}

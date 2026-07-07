@@ -3,6 +3,7 @@ import Slider from "./Slider";
 import { useDevelopStore } from "../../store/develop";
 import {
   maskKindLabel,
+  newAiMask,
   newBrushMask,
   newColorMask,
   newLinearMask,
@@ -123,6 +124,11 @@ export default function MaskPanel({
           label="+ Color"
           disabled={atCap}
           onClick={() => onAddMask(newColorMask())}
+        />
+        <AddBtn
+          label="+ AI Select"
+          disabled={atCap}
+          onClick={() => onAddMask(newAiMask())}
         />
       </div>
 
@@ -373,6 +379,12 @@ export default function MaskPanel({
                   onAddComponent(selected, newColorMask().components[0])
                 }
               />
+              <CompBtn
+                label="+AI"
+                onClick={() =>
+                  onAddComponent(selected, newAiMask().components[0])
+                }
+              />
             </div>
           </div>
 
@@ -445,6 +457,26 @@ export default function MaskPanel({
                 onChange={(v) => setComp0Kind({ feather: v / 100 })}
               />
               <div style={{ height: 6 }} />
+            </div>
+          )}
+
+          {comp.kind.type === "ai" && (
+            <div style={{ marginBottom: 8 }}>
+              <p
+                style={{
+                  fontSize: 11,
+                  color: "var(--color-t3)",
+                  margin: "0 0 6px",
+                  lineHeight: 1.5,
+                }}
+              >
+                Click an object to select it. Click more to extend;
+                Alt/Option-click to remove areas.
+                {comp.kind.points.length > 0 &&
+                  ` (${comp.kind.points.length} point${
+                    comp.kind.points.length === 1 ? "" : "s"
+                  })`}
+              </p>
             </div>
           )}
 

@@ -85,6 +85,25 @@ export function newBrushMask(): Mask {
   };
 }
 
+/** An AI (SAM) object-select mask. Empty until the user clicks the image; each click adds a prompt
+ *  point (see `MaskOverlay`) that the backend segments into coverage. `feather` on for LR-parity soft
+ *  edges (routes the baked alpha through the edge-aware refine pass). */
+export function newAiMask(): Mask {
+  const component: MaskComponent = {
+    kind: { type: "ai", model: "mobile_sam", points: [], hash: "" },
+    op: "add",
+    invert: false,
+    feather: true,
+  };
+  return {
+    name: "AI Select",
+    components: [component],
+    adjust: freshAdjust(),
+    opacity: 1,
+    enabled: true,
+  };
+}
+
 /** A luminance-range mask selecting mid-to-bright tones (refined by sliders). */
 export function newLuminanceMask(): Mask {
   const component: MaskComponent = {

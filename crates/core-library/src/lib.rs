@@ -64,10 +64,10 @@ pub use query::{
 };
 pub use reconcile::{reconcile, ReconcileStats};
 pub use settings::{
-    animal_detector_size, face_stage_enabled, get_meta, library_root, preview_edge,
-    set_animal_detector_size, set_face_stage_enabled, set_library_root, set_meta, set_preview_edge,
-    set_thumb_cache_cap, thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP,
-    PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
+    animal_detector_size, face_stage_enabled, get_meta, library_root, mask_ai_tier, preview_edge,
+    set_animal_detector_size, set_face_stage_enabled, set_library_root, set_mask_ai_tier, set_meta,
+    set_preview_edge, set_thumb_cache_cap, thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE,
+    DEFAULT_THUMB_CACHE_CAP, PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
 };
 pub use sidecar::{
     hydrate_if_blank, rebuild_from_sidecars, write_all_sidecars, write_sidecar, Sidecar,

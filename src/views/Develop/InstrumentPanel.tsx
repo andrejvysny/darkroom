@@ -4,6 +4,8 @@ import Slider from "./Slider";
 import ToneCurve from "./ToneCurve";
 import ColorMixer from "./ColorMixer";
 import ColorBalance from "./ColorBalance";
+import ChannelMixer from "./ChannelMixer";
+import Border from "./Border";
 import MaskPanel from "./MaskPanel";
 import Icon from "../../components/Icon";
 import { useDevelopStore } from "../../store/develop";
@@ -19,7 +21,11 @@ import {
   type HslBand,
   type Crop,
   type CbRgb,
+  type ChannelMix,
+  type Border as BorderData,
   DEFAULT_CB_RGB,
+  DEFAULT_CHANNEL_MIX,
+  DEFAULT_BORDER,
 } from "../../lib/ipc";
 
 interface InstrumentPanelProps {
@@ -29,6 +35,8 @@ interface InstrumentPanelProps {
   onHslChange: (index: number, patch: Partial<HslBand>) => void;
   onCropChange: (patch: Partial<Crop>) => void;
   onColorBalanceChange: (patch: Partial<CbRgb>) => void;
+  onChannelMixChange: (patch: Partial<ChannelMix>) => void;
+  onBorderChange: (patch: Partial<BorderData>) => void;
   resetKeys: (keys: ScalarParamKey[]) => void;
   onReset: () => void;
   onAddMask: (mask: Mask) => void;
@@ -51,6 +59,8 @@ export default function InstrumentPanel({
   onHslChange,
   onCropChange,
   onColorBalanceChange,
+  onChannelMixChange,
+  onBorderChange,
   resetKeys,
   onReset,
   onAddMask,
@@ -280,6 +290,15 @@ export default function InstrumentPanel({
         onReset={() => onColorBalanceChange({ ...DEFAULT_CB_RGB })}
       >
         <ColorBalance value={params.cbRgb} onChange={onColorBalanceChange} />
+      </Module>
+
+      {/* Channel Mixer / swap */}
+      <Module
+        title="Channel mixer"
+        defaultCollapsed
+        onReset={() => onChannelMixChange({ ...DEFAULT_CHANNEL_MIX })}
+      >
+        <ChannelMixer value={params.channelMix} onChange={onChannelMixChange} />
       </Module>
 
       {/* Detail */}
@@ -512,6 +531,15 @@ export default function InstrumentPanel({
           value={params.crop.angle}
           onChange={(v) => onCropChange({ angle: v })}
         />
+      </Module>
+
+      {/* Border / frame */}
+      <Module
+        title="Border"
+        defaultCollapsed
+        onReset={() => onBorderChange({ ...DEFAULT_BORDER })}
+      >
+        <Border value={params.border} onChange={onBorderChange} />
       </Module>
 
       {/* Global reset at panel bottom */}

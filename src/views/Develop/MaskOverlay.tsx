@@ -20,6 +20,8 @@ interface MaskOverlayProps {
   brush: BrushSettings;
   /** Commit a finished brush stroke to the mask. */
   onCommitStroke: (stroke: BrushStroke) => void;
+  /** Add an AI (SAM) prompt point (normalized [0,1]); `positive=false` subtracts. */
+  onAiPoint: (nx: number, ny: number, positive: boolean) => void;
 }
 
 const ACCENT = "var(--color-accent)";
@@ -64,6 +66,7 @@ export default function MaskOverlay({
   onChangeKind,
   brush,
   onCommitStroke,
+  onAiPoint,
 }: MaskOverlayProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Disarm the eyedropper while the crop tool is active — the stage shows the uncropped frame then,
@@ -138,6 +141,16 @@ export default function MaskOverlay({
           onCommitStroke={onCommitStroke}
         />
       )}
+      {kind.type === "ai" && (
+        <AiLayer
+          kind={kind}
+          w={width}
+          h={height}
+          viewRect={viewRect}
+          svgRef={svgRef}
+          onAiPoint={onAiPoint}
+        />
+      )}
       {kind.type === "colorRange" && picking && (
         <rect
           x={0}
@@ -201,6 +214,121 @@ async function sampleCanvasHsv(
   ).data;
   const [hue, sat] = rgbToHsv(d[0] / 255, d[1] / 255, d[2] / 255);
   return { hue, sat };
+}
+
+/** AI (SAM) object select: click to add a positive prompt point (Alt/Option-click subtracts). Each
+ *  click segments on the backend; the resolved coverage renders via the normal mask overlay. Existing
+ *  prompt points are shown as green (add) / red (subtract) dots. */
+function AiLayer({
+  kind,
+  w,
+  h,
+  viewRect,
+  svgRef,
+  onAiPoint,
+}: {
+  kind: Extract<ComponentKind, { type: "ai" }>;
+  w: number;
+  h: number;
+  viewRect: ViewRect;
+  svgRef: React.RefObject<SVGSVGElement | null>;
+  onAiPoint: (nx: number, ny: number, positive: boolean) => void;
+}) {
+  return (
+    <g>
+      <rect
+        x={0}
+        y={0}
+        width={w}
+        height={h}
+        fill="transparent"
+        style={{ cursor: "crosshair" }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          const rect = svgRef.current?.getBoundingClientRect();
+          if (!rect) return;
+          const [nx, ny] = clientToNormView(
+            rect,
+            e.clientX,
+            e.clientY,
+            viewRect,
+          );
+          // Alt/Option-click (or secondary button) = subtract (background) point.
+          const positive = !(e.altKey || e.button === 2);
+          onAiPoint(nx, ny, positive);
+        }}
+        onContextMenu={(e) => e.preventDefault()}
+      />
+      <defs>
+        <filter id="ai-pt-shadow" x="-50%" y="-50%" width="200%" height="200%">
+          <feDropShadow
+            dx="0"
+            dy="0"
+            stdDeviation="1.5"
+            floodColor="#000"
+            floodOpacity="0.6"
+          />
+        </filter>
+      </defs>
+      {/* Instruction hint when the selection is still empty — makes the click target obvious. */}
+      {kind.points.length === 0 && (
+        <g pointerEvents="none">
+          <rect
+            x={w / 2 - 150}
+            y={22}
+            width={300}
+            height={30}
+            rx={15}
+            fill="rgba(0,0,0,0.62)"
+            stroke="rgba(255,255,255,0.18)"
+            strokeWidth={1}
+          />
+          <text
+            x={w / 2}
+            y={42}
+            textAnchor="middle"
+            fill="#fff"
+            fontSize={12.5}
+            fontWeight={500}
+          >
+            Click the subject to select it
+          </text>
+        </g>
+      )}
+      {kind.points.map((p, i) => {
+        const [px, py] = normToPx([p.x, p.y], viewRect, w, h);
+        const c = p.positive ? "#2ecc71" : "#e2554f";
+        return (
+          <g key={i} pointerEvents="none" filter="url(#ai-pt-shadow)">
+            <circle cx={px} cy={py} r={9} fill="#fff" opacity={0.95} />
+            <circle cx={px} cy={py} r={6.5} fill={c} />
+            {/* +/− glyph for add vs subtract clarity. */}
+            <line
+              x1={px - 3}
+              y1={py}
+              x2={px + 3}
+              y2={py}
+              stroke="#fff"
+              strokeWidth={1.6}
+              strokeLinecap="round"
+            />
+            {p.positive && (
+              <line
+                x1={px}
+                y1={py - 3}
+                x2={px}
+                y2={py + 3}
+                stroke="#fff"
+                strokeWidth={1.6}
+                strokeLinecap="round"
+              />
+            )}
+          </g>
+        );
+      })}
+    </g>
+  );
 }
 
 function BrushLayer({

@@ -13,6 +13,8 @@ import {
   developSession,
   developSetEdit,
   effectivePreviewEdge,
+  maskAiEncode,
+  maskAiPrompt,
   thumbPrioritize,
   thumbUrl,
   MASK_CAP,
@@ -30,6 +32,8 @@ import {
   type HslBand,
   type Crop,
   type CbRgb,
+  type ChannelMix,
+  type Border,
   DEFAULT_CROP,
 } from "../../lib/ipc";
 import type { DerivedView } from "../../lib/viewport";
@@ -577,6 +581,27 @@ export function useDevelop() {
     [selectedId, commit],
   );
 
+  const onChannelMixChange = useCallback(
+    (patch: Partial<ChannelMix>) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      commit(selectedId, {
+        ...cur,
+        channelMix: { ...cur.channelMix, ...patch },
+      });
+    },
+    [selectedId, commit],
+  );
+
+  const onBorderChange = useCallback(
+    (patch: Partial<Border>) => {
+      if (selectedId === null) return;
+      const cur = useDevelopStore.getState().params;
+      commit(selectedId, { ...cur, border: { ...cur.border, ...patch } });
+    },
+    [selectedId, commit],
+  );
+
   // ── Mask operations ───────────────────────────────────────────────────────
 
   const addMask = useCallback(
@@ -590,6 +615,15 @@ export function useDevelop() {
         selectedMaskIndex: masks.length - 1,
         selectedComponentIndex: 0,
       });
+      // Warm the SAM embedding in the background the moment an AI mask is added, so the first click
+      // segments instantly (hides the model download + heavy encode behind the user's aiming time).
+      if (mask.components.some((c) => c.kind.type === "ai")) {
+        const id = selectedId;
+        useDevelopStore.getState().setAiMaskBusy(true);
+        void maskAiEncode(id)
+          .catch((e) => log.warn("develop", `AI warm failed: ${String(e)}`))
+          .finally(() => useDevelopStore.getState().setAiMaskBusy(false));
+      }
     },
     [selectedId, commit],
   );
@@ -713,6 +747,48 @@ export function useDevelop() {
     [selectedId, commit],
   );
 
+  // Add an AI (SAM) prompt point to a mask's `ai` component, segment on the backend, and commit the
+  // updated points + coverage key. Re-reads params after the await so a concurrent edit isn't
+  // clobbered. The commit re-renders; the backend cached the alpha under `hash` before returning, so
+  // the render's coverage lookup hits warm.
+  const appendAiPoint = useCallback(
+    async (index: number, nx: number, ny: number, positive: boolean) => {
+      if (selectedId === null) return;
+      const m0 = useDevelopStore.getState().params.masks[index];
+      if (!m0) return;
+      const ci = m0.components.findIndex((c) => c.kind.type === "ai");
+      const comp = ci >= 0 ? m0.components[ci] : undefined;
+      if (!comp || comp.kind.type !== "ai") return;
+      const points = [...comp.kind.points, { x: nx, y: ny, positive }];
+      const model = comp.kind.model;
+      let hash = comp.kind.hash;
+      const setBusy = useDevelopStore.getState().setAiMaskBusy;
+      // Drive the visible Stage loader; on first use the encode/download runs here (embedding cache
+      // miss). Surface failures instead of swallowing them.
+      setBusy(true);
+      try {
+        hash = (await maskAiPrompt(selectedId, points)).hash;
+      } catch (e) {
+        log.warn("develop", `AI mask prompt failed: ${String(e)}`);
+        useAppStore.getState().setToast(`AI mask failed: ${String(e)}`);
+        return;
+      } finally {
+        setBusy(false);
+      }
+      const cur = useDevelopStore.getState().params;
+      const m = cur.masks[index];
+      if (!m || !m.components[ci]) return;
+      const components = m.components.map((c, i) =>
+        i === ci ? { ...c, kind: { type: "ai" as const, model, points, hash } } : c,
+      );
+      const masks = cur.masks.map((mm, i) =>
+        i === index ? { ...mm, components } : mm,
+      );
+      commit(selectedId, { ...cur, masks });
+    },
+    [selectedId, commit],
+  );
+
   const deleteMask = useCallback(
     (index: number) => {
       if (selectedId === null) return;
@@ -811,6 +887,8 @@ export function useDevelop() {
     onHslChange,
     onCropChange,
     onColorBalanceChange,
+    onChannelMixChange,
+    onBorderChange,
     resetKeys,
     reset,
     applyDevelopParams,
@@ -826,6 +904,7 @@ export function useDevelop() {
     updateComponent,
     deleteComponent,
     appendStroke,
+    appendAiPoint,
     deleteMask,
   };
 }

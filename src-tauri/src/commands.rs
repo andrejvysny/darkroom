@@ -949,6 +949,13 @@ pub async fn develop_render(
                 .map(|(_, p)| p.clone())
                 .ok_or_else(|| "full-res image evicted before render".to_string())?
         };
+        // Resolve any AI (SAM) mask coverages referenced by `params` and stash them on the prepared
+        // image so the GPU mask pre-pass can sample kind==5. Empty on the Intel build and when the
+        // params carry no AI masks (no decode cost in that case).
+        let ai_covs = crate::segment::coverages_for(st.inner(), image_id, &params);
+        if let Ok(mut slot) = prepared.ai_coverages.lock() {
+            *slot = ai_covs;
+        }
         let rgba = gpu
             .pipeline
             .render_view(&gpu.ctx, &prepared, &params, &view)
@@ -1121,9 +1128,24 @@ pub async fn export_image(
             core_pipeline::crop_rgba8(&rgba, lin.width, cx, cy, cw, ch)
         };
 
+        // Border / frame composite (solid color + optional pad-to-aspect). A CPU post-step outside
+        // the GPU pipeline; no-op unless the border is active.
+        let (rgba, ow, oh) = if params.border.is_active() {
+            core_pipeline::frame_rgba8(
+                &rgba,
+                cw,
+                ch,
+                params.border.color_rgba8(),
+                params.border.size,
+                params.border.aspect(),
+            )
+        } else {
+            (rgba, cw, ch)
+        };
+
         let bytes = match format.to_lowercase().as_str() {
-            "png" => core_pipeline::rgba8_to_png(&rgba, cw, ch),
-            "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, cw, ch, quality),
+            "png" => core_pipeline::rgba8_to_png(&rgba, ow, oh),
+            "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, ow, oh, quality),
             other => return Err(format!("unsupported export format: {other}")),
         }
         .map_err(|e| e.to_string())?;
@@ -2172,6 +2194,54 @@ pub fn analysis_cancel(app: AppHandle) {
     }
 }
 
+/// Download the interactive-segmentation (AI masking) model weights. Emits `mask_ai:models` progress.
+#[tauri::command]
+pub async fn mask_ai_models_ensure(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::segment::ensure_models(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Whether the AI-masking models are downloaded and ready.
+#[tauri::command]
+pub fn mask_ai_ready(app: AppHandle) -> bool {
+    let st = app.state::<AppState>();
+    crate::segment::models_ready(&st)
+}
+
+/// Warm the SAM image embedding for `image_id` in the background (downloads the tier's model on first
+/// use, then runs the heavy encode) so the first click segments instantly. Fire-and-forget from the UI.
+#[tauri::command]
+pub async fn mask_ai_encode(app: AppHandle, image_id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::segment::ensure_models(&app)?;
+        let st = app.state::<AppState>();
+        crate::segment::warm(&st, image_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Compute an AI (SAM) mask from prompt points on `image_id`. Returns the component key (`hash`) to
+/// store in the mask's `ai` component plus the mask dims + predicted IoU. The heavy image encode runs
+/// once per image and is cached, so repeated clicks are fast.
+#[tauri::command]
+pub async fn mask_ai_prompt(
+    app: AppHandle,
+    image_id: i64,
+    points: Vec<core_pipeline::AiPoint>,
+) -> Result<crate::segment::PromptResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Fetch the (selected-tier) SAM weights on first use — idempotent, skips present files, emits
+        // `mask_ai:models` progress. Without this the first prompt errors "models not downloaded".
+        crate::segment::ensure_models(&app)?;
+        let st = app.state::<AppState>();
+        crate::segment::prompt(&st, image_id, points)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Detected-object category counts (distinct images) for the LeftNav facet.
 #[tauri::command]
 pub async fn analysis_facets(app: AppHandle) -> Result<Vec<FacetRow>, String> {
@@ -2621,6 +2691,31 @@ pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(),
             core_library::set_animal_detector_size(&db.conn, size).map_err(|e| e.to_string())?;
         }
         clear_analyzer_cache(&st)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Configured AI-masking quality tier (`"realtime"` | `"balanced"` | `"max"`).
+#[tauri::command]
+pub async fn mask_ai_tier_get(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::mask_ai_tier(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set the AI-masking tier. Clears the cached SAM embedding so the next prompt re-encodes (a tier
+/// change swaps the encoder); the segmenter itself rebuilds lazily when the tier differs.
+#[tauri::command]
+pub async fn mask_ai_tier_set(app: AppHandle, tier: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_mask_ai_tier(&db.conn, &tier).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

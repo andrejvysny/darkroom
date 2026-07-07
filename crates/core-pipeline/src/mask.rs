@@ -24,12 +24,14 @@ pub struct PrepassComponent {
 }
 
 /// Pre-pass uniform for one mask: a component count plus a fixed-size component array.
-/// 16 + 8×48 = 400 bytes.
+/// 16 + 8×48 = 400 bytes. `ai_scale` = the fraction of the shared AI-alpha texture holding this
+/// mask's baked SAM coverage (set by the bake loop; `[0,0]` when the mask has no AI coverage bound).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PrepassUniform {
     pub count: u32,
-    pub _pad: [u32; 3],
+    pub _pad: u32,
+    pub ai_scale: [f32; 2],
     pub comps: [PrepassComponent; MAX_PREPASS_COMPONENTS],
 }
 
@@ -78,7 +80,9 @@ impl PrepassUniform {
         }
         Self {
             count: count as u32,
-            _pad: [0; 3],
+            _pad: 0,
+            // Overridden by the bake loop when a baked AI coverage is bound for this mask.
+            ai_scale: [0.0, 0.0],
             comps,
         }
     }
@@ -133,6 +137,17 @@ impl MaskPrepass {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Baked AI (SAM) alpha for the current mask (R8Unorm, filterable), sampled for kind==5.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -459,6 +474,15 @@ pub fn mask_has_brush(mask: &Mask) -> bool {
         .any(|c| matches!(c.kind, ComponentKind::Brush { .. }))
 }
 
+/// The first AI component's baked-coverage `hash` for this mask (empty string filtered out), if any.
+/// Used by the bake loop to locate the mask's [`crate::params::AiCoverage`] on the prepared image.
+pub fn mask_ai_hash(mask: &Mask) -> Option<&str> {
+    mask.components.iter().find_map(|c| match &c.kind {
+        ComponentKind::Ai { hash, .. } if !hash.is_empty() => Some(hash.as_str()),
+        _ => None,
+    })
+}
+
 /// Collect all brush strokes across a mask's brush components (in order).
 pub fn mask_brush_strokes(mask: &Mask) -> Vec<BrushStroke> {
     let mut out = Vec::new();
@@ -483,6 +507,11 @@ pub fn mask_geometry_hash(mask: &Mask) -> u64 {
     bytemuck::bytes_of(&PrepassUniform::from_mask(mask)).hash(&mut h);
     // Per-component feather drives the (separable bilateral) refine pass.
     mask_feathered(mask).hash(&mut h);
+    // AI (SAM) coverage: the component `hash` uniquely identifies the baked alpha, so re-bake the
+    // mask layer whenever the prompt (and thus the alpha) changes; unchanged prompts reuse the layer.
+    if let Some(ai) = mask_ai_hash(mask) {
+        ai.hash(&mut h);
+    }
     // Brush strokes are rasterized into coverage; hash their geometry + per-stroke settings.
     for s in &mask_brush_strokes(mask) {
         for p in &s.points {

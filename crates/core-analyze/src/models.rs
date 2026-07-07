@@ -200,6 +200,126 @@ pub const VERIFIER_FILES: &[RemoteFile] = &[
     },
 ];
 
+/// Interactive segmentation (AI masking): **MobileSAM** (Apache-2.0) ONNX export by `Acly/MobileSAM`,
+/// pinned to an immutable HF commit. Split encode/decode: the TinyViT image encoder runs once per
+/// image (`input_image` HWC f32 RGB 0–255, longest side pre-resized to 1024 → `image_embeddings
+/// [1,256,64,64]`); the tiny mask decoder runs per click (`point_coords` in the resized frame + a
+/// trailing `[0,0]`/label `-1` pad point, `orig_im_size=[H,W]` → `masks[1,4,H,W]` logits, `iou[1,4]`,
+/// and `low_res_masks[1,4,256,256]`). We ship the **multi** decoder (returns 3–4 masks; pick best IoU).
+/// Pinned to HF commit `0d3b4033…` (immutable). LFS oids = the file SHA-256.
+/// Realtime tier — MobileSAM (Acly HWC-baked encoder + multi-mask decoder).
+pub const SAM_MOBILE_FILES: &[RemoteFile] = &[
+    RemoteFile {
+        rel: "sam/mobile_sam_image_encoder.onnx",
+        url: "https://huggingface.co/Acly/MobileSAM/resolve/0d3b403339b4674a82493d5e97964dd78089ddc8/mobile_sam_image_encoder.onnx",
+        min_size: 20_000_000,
+        sha256: "580f5fb648ea1062c0aabc26217aed56921985f03f0cbbd852bba81d760cc749",
+    },
+    RemoteFile {
+        rel: "sam/sam_mask_decoder_multi.onnx",
+        url: "https://huggingface.co/Acly/MobileSAM/resolve/0d3b403339b4674a82493d5e97964dd78089ddc8/sam_mask_decoder_multi.onnx",
+        min_size: 12_000_000,
+        sha256: "8976b90a87ba50a6a72217a5ff994f7d25ce16f2229fcc1ed259e1294c622ffe",
+    },
+];
+
+/// Balanced tier — **SAM ViT-B** (359 MB encoder). Standard samexporter export: CHW-preprocessed
+/// `[1,3,1024,1024]` encoder input + the standard decoder interface. Validated end-to-end (IoU 0.99).
+pub const SAM_VITB_FILES: &[RemoteFile] = &[
+    RemoteFile {
+        rel: "sam/sam_vit_b.encoder.onnx",
+        url: "https://huggingface.co/rajlab/sam_vit_b/resolve/main/encoder.onnx",
+        min_size: 300_000_000,
+        sha256: "08d1b45ed63bcb74a6504f01392dafd4b39b9c1df657321b914f4bf56b3754c9",
+    },
+    RemoteFile {
+        rel: "sam/sam_vit_b.decoder.onnx",
+        url: "https://huggingface.co/rajlab/sam_vit_b/resolve/main/decoder.onnx",
+        min_size: 12_000_000,
+        sha256: "67eeb654773f692dd6c5f5c54c8ea3de3be2790cc293ee3c8d0dee137a7751c7",
+    },
+];
+
+/// Max tier — **SAM ViT-L** (1.23 GB encoder, Rookiehan export). Unlike Balanced's rajlab ViT-B, this
+/// export BAKES preprocessing into the graph (HWC dynamic input, like MobileSAM → `HwcBaked` preproc);
+/// standard decoder. Encode ~3.4 s CPU.
+pub const SAM_VITL_FILES: &[RemoteFile] = &[
+    RemoteFile {
+        rel: "sam/sam_vit_l.encoder.onnx",
+        url: "https://huggingface.co/Rookiehan/sam/resolve/main/sam_vit_l_0b3195.encoder.onnx",
+        min_size: 1_000_000_000,
+        sha256: "8218869dc78946dd5ef58031ebcf443f66aa26489ac19dd9359d47a780abbe8a",
+    },
+    RemoteFile {
+        rel: "sam/sam_vit_l.decoder.onnx",
+        url: "https://huggingface.co/Rookiehan/sam/resolve/main/sam_vit_l_0b3195.decoder.onnx",
+        min_size: 12_000_000,
+        sha256: "90905d3895cc7053ced195bc2e8815fad71b528ee809825fc14a402184faec72",
+    },
+];
+
+/// Quality tier for interactive segmentation, user-selectable in Settings. Each maps to a distinct
+/// model with its own encoder-preprocessing convention (the decoder interface is identical). Realtime
+/// is a HWC-baked MobileSAM export; Balanced/Max are standard CHW-preprocessed SAM ViT-B/L exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamTier {
+    Realtime,
+    Balanced,
+    Max,
+}
+
+impl SamTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SamTier::Realtime => "realtime",
+            SamTier::Balanced => "balanced",
+            SamTier::Max => "max",
+        }
+    }
+
+    /// Parse a stored tier tag (see [`Self::as_str`]); unknown tags fall back to `Realtime`.
+    pub fn from_tag(s: &str) -> Self {
+        match s {
+            "balanced" => SamTier::Balanced,
+            "max" => SamTier::Max,
+            _ => SamTier::Realtime,
+        }
+    }
+
+    /// The two ONNX files (encoder, decoder) to download for this tier.
+    pub fn files(self) -> &'static [RemoteFile] {
+        match self {
+            SamTier::Realtime => SAM_MOBILE_FILES,
+            SamTier::Balanced => SAM_VITB_FILES,
+            SamTier::Max => SAM_VITL_FILES,
+        }
+    }
+
+    /// Relative on-disk encoder/decoder paths (index 0 = encoder, 1 = decoder in [`Self::files`]).
+    pub fn encoder_rel(self) -> &'static str {
+        self.files()[0].rel
+    }
+    pub fn decoder_rel(self) -> &'static str {
+        self.files()[1].rel
+    }
+
+    /// Whether this tier's encoder must run CPU-only. The 1.23 GB ViT-L (Max) crashes the CoreML
+    /// NeuralNetwork backend (no clean fallback); CPU runs it reliably at ~3.4 s.
+    pub fn encoder_cpu(self) -> bool {
+        matches!(self, SamTier::Max)
+    }
+
+    /// The encoder input convention for this tier — this differs by EXPORT SOURCE, not backbone:
+    /// Realtime (Acly MobileSAM) and Max (Rookiehan ViT-L) bake resize/normalize/pad into the graph
+    /// (`HwcBaked`), while Balanced (rajlab ViT-B) takes a pre-processed CHW tensor. Verified per model.
+    pub fn preproc(self) -> crate::sam::SamPreproc {
+        match self {
+            SamTier::Realtime | SamTier::Max => crate::sam::SamPreproc::HwcBaked,
+            SamTier::Balanced => crate::sam::SamPreproc::Chw,
+        }
+    }
+}
+
 /// On-disk model directory (typically `<app-data>/models`).
 pub struct ModelStore {
     dir: PathBuf,
@@ -243,6 +363,14 @@ impl ModelStore {
         )
     }
 
+    pub fn sam_encoder_path(&self, tier: SamTier) -> PathBuf {
+        self.path(tier.encoder_rel())
+    }
+
+    pub fn sam_decoder_path(&self, tier: SamTier) -> PathBuf {
+        self.path(tier.decoder_rel())
+    }
+
     fn present(&self, f: &RemoteFile) -> bool {
         self.path(f.rel)
             .metadata()
@@ -282,7 +410,12 @@ fn download(url: &str, dst: &Path, min_size: u64, sha256: &str) -> Result<(), An
     let resp = ureq::get(url)
         .call()
         .map_err(|e| AnalyzeError::Download(format!("{url}: {e}")))?;
-    let tmp = dst.with_extension("part");
+    // UNIQUE temp per download: two concurrent downloads of the same file must not share a `.part`
+    // (interleaved writes corrupt the on-disk bytes while each stream's own hasher still computes the
+    // correct sha — the corrupt file then passes the sha gate and gets renamed into place).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dst.with_extension(format!("part.{}.{uniq}", std::process::id()));
     let digest = {
         let mut reader = resp.into_body().into_reader();
         let mut out = std::fs::File::create(&tmp)?;
