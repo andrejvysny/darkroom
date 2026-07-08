@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../store/app";
 import { openExport } from "../lib/export";
+import { checkForUpdate } from "../lib/useUpdater";
 import { fmtShortcut } from "../lib/platform";
 import Icon, { IconName } from "./Icon";
 
@@ -71,6 +72,12 @@ export default function CommandPalette() {
       label: "AI Models…",
       shortcut: "",
       run: () => setModelManagerOpen(true),
+    },
+    {
+      icon: "reset",
+      label: "Check for updates…",
+      shortcut: "",
+      run: () => void checkForUpdate({ silent: false }),
     },
   ];
 

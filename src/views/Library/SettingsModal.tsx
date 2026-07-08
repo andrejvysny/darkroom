@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
+import { getVersion } from "@tauri-apps/api/app";
+import {
+  checkForUpdate,
+  autoCheckEnabled,
+  setAutoCheckEnabled,
+} from "../../lib/useUpdater";
 import {
   thumbCacheCap,
   thumbCacheSize,
@@ -101,6 +107,8 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [logs, setLogs] = useState<LogsStatus | null>(null);
   const [logsBusy, setLogsBusy] = useState(false);
   const [confirmLogsDelete, setConfirmLogsDelete] = useState(false);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [autoCheck, setAutoCheck] = useState(autoCheckEnabled());
 
   // Track whether the initial load has settled so debounce doesn't fire on open
   const initializedRef = useRef(false);
@@ -120,6 +128,10 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     setConfirmReset(false);
     setConfirmFaceWipe(false);
     setConfirmLogsDelete(false);
+    setAutoCheck(autoCheckEnabled());
+    void getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(null));
     void Promise.all([
       thumbCacheCap(),
       thumbCacheSize(),
@@ -463,6 +475,48 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
               }}
             >
               Manage models…
+            </button>
+          </div>
+
+          {/* Updates */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>Updates</div>
+            <div style={descStyle}>
+              Darkroom updates itself from GitHub Releases. You're on version{" "}
+              <span style={{ fontFamily: "var(--font-mono)" }}>
+                {appVersion ?? "—"}
+              </span>
+              . When an update is found you're prompted to download and restart.
+            </div>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 12,
+                color: "var(--color-t2)",
+                marginBottom: 10,
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={autoCheck}
+                onChange={(e) => {
+                  setAutoCheck(e.target.checked);
+                  setAutoCheckEnabled(e.target.checked);
+                }}
+              />
+              Automatically check for updates on launch
+            </label>
+            <button
+              style={btnSecondary}
+              onClick={() => {
+                onClose();
+                void checkForUpdate({ silent: false });
+              }}
+            >
+              Check for updates
             </button>
           </div>
 

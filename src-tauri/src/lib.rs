@@ -36,7 +36,10 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[allow(unused_mut)]
-    let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
 
     // Tier-3 E2E: real-backend UI automation via the tauri-plugin-playwright socket bridge.
     // Behind a feature + optional dep so it is never compiled into release builds.

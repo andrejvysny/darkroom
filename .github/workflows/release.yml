@@ -27,12 +27,12 @@ jobs:
           - {
               platform: macos-15,
               rustTargets: "aarch64-apple-darwin",
-              args: "--target aarch64-apple-darwin --bundles dmg",
+              args: "--target aarch64-apple-darwin --bundles app,dmg",
             }
           - {
               platform: macos-15-intel,
               rustTargets: "x86_64-apple-darwin",
-              args: "--target x86_64-apple-darwin --bundles dmg",
+              args: "--target x86_64-apple-darwin --bundles app,dmg",
             }
           - {
               platform: windows-latest,
@@ -159,12 +159,17 @@ jobs:
 
       # tauri-action runs beforeBuildCommand (npm run build), bundles, and uploads to the release.
       # Pinned from tauri-apps/tauri-action v0.6.2.
-      # NOTE: Don't pass signing secrets to tauri-action (causes import failures when certs are empty).
-      # tauri.conf.json has signingIdentity="-" for ad-hoc signing as default.
+      # NOTE: Don't pass Apple/Windows CODE-signing secrets here (causes import failures when certs
+      # are empty). Those are handled by the env-gated step above. The TAURI_SIGNING_* vars below are
+      # the minisign UPDATER keys (separate concern) — they sign the update artifacts + latest.json so
+      # the in-app updater accepts them. With createUpdaterArtifacts=true, tauri-action also generates
+      # and uploads latest.json to the release.
       - name: Build app + create release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           args: ${{ matrix.args }}
           tauriScript: npm run tauri
@@ -175,6 +180,9 @@ jobs:
             - macOS Apple Silicon and Intel DMGs are ad-hoc signed and not notarized unless Developer ID signing secrets are configured.
             - Intel macOS build ships with AI analysis disabled because ONNX Runtime has no x86_64 macOS prebuilt for the pinned ort runtime.
             - Windows x64 NSIS installer is unsigned unless an Authenticode certificate is configured.
-          # Publish beta-* tags directly as pre-releases; keep stable v* tags as drafts for review.
-          releaseDraft: ${{ !startsWith(env.RELEASE_TAG, 'beta-') }}
-          prerelease: true
+            - In-app auto-update is available from this version onward. Older installs (≤ 0.3.0) have no updater and must install this build once manually; subsequent releases update in-app.
+          # Stable v* tags publish as full releases (non-draft, non-prerelease) so GitHub marks them
+          # "Latest" — required for the updater endpoint releases/latest/download/latest.json to
+          # resolve. beta-* tags stay pre-releases (not an auto-update channel).
+          releaseDraft: false
+          prerelease: ${{ startsWith(env.RELEASE_TAG, 'beta-') }}

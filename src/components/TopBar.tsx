@@ -25,6 +25,7 @@ export default function TopBar() {
   const setView = useAppStore((s) => s.setView);
   const setPaletteOpen = useAppStore((s) => s.setPaletteOpen);
   const onImport = useAppStore((s) => s.onImport);
+  const onOpenSettings = useAppStore((s) => s.onOpenSettings);
   const onSearch = useAppStore((s) => s.onSearch);
   const onDevelopReset = useAppStore((s) => s.onDevelopReset);
   const currentFilename = useAppStore(
@@ -162,6 +163,14 @@ export default function TopBar() {
           <button className="tbtn ghost" onClick={() => onImport?.()}>
             <Icon name="import" />
             Import
+          </button>
+          <button
+            className="tbtn ghost"
+            title="Settings"
+            aria-label="Settings"
+            onClick={() => onOpenSettings?.()}
+          >
+            <Icon name="bolt" />
           </button>
         </>
       ) : (
