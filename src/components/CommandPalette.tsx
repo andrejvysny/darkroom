@@ -62,7 +62,7 @@ export default function CommandPalette() {
       run: () => openExport(selectedId == null ? [] : [selectedId]),
     },
     {
-      icon: "bolt",
+      icon: "cog",
       label: "Settings…",
       shortcut: "⌘,",
       run: () => onOpenSettings?.(),

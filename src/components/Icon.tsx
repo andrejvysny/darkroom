@@ -24,7 +24,8 @@ export type IconName =
   | "pick"
   | "zoom"
   | "tag"
-  | "scan";
+  | "scan"
+  | "cog";
 
 interface IconProps {
   name: IconName;
@@ -133,6 +134,12 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <rect x="3" y="3" width="10" height="10" rx="1.5" />
       <circle cx="6" cy="6.5" r="1.2" />
       <path d="M9 5.5h2M9 7.5h2M5 10h6" />
+    </>
+  ),
+  cog: (
+    <>
+      <path d="M6.54 3.22 L7.01 1.37 L8.99 1.37 L9.46 3.22 L10.35 3.59 L11.99 2.61 L13.39 4.01 L12.41 5.65 L12.78 6.54 L14.63 7.01 L14.63 8.99 L12.78 9.46 L12.41 10.35 L13.39 11.99 L11.99 13.39 L10.35 12.41 L9.46 12.78 L8.99 14.63 L7.01 14.63 L6.54 12.78 L5.65 12.41 L4.01 13.39 L2.61 11.99 L3.59 10.35 L3.22 9.46 L1.37 8.99 L1.37 7.01 L3.22 6.54 L3.59 5.65 L2.61 4.01 L4.01 2.61 L5.65 3.59 Z" />
+      <circle cx="8" cy="8" r="2.4" />
     </>
   ),
 };

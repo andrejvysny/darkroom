@@ -170,7 +170,7 @@ export default function TopBar() {
             aria-label="Settings"
             onClick={() => onOpenSettings?.()}
           >
-            <Icon name="bolt" />
+            <Icon name="cog" />
           </button>
         </>
       ) : (
