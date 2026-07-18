@@ -117,7 +117,8 @@ fn make_trash_ctx() -> trash::TrashContext {
 }
 
 /// `YYYY/YYYY-MM-DD` from an epoch-seconds capture date (naive-as-UTC, matching how it was stored).
-fn date_subpath(epoch: i64) -> String {
+/// Public: also used by the `hdr_merge` command to route a generated merged-HDR EXR.
+pub fn date_subpath(epoch: i64) -> String {
     DateTime::from_timestamp(epoch, 0)
         .map(|dt| dt.format("%Y/%Y-%m-%d").to_string())
         .unwrap_or_else(|| "unknown/unknown".to_string())
@@ -133,7 +134,8 @@ fn file_mtime_epoch(path: &Path) -> i64 {
 }
 
 /// Pick a non-colliding destination path within `dir` for `filename` (suffixes `_1`, `_2`, …).
-fn unique_dest(dir: &Path, filename: &str) -> PathBuf {
+/// Public: also used by the `hdr_merge` command for generated merged-HDR EXRs.
+pub fn unique_dest(dir: &Path, filename: &str) -> PathBuf {
     let primary = dir.join(filename);
     if !primary.exists() {
         return primary;

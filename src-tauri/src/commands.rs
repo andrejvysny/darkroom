@@ -3331,6 +3331,254 @@ pub async fn snapshot_delete(app: AppHandle, snapshot_id: i64) -> Result<(), Str
     .map_err(|e| e.to_string())?
 }
 
+// ---------- Merge to HDR ----------
+
+/// Merge 2–9 bracketed RAW frames (tripod, manually selected) into one scene-referred HDR EXR,
+/// write it into the library, catalog it (`format='hdr'`), and return the new row.
+///
+/// Pipeline: numeric EXIF → EV₁₀₀ per frame → reference = median EV → decode every frame full-res
+/// with the REFERENCE frame's as-shot WB (`develop_linear_wb`) → streaming exposure-weighted merge
+/// (`core_hdr::MergeAccumulator`) → fp16 linear-ProPhoto EXR with embedded metadata + parentage
+/// (`core_raw::write_hdr_exr`) → `process_file` + `insert_image`.
+///
+/// Emits `hdr:progress {done, total, stage}` (total = frames + 2: each merged frame, the EXR
+/// write, the catalog step) and `hdr:done {image}` + `library:changed` on success.
+#[tauri::command]
+pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, String> {
+    use std::sync::atomic::AtomicBool;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+
+        // Single-flight: a merge decodes N full-res RAWs; a second one would thrash memory.
+        if st.hdr_running.swap(true, Ordering::SeqCst) {
+            return Err("an HDR merge is already running".to_string());
+        }
+        struct Running<'a>(&'a AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _running = Running(&st.hdr_running);
+        // Gate the FS watcher so it can't index the freshly-renamed EXR before our own catalog
+        // step (insert is hash-idempotent, but the watcher path would race the returned row).
+        let _watch_guard = crate::watch::ImportGuard::new(app.clone());
+
+        if !(2..=9).contains(&image_ids.len()) {
+            return Err(format!(
+                "select 2–9 bracketed RAW frames to merge (got {})",
+                image_ids.len()
+            ));
+        }
+        let total = image_ids.len() + 2;
+        let progress = |done: usize, stage: &str| {
+            let _ = app.emit(
+                "hdr:progress",
+                serde_json::json!({"done": done, "total": total, "stage": stage}),
+            );
+        };
+
+        // Load + validate the source rows (brief lock).
+        struct Frame {
+            id: i64,
+            path: PathBuf,
+            hash_hex: String,
+            folder_id: i64,
+        }
+        let frames: Vec<Frame> = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            image_ids
+                .iter()
+                .map(|&id| {
+                    let (path, status, format, hash, folder_id): (
+                        String,
+                        String,
+                        Option<String>,
+                        Vec<u8>,
+                        i64,
+                    ) = db
+                        .conn
+                        .query_row(
+                            "SELECT path, status, IFNULL(format,'raw'), content_hash,
+                                    IFNULL(folder_id, -1)
+                             FROM images WHERE id = ?1",
+                            core_db::rusqlite::params![id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                        )
+                        .map_err(|_| format!("image {id} not found"))?;
+                    if status != "present" {
+                        return Err(format!("{path}: file is missing — relink it first"));
+                    }
+                    match format.as_deref() {
+                        Some("raw") | None => {}
+                        Some(other) => {
+                            return Err(format!(
+                                "{path}: HDR merge takes RAW frames only (this is {other})"
+                            ))
+                        }
+                    }
+                    Ok(Frame {
+                        id,
+                        path: PathBuf::from(path),
+                        hash_hex: hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        folder_id,
+                    })
+                })
+                .collect::<Result<_, String>>()?
+        };
+
+        // Numeric exposure per frame → EV, reference (median EV), shortest (max EV).
+        progress(0, "reading exposure");
+        let exposures: Vec<core_hdr::ExposureInfo> = frames
+            .iter()
+            .map(|f| {
+                let src = core_raw::source_from_path(&f.path)
+                    .map_err(|e| format!("{}: {e}", f.path.display()))?;
+                let (t, n, iso) = core_raw::read_exposure_numeric(&src)
+                    .map_err(|e| format!("{}: {e}", f.path.display()))?
+                    .ok_or_else(|| {
+                        format!(
+                            "{}: missing shutter/aperture/ISO EXIF (needed for EV math)",
+                            f.path.display()
+                        )
+                    })?;
+                Ok(core_hdr::ExposureInfo {
+                    exposure_time_s: t,
+                    f_number: n,
+                    iso,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let evs: Vec<f64> = exposures
+            .iter()
+            .map(|e| core_hdr::ev100(e).map_err(|e| e.to_string()))
+            .collect::<Result<_, String>>()?;
+        if evs.iter().all(|&ev| (ev - evs[0]).abs() < 0.2) {
+            return Err(
+                "all frames have the same exposure — select a bracketed set (varying shutter)"
+                    .to_string(),
+            );
+        }
+        let ref_idx = core_hdr::reference_index(&exposures).map_err(|e| e.to_string())?;
+        let shortest_idx = (0..evs.len())
+            .max_by(|&a, &b| evs[a].total_cmp(&evs[b]))
+            .expect("non-empty");
+
+        // Decode the reference first (capturing its as-shot WB), then stream the rest.
+        let ref_src = core_raw::source_from_path(&frames[ref_idx].path)
+            .map_err(|e| format!("{}: {e}", frames[ref_idx].path.display()))?;
+        let (ref_img, ref_wb) =
+            core_raw::develop_linear_wb(&ref_src, None).map_err(|e| e.to_string())?;
+        let mut acc = core_hdr::MergeAccumulator::new(ref_img.width, ref_img.height);
+        acc.add_frame(&ref_img, 1.0, ref_idx == shortest_idx)
+            .map_err(|e| e.to_string())?;
+        drop(ref_img);
+        let mut done = 1;
+        progress(done, "merging");
+        for (i, frame) in frames.iter().enumerate() {
+            if i == ref_idx {
+                continue;
+            }
+            let src = core_raw::source_from_path(&frame.path)
+                .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+            let (img, _) = core_raw::develop_linear_wb(&src, Some(ref_wb))
+                .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+            let scale = core_hdr::relative_scale(&exposures[i], &exposures[ref_idx])
+                .map_err(|e| e.to_string())?;
+            acc.add_frame(&img, scale as f32, i == shortest_idx)
+                .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+            done += 1;
+            progress(done, "merging");
+        }
+        let merged = acc.finish().map_err(|e| e.to_string())?;
+
+        // Destination: library_root/YYYY/YYYY-MM-DD (import's date routing) when a root is set,
+        // else next to the reference frame. Metadata = the reference frame's (rides inside the EXR).
+        let meta = core_raw::read_metadata(&ref_src).map_err(|e| e.to_string())?;
+        let library_root: Option<String> = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::library_root(&db.conn).map_err(|e| e.to_string())?
+        };
+        let ref_parent = frames[ref_idx]
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "reference frame has no parent directory".to_string())?;
+        let dest_dir = match &library_root {
+            Some(root) => {
+                let capture = meta
+                    .capture_date
+                    .unwrap_or_else(core_library::index::now_epoch);
+                Path::new(root).join(core_import::date_subpath(capture))
+            }
+            None => ref_parent.clone(),
+        };
+        std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+        let ref_stem = frames[ref_idx]
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("merge");
+        let dest = core_import::unique_dest(&dest_dir, &format!("{ref_stem}_HDR.exr"));
+
+        let sources: Vec<core_raw::HdrSourceInfo> = frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| core_raw::HdrSourceInfo {
+                image_id: f.id,
+                content_hash_hex: f.hash_hex.clone(),
+                relative_ev: (evs[i] - evs[ref_idx]) as f32,
+            })
+            .collect();
+        core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx)
+            .map_err(|e| e.to_string())?;
+        drop(merged);
+        done += 1;
+        progress(done, "writing");
+
+        // Catalog: hash + thumb + meta from the file (metadata flows from the EXR attributes),
+        // then a brief lock to insert. Folder row: the library root when routing under it,
+        // else the reference frame's own folder.
+        let processed = core_library::process_file(&dest, &st.thumbs, core_library::THUMB_SIZE)
+            .map_err(|e| e.to_string())?;
+        let row = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let conn = &db.conn;
+            let folder_id = match &library_root {
+                Some(root) => {
+                    core_library::add_root(conn, Path::new(root)).map_err(|e| e.to_string())?
+                }
+                None if frames[ref_idx].folder_id >= 0 => frames[ref_idx].folder_id,
+                None => core_library::add_root(conn, &ref_parent).map_err(|e| e.to_string())?,
+            };
+            let id = core_library::insert_image(
+                conn,
+                folder_id,
+                core_library::index::now_epoch(),
+                &processed,
+            )
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                // Byte-identical EXR already catalogued (same bracket merged before).
+                let _ = std::fs::remove_file(&dest);
+                "an identical merge of these frames is already in the library".to_string()
+            })?;
+            core_library::image_by_id(conn, id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "merged image row vanished after insert".to_string())?
+        };
+        done += 1;
+        progress(done, "done");
+        let _ = app.emit("hdr:done", serde_json::json!({ "image": &row }));
+        let _ = app.emit("library:changed", ());
+        crate::thumb_queue::enqueue_all(&app);
+        Ok(row)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod preset_tests {
     /// The `core-preset` ModuleScope owns a copy of the DevelopParams field-key list (it must not

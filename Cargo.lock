@@ -963,6 +963,7 @@ dependencies = [
  "core-analyze",
  "core-db",
  "core-dedup",
+ "core-hdr",
  "core-import",
  "core-library",
  "core-pipeline",
