@@ -36,6 +36,7 @@ fn de(e: impl std::fmt::Display) -> RawError {
 
 /// Color + provenance metadata captured at decode time and required to author the merged DNG.
 /// Opaque by design: the rawler-typed internals never cross a crate boundary.
+#[derive(Clone)]
 pub struct PanoColorMeta {
     color_matrix: HashMap<Illuminant, FlatColorMatrix>,
     wb_coeffs: [f32; 4],
@@ -225,6 +226,27 @@ pub fn write_pano_dng(
     Ok(())
 }
 
+/// Display-referred JPEG of a camera-native buffer (as-shot WB + camera→sRGB + OETF), long side
+/// ≤ `max_edge`. Serves the merge dialog's live preview — same math as the embedded DNG preview,
+/// so what the dialog shows is what the thumbnail will look like.
+pub fn native_to_srgb_jpeg(
+    width: u32,
+    height: u32,
+    rgb_native: &[f32],
+    meta: &PanoColorMeta,
+    max_edge: u32,
+    quality: u8,
+) -> Result<Vec<u8>, RawError> {
+    if rgb_native.len() != width as usize * height as usize * 3 {
+        return Err(RawError::Decode("preview buffer length mismatch".into()));
+    }
+    let img = preview_srgb_edge(width, height, rgb_native, meta, max_edge);
+    let mut out = std::io::Cursor::new(Vec::new());
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+    img.write_with_encoder(enc).map_err(de)?;
+    Ok(out.into_inner())
+}
+
 /// Small display-referred preview of a camera-native buffer: box-downsample to ≤1024 px, then
 /// as-shot WB + camera→sRGB(D65) matrix + sRGB OETF. Preview-only math (the raw subframe is the
 /// source of truth), so the D50/D65 nuance vs the develop path's ProPhoto pipeline is irrelevant.
@@ -234,9 +256,19 @@ fn preview_srgb(
     rgb_native: &[f32],
     meta: &PanoColorMeta,
 ) -> image::DynamicImage {
+    preview_srgb_edge(width, height, rgb_native, meta, 1024)
+}
+
+fn preview_srgb_edge(
+    width: u32,
+    height: u32,
+    rgb_native: &[f32],
+    meta: &PanoColorMeta,
+    max_edge: u32,
+) -> image::DynamicImage {
     let (w, h) = (width as usize, height as usize);
     let long = w.max(h);
-    let step = long.div_ceil(1024).max(1);
+    let step = long.div_ceil(max_edge as usize).max(1);
     let (pw, ph) = (w.div_ceil(step), h.div_ceil(step));
 
     // cam→sRGB, row-normalized so camera neutral maps to sRGB neutral (same recipe as
