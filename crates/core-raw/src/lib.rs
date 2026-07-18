@@ -19,6 +19,7 @@ pub use develop::{
 pub use display::{classify, is_display, ImageKind};
 pub use error::RawError;
 pub use hash::{content_hash, hash_file, hex};
+pub use hdr_file::{read_hdr_sources, write_hdr_exr, HdrSourceInfo, HdrSources};
 pub use meta::{capture_fingerprint, read_metadata, RawMeta};
 pub use thumb::{oriented_preview, preview_image, preview_with_orientation, thumbnail_jpeg, Thumb};
 

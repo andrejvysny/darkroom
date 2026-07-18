@@ -821,11 +821,13 @@ dependencies = [
  "anyhow",
  "blake3",
  "chrono",
+ "exr",
  "image",
  "kamadak-exif",
  "libheif-rs",
  "rawler",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
