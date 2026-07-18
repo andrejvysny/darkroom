@@ -763,6 +763,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-hdr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-raw",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "core-import"
 version = "0.1.0"
 dependencies = [

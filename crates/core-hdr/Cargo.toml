@@ -1,0 +1,12 @@
+[package]
+name = "core-hdr"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-raw = { path = "../core-raw" }
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"
