@@ -53,6 +53,13 @@ pub struct AppState {
     pub denoise_running: AtomicBool,
     /// Set by `denoise_cancel` to abort the running compute (checked between phases).
     pub denoise_cancel: AtomicBool,
+    /// Guards against two panorama merges running at once.
+    pub panorama_running: AtomicBool,
+    /// Set by `panorama_cancel` to abort the running merge (checked between sources/phases).
+    pub panorama_cancel: AtomicBool,
+    /// Downscaled source frames cached for the merge dialog preview, so projection/crop toggles
+    /// restitch without re-decoding the raws (see `panorama::PreviewCache`).
+    pub panorama_preview_cache: crate::panorama::PreviewCacheSlot,
     /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
     /// newer request has already superseded it.
     pub latest_render: AtomicU64,
@@ -199,6 +206,9 @@ impl AppState {
             denoiser: Mutex::new(None),
             denoise_running: AtomicBool::new(false),
             denoise_cancel: AtomicBool::new(false),
+            panorama_running: AtomicBool::new(false),
+            panorama_cancel: AtomicBool::new(false),
+            panorama_preview_cache: Mutex::new(None),
             latest_render: AtomicU64::new(0),
             hist_seq: AtomicU64::new(0),
             current_image: AtomicI64::new(-1),

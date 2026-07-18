@@ -5,6 +5,7 @@ mod logging;
 mod model_mgmt;
 mod prefetch;
 mod protocol;
+mod panorama;
 mod state;
 mod thumb_queue;
 mod watch;
@@ -196,6 +197,10 @@ pub fn run() {
             commands::denoise_apply,
             commands::denoise_clear,
             commands::denoise_cancel,
+            commands::panorama_preview,
+            commands::panorama_merge,
+            commands::panorama_cancel,
+            commands::panorama_status,
             commands::mask_ai_models_ensure,
             commands::mask_ai_ready,
             commands::mask_ai_encode,
