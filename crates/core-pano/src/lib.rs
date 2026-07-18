@@ -30,6 +30,7 @@ mod graph;
 mod matching;
 mod project;
 mod ransac;
+mod rectangle;
 mod rng;
 mod seam;
 mod wave;
@@ -302,10 +303,6 @@ pub fn compose(
     opt: &StitchOptions,
     progress: &(dyn Fn(Phase) + Sync),
 ) -> Result<StitchResult, PanoError> {
-    // `boundary_warp` is reserved for v-next boundary warp / rectangling (Phase::Rectangle); it is
-    // accepted but has no effect in v1.
-    let _ = opt.boundary_warp;
-
     progress(Phase::Warp);
 
     let cams = project::build_used_cams(frames, reg);
@@ -326,6 +323,7 @@ pub fn compose(
         &low_warps,
         &reg.used_indices,
         &reg.pairwise,
+        &gains,
         low_map.width,
         low_map.height,
     );
@@ -342,6 +340,19 @@ pub fn compose(
     let (mut rgb, mut valid) = blender.finish();
     let mut width = map.width;
     let mut height = map.height;
+
+    // Boundary warp / rectangling (Phase P5): warp the composite so its valid region fills more of the
+    // rectangle, so the auto-crop below keeps far more content. Gated on `boundary_warp > 0` (the
+    // slider is 0..100 → lerp strength t = warp/100); at 0 the pass is skipped entirely, keeping the
+    // pre-P5 output byte-identical.
+    if opt.boundary_warp > 0.0 {
+        progress(Phase::Rectangle);
+        let t = (opt.boundary_warp as f64 / 100.0).clamp(0.0, 1.0);
+        if let Some((wrgb, wvalid)) = rectangle::rectangle_warp(&rgb, &valid, width, height, t) {
+            rgb = wrgb;
+            valid = wvalid;
+        }
+    }
 
     progress(Phase::Crop);
 

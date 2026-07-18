@@ -18,6 +18,21 @@ fn opts(projection: Projection, auto_crop: bool, max_long_side: u32) -> StitchOp
     }
 }
 
+fn opts_warp(
+    projection: Projection,
+    auto_crop: bool,
+    max_long_side: u32,
+    boundary_warp: f32,
+) -> StitchOptions {
+    StitchOptions {
+        projection,
+        boundary_warp,
+        auto_crop,
+        max_long_side,
+        preview: false,
+    }
+}
+
 /// Rec.601 luma of an interleaved-RGB pixel.
 #[inline]
 fn luma(rgb: &[f32], i: usize) -> f32 {
@@ -209,6 +224,220 @@ fn size_cap_forces_downscale() {
     println!(
         "size cap: {}x{} (long {long}), capped={}",
         res.width, res.height, res.capped
+    );
+}
+
+/// Pearson correlation of Rec.601 luma between two equal-sized composites over their central 40% box.
+fn central_luma_corr(a: &[f32], b: &[f32], w: usize, h: usize) -> f64 {
+    let (x0, x1) = (w * 3 / 10, w * 7 / 10);
+    let (y0, y1) = (h * 3 / 10, h * 7 / 10);
+    let lum = |p: &[f32], i: usize| {
+        0.299 * p[i * 3] as f64 + 0.587 * p[i * 3 + 1] as f64 + 0.114 * p[i * 3 + 2] as f64
+    };
+    let (mut sa, mut sb, mut n) = (0.0, 0.0, 0.0);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            sa += lum(a, y * w + x);
+            sb += lum(b, y * w + x);
+            n += 1.0;
+        }
+    }
+    let (ma, mb) = (sa / n, sb / n);
+    let (mut cab, mut caa, mut cbb) = (0.0, 0.0, 0.0);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let da = lum(a, y * w + x) - ma;
+            let db = lum(b, y * w + x) - mb;
+            cab += da * db;
+            caa += da * da;
+            cbb += db * db;
+        }
+    }
+    cab / (caa.sqrt() * cbb.sqrt())
+}
+
+#[test]
+fn boundary_warp_enlarges_crop_and_preserves_interior() {
+    // (Priority-1 test 1) With boundary_warp=100 the valid region is warped toward the rectangle, so
+    // the auto-crop keeps a materially larger area (>= 1.15x), while the interior content is preserved
+    // (central-region luma correlation between the warped and unwarped composite >= 0.9).
+    let frames = three_frames([1.0, 1.0, 1.0]);
+
+    let cropped0 = stitch(&frames, &opts(Projection::Cylindrical, true, 4000), &|_| {})
+        .expect("warp=0 stitch");
+    let cropped1 = stitch(
+        &frames,
+        &opts_warp(Projection::Cylindrical, true, 4000, 100.0),
+        &|_| {},
+    )
+    .expect("warp=100 stitch");
+
+    let a0 = cropped0.width * cropped0.height;
+    let a1 = cropped1.width * cropped1.height;
+    let ratio = a1 as f64 / a0 as f64;
+    assert!(
+        ratio >= 1.15,
+        "boundary warp should grow the cropped area >= 1.15x: {}x{} -> {}x{} (ratio {ratio:.3})",
+        cropped0.width,
+        cropped0.height,
+        cropped1.width,
+        cropped1.height
+    );
+
+    // Interior preservation is measured on the UNCROPPED composites (identical dimensions).
+    let full0 = stitch(
+        &frames,
+        &opts(Projection::Cylindrical, false, 4000),
+        &|_| {},
+    )
+    .expect("warp=0 uncropped");
+    let full1 = stitch(
+        &frames,
+        &opts_warp(Projection::Cylindrical, false, 4000, 100.0),
+        &|_| {},
+    )
+    .expect("warp=100 uncropped");
+    assert_eq!(
+        (full0.width, full0.height),
+        (full1.width, full1.height),
+        "warp keeps the canvas dimensions"
+    );
+    let corr = central_luma_corr(&full1.rgb, &full0.rgb, full0.width, full0.height);
+    assert!(
+        corr >= 0.9,
+        "boundary warp must preserve interior content, central correlation {corr:.4} < 0.9"
+    );
+    println!("boundary warp: crop area ratio {ratio:.3}, central correlation {corr:.4}");
+}
+
+#[test]
+fn boundary_warp_zero_is_identical_and_phaseless() {
+    // (Priority-1 test 2) warp=0 leaves the pre-P5 path untouched: no Rectangle phase is emitted and
+    // the output is byte-identical run to run, and it differs from a real (warp>0) rectangling run.
+    let frames = three_frames([1.0, 1.0, 1.0]);
+
+    let phases = Mutex::new(Vec::<String>::new());
+    let rec = |p: Phase| phases.lock().unwrap().push(format!("{p:?}"));
+    let a = stitch(&frames, &opts(Projection::Cylindrical, false, 4000), &rec).expect("warp=0 a");
+    assert!(
+        !phases.lock().unwrap().iter().any(|p| p == "Rectangle"),
+        "warp=0 must not emit the Rectangle phase: {:?}",
+        phases.lock().unwrap()
+    );
+
+    let b = stitch(
+        &frames,
+        &opts(Projection::Cylindrical, false, 4000),
+        &|_| {},
+    )
+    .expect("warp=0 b");
+    assert_eq!(
+        a.rgb, b.rgb,
+        "warp=0 rgb must be byte-identical (deterministic no-op)"
+    );
+    assert_eq!(
+        a.valid_mask, b.valid_mask,
+        "warp=0 mask must be byte-identical"
+    );
+
+    // A real rectangling run emits Rectangle and changes the pixels.
+    let wphases = Mutex::new(Vec::<String>::new());
+    let wrec = |p: Phase| wphases.lock().unwrap().push(format!("{p:?}"));
+    let c = stitch(
+        &frames,
+        &opts_warp(Projection::Cylindrical, false, 4000, 100.0),
+        &wrec,
+    )
+    .expect("warp=100");
+    assert!(
+        wphases.lock().unwrap().iter().any(|p| p == "Rectangle"),
+        "warp>0 must emit the Rectangle phase"
+    );
+    assert!(c.rgb != a.rgb, "warp>0 must actually change the composite");
+}
+
+#[test]
+fn deghosting_keeps_moving_object_single_source() {
+    // (Priority-3 test) A bright square painted into ONLY frame 0's overlap region simulates a moving
+    // object. A ghosting seam that ran through it would blend the square against frame 1's (dark)
+    // background, gashing the square with dark pixels. Assert instead that the square survives intact
+    // and single-source: present at full brightness, ~its injected size, with a near-uniform interior
+    // (no dark blend gash → low interior gradient).
+    let base = make_base();
+    let sq = 60usize;
+    let mut f0 = common::render_view(&base, -12.0, 1.0);
+    // Paint the square into frame 0's right portion, which overlaps frame 1.
+    for y in 220..(220 + sq) {
+        for x in 560..(560 + sq) {
+            let i = (y * VIEW_W + x) * 3;
+            f0.rgb[i] = 1.0;
+            f0.rgb[i + 1] = 1.0;
+            f0.rgb[i + 2] = 1.0;
+        }
+    }
+    let frames = vec![
+        f0,
+        common::render_view(&base, 0.0, 1.0),
+        common::render_view(&base, 12.0, 1.0),
+    ];
+    let res = stitch(
+        &frames,
+        &opts(Projection::Cylindrical, false, 4000),
+        &|_| {},
+    )
+    .expect("stitch should succeed");
+    let (w, h) = (res.width, res.height);
+
+    // Locate the surviving bright square (luma > 0.7 over covered pixels).
+    let (mut maxl, mut nbright) = (0.0f32, 0usize);
+    let (mut bx0, mut by0, mut bx1, mut by1) = (w, h, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if res.valid_mask[y * w + x] == 0 {
+                continue;
+            }
+            let l = luma(&res.rgb, y * w + x);
+            maxl = maxl.max(l);
+            if l > 0.7 {
+                nbright += 1;
+                bx0 = bx0.min(x);
+                by0 = by0.min(y);
+                bx1 = bx1.max(x);
+                by1 = by1.max(y);
+            }
+        }
+    }
+    assert!(
+        maxl >= 0.9,
+        "moving object lost brightness (ghosted): max luma {maxl:.3}"
+    );
+    assert!(
+        nbright >= (sq * sq) / 2,
+        "too little of the object survived: {nbright} bright px (injected {sq}x{sq})"
+    );
+
+    // Interior of the square must be a solid single source: shrink the bright bbox by a margin and
+    // check the max luma gradient there is small (a seam gash would show a dark step ~1.0).
+    let m = 10usize;
+    assert!(
+        bx1 > bx0 + 2 * m && by1 > by0 + 2 * m,
+        "bright region too small to probe"
+    );
+    let mut inner_max_grad = 0.0f32;
+    for y in (by0 + m)..(by1 - m) {
+        for x in (bx0 + m)..(bx1 - m) {
+            inner_max_grad = inner_max_grad.max(grad_mag(&res.rgb, w, h, x, y));
+        }
+    }
+    assert!(
+        inner_max_grad < 0.3,
+        "seam gash through the object: interior max gradient {inner_max_grad:.3}"
+    );
+    println!(
+        "deghosting: object survived {}x{} (max luma {maxl:.3}, {nbright} bright px, \
+         interior max grad {inner_max_grad:.4})",
+        bx1 - bx0 + 1,
+        by1 - by0 + 1
     );
 }
 

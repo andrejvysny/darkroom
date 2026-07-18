@@ -11,13 +11,17 @@ P0–P4 landed + headless-green (see `CURRENT_STATE.md` top section for the full
    JPEG + open the DNG in Develop (WB slider must behave raw-like; check seam quality on real
    parallax/exposure drift), ideally `dng_validate` from Adobe DNG SDK. Then in-app: select →
    merge dialog → preview → merge → pano appears linked + editable.
-2. **P5 Boundary Warp** — He/Chang/Sun 2013 simplified rectangling in `core-pano/src/rectangle.rs`
-   (mesh + shape-preservation + boundary attraction, sparse LSQ; slider lerps identity→full).
-   UI slider already wired through; backend currently ignores the value (`Phase::Rectangle`
-   reserved). Fallback stays auto-crop.
-3. **P5 seam/ghost quality** — graph-cut seam finder (consider `pathfinding` crate Dinic) to
-   replace/augment DP; basic deghosting (per-pixel source agreement); Perspective FOV clamp is done
-   (falls back to cylindrical >150°).
+2. ~~P5 Boundary Warp~~ **DONE** — `core-pano/src/rectangle.rs`: inverse bilinear mesh warp
+   (boundary attraction + membrane shape-preservation, CG solve, distance-gated interior anchor so
+   the warp has compact support, global-factor bisection guarantees no quad folds). Synthetic:
+   crop area ×1.179 at warp=100, interior correlation 1.0000, warp=0 byte-identical. Line
+   preservation deliberately out of scope v1.
+3. ~~P5 seam/ghost quality~~ **DONE (with a measured verdict)** — graph-cut seam implemented
+   (`pathfinding` Edmonds-Karp, ≤150k nodes) but **DP stays default**: benchmark showed ~35 ms
+   (DP) vs ~42 s (graph-cut) at identical seam quality on the synthetic scenes; kept behind the
+   internal `SEAM_METHOD` const with an `#[ignore]`d benchmark test. Deghosting: gain-corrected
+   diff + 8×median ghost mask (3px dilated) as hard seam penalty — moving objects render from a
+   single source. Re-benchmark graph-cut on real parallax captures before reconsidering.
 4. **Memory follow-up** — streaming decode-on-demand `Frame` source so `merge` never holds all
    full-res sources (~4 GB at 10 R7 frames today); band-tiled compositing if gigapixel ever matters
    (cap is 12000px now so the develop pipeline can open the result).
