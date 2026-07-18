@@ -371,6 +371,13 @@ export function importCommit(
   });
 }
 
+/** Merge 2–9 bracketed RAW frames (tripod) into a scene-referred HDR EXR in the library.
+ *  Long-running: emits `hdr:progress {done,total,stage}` then `hdr:done {image}` +
+ *  `library:changed`; resolves with the new catalog row (format "hdr"). */
+export function hdrMerge(imageIds: number[]): Promise<ImageRow> {
+  return invoke<ImageRow>("hdr_merge", { imageIds });
+}
+
 export function dedupScan(category: "byte" | "capture"): Promise<DupGroup[]> {
   return invoke<DupGroup[]>("dedup_scan", { category });
 }

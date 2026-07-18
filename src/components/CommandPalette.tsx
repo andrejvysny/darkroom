@@ -19,6 +19,7 @@ export default function CommandPalette() {
   const view = useAppStore((s) => s.view);
   const selectedId = useAppStore((s) => s.selectedId);
   const onImport = useAppStore((s) => s.onImport);
+  const onMergeHdr = useAppStore((s) => s.onMergeHdr);
   const onOpenSettings = useAppStore((s) => s.onOpenSettings);
   const setModelManagerOpen = useAppStore((s) => s.setModelManagerOpen);
   const onSavePreset = useAppStore((s) => s.onSavePreset);
@@ -42,6 +43,12 @@ export default function CommandPalette() {
       label: "Import from SD card…",
       shortcut: "⌘I",
       run: () => onImport?.(),
+    },
+    {
+      icon: "photos",
+      label: "Merge to HDR\u2026",
+      shortcut: "",
+      run: () => onMergeHdr?.(),
     },
     {
       icon: "copy",
