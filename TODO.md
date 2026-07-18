@@ -2,6 +2,29 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## IN PROGRESS: Panorama merge (branch `claude/darkroom-panorama-research-ruvw38`, 2026-07-18)
+
+P0–P4 landed + headless-green (see `CURRENT_STATE.md` top section for the full map). Remaining:
+
+1. **Visual QA on real panos (BLOCKING before merge to main)** — needs the dev machine's CR3 sets:
+   `cargo run --release -p core-raw --example stitch_cr3 -- <dir> /tmp/o.dng`, eyeball the proof
+   JPEG + open the DNG in Develop (WB slider must behave raw-like; check seam quality on real
+   parallax/exposure drift), ideally `dng_validate` from Adobe DNG SDK. Then in-app: select →
+   merge dialog → preview → merge → pano appears linked + editable.
+2. **P5 Boundary Warp** — He/Chang/Sun 2013 simplified rectangling in `core-pano/src/rectangle.rs`
+   (mesh + shape-preservation + boundary attraction, sparse LSQ; slider lerps identity→full).
+   UI slider already wired through; backend currently ignores the value (`Phase::Rectangle`
+   reserved). Fallback stays auto-crop.
+3. **P5 seam/ghost quality** — graph-cut seam finder (consider `pathfinding` crate Dinic) to
+   replace/augment DP; basic deghosting (per-pixel source agreement); Perspective FOV clamp is done
+   (falls back to cylindrical >150°).
+4. **Memory follow-up** — streaming decode-on-demand `Frame` source so `merge` never holds all
+   full-res sources (~4 GB at 10 R7 frames today); band-tiled compositing if gigapixel ever matters
+   (cap is 12000px now so the develop pipeline can open the result).
+5. **Small leftovers** — free the preview cache on modal close (today only on merge; add a
+   `panorama_close` command or piggyback selection change); `panorama_status` has no frontend
+   consumer yet (reconnect-after-restart UX); HDR-pano (bracketed) explicitly out of scope for v1.
+
 ## Repo state sync (2026-07-02) — CURRENT
 
 - **`main` = `8c1072c`** (unpushed to origin), version **`0.2.0` (beta-2.0) RELEASED**. Since the
