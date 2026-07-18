@@ -2,6 +2,44 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## HDR pass follow-ups (2026-07-18, branch `claude/hdr-heif-support-5r5ztx`) — CURRENT
+
+Landed: Canon HDR PQ `.hif` full develop support (libheif → PQ → linear ProPhoto) + Merge-to-HDR
+tripod v1 (fp16 linear-ProPhoto EXR, `hdr_merge` IPC, SelectionBar/palette UI). All Linux-runnable
+gates green (incl. a committed synthetic 10-bit PQ HEIF fixture decoding byte-exact). Details:
+`CURRENT_STATE.md` "Latest pass — HDR". **Binding-map correction: 0–15 all used (15 = ChanMix);
+next free = @binding(16).**
+
+**Needs the dev Mac + real fixtures (drop into `library/fixtures-hdr/`: landscape + portrait .HIF,
+a CR3+HIF same-capture pair, a 3–5-frame tripod AEB CR3 bracket with clipped highlights):**
+
+- [ ] `brew install libheif`, then S1 gate: `cargo run -p core-raw --example heif_gate
+      library/fixtures-hdr` — real R7 .HIF must decode (10-bit 4:2:2 via libde265; fallback if it
+      chokes: libheif ffmpeg decoder plugin / macOS ImageIO re-plan). Check the PORTRAIT line —
+      if with/without-transform dims match on a portrait file but the EXIF tag says 6/8, add
+      `.oriented()` in `heif.rs` (risk R4).
+- [ ] S2 calibration: `cargo run -p core-raw --example calibrate_pq pair.CR3 pair.HIF` — keep the
+      203-nit anchor if |ΔEV| ≤ 0.25, else adopt the suggested `HDR_DIFFUSE_WHITE_NITS` (record the
+      measurement in `core-raw/src/color.rs` docs).
+- [ ] `cargo run -p core-hdr --example merge_one library/fixtures-hdr` on the real bracket; eyeball
+      `/tmp/darkroom-hdr.exr` via `cargo run -p core-pipeline --example render_one /tmp/darkroom-hdr.exr`
+      (highlight recovery vs the middle frame).
+- [ ] In-app QA (`npm run tauri dev`): HIF opens in Develop (side-by-side vs CR3 sibling ≈ same
+      brightness under defaults); WB/exposure/all modules respond; thumbs + `develop_preview_jpeg`
+      latency acceptable on 33 MP HIF (full decode, no embedded preview fast path yet); select
+      bracket → Merge to HDR → pill → new `_HDR.exr` row with HDR chip → develop (Highlights slider
+      recovers headroom) → export JPEG; HEIF/HDR filter chips; dedup scan on the CR3+HIF pair
+      (same-capture groups like RAW+JPEG — expected, manual resolve only).
+- [ ] Release checklist: bundle `libheif.1.dylib` + `libde265.0.dylib` (otool -L closure) via
+      `tauri.conf.json` `bundle.macOS.frameworks`; CI macOS job needs `brew install libheif`,
+      Linux jobs `apt-get install libheif-dev libde265-dev`.
+
+**Deferred increments (do NOT creep into this pass):** alignment (MTB) + deghosting + auto
+bracket detection; hand-held merge; fp16 DNG export (Lightroom interop); HEIF *export*; general
+`.heic`/iPhone (non-PQ profiles get a clean error today); Windows HIF decode (vcpkg libheif — cfg
+stub ships); embedded-thumbnail fast path for HIF thumbs; `hdr_sources` DB table + "show source
+frames" UI (parentage lives in the EXR's `darkroom:sources` attr); HDR/EDR display output.
+
 ## Repo state sync (2026-07-02) — CURRENT
 
 - **`main` = `8c1072c`** (unpushed to origin), version **`0.2.0` (beta-2.0) RELEASED**. Since the

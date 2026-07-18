@@ -183,6 +183,7 @@ fn main() -> anyhow::Result<()> {
             overlay_layer: -1,
             overlay_color: [0.85, 0.10, 0.10],
             overlay_strength: 0.5,
+            crop_preview: false,
         };
         let (vf, vp) = time_n(|| {
             pipe.render_view(&ctx, &prep, &params, &view).unwrap();

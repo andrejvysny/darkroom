@@ -30,7 +30,14 @@ cargo run -p core-raw      --example decode_gate    # rawler decodes R7 CR3
 cargo run -p core-library  --example scan_library   # index all 240 + thumbs (~2s)
 cargo run -p core-pipeline --example render_one     # decode → GPU develop → PNG in /tmp
 cargo run -p core-pipeline --example export_full    # full-res export → /tmp
+cargo run -p core-raw      --example heif_gate DIR  # libheif decodes R7 HDR PQ .HIF (S1 gate)
+cargo run -p core-raw      --example calibrate_pq A.CR3 A.HIF  # PQ anchor ΔEV vs same-capture CR3
+cargo run -p core-hdr      --example merge_one DIR  # tripod CR3 bracket → merged-HDR EXR in /tmp
 ```
+
+System deps for HEIF decode (dynamic-linked): macOS `brew install libheif`; Linux
+`apt-get install libheif-dev libde265-dev`. `.dmg` bundling of the dylibs is a release-checklist
+item (`bundle.macOS.frameworks`) — dev machines use Homebrew's copies.
 
 App data (catalog + thumb cache): `~/Library/Application Support/com.andrejvysny.darkroom/`
 (`catalog.db` is WAL — recent rows live in `catalog.db-wal` until checkpoint).
@@ -45,11 +52,12 @@ enumerated in `CURRENT_STATE.md` ("IPC command surface").
 | Crate           | Role                                                                                                                                    |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `core-db`       | SQLite catalog: DDL (STRICT), migrations, pragmas. **Re-exports `rusqlite`** so every crate links one copy.                             |
-| `core-raw`      | rawler decode, embedded thumb/preview, EXIF meta, BLAKE3 hash, capture fingerprint, linear develop. **All rawler calls isolated here.** |
+| `core-raw`      | rawler decode, embedded thumb/preview, EXIF meta, BLAKE3 hash, capture fingerprint, linear develop. **All rawler calls isolated here** — and all libheif calls (`heif.rs`, HDR PQ `.hif`) + merged-HDR EXR I/O (`hdr_file.rs`). |
 | `core-library`  | indexing (rayon), thumb cache, queries, keywords, collections, culling, edit persistence                                                |
 | `core-pipeline` | wgpu/Metal develop pipeline (`develop.wgsl`, prepare/render), PNG/JPEG encode                                                           |
 | `core-import`   | copy/move/reference import, date routing (`YYYY/YYYY-MM-DD`), hash-verify, Trash                                                        |
 | `core-dedup`    | byte-identical + same-capture grouping, safe resolve → Trash                                                                            |
+| `core-hdr`      | exposure-bracket merge math (EV₁₀₀, streaming weighted accumulator) — pure CPU over `LinearImage`, tripod v1                            |
 | `src-tauri`     | IPC commands (`commands.rs`), `thumb://` protocol (`protocol.rs`), managed state (`state.rs`)                                           |
 
 **Frontend:** `App.tsx` → `TopBar` + (`LibraryView` | `DevelopView`) + `CommandPalette` + `Toast`.
@@ -66,8 +74,9 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 ## Hard constraints (do not violate — see CURRENT_STATE.md for detail)
 
 - **Do NOT add padding to the `vec3 wb_gain` uniform** (`params.rs` ↔ `develop.wgsl`). A scalar packs into the vec3 tail per std140/WGSL; it is correct. A past review false-flagged it. Guarded by golden test `param_effects.rs`.
-- **All new GPU data must use new bindings**, never alter `ParamsUniform`. Bindings 0–14 are all in use; **next free = `@binding(15)`**. Map: 0 `input_tex`, 1 `input_smp`, 2 `ParamsUniform` (guarded), 3 tone-curve LUT, 4 HSL `FxUniform`, 5–7 masks (array + sampler + storage), 8 white-balance CAT mat3, 9 Detail+vignette `ExtraUniform`, **10 `ToneOpUniform` (scene-referred base tone operator), 11 `base_lut` (base-curve texture), 12 `GeomUniform` (crop/straighten), 13 `ViewUniform` (viewport + mask overlay), 14 `CbRgbUniform` (Color-balance-RGB grading)**. (Global WB rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
+- **All new GPU data must use new bindings**, never alter `ParamsUniform`. Bindings 0–15 are all in use; **next free = `@binding(16)`**. Map: 0 `input_tex`, 1 `input_smp`, 2 `ParamsUniform` (guarded), 3 tone-curve LUT, 4 HSL `FxUniform`, 5–7 masks (array + sampler + storage), 8 white-balance CAT mat3, 9 Detail+vignette+Presence `ExtraUniform`, **10 `ToneOpUniform` (scene-referred base tone operator), 11 `base_lut` (base-curve texture), 12 `GeomUniform` (crop/straighten + lens), 13 `ViewUniform` (viewport + mask overlay), 14 `CbRgbUniform` (Color-balance-RGB grading), 15 `ChanMix` (channel mixer)**. (Global WB rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
 - **rawler `=0.7.2`** pinned (non-SemVer; CR3/EOS R7 validated, no LibRaw). Keep every rawler call inside `core-raw`.
+- **libheif-rs `=2.7.0`** pinned, `default-features=false, features=["v1_17"]` (oldest supported system libheif — Ubuntu noble; Homebrew's newer releases are API-compatible). Keep every libheif call inside `core-raw/src/heif.rs`; not built on Windows (stub returns a clean error). `exr = "1.74"` (same version image 0.25 already pulls) for merged-HDR files.
 - **wgpu `=29`** — API differs substantially from older majors (Instance/device/pipeline-descriptor changes catalogued in CURRENT_STATE.md).
 - **rusqlite `0.39` + rusqlite_migration `=2.5.0`** pinned for rustc 1.91 (newer needs ≥1.95). Don't bump without checking MSRV.
 - All SQL filters use bound named params (injection-safe) — keep new queries that way.
@@ -82,6 +91,13 @@ working space, scene-referred **ACR base tone operator** (`@binding(10/11)`), Ke
 `sample_bilinear`), and **viewport render** (`@binding(13)` — full-res zoom + mask overlay). The import
 freeze (whole-import DB lock) is **resolved** (ea0d66a); the AI scan pipeline (D-FINE-M + MegaDetector
 
-- MobileCLIP verifier + Florence-2) is production-wired (F1 0.905). **Still UI-only / not wired:** Lens
-  distortion / chromatic-aberration only (greenfield — no shader effect). Crop is wired (visual-QA
+- MobileCLIP verifier + Florence-2) is production-wired (F1 0.905). Crop is wired (visual-QA
   pending). Check `TODO.md` before assuming a develop module is functional.
+
+**HDR (2026-07-18, branch `claude/hdr-heif-support-5r5ztx`):** Canon **HDR PQ HEIF (`.hif`)** decodes
+to scene-linear ProPhoto via libheif (PQ EOTF, BT.2408 203-nit diffuse-white anchor → 1.0,
+BT.2020→ProPhoto CAT) with full develop support (`ImageKind::Heif`, `display_referred=false`), and
+**Merge to HDR** (tripod v1: no align/deghost) merges 2–9 bracketed CR3s into an fp16 linear-ProPhoto
+**EXR** (`ImageKind::Hdr`, format `'hdr'`, metadata + parentage embedded as EXR attributes) via
+`hdr_merge` IPC. Real-R7 `.HIF` validation on the dev machine is **pending fixtures** (S1/S2 in the
+plan); the synthetic 10-bit PQ fixture (`core-raw/tests/fixtures/synthetic_pq.hif`) is CI-validated.
