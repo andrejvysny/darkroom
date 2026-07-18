@@ -131,10 +131,19 @@ impl LinearImage {
 /// uprighted to its EXIF orientation. One decoder serves both the metadata (orientation) read and the
 /// pixel decode.
 pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
-    if crate::display::is_display(src.path()) {
-        let bytes = src.as_vec()?;
-        let orientation = crate::display::exif_orientation(&bytes);
-        return crate::display::decode_display_linear(&bytes, orientation);
+    match crate::display::classify(src.path()) {
+        crate::display::ImageKind::Jpeg | crate::display::ImageKind::Png => {
+            let bytes = src.as_vec()?;
+            let orientation = crate::display::exif_orientation(&bytes);
+            return crate::display::decode_display_linear(&bytes, orientation);
+        }
+        crate::display::ImageKind::Heif => {
+            return crate::heif::decode_heif_linear(&src.as_vec()?);
+        }
+        crate::display::ImageKind::Hdr => {
+            return crate::hdr_file::read_hdr_linear(&src.as_vec()?);
+        }
+        crate::display::ImageKind::Raw => {}
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let params = RawDecodeParams::default();
@@ -196,8 +205,9 @@ pub fn develop_linear_denoised(
     src: &RawSource,
     denoiser: &dyn MosaicDenoiser,
 ) -> Result<DenoiseOutput, RawError> {
-    // Already-developed display images have no mosaic; return the clean decode only.
-    if crate::display::is_display(src.path()) {
+    // Only rawler-decoded RAW files have a mosaic; every other kind (display JPEG/PNG, HEIF,
+    // merged-HDR EXR) returns the clean decode only.
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
         return Ok(DenoiseOutput {
             clean: develop_linear(src)?,
             denoised: None,
@@ -274,8 +284,8 @@ pub fn develop_linear_denoised(
 /// As-shot white-balance coefficients `[r, g, b, g2]` from the camera (neutral `[1;4]` if absent).
 /// Used as a model input for learned auto-white-balance / lighting normalization. One raw decode.
 pub fn as_shot_wb(src: &RawSource) -> Result<[f32; 4], RawError> {
-    if crate::display::is_display(src.path()) {
-        // Display images carry no camera white-balance; treat as neutral.
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
+        // Non-RAW images carry no camera white-balance coefficients; treat as neutral.
         return Ok([1.0; 4]);
     }
     let raw = rawler::decode(src, &RawDecodeParams::default()).map_err(de)?;
@@ -413,8 +423,8 @@ fn develop_calibrated(raw: &RawImage) -> Result<LinearImage, RawError> {
 /// or any image whose color matrix is missing/malformed, transparently falls back to the
 /// full-quality [`develop_linear`].
 pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> {
-    if crate::display::is_display(src.path()) {
-        // No superpixel fast path for an already-developed image; decode it directly.
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
+        // No superpixel fast path for a non-mosaic source; decode it directly.
         return develop_linear(src);
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;

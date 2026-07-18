@@ -85,8 +85,14 @@ impl RawMeta {
 
 /// Read metadata from an open [`RawSource`] WITHOUT decoding pixels (fast indexing path).
 pub fn read_metadata(src: &RawSource) -> Result<RawMeta, RawError> {
-    if crate::display::is_display(src.path()) {
-        return Ok(crate::display::read_display_meta(&src.as_vec()?));
+    use crate::display::ImageKind;
+    match crate::display::classify(src.path()) {
+        ImageKind::Jpeg | ImageKind::Png => {
+            return Ok(crate::display::read_display_meta(&src.as_vec()?))
+        }
+        ImageKind::Heif => return Ok(crate::heif::read_heif_meta(&src.as_vec()?)),
+        ImageKind::Hdr => return Ok(crate::hdr_file::read_hdr_meta(&src.as_vec()?)),
+        ImageKind::Raw => {}
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let md = decoder

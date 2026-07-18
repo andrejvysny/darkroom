@@ -2,10 +2,13 @@
 //!
 //! All `rawler` calls are isolated in this crate (rawler's API is non-SemVer; pinned `=0.7.2`).
 
+pub(crate) mod color;
 pub mod develop;
 pub mod display;
 pub mod error;
 pub mod hash;
+pub mod hdr_file;
+pub mod heif;
 pub mod meta;
 pub mod thumb;
 
