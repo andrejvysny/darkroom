@@ -10,6 +10,7 @@ members = [
     "crates/core-import",
     "crates/core-analyze",
     "crates/core-preset",
+    "crates/core-pano",
 ]
 
 [workspace.package]

@@ -780,6 +780,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-pano"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "imageproc",
+ "nalgebra 0.33.3",
+ "rand 0.8.6",
+ "rayon",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "core-pipeline"
 version = "0.1.0"
 dependencies = [
