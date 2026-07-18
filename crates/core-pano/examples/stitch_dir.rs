@@ -9,10 +9,11 @@
 //! ```
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use nalgebra::Rotation3;
 
-use core_pano::{register, Frame, Phase};
+use core_pano::{compose, register, Frame, Phase, Projection, StitchOptions};
 
 fn main() {
     let dir = match std::env::args().nth(1) {
@@ -105,4 +106,54 @@ fn main() {
         "\nBA: rms = {:.6} (radians-ish), converged = {}",
         reg.ba_final_rms, reg.ba_converged
     );
+
+    // --- Full compositing (P2), reusing the registration above via `compose`. ---
+    let opt = StitchOptions {
+        projection: Projection::Auto,
+        boundary_warp: 0.0,
+        auto_crop: true,
+        max_long_side: 8000,
+        preview: false,
+    };
+    let t0 = Instant::now();
+    let res = match compose(&frames, &reg, &opt, &progress) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("compositing failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let dt = t0.elapsed();
+
+    println!("\n--- stitch ---");
+    println!(
+        "output {}x{} px, projection = {:?}, capped = {}, {} frames used, composited in {:.2?}",
+        res.width,
+        res.height,
+        res.projection_used,
+        res.capped,
+        res.used_indices.len(),
+        dt
+    );
+
+    // Quick display encode: camera-native linear is dim, so exposure up ×4, clamp, then sRGB-ish
+    // gamma (x^(1/2.2)). Purely for eyeballing the result — not a colour-managed export.
+    let mut buf = vec![0u8; res.width * res.height * 3];
+    for i in 0..res.width * res.height {
+        for c in 0..3 {
+            let v = (res.rgb[i * 3 + c] * 4.0).clamp(0.0, 1.0);
+            buf[i * 3 + c] = (v.powf(1.0 / 2.2) * 255.0).round() as u8;
+        }
+    }
+    let out = "/tmp/pano_out.png";
+    match image::save_buffer(
+        out,
+        &buf,
+        res.width as u32,
+        res.height as u32,
+        image::ColorType::Rgb8,
+    ) {
+        Ok(()) => println!("wrote {out}"),
+        Err(e) => eprintln!("failed to write {out}: {e}"),
+    }
 }

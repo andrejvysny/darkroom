@@ -20,13 +20,18 @@
 //! - Luma for features is `Y = 0.299R + 0.587G + 0.114B` on the linear data, then percentile-stretched
 //!   (2%..98%) to u8 because camera-native values are dim; see [`features`].
 
+mod blend;
 mod bundle;
 mod camera;
+mod crop;
+mod exposure;
 mod features;
 mod graph;
 mod matching;
+mod project;
 mod ransac;
 mod rng;
+mod seam;
 mod wave;
 
 use nalgebra::{Matrix3, Point2};
@@ -97,6 +102,22 @@ pub struct Registration {
     pub ba_final_rms: f64,
     /// False if BA diverged and the spanning-tree seed poses were kept instead.
     pub ba_converged: bool,
+}
+
+/// The stitched panorama (Phase P2 output).
+pub struct StitchResult {
+    pub width: usize,
+    pub height: usize,
+    /// Interleaved RGB, camera-native linear, clamped `>= 0` (`rgb.len() == width*height*3`).
+    pub rgb: Vec<f32>,
+    /// `1` = covered by at least one frame, `0` = empty (`valid_mask.len() == width*height`).
+    pub valid_mask: Vec<u8>,
+    pub reference_index: usize,
+    pub used_indices: Vec<usize>,
+    /// The projection actually used — never [`Projection::Auto`] (resolved from FOV / overrides).
+    pub projection_used: Projection,
+    /// True if [`StitchOptions::max_long_side`] forced a uniform downscale of the canvas.
+    pub capped: bool,
 }
 
 /// A verified overlapping pair and its inlier correspondences.
@@ -251,6 +272,111 @@ pub fn register(
         pairwise,
         ba_final_rms: ba.final_rms,
         ba_converged: ba.converged,
+    })
+}
+
+/// Register `frames` and composite them into a finished panorama.
+///
+/// This is [`register`] followed by [`compose`]. `progress` is invoked at the start of each phase:
+/// `Register` and `BundleAdjust` inside [`register`], then `Warp`, `Blend`, and `Crop` here.
+pub fn stitch(
+    frames: &[Frame],
+    opt: &StitchOptions,
+    progress: &(dyn Fn(Phase) + Sync),
+) -> Result<StitchResult, PanoError> {
+    let reg = register(frames, progress)?;
+    compose(frames, &reg, opt, progress)
+}
+
+/// Composite an already-computed [`Registration`] into a panorama (lets a caller reuse a registration).
+///
+/// Pipeline: pick the projection surface (honoring [`StitchOptions::projection`], with an auto rule and
+/// a wide-Perspective→Cylindrical fallback) → lay out the canvas (border-sampled extent, capped to
+/// [`StitchOptions::max_long_side`]) → low-res warp for exposure gains + seam masks → full-res
+/// streaming multi-band blend → optional auto-crop. Frames outside `reg.used_indices` are ignored.
+///
+/// Emits `Phase::Warp`, `Phase::Blend`, `Phase::Crop` at the corresponding stage starts.
+pub fn compose(
+    frames: &[Frame],
+    reg: &Registration,
+    opt: &StitchOptions,
+    progress: &(dyn Fn(Phase) + Sync),
+) -> Result<StitchResult, PanoError> {
+    // `boundary_warp` is reserved for v-next boundary warp / rectangling (Phase::Rectangle); it is
+    // accepted but has no effect in v1.
+    let _ = opt.boundary_warp;
+
+    progress(Phase::Warp);
+
+    let cams = project::build_used_cams(frames, reg);
+    let ref_slot = reg
+        .used_indices
+        .iter()
+        .position(|&f| f == reg.reference_index)
+        .unwrap_or(0);
+
+    let (h_span, v_span) = project::angular_spans(&cams);
+    let projection = project::resolve_projection(opt.projection, h_span, v_span);
+    let (map, capped) = project::build_map(&cams, ref_slot, projection, opt.max_long_side);
+
+    // Low-resolution warps drive exposure compensation and seam finding; hold them all (small).
+    let (low_map, low_warps) = project::warp_lowres(&cams, &reg.used_indices, frames, &map);
+    let gains = exposure::solve_gains(&low_warps);
+    let seams = seam::build_id_map(
+        &low_warps,
+        &reg.used_indices,
+        &reg.pairwise,
+        low_map.width,
+        low_map.height,
+    );
+    drop(low_warps);
+
+    progress(Phase::Blend);
+
+    let mut blender = blend::Blender::new(map.width, map.height);
+    for (slot, (&fidx, cam)) in reg.used_indices.iter().zip(cams.iter()).enumerate() {
+        if let Some(w) = project::warp(cam, &frames[fidx], &map) {
+            blender.add(&w, slot, &seams, gains[slot]);
+        }
+    }
+    let (mut rgb, mut valid) = blender.finish();
+    let mut width = map.width;
+    let mut height = map.height;
+
+    progress(Phase::Crop);
+
+    if opt.auto_crop {
+        let (x0, y0, cw, ch) = crop::largest_inscribed_rect(&valid, width, height);
+        // Skip if the inscribed rect degenerates (< 16 px either side) or would not actually crop.
+        if cw >= 16 && ch >= 16 && (cw < width || ch < height) {
+            let mut nrgb = vec![0.0f32; cw * ch * 3];
+            let mut nvalid = vec![0u8; cw * ch];
+            for y in 0..ch {
+                for x in 0..cw {
+                    let src = (y0 + y) * width + (x0 + x);
+                    let dst = y * cw + x;
+                    nrgb[dst * 3] = rgb[src * 3];
+                    nrgb[dst * 3 + 1] = rgb[src * 3 + 1];
+                    nrgb[dst * 3 + 2] = rgb[src * 3 + 2];
+                    nvalid[dst] = valid[src];
+                }
+            }
+            rgb = nrgb;
+            valid = nvalid;
+            width = cw;
+            height = ch;
+        }
+    }
+
+    Ok(StitchResult {
+        width,
+        height,
+        rgb,
+        valid_mask: valid,
+        reference_index: reg.reference_index,
+        used_indices: reg.used_indices.clone(),
+        projection_used: projection,
+        capped,
     })
 }
 
