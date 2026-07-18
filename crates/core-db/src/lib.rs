@@ -34,6 +34,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/015_presets.sql"),
     include_str!("../migrations/016_develop_snapshots.sql"),
     include_str!("../migrations/017_image_format.sql"),
+    include_str!("../migrations/018_panorama.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -132,7 +133,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 17, "expected 17 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 18, "expected 18 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -142,6 +143,82 @@ mod tests {
         assert!(
             has_format,
             "images.format column missing after migration 017"
+        );
+    }
+
+    /// Inserts a folder + an image row (owned by that folder) and returns the image id. Mirrors the
+    /// minimal-columns insert helper style used by the `core-library` integration tests (only the
+    /// `NOT NULL` columns are set; everything else takes its default/NULL).
+    fn insert_folder_and_image(conn: &Connection, tag: u8) -> i64 {
+        conn.execute(
+            "INSERT INTO folders(path, added_at) VALUES (?1, 0)",
+            rusqlite::params![format!("/lib/folder{tag}")],
+        )
+        .unwrap();
+        let folder_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO images(content_hash, file_size, path, folder_id, original_filename, status, imported_at)
+             VALUES (?1, 1, ?2, ?3, ?4, 'present', 0)",
+            rusqlite::params![vec![tag; 32], format!("/lib/{tag}.cr3"), folder_id, format!("{tag}.cr3")],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn migration_018_adds_panorama_sources() {
+        let db = Db::open_in_memory().unwrap();
+
+        // (a) Deleting the pano (parent) image cascades to the link row.
+        let pano1 = insert_folder_and_image(&db.conn, 1);
+        let src1 = insert_folder_and_image(&db.conn, 2);
+        db.conn
+            .execute(
+                "INSERT INTO panorama_sources(pano_image_id, source_image_id, position) VALUES (?1, ?2, 0)",
+                rusqlite::params![pano1, src1],
+            )
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![pano1])
+            .unwrap();
+        let links: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM panorama_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            links, 0,
+            "deleting the pano image must cascade-delete its panorama_sources link row"
+        );
+
+        // (b) Deleting a source image cascades to the link row but leaves the pano image intact.
+        let pano2 = insert_folder_and_image(&db.conn, 3);
+        let src2 = insert_folder_and_image(&db.conn, 4);
+        db.conn
+            .execute(
+                "INSERT INTO panorama_sources(pano_image_id, source_image_id, position) VALUES (?1, ?2, 0)",
+                rusqlite::params![pano2, src2],
+            )
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![src2])
+            .unwrap();
+        let links2: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM panorama_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            links2, 0,
+            "deleting a source image must cascade-delete its panorama_sources link row"
+        );
+        let pano_still_present: bool = db
+            .conn
+            .prepare("SELECT 1 FROM images WHERE id = ?1")
+            .unwrap()
+            .exists(rusqlite::params![pano2])
+            .unwrap();
+        assert!(
+            pano_still_present,
+            "the pano image itself must survive its source frame's deletion"
         );
     }
 
@@ -183,6 +260,7 @@ mod tests {
             "images",
             "import_sessions",
             "keywords",
+            "panorama_sources",
             "person",
             "presets",
             "ratings_flags",

@@ -284,7 +284,7 @@ pub fn as_shot_wb(src: &RawSource) -> Result<[f32; 4], RawError> {
 
 /// Select the camera→XYZ color matrix (prefer the D65 illuminant), padded to `[[f32;3];4]`.
 /// `None` when no matrix is present or it is malformed — callers fall back to the calibrated path.
-fn cam_xyz2cam(raw: &RawImage) -> Option<[[f32; 3]; 4]> {
+pub(crate) fn cam_xyz2cam(raw: &RawImage) -> Option<[[f32; 3]; 4]> {
     let (_ill, color_matrix) = raw
         .color_matrix
         .iter()
@@ -309,7 +309,7 @@ fn cam_xyz2cam(raw: &RawImage) -> Option<[[f32; 3]; 4]> {
 }
 
 /// As-shot white-balance coeffs, or neutral when the camera reported none.
-fn wb_or_neutral(raw: &RawImage) -> [f32; 4] {
+pub(crate) fn wb_or_neutral(raw: &RawImage) -> [f32; 4] {
     if raw.wb_coeffs[0].is_nan() {
         [1.0; 4]
     } else {
@@ -328,15 +328,7 @@ fn wb_or_neutral(raw: &RawImage) -> [f32; 4] {
 /// sensors fall back to rawler's calibrated develop.
 fn develop_linear_from(raw: &RawImage) -> Result<LinearImage, RawError> {
     if let Some(xyz2cam) = cam_xyz2cam(raw) {
-        let dev = RawDevelop {
-            steps: vec![
-                ProcessingStep::Rescale,
-                ProcessingStep::Demosaic,
-                ProcessingStep::CropActiveArea,
-                ProcessingStep::CropDefault,
-            ],
-        };
-        if let Intermediate::ThreeColor(px) = dev.develop_intermediate(raw).map_err(de)? {
+        if let Some(px) = demosaic_camera_native(raw)? {
             let wb = wb_or_neutral(raw);
             let rgb = map_3ch_to_rgb(&px, &wb, xyz2cam);
             return Ok(LinearImage {
@@ -347,6 +339,27 @@ fn develop_linear_from(raw: &RawImage) -> Result<LinearImage, RawError> {
         }
     }
     develop_calibrated(raw)
+}
+
+/// Demosaic to **camera-native** normalized 3-channel data: black/white-level rescale + demosaic +
+/// active/recommended crop — WITHOUT white balance and WITHOUT any color matrix. This is the shared
+/// front half of [`develop_linear_from`], split out so the panorama pipeline (`crate::pano`) can
+/// stitch in the camera's own linear space (the merged LinearRaw DNG then re-applies the identical
+/// wb+matrix math on decode). `None` for sensors that don't demosaic to three channels
+/// (4-colour CYGM, monochrome) — those can't author a cpp=3 LinearRaw DNG.
+pub(crate) fn demosaic_camera_native(raw: &RawImage) -> Result<Option<Color2D<f32, 3>>, RawError> {
+    let dev = RawDevelop {
+        steps: vec![
+            ProcessingStep::Rescale,
+            ProcessingStep::Demosaic,
+            ProcessingStep::CropActiveArea,
+            ProcessingStep::CropDefault,
+        ],
+    };
+    Ok(match dev.develop_intermediate(raw).map_err(de)? {
+        Intermediate::ThreeColor(px) => Some(px),
+        _ => None,
+    })
 }
 
 /// rawler's calibrated develop (clips highlights via `clip_euclidean_norm_avg`). Fallback for
@@ -497,7 +510,11 @@ pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> 
 /// decode; the GPU develop converts ProPhoto→sRGB only at the display transition. (2) highlights are
 /// clipped with `clip_negative` (floor negatives only, **keep values >1.0**) instead of
 /// `clip_euclidean_norm_avg`, preserving scene-referred highlight headroom for the soft rolloff.
-fn map_3ch_to_rgb(src: &Color2D<f32, 3>, wb_coeff: &[f32; 4], xyz2cam: [[f32; 3]; 4]) -> RgbF32 {
+pub(crate) fn map_3ch_to_rgb(
+    src: &Color2D<f32, 3>,
+    wb_coeff: &[f32; 4],
+    xyz2cam: [[f32; 3]; 4],
+) -> RgbF32 {
     // camera→linear-ProPhoto: ProPhoto→XYZ(D50) (rawler's XYZ→ProPhoto inverse) → cam, row-normalized
     // so camera neutral maps to ProPhoto neutral, then inverted to cam→ProPhoto.
     let pp_to_xyz = pseudo_inverse(XYZ_TO_PROFOTORGB_D50);
