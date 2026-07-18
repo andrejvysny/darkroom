@@ -1792,6 +1792,57 @@ export function facesDeleteAll(): Promise<void> {
   return invoke<void>("faces_delete_all", {});
 }
 
+// ── Panorama merge ───────────────────────────────────────────────────────────
+
+/** Stitch projection surface. "auto" lets the backend pick from the source images' overlap/FOV. */
+export type PanoramaProjection =
+  | "auto"
+  | "spherical"
+  | "cylindrical"
+  | "perspective";
+
+/** Shared option set for `panoramaPreview`/`panoramaMerge` (mirrors the fixed Rust IPC contract —
+ *  `panorama_preview`/`panorama_merge` take these four fields; Tauri auto-converts the camelCase JS
+ *  keys below to the Rust commands' snake_case params). */
+export type PanoramaOptions = {
+  imageIds: number[];
+  projection: PanoramaProjection;
+  /** 0..100; the backend clamps. Blends the seam boundary to hide parallax/exposure mismatches. */
+  boundaryWarp: number;
+  autoCrop: boolean;
+};
+
+/** Fast low-res preview of a panorama merge for the given options. Returns an object URL backed by
+ *  JPEG bytes (caller must revoke). The command doesn't exist on the backend yet — an invoke failure
+ *  (e.g. "command not found") should be handled by the caller via `isMergeEngineUnavailable`. */
+export async function panoramaPreview(opts: PanoramaOptions): Promise<string> {
+  const buf = await invoke<ArrayBuffer>("panorama_preview", {
+    imageIds: opts.imageIds,
+    projection: opts.projection,
+    boundaryWarp: opts.boundaryWarp,
+    autoCrop: opts.autoCrop,
+  });
+  return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+}
+
+/** Run the full panorama merge for the given options. Resolves with the new image's id only once the
+ *  whole merge finishes (register → bundle-adjust → warp → blend → crop → rectangle → encode);
+ *  progress arrives via the `panorama:progress`/`panorama:done`/`panorama:error` events in the
+ *  meantime (see `lib/usePanorama.ts`). */
+export function panoramaMerge(opts: PanoramaOptions): Promise<number> {
+  return invoke<number>("panorama_merge", {
+    imageIds: opts.imageIds,
+    projection: opts.projection,
+    boundaryWarp: opts.boundaryWarp,
+    autoCrop: opts.autoCrop,
+  });
+}
+
+/** Request the running panorama merge to stop. */
+export function panoramaCancel(): Promise<void> {
+  return invoke<void>("panorama_cancel", {});
+}
+
 /** Inline-style props that crop a face out of its image thumbnail (a CSS sprite crop), padded for a
  *  pleasant headshot. `bbox` is normalized `[x1,y1,x2,y2]`; the thumbnail is aspect-preserving and
  *  EXIF-oriented, matching the (also oriented) face coordinates. */

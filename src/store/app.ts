@@ -35,6 +35,13 @@ interface AppState {
   /** Images queued in the Export modal; null = modal closed. */
   exportTargets: ExportTarget[] | null;
   setExportTargets: (t: ExportTarget[] | null) => void;
+  /** Image ids queued for the Panorama merge modal; null = modal closed. */
+  panoramaSources: number[] | null;
+  setPanoramaSources: (ids: number[] | null) => void;
+  /** Active panorama merge job (current backend phase); null = no merge in flight. Drives the
+   *  PanoramaPill; fed by the `panorama:progress` event, cleared on `panorama:done`/`panorama:error`. */
+  panoramaJob: { phase: string } | null;
+  setPanoramaJob: (job: { phase: string } | null) => void;
   /** AI Models manager modal open state. */
   modelManagerOpen: boolean;
   setModelManagerOpen: (b: boolean) => void;
@@ -91,6 +98,10 @@ export const useAppStore = create<AppState>((set) => ({
   setGridMode: (m) => set({ gridMode: m }),
   exportTargets: null,
   setExportTargets: (t) => set({ exportTargets: t }),
+  panoramaSources: null,
+  setPanoramaSources: (ids) => set({ panoramaSources: ids }),
+  panoramaJob: null,
+  setPanoramaJob: (job) => set({ panoramaJob: job }),
   modelManagerOpen: false,
   setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
   onImport: null,

@@ -71,6 +71,7 @@ export default function LibraryView() {
   const gridMode = useAppStore((s) => s.gridMode);
   const setGridMode = useAppStore((s) => s.setGridMode);
   const setLibraryImages = useAppStore((s) => s.setLibraryImages);
+  const setPanoramaSources = useAppStore((s) => s.setPanoramaSources);
   const thumbVersions = useAppStore((s) => s.thumbVersions);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnOpenSettings = useAppStore((s) => s.setOnOpenSettings);
@@ -454,6 +455,11 @@ export default function LibraryView() {
     openExport(selectedIds);
   }, [selectedIds]);
 
+  const batchMergePanorama = useCallback(() => {
+    if (selectedIds.length < 2 || selectedIds.length > 10) return;
+    setPanoramaSources(selectedIds);
+  }, [selectedIds, setPanoramaSources]);
+
   const collapseSelection = useCallback(() => {
     setSelectedId(selectedId);
   }, [selectedId, setSelectedId]);
@@ -540,6 +546,8 @@ export default function LibraryView() {
                 onAddKeyword={batchAddKeyword}
                 onAddToCollection={batchAddToCollection}
                 onExport={batchExport}
+                onMergePanorama={batchMergePanorama}
+                canMergePanorama={selectedIds.length >= 2 && selectedIds.length <= 10}
                 onClear={collapseSelection}
               />
             </div>

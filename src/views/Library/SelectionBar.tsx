@@ -21,6 +21,10 @@ interface SelectionBarProps {
   onAddKeyword: (name: string) => void;
   onAddToCollection: (collectionId: number) => void;
   onExport: () => void;
+  /** Opens the panorama merge modal for the current selection. */
+  onMergePanorama: () => void;
+  /** True when the selection count is in the mergeable range (2..=10). */
+  canMergePanorama: boolean;
   onClear: () => void;
 }
 
@@ -73,6 +77,8 @@ export default function SelectionBar({
   onAddKeyword,
   onAddToCollection,
   onExport,
+  onMergePanorama,
+  canMergePanorama,
   onClear,
 }: SelectionBarProps) {
   const [kw, setKw] = useState("");
@@ -275,6 +281,22 @@ export default function SelectionBar({
           ))}
         </select>
       )}
+
+      <Divider />
+
+      {/* Panorama merge (needs 2..10 images) */}
+      <button
+        style={{
+          ...btn(),
+          opacity: canMergePanorama ? 1 : 0.45,
+          cursor: canMergePanorama ? "pointer" : "default",
+        }}
+        onClick={canMergePanorama ? onMergePanorama : undefined}
+        disabled={!canMergePanorama}
+        title={canMergePanorama ? "Merge selected photos into a panorama" : "Select 2–10 photos"}
+      >
+        <Icon name="stack" size={12} /> Merge to Panorama…
+      </button>
 
       <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
         <button style={btn()} onClick={onExport}>
