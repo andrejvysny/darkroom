@@ -107,13 +107,19 @@ Branch `claude/hdr-heif-support-5r5ztx`. Plan: `~/.claude/plans/i-need-you-to-co
   {done,total,stage}` / `hdr:done {image}` / `library:changed`. FE: `useHdrMerge` hook, SelectionBar
   "Merge to HDR" + palette row, progress pill, HDR grid chip, format-aware TopBar badge, HEIF/HDR
   file-type filter chips. `SUPPORTED_EXT` += `hif`, `exr`.
-- **Validated here (Linux):** synthetic 10-bit PQ HEIF fixture (committed, 723 B, heif-enc lossless)
-  decodes byte-exact through `develop_linear` (diffuse white ≈1.0, max ≈49.26); EXR round-trip; all
-  merge math tests; clippy/fmt/tsc green; `cargo check -p darkroom` green (GTK + pip-onnxruntime
-  shims). **Pending on the dev Mac:** real R7 `.HIF` through `heif_gate` (S1 go/no-go: libde265 vs
-  Canon 4:2:2 — fallback = libheif ffmpeg decoder plugin), `calibrate_pq` on a CR3+HIF same-capture
-  pair (adopt measured anchor if |ΔEV| > 0.25), `merge_one` on a real tripod bracket, in-app QA,
-  `.dmg` dylib bundling (`bundle.macOS.frameworks`, `libheif.1.dylib` + `libde265.0.dylib`).
+- **Validated here (Linux):** synthetic 10-bit PQ HEIF fixtures (committed; 4:2:0 AND
+  **4:2:2 — the exact Canon codec profile, retiring risk R1 at codec level**) decode byte-exact
+  through `develop_linear` (diffuse white ≈1.0, max ≈49.26); a committed real iPhone gain-map HEIC
+  is rejected with the clean profile error (negative test); 51-file Nokia conformance survey via
+  the now fault-tolerant `heif_gate` (35 decode, 16 clean container errors, 0 crashes; all 8-bit);
+  EXR round-trip; all merge math tests; full merge plumbing on a fabricated ±2 EV bracket of the
+  committed R7 CR3 (exiftool-rewritten ExposureTime; 3×32.3 MP decode → 107 MB EXR → read-back);
+  clippy/fmt/tsc green; `cargo check -p darkroom` green (GTK + pip-onnxruntime shims).
+  **Pending on the dev Mac (real files only):** real R7 `.HIF` through `heif_gate` (Canon
+  container: heix brand/grid/thumbnail/irot — codec already CI-proven), `calibrate_pq` on a
+  CR3+HIF same-capture pair (adopt measured anchor if |ΔEV| > 0.25), `merge_one` on a real tripod
+  bracket (HDR look, not just plumbing), in-app QA, `.dmg` dylib bundling
+  (`bundle.macOS.frameworks`, `libheif.1.dylib` + `libde265.0.dylib`).
 
 ## Latest AI work — Unified AI pipeline (branch `feat/unified-ai-pipeline`, MERGED `f663ee0`)
 

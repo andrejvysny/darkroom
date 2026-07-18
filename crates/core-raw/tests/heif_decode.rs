@@ -27,14 +27,14 @@ fn pq_eotf(e: f64) -> f64 {
 
 const DIFFUSE_WHITE_NITS: f64 = 203.0;
 
-#[test]
-fn synthetic_pq_heif_round_trips() {
-    // The fixture's three neutral bands, as exact 10-bit PQ codes (see gen_pq_fixture.rs).
+/// Shared assertions for the committed synthetic PQ fixtures (both chroma variants carry the same
+/// three neutral bands at exact 10-bit PQ codes — see `gen_pq_fixture.rs`).
+fn assert_pq_fixture(path: &str) {
     const BAND_CODES: [u16; 3] = [153, 594, 1023]; // ≈1 nit, 203 nits (diffuse white), 10 000 nits
     const W: u32 = 96;
     const H: u32 = 64;
 
-    let path = PathBuf::from("tests/fixtures/synthetic_pq.hif");
+    let path = PathBuf::from(path);
     assert!(
         path.exists(),
         "committed fixture missing: {}",
@@ -84,9 +84,48 @@ fn synthetic_pq_heif_round_trips() {
     assert_eq!((prev.width(), prev.height()), (W, H));
     let meta = core_raw::read_metadata(&src).unwrap();
     assert!(meta.camera_model.is_none());
+}
 
-    // A non-PQ HEIF-family file must be rejected with a clean profile error, not wrong colors:
-    // covered implicitly — verify_pq_bt2020 rejects when nclx ≠ BT.2020/PQ (unit of heif.rs).
+#[test]
+fn synthetic_pq_heif_round_trips() {
+    assert_pq_fixture("tests/fixtures/synthetic_pq.hif");
+}
+
+/// Same content encoded as **10-bit YCbCr 4:2:2** (verified with `heif-info`) — the exact codec
+/// profile Canon HDR PQ `.HIF` files use (HEVC Main 4:2:2 10 intra). Guards libde265's
+/// range-extensions decode path in CI (risk R1 of the HDR plan).
+#[test]
+fn synthetic_pq422_heif_round_trips() {
+    assert_pq_fixture("tests/fixtures/synthetic_pq422.hif");
+}
+
+/// A non-PQ HEIF (real iPhone 13 Pro gain-map HDR HEIC, MIT-licensed — see APPLE_HDR_LICENSE)
+/// must be rejected with the clean profile error, never decoded to wrong colors — while its Exif
+/// metadata still reads fine.
+#[test]
+fn non_pq_heif_rejected_cleanly() {
+    let path = PathBuf::from("tests/fixtures/apple_hdr_gainmap.hif");
+    assert!(path.exists(), "committed fixture missing");
+
+    let src = core_raw::source_from_path(&path).unwrap();
+    let msg = match core_raw::develop_linear(&src) {
+        Ok(_) => panic!("non-PQ profile must be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("expected BT.2020 PQ"),
+        "unexpected error text: {msg}"
+    );
+    // The thumbnail path goes through the same decode and must fail the same clean way.
+    assert!(core_raw::thumbnail_jpeg(&src, 128, 82).is_err());
+
+    // Metadata is independent of pixel decode and still works.
+    let meta = core_raw::read_metadata(&src).unwrap();
+    assert_eq!(meta.camera_model.as_deref(), Some("iPhone 13 Pro"));
+    assert_eq!(
+        meta.orientation, None,
+        "HEIF meta must not re-expose EXIF orientation"
+    );
 }
 
 fn fixture_dir() -> PathBuf {

@@ -10,14 +10,40 @@ gates green (incl. a committed synthetic 10-bit PQ HEIF fixture decoding byte-ex
 `CURRENT_STATE.md` "Latest pass — HDR". **Binding-map correction: 0–15 all used (15 = ChanMix);
 next free = @binding(16).**
 
+**Sample-based validation round (2026-07-18, same branch — user has no R7 files yet, so public
+GitHub samples + synthesis were used; downloads live UNCOMMITTED in `library/fixtures-samples/`,
+already gitignored):**
+
+- **R1 (libde265 vs Canon's HEVC Main 4:2:2 10 intra) retired at codec level:** a second committed
+  fixture `synthetic_pq422.hif` (591 B, heif-enc `-p chroma=422`, verified `YCbCr 4:2:2 / 10-bit`
+  via heif-info) decodes byte-exact through `develop_linear` — CI-guarded by
+  `synthetic_pq422_heif_round_trips`. What this does NOT cover: Canon's real container (heix brand,
+  grid/tiled layout, embedded thumb, irot) — still a Mac+fixture item.
+- **Negative-profile test committed:** `apple_hdr_gainmap.hif` (real iPhone 13 Pro gain-map HEIC,
+  MIT — `APPLE_HDR_LICENSE`) → clean "expected BT.2020 PQ" rejection, metadata still readable
+  (`non_pq_heif_rejected_cleanly`).
+- **Corpus survey:** all 51 Nokia `heif_conformance` stills through `heif_gate` (now
+  per-file fault-tolerant): 35 decode OK, 16 fail with clean libheif errors (sequences /
+  intentionally-broken items), zero crashes. All decodable ones are 8-bit — the suite has no
+  10-bit stills, hence the synthesized 4:2:2 fixture above.
+- **Merge plumbing validated on real sensor data:** fabricated ±2 EV bracket (3 copies of the
+  committed `_55A3947.CR3`, `ExposureTime` rewritten via exiftool 12.76 — rawler parses the
+  rewritten files fine) through `merge_one`: EV math exact, median reference picked, 3×32.3 MP
+  reference-WB decodes, streaming merge, 107 MB EXR written + read back via the thumbnail path.
+  NOTE: frames share identical pixels, so output brightness is a scale-blend (~×1.75 midtones) —
+  plumbing proof only, NOT an HDR-look check. Recreate with:
+  `cp` ×3 + `exiftool -overwrite_original -ExposureTime=… frame_m2ev.CR3` (one file per invocation)
+  + `cargo run -p core-hdr --example merge_one library/fixtures-samples/bracket`.
+
 **Needs the dev Mac + real fixtures (drop into `library/fixtures-hdr/`: landscape + portrait .HIF,
 a CR3+HIF same-capture pair, a 3–5-frame tripod AEB CR3 bracket with clipped highlights):**
 
 - [ ] `brew install libheif`, then S1 gate: `cargo run -p core-raw --example heif_gate
-      library/fixtures-hdr` — real R7 .HIF must decode (10-bit 4:2:2 via libde265; fallback if it
-      chokes: libheif ffmpeg decoder plugin / macOS ImageIO re-plan). Check the PORTRAIT line —
-      if with/without-transform dims match on a portrait file but the EXIF tag says 6/8, add
-      `.oriented()` in `heif.rs` (risk R4).
+      library/fixtures-hdr` — real R7 .HIF must decode. The codec leg (10-bit 4:2:2 via libde265)
+      is already proven by the committed `synthetic_pq422.hif` CI test; what remains real-file-only
+      is Canon's container: heix brand, grid/tiled primary, embedded thumbnail, irot. Check the
+      PORTRAIT line — if with/without-transform dims match on a portrait file but the EXIF tag
+      says 6/8, add `.oriented()` in `heif.rs` (risk R4).
 - [ ] S2 calibration: `cargo run -p core-raw --example calibrate_pq pair.CR3 pair.HIF` — keep the
       203-nit anchor if |ΔEV| ≤ 0.25, else adopt the suggested `HDR_DIFFUSE_WHITE_NITS` (record the
       measurement in `core-raw/src/color.rs` docs).
