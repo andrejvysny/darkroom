@@ -105,28 +105,35 @@ fn srgb_oetf(c: f32) -> f32 {
     }
 }
 
-/// Encode a linear-ProPhoto [`LinearImage`] as a clamped SDR sRGB JPEG (the shader's display
-/// transition on the CPU: `pp_to_srgb` · clamp · sRGB OETF · JPEG). Scene-referred headroom >1.0 is
+/// Convert a linear-ProPhoto [`LinearImage`] to clamped SDR sRGB 8-bit (the shader's display
+/// transition on the CPU: `pp_to_srgb` · clamp · sRGB OETF). Scene-referred headroom >1.0 is
 /// hard-clipped — callers that need proper HDR→SDR tone mapping use the GPU canonical render; this
 /// serves the transient thumbnail/preview paths for formats without an embedded SDR preview
 /// (HEIF / merged-HDR EXR).
+pub(crate) fn linear_to_srgb_rgb8(img: &LinearImage) -> image::RgbImage {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let mut rgb8 = Vec::with_capacity(w * h * 3);
+    for px in img.data.chunks_exact(3) {
+        for row in &PP_TO_SRGB {
+            let lin = row[0] * px[0] + row[1] * px[1] + row[2] * px[2];
+            rgb8.push((srgb_oetf(lin) * 255.0).round() as u8);
+        }
+    }
+    image::RgbImage::from_raw(img.width, img.height, rgb8)
+        .expect("buffer length matches dims by construction")
+}
+
+/// [`linear_to_srgb_rgb8`] encoded as JPEG at `quality`.
 pub(crate) fn linear_to_srgb_jpeg(img: &LinearImage, quality: u8) -> Result<Vec<u8>, RawError> {
     use image::codecs::jpeg::JpegEncoder;
     use image::ExtendedColorType;
 
-    let (w, h) = (img.width as usize, img.height as usize);
-    let mut rgb8 = Vec::with_capacity(w * h * 3);
-    for px in img.data.chunks_exact(3) {
-        for ch in 0..3 {
-            let lin = PP_TO_SRGB[ch][0] * px[0] + PP_TO_SRGB[ch][1] * px[1] + PP_TO_SRGB[ch][2] * px[2];
-            rgb8.push((srgb_oetf(lin) * 255.0).round() as u8);
-        }
-    }
+    let rgb8 = linear_to_srgb_rgb8(img);
     let mut buf = Vec::new();
     JpegEncoder::new_with_quality(&mut buf, quality).encode(
-        &rgb8,
-        img.width,
-        img.height,
+        rgb8.as_raw(),
+        rgb8.width(),
+        rgb8.height(),
         ExtendedColorType::Rgb8,
     )?;
     Ok(buf)

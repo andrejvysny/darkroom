@@ -31,6 +31,19 @@ export default function TopBar() {
   const currentFilename = useAppStore(
     (s) => s.libraryImages.find((i) => i.id === s.selectedId)?.filename ?? "—",
   );
+  const currentFormat = useAppStore(
+    (s) => s.libraryImages.find((i) => i.id === s.selectedId)?.format ?? "raw",
+  );
+  // Pipeline badge per catalog format: raw/heif/hdr are scene-linear (base tone operator active),
+  // jpeg/png are display-referred (tone bypass).
+  const formatBadge =
+    {
+      raw: "RAW · scene-linear",
+      heif: "HDR PQ · scene-linear",
+      hdr: "HDR · scene-linear",
+      jpeg: "JPEG · display-referred",
+      png: "PNG · display-referred",
+    }[currentFormat] ?? `${currentFormat.toUpperCase()} · scene-linear`;
   const showBefore = useDevelopStore((s) => s.showBefore);
   const setShowBefore = useDevelopStore((s) => s.setShowBefore);
 
@@ -205,7 +218,7 @@ export default function TopBar() {
                 padding: "2px 6px",
               }}
             >
-              RAW · scene-linear
+              {formatBadge}
             </span>
           </div>
           <button

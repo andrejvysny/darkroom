@@ -13,5 +13,11 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
+# HEIF (.hif) decode. Pinned exact (C-API surface); `v1_17` matches the oldest system libheif we
+# support (Ubuntu noble's 1.17); Homebrew's newer libheif is backward-compatible with that subset.
+# Not built on Windows (no system libheif there yet) — `heif.rs` compiles a stub instead.
+[target.'cfg(not(windows))'.dependencies]
+libheif-rs = { version = "=2.7.0", default-features = false, features = ["v1_17"] }
+
 [dev-dependencies]
 anyhow = "1"

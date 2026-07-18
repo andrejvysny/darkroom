@@ -86,7 +86,7 @@ export type QueryParams = {
   detectedCategory?: string | null;
   /** Restrict to images containing a (confirmed or suggested) face of this person. */
   personId?: number | null;
-  /** Source format bucket filter: "raw" | "jpeg" | "png". */
+  /** Source format bucket filter: "raw" | "jpeg" | "png" | "heif" | "hdr". */
   format?: string | null;
   search?: string | null;
   sort?: SortKey;
@@ -164,7 +164,8 @@ export type ImageRow = {
   /** When the image was catalogued (epoch seconds): keyset cursor for import-date sorts + a live
    *  sorted-merge comparator key. */
   importedAt: number;
-  /** Source format bucket ("raw" | "jpeg" | "png"); null for legacy rows predating the column. */
+  /** Source format bucket ("raw" | "jpeg" | "png" | "heif" | "hdr"); null for legacy rows
+   *  predating the column. */
   format: string | null;
 };
 

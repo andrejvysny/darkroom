@@ -299,6 +299,8 @@ export default function LeftNav({
 
 const FILE_TYPES: { kind: string; label: string }[] = [
   { kind: "raw", label: "RAW" },
+  { kind: "heif", label: "HEIF" },
+  { kind: "hdr", label: "HDR" },
   { kind: "jpeg", label: "JPEG" },
   { kind: "png", label: "PNG" },
 ];
