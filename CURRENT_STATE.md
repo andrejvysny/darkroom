@@ -8,6 +8,51 @@
 > Branch `feat/lens-corrections` (in progress) adds lens distortion/CA + pre-release signing scaffolding.
 > Everything below dated 2026-06-26 predates those merges.
 
+## Panorama detection (branch `claude/panorama-detection-ob1jjq`, 2026-07-19) — CURRENT
+
+**"Detect panoramas"**: one click scans the whole library incrementally in the background, suggests
+stitchable groups, and a review panel hands each group into the existing merge flow. Method = Brown &
+Lowe "Recognising Panoramas" (the OpenCV-stitcher lineage) composed with an EXIF prefilter; no OSS
+photo manager ships this, so there was no reference implementation.
+
+- **Pipeline**: `core_library::pano_detect` metadata prefilter (present images with `capture_date`,
+  ordered by camera key + time; clusters split on >30 s gap / camera / EXIF-orientation / focal-ratio
+  >1.06 — NULLs compatible; oversize runs largest-gap-chunked to ≤48) → `core_pano::detect_groups`
+  over cached **512 px thumbs** (always present after import, already EXIF-upright → homographies
+  safe): the existing FAST+BRIEF / ratio+cross-check / RANSAC front end **unchanged**; per verified
+  pair `conf = inliers/(8+0.3·matches)` (>1 by the existing gate, so overlap+shift is the real
+  classifier), `overlap` = symmetric warped-quad∩rect area (Sutherland–Hodgman + shoelace), `shift`
+  = ‖H·cᵢ−cⱼ‖/diagⱼ; **Pano** edge = overlap∈[0.10,0.92] ∧ shift≥0.10, **Burst** = >0.92 ∧ <0.05
+  (excluded — also absorbs HDR brackets); union-find keeps **all** components ≥2 (`graph.rs` keeps
+  only the largest — deliberately not reused); group confidence = min edge conf on the max spanning
+  tree (weakest necessary link). Thresholds live in `DetectOptions` / `ClusterParams`.
+- **Persistence** (migration **019**, schema = 19): `pano_detect_groups` upserted by `member_key`
+  (blake3 of sorted member content hashes → dismissed/merged status survives rescans AND re-imports),
+  `pano_detect_members` (`position` = capture order), `pano_detect_scan` (per-image `ALGO_VERSION`
+  markers → incremental scans; bump `panodetect-v1` in `core-library/src/pano_detect.rs` to force a
+  rescan; `force` bypasses markers but keeps dismissals via member_key).
+- **Job** `src-tauri/pano_detect.rs` (panorama.rs RunGuard + brief-DB-lock discipline — thumb decode
+  and detect fully unlocked): events `pano_detect:progress {phase:"cluster"|"verify",done,total}` /
+  `pano_detect:done {found}` / `pano_detect:error {message}`; cancel drains to `done` with the
+  partial count (analysis.rs convention). Unconditional module (no ML → no cfg stub).
+- **Frontend**: `usePanoDetect` hook (per-instance StrictMode-safe listeners), `PanoSuggestions`
+  overlay (thumb strips, confidence badge, capture range, dismiss/undo + show-dismissed; "Preview &
+  Merge…" gated on `allRaw` — merge is RAW-only — hands member ids to `PanoramaModal` via
+  `panoramaSources`), LeftNav "Panoramas" section + suggested count, CommandPalette entry;
+  `panorama:done` records suggestion-originated merges via `pano_detect_mark_merged`
+  (`activePanoDetectGroupId` store field, cleared on merge error).
+- **Validated on real photos** (this container): 19-image corpus (opencv_extra boat×6 /
+  newspaper×4 / s×2 / a×3 + synthetic burst trio + unrelated control) → exactly the 4 ground-truth
+  groups, bursts classified Burst and excluded, unrelated matched nothing, **0 false pairs of 171**
+  at 512 px; every detected group then stitched clean via the harness. Mocked-Chromium UI
+  walkthrough green (zero console errors). Harness:
+  `cargo run --release -p core-pano --example detect_dir -- <dir> [--edge N] [--all-pairs] [--stitch]`.
+- Also landed: merge-dialog preview cache now released on plain modal close
+  (`panorama_preview_release`, closes TODO leftover #5a).
+- **NOT yet done**: in-app run over the dev machine's real CR3 library (container has 1 CR3);
+  threshold audit on messier corpora (hand-held multi-row, moving subjects); Tier-3 e2e of
+  detect→review→merge.
+
 ## Panorama merge (branch `claude/darkroom-panorama-research-ruvw38`, 2026-07-18) — CURRENT
 
 Lightroom-style **Photo Merge → Panorama** landed end-to-end (P0–P4 of the plan in
@@ -49,7 +94,8 @@ schema = 18) and editable in Develop **with full raw WB latitude** (no tone curv
   the DNG in Develop (WB slider must behave like a raw; optionally Adobe `dng_validate`).
 - **v1 limits (see TODO)**: Boundary Warp inert (P5: He/Chang/Sun rectangling), DP seams (graph-cut
   P5), no deghosting; `merge` holds all full-res sources in RAM (~0.4 GB/frame → ~4 GB at 10
-  frames); preview cache freed on merge but not on plain modal close.
+  frames); ~~preview cache freed on merge but not on plain modal close~~ (fixed 2026-07-19:
+  `panorama_preview_release`).
 
 ## Repo state sync (2026-06-26)
 
@@ -324,6 +370,14 @@ replace_all) → DevelopParams` (merged, NOT persisted — FE commits), `presets
 - Collections: `collections_list`, `collections_for_image`, `collection_create`,
   `collection_rename`, `collection_delete`, `collection_add_images`, `collection_remove_images`
 - Dedup: `dedup_scan`, `dedup_resolve`
+- Panorama merge: `panorama_preview`, `panorama_merge`, `panorama_cancel`, `panorama_status`,
+  `panorama_preview_release` (drop the dialog's frame cache on close). Events:
+  `panorama:{progress {phase}, done {imageId}, error}`
+- Panorama detection (**NEW**, 2026-07-19): `pano_detect_run(force)`, `pano_detect_cancel`,
+  `pano_detect_status` → `{running, suggested}`, `pano_detect_groups(include_dismissed)` →
+  `PanoGroupRow[]`, `pano_detect_dismiss(group_id, dismissed)`,
+  `pano_detect_mark_merged(group_id, merged_image_id)`. Events:
+  `pano_detect:{progress {phase,done,total}, done {found}, error {message}}`
 - Import: `import_start`
 - AI scan / People (**unified manual pass** — `feat/unified-ai-pipeline`): `analysis_status`,
   `analysis_run(force)`, `analysis_cancel`, `analysis_models_ensure`, `analysis_facets`,

@@ -25,9 +25,29 @@ P0–P4 landed + headless-green (see `CURRENT_STATE.md` top section for the full
 4. **Memory follow-up** — streaming decode-on-demand `Frame` source so `merge` never holds all
    full-res sources (~4 GB at 10 R7 frames today); band-tiled compositing if gigapixel ever matters
    (cap is 12000px now so the develop pipeline can open the result).
-5. **Small leftovers** — free the preview cache on modal close (today only on merge; add a
-   `panorama_close` command or piggyback selection change); `panorama_status` has no frontend
-   consumer yet (reconnect-after-restart UX); HDR-pano (bracketed) explicitly out of scope for v1.
+5. **Small leftovers** — ~~free the preview cache on modal close~~ **DONE 2026-07-19**
+   (`panorama_preview_release` command, called from PanoramaModal's close cleanup);
+   `panorama_status` has no frontend consumer yet (reconnect-after-restart UX); HDR-pano
+   (bracketed) explicitly out of scope for v1.
+
+## IN PROGRESS: Panorama detection (branch `claude/panorama-detection-ob1jjq`, 2026-07-19)
+
+"Detect panoramas" landed end-to-end — migration 019, `core_pano::detect_groups`,
+`core_library::pano_detect`, `src-tauri/pano_detect.rs` job + 6 commands, `PanoSuggestions` review
+UI with merge handoff — and is **validated on real photos** (4/4 ground-truth groups, 0 false pairs;
+see `CURRENT_STATE.md` top section). Remaining:
+
+1. **In-app QA on the dev machine's real CR3 library** — run Detect from the LeftNav Panoramas
+   section; confirm real sweeps group (typical pano: 2–10 frames seconds apart at fixed focal),
+   dismiss/undo persistence across restarts, merge handoff → `pano_detect_mark_merged`, and that an
+   incremental re-run after new imports only scans the new clusters. (Container validation used
+   JPEG corpora + mocked UI; the thumb-based detection path is format-agnostic.)
+2. **Threshold audit on messier corpora** — hand-held multi-row panos, moving subjects, zoom drift.
+   Knobs: `core_pano::DetectOptions`, `core_library::pano_detect::ClusterParams`. Bump
+   `ALGO_VERSION` on ANY change so the incremental scan invalidates.
+3. Optional: surface Burst edges as a "burst stack" suggestion category (already classified in
+   `DetectReport.edges`, currently not persisted).
+4. Tier-3 e2e (real backend) of detect → review → merge, macOS.
 
 ## Repo state sync (2026-07-02) — CURRENT
 
