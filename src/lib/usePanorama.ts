@@ -1,7 +1,12 @@
 import { useCallback, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../store/app";
-import { panoramaMerge, panoramaCancel, type PanoramaOptions } from "./ipc";
+import {
+  panoramaMerge,
+  panoramaCancel,
+  panoDetectMarkMerged,
+  type PanoramaOptions,
+} from "./ipc";
 import { log } from "./logger";
 
 /** Human-readable label for each backend merge phase (`panorama:progress` `phase`). Falls back to the
@@ -57,6 +62,18 @@ function bootstrapListeners(): void {
     // The backend also emits `library:changed` when it commits the new image, which `useLibrary`
     // already refreshes the grid on — here we just carry the freshly-merged image into the selection.
     useAppStore.getState().setSelection([ev.payload.imageId], ev.payload.imageId);
+
+    // If this merge was handed off from a detected panorama suggestion (PanoSuggestions →
+    // openMerge), tell the backend the group is now merged so it drops out of the review list.
+    const activeGroupId = useAppStore.getState().activePanoDetectGroupId;
+    if (activeGroupId != null) {
+      useAppStore.getState().setActivePanoDetectGroup(null);
+      void panoDetectMarkMerged(activeGroupId, ev.payload.imageId).catch(
+        (err: unknown) => {
+          log.debug("panorama", "mark merged failed", log.errorSummary(err));
+        },
+      );
+    }
   });
 
   void listen<{ message: string }>("panorama:error", (ev) => {
@@ -64,6 +81,9 @@ function bootstrapListeners(): void {
     useAppStore
       .getState()
       .setToast(`Panorama merge failed: ${ev.payload.message}`);
+    // Don't mark a detected group merged on a failed stitch — clear the handoff so a retry (or a
+    // fresh manual merge) doesn't spuriously call panoDetectMarkMerged later.
+    useAppStore.getState().setActivePanoDetectGroup(null);
   });
 }
 

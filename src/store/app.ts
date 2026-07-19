@@ -42,6 +42,14 @@ interface AppState {
    *  PanoramaPill; fed by the `panorama:progress` event, cleared on `panorama:done`/`panorama:error`. */
   panoramaJob: { phase: string } | null;
   setPanoramaJob: (job: { phase: string } | null) => void;
+  /** Panorama-suggestions review overlay open state (see `views/Panorama/PanoSuggestions.tsx`). */
+  panoSuggestOpen: boolean;
+  setPanoSuggestOpen: (b: boolean) => void;
+  /** Detected panorama group currently staged into the merge modal (`PanoramaModal`), so
+   *  `usePanorama`'s `panorama:done` handler knows to call `panoDetectMarkMerged` once the stitch
+   *  lands. null = no detected-group merge in flight (e.g. a manual multi-select merge). */
+  activePanoDetectGroupId: number | null;
+  setActivePanoDetectGroup: (id: number | null) => void;
   /** AI Models manager modal open state. */
   modelManagerOpen: boolean;
   setModelManagerOpen: (b: boolean) => void;
@@ -102,6 +110,10 @@ export const useAppStore = create<AppState>((set) => ({
   setPanoramaSources: (ids) => set({ panoramaSources: ids }),
   panoramaJob: null,
   setPanoramaJob: (job) => set({ panoramaJob: job }),
+  panoSuggestOpen: false,
+  setPanoSuggestOpen: (b) => set({ panoSuggestOpen: b }),
+  activePanoDetectGroupId: null,
+  setActivePanoDetectGroup: (id) => set({ activePanoDetectGroupId: id }),
   modelManagerOpen: false,
   setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
   onImport: null,

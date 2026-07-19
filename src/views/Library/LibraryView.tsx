@@ -29,6 +29,7 @@ import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
 import { openExport } from "../../lib/export";
 import { useAnalysis } from "../../lib/useAnalysis";
+import { usePanoDetect } from "../../lib/usePanoDetect";
 import LeftNav from "./LeftNav";
 import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
@@ -85,6 +86,8 @@ export default function LibraryView() {
 
   const lib = useLibrary();
   const analysis = useAnalysis();
+  const panoDetect = usePanoDetect();
+  const setPanoSuggestOpen = useAppStore((s) => s.setPanoSuggestOpen);
   const [stoppingAnalysis, setStoppingAnalysis] = useState(false);
 
   // While analysis runs (doneVersion bumps as batches commit), keep the filtered grid in sync so
@@ -507,6 +510,8 @@ export default function LibraryView() {
           onRenameCollection={handleRenameCollection}
           onDeleteKeyword={handleDeleteKeyword}
           analysis={analysis}
+          panoSuggested={panoDetect.status?.suggested ?? 0}
+          onOpenPanoSuggestions={() => setPanoSuggestOpen(true)}
         />
       </div>
 

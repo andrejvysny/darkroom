@@ -9,6 +9,7 @@ import TopBar from "./components/TopBar";
 import CommandPalette from "./components/CommandPalette";
 import ExportModal from "./views/Export/ExportModal";
 import PanoramaModal from "./views/Panorama/PanoramaModal";
+import PanoSuggestions from "./views/Panorama/PanoSuggestions";
 import ModelManagerModal from "./views/Library/ModelManagerModal";
 import DownloadPill from "./components/DownloadPill";
 import PanoramaPill from "./components/PanoramaPill";
@@ -48,6 +49,7 @@ export default function App() {
       <CommandPalette />
       <ExportModal />
       <PanoramaModal />
+      <PanoSuggestions />
       <ModelManagerModal />
       <DownloadPill />
       <PanoramaPill />

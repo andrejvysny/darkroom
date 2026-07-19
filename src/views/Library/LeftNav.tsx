@@ -32,6 +32,11 @@ interface LeftNavProps {
   onDeleteKeyword: (id: number) => void;
   /** AI analysis facets + actions — passed from LibraryView via useAnalysis */
   analysis: AnalysisState & AnalysisActions;
+  /** Count of panorama groups awaiting review — passed from LibraryView via usePanoDetect,
+   *  mirroring how `analysis` is wired. */
+  panoSuggested: number;
+  /** Opens the PanoSuggestions review overlay. */
+  onOpenPanoSuggestions: () => void;
 }
 
 function SectionHeading({
@@ -76,6 +81,8 @@ export default function LeftNav({
   onRenameCollection,
   onDeleteKeyword,
   analysis,
+  panoSuggested,
+  onOpenPanoSuggestions,
 }: LeftNavProps) {
   const noFilters = !hasActiveFilters(params);
   const picksActive = params.flag === "pick";
@@ -239,6 +246,42 @@ export default function LeftNav({
         patchParams={patchParams}
         clearFilters={clearFilters}
       />
+
+      {/* Panoramas section — detected groups awaiting review (see PanoSuggestions.tsx). */}
+      <div>
+        <SectionHeading
+          action={
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenPanoSuggestions();
+              }}
+              title="Review panorama suggestions"
+              aria-label="Review panorama suggestions"
+              style={{
+                fontSize: 10,
+                padding: "1px 6px",
+                borderRadius: "var(--radius-sm)",
+                border: "1px solid var(--color-line)",
+                background: "transparent",
+                color: "var(--color-t2)",
+                cursor: "pointer",
+                lineHeight: 1.5,
+              }}
+            >
+              Review
+            </button>
+          }
+        >
+          Panoramas
+        </SectionHeading>
+        <NavRow
+          icon="stack"
+          label="Suggestions"
+          count={panoSuggested > 0 ? panoSuggested.toLocaleString() : ""}
+          onClick={onOpenPanoSuggestions}
+        />
+      </div>
 
       {/* Detected section */}
       <div>
