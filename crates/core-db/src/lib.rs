@@ -35,6 +35,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/016_develop_snapshots.sql"),
     include_str!("../migrations/017_image_format.sql"),
     include_str!("../migrations/018_panorama.sql"),
+    include_str!("../migrations/019_pano_detect.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -133,7 +134,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 18, "expected 18 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 19, "expected 19 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -223,6 +224,85 @@ mod tests {
     }
 
     #[test]
+    fn migration_019_pano_detect_cascades() {
+        let db = Db::open_in_memory().unwrap();
+
+        let image_a = insert_folder_and_image(&db.conn, 1);
+        let image_b = insert_folder_and_image(&db.conn, 2);
+
+        db.conn
+            .execute(
+                "INSERT INTO pano_detect_groups(member_key, algo_version, confidence, detected_at, merged_image_id)
+                 VALUES ('k1', 'v1', 1.5, 0, ?1)",
+                rusqlite::params![image_b],
+            )
+            .unwrap();
+        let group_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO pano_detect_members(group_id, image_id, position) VALUES (?1, ?2, 0)",
+                rusqlite::params![group_id, image_a],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO pano_detect_scan(image_id, algo_version, scanned_at) VALUES (?1, 'v1', 0)",
+                rusqlite::params![image_a],
+            )
+            .unwrap();
+
+        // (a) Deleting a member image cascades both its membership row and its scan marker.
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![image_a])
+            .unwrap();
+        let members: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM pano_detect_members", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            members, 0,
+            "deleting a member image must cascade-delete its pano_detect_members row"
+        );
+        let scans: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM pano_detect_scan", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            scans, 0,
+            "deleting a member image must cascade-delete its pano_detect_scan row"
+        );
+
+        // (b) Deleting the merged image sets merged_image_id NULL but leaves the group row intact.
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![image_b])
+            .unwrap();
+        let merged_image_id: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT merged_image_id FROM pano_detect_groups WHERE id = ?1",
+                rusqlite::params![group_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            merged_image_id, None,
+            "deleting the merged image must null out pano_detect_groups.merged_image_id"
+        );
+
+        // (c) member_key is UNIQUE — a second group with the same key must fail to insert.
+        let dup = db.conn.execute(
+            "INSERT INTO pano_detect_groups(member_key, algo_version, confidence, detected_at) VALUES ('k1', 'v2', 0.5, 1)",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "inserting a second group with a duplicate member_key must violate the UNIQUE constraint"
+        );
+    }
+
+    #[test]
     fn opens_and_creates_all_tables() {
         let db = Db::open_in_memory().unwrap();
         let mut names: Vec<String> = db
@@ -260,6 +340,9 @@ mod tests {
             "images",
             "import_sessions",
             "keywords",
+            "pano_detect_groups",
+            "pano_detect_members",
+            "pano_detect_scan",
             "panorama_sources",
             "person",
             "presets",
