@@ -60,13 +60,14 @@ fn main() -> anyhow::Result<()> {
 
     let ratio = g_hif / g_raw;
     let dev = ratio.log2();
+    let current = core_raw::HDR_DIFFUSE_WHITE_NITS;
     println!("HIF/CR3 ratio {ratio:.4} = {dev:+.3} EV");
     println!(
-        "suggested HDR_DIFFUSE_WHITE_NITS = {:.0}  (current 203)",
-        203.0 * ratio
+        "suggested HDR_DIFFUSE_WHITE_NITS = {:.0}  (current {current:.0})",
+        current * ratio
     );
     if dev.abs() <= 0.25 {
-        println!("|ΔEV| ≤ 0.25 → keep 203.");
+        println!("|ΔEV| ≤ 0.25 → keep {current:.0}.");
     } else {
         println!("|ΔEV| > 0.25 → adopt the suggested constant in core-raw/src/color.rs and note the measurement.");
     }

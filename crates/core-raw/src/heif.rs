@@ -5,10 +5,10 @@
 //! output still PQ-encoded) → PQ EOTF (ST 2084) → linear BT.2020 → Bradford-adapted matrix →
 //! **linear ProPhoto (D50)** [`LinearImage`], the develop pipeline's working format.
 //!
-//! Luminance anchor: PQ is absolute; we normalize so BT.2408 diffuse white
-//! ([`crate::color::HDR_DIFFUSE_WHITE_NITS`] = 203 cd/m²) lands at working-space 1.0 — SDR content
-//! sits in [0,1] and speculars extend to ≈49× as scene-referred headroom, consumed by the same ACR
-//! base tone operator as RAW (`display_referred` stays `false`).
+//! Luminance anchor: PQ is absolute; we normalize so [`crate::color::HDR_DIFFUSE_WHITE_NITS`]
+//! (300 cd/m², calibrated against a real R7 CR3+HIF pair — see `color.rs`) lands at working-space
+//! 1.0 — SDR content sits in [0,1] and speculars extend to ≈33× as scene-referred headroom,
+//! consumed by the same ACR base tone operator as RAW (`display_referred` stays `false`).
 //!
 //! Orientation: libheif's decode applies the container's geometric transforms (irot/imir/clap)
 //! itself, so decoded pixels arrive upright — the EXIF orientation tag must NOT be applied again
@@ -52,60 +52,80 @@ mod imp {
         Ok(())
     }
 
-    /// Decode the primary image → scene-linear ProPhoto [`LinearImage`] (headroom >1.0 preserved).
-    pub fn decode_heif_linear(bytes: &[u8]) -> Result<LinearImage, RawError> {
-        let ctx = HeifContext::read_from_bytes(bytes).map_err(de)?;
-        let handle = ctx.primary_image_handle().map_err(de)?;
-        verify_pq_bt2020(&handle)?;
+    /// Decode ONE image handle (primary or embedded thumbnail) → scene-linear ProPhoto. The PQ
+    /// signal chain runs per-row in parallel (rayon): at 32.5 MP the serial conversion added ~6 s
+    /// on top of the ~5 s HEVC decode.
+    fn decode_handle_linear(lib: &LibHeif, handle: &ImageHandle) -> Result<LinearImage, RawError> {
+        use rayon::prelude::*;
 
-        let lib = LibHeif::new();
         let img = lib
-            .decode(&handle, ColorSpace::Rgb(RgbChroma::HdrRgbLe), None)
+            .decode(handle, ColorSpace::Rgb(RgbChroma::HdrRgbLe), None)
             .map_err(de)?;
         let planes = img.planes();
         let plane = planes
             .interleaved
             .ok_or_else(|| de("decoded image has no interleaved RGB plane"))?;
-        let (w, h) = (plane.width, plane.height);
+        let (w, h) = (plane.width as usize, plane.height as usize);
         let bits = plane.bits_per_pixel; // per channel (10 for Canon HIF)
         if !(9..=16).contains(&bits) {
             return Err(de(format!("unexpected bit depth {bits} (expected 10–16)")));
         }
         let n_codes = 1usize << bits;
+        let row_len = w * 6; // 3 channels × u16-LE
+        if h > 0 && plane.data.len() < (h - 1) * plane.stride + row_len {
+            return Err(de("decoded plane shorter than stride × height"));
+        }
 
         // PQ EOTF per code value via LUT (≤65k entries) — pq_eotf is pow-heavy per call.
-        // Signal → linear BT.2020, scaled so diffuse white (203 nits) = 1.0.
+        // Signal → linear BT.2020, scaled so diffuse white = 1.0.
         let scale = PQ_MAX_NITS / HDR_DIFFUSE_WHITE_NITS;
         let lut: Vec<f32> = (0..n_codes)
             .map(|c| (pq_eotf(c as f64 / (n_codes - 1) as f64) * scale) as f32)
             .collect();
         let m = bt2020_to_prophoto_d50();
 
-        let row_len = w as usize * 6; // 3 channels × u16-LE
-        let mut data = Vec::with_capacity(w as usize * h as usize * 3);
-        for row in 0..h as usize {
-            let start = row * plane.stride;
-            let row_bytes = plane
-                .data
-                .get(start..start + row_len)
-                .ok_or_else(|| de("decoded plane shorter than stride × height"))?;
-            for px in row_bytes.chunks_exact(6) {
-                let code = |i: usize| u16::from_le_bytes([px[i], px[i + 1]]) as usize;
-                let r = lut[code(0).min(n_codes - 1)];
-                let g = lut[code(2).min(n_codes - 1)];
-                let b = lut[code(4).min(n_codes - 1)];
-                // linear BT.2020 → linear ProPhoto; floor negatives only (keep >1.0 headroom),
-                // mirroring rawler's `clip_negative` on the RAW path.
-                data.push((m[0][0] * r + m[0][1] * g + m[0][2] * b).max(0.0));
-                data.push((m[1][0] * r + m[1][1] * g + m[1][2] * b).max(0.0));
-                data.push((m[2][0] * r + m[2][1] * g + m[2][2] * b).max(0.0));
-            }
-        }
+        let mut data = vec![0f32; w * h * 3];
+        data.par_chunks_exact_mut(w * 3)
+            .enumerate()
+            .for_each(|(row, out)| {
+                let start = row * plane.stride;
+                let row_bytes = &plane.data[start..start + row_len];
+                for (o, px) in out.chunks_exact_mut(3).zip(row_bytes.chunks_exact(6)) {
+                    let code = |i: usize| u16::from_le_bytes([px[i], px[i + 1]]) as usize;
+                    let r = lut[code(0).min(n_codes - 1)];
+                    let g = lut[code(2).min(n_codes - 1)];
+                    let b = lut[code(4).min(n_codes - 1)];
+                    // linear BT.2020 → linear ProPhoto; floor negatives only (keep >1.0 headroom),
+                    // mirroring rawler's `clip_negative` on the RAW path.
+                    o[0] = (m[0][0] * r + m[0][1] * g + m[0][2] * b).max(0.0);
+                    o[1] = (m[1][0] * r + m[1][1] * g + m[1][2] * b).max(0.0);
+                    o[2] = (m[2][0] * r + m[2][1] * g + m[2][2] * b).max(0.0);
+                }
+            });
         Ok(LinearImage {
-            width: w,
-            height: h,
+            width: w as u32,
+            height: h as u32,
             data,
         })
+    }
+
+    /// The largest embedded thumbnail handle, if any. Canon .HIF files carry 10-bit PQ thumbnails
+    /// (R7: 320×214 and 1620×1080) — decoding one is ~20× faster than the 32.5 MP primary.
+    fn largest_thumb_handle(handle: &ImageHandle) -> Option<ImageHandle> {
+        let mut ids = vec![0; handle.number_of_thumbnails()];
+        handle.thumbnail_ids(&mut ids);
+        ids.iter()
+            .filter_map(|id| handle.thumbnail(*id).ok())
+            .max_by_key(|t| t.width())
+    }
+
+    /// Decode the primary image → scene-linear ProPhoto [`LinearImage`] (headroom >1.0 preserved).
+    pub fn decode_heif_linear(bytes: &[u8]) -> Result<LinearImage, RawError> {
+        let ctx = HeifContext::read_from_bytes(bytes).map_err(de)?;
+        let handle = ctx.primary_image_handle().map_err(de)?;
+        verify_pq_bt2020(&handle)?;
+        let lib = LibHeif::new();
+        decode_handle_linear(&lib, &handle)
     }
 
     /// Raw TIFF/Exif payload from the container's `Exif` metadata block (the stored block starts
@@ -149,29 +169,60 @@ mod imp {
     }
 
     /// Full-res clamped-SDR preview (serves AI scan / dedup / instant develop paint). PQ headroom
-    /// is hard-clipped; the GPU canonical render supersedes this wherever tone quality matters.
+    /// Decode for preview/thumbnail duty at ≥ `min_edge` px: the largest embedded thumbnail when
+    /// it is big enough (Canon .HIF carries a 10-bit PQ 1620×1080 — ~20× faster than the 32.5 MP
+    /// primary), else the primary. Returns the linear image plus the PRIMARY's dims (the catalog /
+    /// capture-fingerprint identity, regardless of which handle supplied the pixels).
+    fn decode_preview_linear(
+        bytes: &[u8],
+        min_edge: u32,
+    ) -> Result<(LinearImage, u32, u32), RawError> {
+        let ctx = HeifContext::read_from_bytes(bytes).map_err(de)?;
+        let handle = ctx.primary_image_handle().map_err(de)?;
+        verify_pq_bt2020(&handle)?;
+        let lib = LibHeif::new();
+        let (pw, ph) = (handle.width(), handle.height());
+
+        if let Some(th) = largest_thumb_handle(&handle) {
+            // Use the thumb only when it can serve the requested edge (no upscaling) and matches
+            // the primary's aspect (a letterboxed/cropped thumb would shift derived boxes).
+            let big_enough = th.width().max(th.height()) >= min_edge.min(pw.max(ph));
+            let aspect_ok = (th.width() as f64 * ph as f64 - th.height() as f64 * pw as f64).abs()
+                / (pw.max(ph) as f64)
+                < 4.0;
+            if big_enough && aspect_ok {
+                if let Ok(lin) = decode_handle_linear(&lib, &th) {
+                    return Ok((lin, pw, ph));
+                }
+            }
+        }
+        Ok((decode_handle_linear(&lib, &handle)?, pw, ph))
+    }
+
+    /// Clamped-SDR preview (serves AI scan / dedup / instant develop paint). Uses the embedded
+    /// thumbnail when it can serve ~1620 px, else the full primary. PQ headroom is hard-clipped;
+    /// the GPU canonical render supersedes this wherever tone quality matters.
     pub fn decode_heif_preview(bytes: &[u8]) -> Result<DynamicImage, RawError> {
-        let lin = decode_heif_linear(bytes)?;
+        let (lin, _, _) = decode_preview_linear(bytes, 1080)?;
         Ok(DynamicImage::ImageRgb8(
             crate::display::linear_to_srgb_rgb8(&lin),
         ))
     }
 
-    /// Thumbnail via full PQ decode → linear downscale → clamped SDR JPEG. Slower than an embedded
-    /// preview (there is no full-size SDR preview in a .HIF) but colorimetrically right; the
-    /// ThumbQueue's canonical GPU render replaces it asynchronously.
+    /// Thumbnail via PQ decode → linear downscale → clamped SDR JPEG, preferring the embedded
+    /// thumbnail when it covers `max_edge`. Colorimetrically identical to the primary path (same
+    /// PQ→ProPhoto chain); the ThumbQueue's canonical GPU render replaces it asynchronously.
     pub fn decode_heif_thumb(bytes: &[u8], max_edge: u32, quality: u8) -> Result<Thumb, RawError> {
-        let lin = decode_heif_linear(bytes)?;
-        // Already upright: native == display dims (the capture fingerprint uses src_*).
-        let (sw, sh) = (lin.width, lin.height);
+        let (lin, pw, ph) = decode_preview_linear(bytes, max_edge)?;
         let small = lin.downscale_into(max_edge);
         let jpeg = crate::display::linear_to_srgb_jpeg(&small, quality)?;
+        // Already upright: native == display dims — always the PRIMARY's (fingerprint stability).
         Ok(Thumb {
             jpeg,
-            src_width: sw,
-            src_height: sh,
-            disp_width: sw,
-            disp_height: sh,
+            src_width: pw,
+            src_height: ph,
+            disp_width: pw,
+            disp_height: ph,
         })
     }
 }

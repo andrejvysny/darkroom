@@ -2,7 +2,7 @@
 //!
 //! All `rawler` calls are isolated in this crate (rawler's API is non-SemVer; pinned `=0.7.2`).
 
-pub(crate) mod color;
+pub mod color;
 pub mod develop;
 pub mod display;
 pub mod error;
@@ -12,6 +12,7 @@ pub mod heif;
 pub mod meta;
 pub mod thumb;
 
+pub use color::HDR_DIFFUSE_WHITE_NITS;
 pub use develop::{
     as_shot_wb, develop_linear, develop_linear_denoised, develop_linear_preview, develop_linear_wb,
     DenoiseOutput, LinearImage, MosaicDenoiser, MosaicInfo,

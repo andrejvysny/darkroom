@@ -94,10 +94,12 @@ freeze (whole-import DB lock) is **resolved** (ea0d66a); the AI scan pipeline (D
 - MobileCLIP verifier + Florence-2) is production-wired (F1 0.905). Crop is wired (visual-QA
   pending). Check `TODO.md` before assuming a develop module is functional.
 
-**HDR (2026-07-18, branch `claude/hdr-heif-support-5r5ztx`):** Canon **HDR PQ HEIF (`.hif`)** decodes
-to scene-linear ProPhoto via libheif (PQ EOTF, BT.2408 203-nit diffuse-white anchor → 1.0,
-BT.2020→ProPhoto CAT) with full develop support (`ImageKind::Heif`, `display_referred=false`), and
-**Merge to HDR** (tripod v1: no align/deghost) merges 2–9 bracketed CR3s into an fp16 linear-ProPhoto
-**EXR** (`ImageKind::Hdr`, format `'hdr'`, metadata + parentage embedded as EXR attributes) via
-`hdr_merge` IPC. Real-R7 `.HIF` validation on the dev machine is **pending fixtures** (S1/S2 in the
-plan); the synthetic 10-bit PQ fixture (`core-raw/tests/fixtures/synthetic_pq.hif`) is CI-validated.
+**HDR (2026-07-19, branch `claude/hdr-heif-support-5r5ztx`):** Canon **HDR PQ HEIF (`.hif`)** decodes
+to scene-linear ProPhoto via libheif (PQ EOTF, **300-nit diffuse-white anchor** → 1.0 — calibrated
+against a real R7 CR3+HIF pair, see `core-raw/src/color.rs`; BT.2020→ProPhoto CAT) with full develop
+support (`ImageKind::Heif`, `display_referred=false`), and **Merge to HDR** (tripod v1: no
+align/deghost) merges 2–9 bracketed CR3s into an fp16 linear-ProPhoto **EXR** (`ImageKind::Hdr`,
+format `'hdr'`, metadata + parentage embedded as EXR attributes) via `hdr_merge` IPC. **Validated on
+a real R7 HDR shot** (3-frame ±3 EV bracket + camera HIF): container/nclx/Exif/decode all pass;
+thumbnails use the HIF's embedded 10-bit 1620×1080 preview (~10× faster); PQ conversion is
+rayon-parallel. Synthetic 4:2:0 + 4:2:2 10-bit PQ fixtures are CI-validated.

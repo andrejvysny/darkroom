@@ -35,21 +35,30 @@ already gitignored):**
   `cp` ×3 + `exiftool -overwrite_original -ExposureTime=… frame_m2ev.CR3` (one file per invocation)
   + `cargo run -p core-hdr --example merge_one library/fixtures-samples/bracket`.
 
-**Needs the dev Mac + real fixtures (drop into `library/fixtures-hdr/`: landscape + portrait .HIF,
-a CR3+HIF same-capture pair, a 3–5-frame tripod AEB CR3 bracket with clipped highlights):**
+**Real-file validation round (2026-07-19, DONE here on Linux with the user's real R7 HDR shot —
+`855A6554.HIF` + 3 bracketed CR3s `_55A6551–3.CR3`, ±3 EV, staged from the repo's `HDR/` folder on
+`main` into `library/fixtures-hdr/`):**
 
-- [ ] `brew install libheif`, then S1 gate: `cargo run -p core-raw --example heif_gate
-      library/fixtures-hdr` — real R7 .HIF must decode. The codec leg (10-bit 4:2:2 via libde265)
-      is already proven by the committed `synthetic_pq422.hif` CI test; what remains real-file-only
-      is Canon's container: heix brand, grid/tiled primary, embedded thumbnail, irot. Check the
-      PORTRAIT line — if with/without-transform dims match on a portrait file but the EXIF tag
-      says 6/8, add `.oriented()` in `heif.rs` (risk R4).
-- [ ] S2 calibration: `cargo run -p core-raw --example calibrate_pq pair.CR3 pair.HIF` — keep the
-      203-nit anchor if |ΔEV| ≤ 0.25, else adopt the suggested `HDR_DIFFUSE_WHITE_NITS` (record the
-      measurement in `core-raw/src/color.rs` docs).
-- [ ] `cargo run -p core-hdr --example merge_one library/fixtures-hdr` on the real bracket; eyeball
-      `/tmp/darkroom-hdr.exr` via `cargo run -p core-pipeline --example render_one /tmp/darkroom-hdr.exr`
-      (highlight recovery vs the middle frame).
+- [x] S1 real-file gate PASSED: real R7 .HIF (6960×4640, 10-bit, nclx BT.2020/PQ/full-range)
+      decodes via libde265; Exif parses (model/ISO/shutter); no irot on landscape files; carries
+      embedded 10-bit PQ thumbnails (320×214 + 1620×1080). → Implemented: embedded-thumbnail fast
+      path for thumb/preview duty (~10× faster grid thumbs, primary still used when the requested
+      edge exceeds the thumb) + rayon-parallel PQ→ProPhoto conversion.
+- [x] S2 calibration DONE: metered CR3 vs camera HIF measured **+0.572 EV** → anchor adopted
+      **HDR_DIFFUSE_WHITE_NITS = 300** (measurement + composite-source caveat recorded in
+      color.rs; refine against a plain RAW+HIF simultaneous-recording pair if one appears).
+- [x] merge_one on the real bracket: EV math exact (×7.81/×0.125), no visible ghosting vs the
+      camera HIF (geometry identical), merged EXR + SDR preview produced. Note: this scene never
+      clips the metered frame (f/22 sunset, max ≈275 nits), so it exercises shadow-noise merging,
+      not highlight recovery.
+
+**Still needs the dev Mac (or more fixtures):**
+
+- [ ] PORTRAIT .HIF check (no portrait fixture yet): if with/without-transform dims match but the
+      EXIF tag says 6/8, add `.oriented()` in `heif.rs` (risk R4).
+- [ ] A bracket with CLIPPED highlights to visually confirm highlight recovery (this set had none).
+- [ ] A plain RAW+HIF simultaneous-recording pair to refine the 300-nit anchor (current pair is an
+      HDR-mode composite, which may bias mid-tones).
 - [ ] In-app QA (`npm run tauri dev`): HIF opens in Develop (side-by-side vs CR3 sibling ≈ same
       brightness under defaults); WB/exposure/all modules respond; thumbs + `develop_preview_jpeg`
       latency acceptable on 33 MP HIF (full decode, no embedded preview fast path yet); select

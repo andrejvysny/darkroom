@@ -25,8 +25,6 @@ fn pq_eotf(e: f64) -> f64 {
     (((p - C1).max(0.0)) / (C2 - C3 * p)).powf(1.0 / M1)
 }
 
-const DIFFUSE_WHITE_NITS: f64 = 203.0;
-
 /// Shared assertions for the committed synthetic PQ fixtures (both chroma variants carry the same
 /// three neutral bands at exact 10-bit PQ codes — see `gen_pq_fixture.rs`).
 fn assert_pq_fixture(path: &str) {
@@ -48,13 +46,20 @@ fn assert_pq_fixture(path: &str) {
     let lin = core_raw::develop_linear(&src).unwrap();
     assert_eq!((lin.width, lin.height), (W, H));
 
+    // Expected values derive from the SHIPPING anchor, so a recalibration of
+    // HDR_DIFFUSE_WHITE_NITS never breaks this test — the fixture's bands are defined in absolute
+    // nits (≈1 / 203 / 10 000), independent of where the anchor puts working-space 1.0.
+    let anchor = core_raw::HDR_DIFFUSE_WHITE_NITS;
     let expected: Vec<f32> = BAND_CODES
         .iter()
-        .map(|&c| (pq_eotf(c as f64 / 1023.0) * 10000.0 / DIFFUSE_WHITE_NITS) as f32)
+        .map(|&c| (pq_eotf(c as f64 / 1023.0) * 10000.0 / anchor) as f32)
         .collect();
-    // Diffuse-white band must land at ≈1.0 and the top band at ≈49.26 (the PQ anchor contract).
-    assert!((expected[1] - 1.0).abs() < 0.01, "band-code table drifted");
-    assert!(expected[2] > 40.0);
+    // Sanity on the derivation itself: band 1 encodes 203 nits, band 2 the 10 000-nit PQ peak.
+    assert!(
+        (expected[1] - (203.0 / anchor) as f32).abs() < 0.01,
+        "band-code table drifted"
+    );
+    assert!((expected[2] - (10000.0 / anchor) as f32).abs() / expected[2] < 0.01);
 
     for (band, &want) in expected.iter().enumerate() {
         let col = (W as usize / 3) * band + W as usize / 6;
@@ -169,10 +174,15 @@ fn real_r7_hif_fixture() {
 
     let lin = core_raw::develop_linear(&src).unwrap();
     assert!(lin.width > 1000 && lin.height > 1000);
-    // Real HDR PQ content must carry >1.0 scene-referred headroom somewhere.
+    // Sanity on the PQ normalization: the brightest pixel of a real shot should decode to a
+    // plausible absolute luminance — above 100 nits (virtually any real scene) and at most the
+    // 10 000-nit PQ peak. (A fixed ">1.0 headroom" check would wrongly fail dark scenes whose
+    // brightest content sits below the anchor.)
+    let max_v = lin.data.iter().cloned().fold(0f32, f32::max) as f64;
+    let max_nits = max_v * core_raw::HDR_DIFFUSE_WHITE_NITS;
     assert!(
-        lin.data.iter().any(|&v| v > 1.0),
-        "no values above diffuse white — PQ normalization suspect"
+        (100.0..=10000.0).contains(&max_nits),
+        "brightest pixel ≈{max_nits:.0} nits — PQ normalization suspect"
     );
 
     let thumb = core_raw::thumbnail_jpeg(&src, 512, 82).unwrap();

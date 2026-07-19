@@ -115,11 +115,15 @@ Branch `claude/hdr-heif-support-5r5ztx`. Plan: `~/.claude/plans/i-need-you-to-co
   EXR round-trip; all merge math tests; full merge plumbing on a fabricated ±2 EV bracket of the
   committed R7 CR3 (exiftool-rewritten ExposureTime; 3×32.3 MP decode → 107 MB EXR → read-back);
   clippy/fmt/tsc green; `cargo check -p darkroom` green (GTK + pip-onnxruntime shims).
-  **Pending on the dev Mac (real files only):** real R7 `.HIF` through `heif_gate` (Canon
-  container: heix brand/grid/thumbnail/irot — codec already CI-proven), `calibrate_pq` on a
-  CR3+HIF same-capture pair (adopt measured anchor if |ΔEV| > 0.25), `merge_one` on a real tripod
-  bracket (HDR look, not just plumbing), in-app QA, `.dmg` dylib bundling
-  (`bundle.macOS.frameworks`, `libheif.1.dylib` + `libde265.0.dylib`).
+  **Real-file round (2026-07-19, user's actual R7 HDR shot):** S1 PASSED on the real .HIF
+  (container/nclx/Exif/thumbnails all as assumed; no crash, 10-bit decode exact); S2 calibrated —
+  anchor now **HDR_DIFFUSE_WHITE_NITS = 300** (+0.572 EV measured vs the metered CR3; record in
+  color.rs); real ±3 EV bracket merged with no ghosting vs the camera's own HDR composite.
+  Optimizations landed from the analysis: embedded 10-bit thumbnail fast path for HIF
+  thumbs/previews (~10× faster) + rayon-parallel PQ conversion (core-raw now depends on rayon).
+  **Pending on the dev Mac:** in-app QA, `.dmg` dylib bundling (`bundle.macOS.frameworks`,
+  `libheif.1.dylib` + `libde265.0.dylib`); portrait-.HIF irot check + clipped-highlight bracket +
+  plain RAW+HIF pair when such fixtures appear.
 
 ## Latest AI work — Unified AI pipeline (branch `feat/unified-ai-pipeline`, MERGED `f663ee0`)
 

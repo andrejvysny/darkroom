@@ -117,11 +117,20 @@ const PQ_C3: f64 = 2392.0 / 4096.0 * 32.0; // 18.6875
 /// PQ signal 1.0 corresponds to this absolute luminance.
 pub(crate) const PQ_MAX_NITS: f64 = 10000.0;
 
-/// The PQ luminance that maps to working-space 1.0 — BT.2408's diffuse/graphics white. This is the
-/// single calibration knob for HEIF brightness: chosen so a CR3+HIF pair of the same capture
-/// develops to matching brightness under the shared ACR default tone. Recalibrate via
-/// `examples/calibrate_pq.rs` if a same-capture pair shows |ΔEV| > 0.25.
-pub(crate) const HDR_DIFFUSE_WHITE_NITS: f64 = 203.0;
+/// The PQ luminance that maps to working-space 1.0. This is the single calibration knob for HEIF
+/// brightness: chosen so a CR3+HIF pair of the same capture develops to matching brightness under
+/// the shared ACR default tone. Recalibrate via `examples/calibrate_pq.rs` if a same-capture pair
+/// shows |ΔEV| > 0.25.
+///
+/// Calibration record (2026-07-19): started at BT.2408's 203-nit diffuse white; measured against a
+/// real EOS R7 pair — `_55A6551.CR3` (the metered frame, 1/80 s f/22 ISO 250) vs `855A6554.HIF`
+/// (the camera's HDR-mode composite of the same burst, identical exposure settings) — the HIF
+/// developed **+0.572 EV** brighter (mid-tone geomean ratio 1.487), so the anchor was raised to
+/// the measured ≈302 → **300**. Caveat: that HIF is an in-camera HDR *composite* (Canon's HDR tone
+/// treatment can lift mid-tones), so refine against a plain RAW+HIF simultaneous-recording pair if
+/// one becomes available. Public so the fixture tests and `calibrate_pq` derive their expectations
+/// from the shipping value instead of a drifting copy.
+pub const HDR_DIFFUSE_WHITE_NITS: f64 = 300.0;
 
 /// ST 2084 EOTF: PQ-encoded signal `e ∈ [0,1]` → normalized linear luminance `Y ∈ [0,1]`
 /// (multiply by [`PQ_MAX_NITS`] for cd/m²).
