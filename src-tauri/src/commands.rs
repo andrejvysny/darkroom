@@ -2305,6 +2305,14 @@ pub async fn panorama_status(app: AppHandle) -> Result<crate::panorama::PanoStat
     .map_err(|e| e.to_string())?
 }
 
+/// Drop the merge dialog's cached preview frames (modal closed — they are only useful while the
+/// dialog is re-stitching the same source set on option toggles).
+#[tauri::command]
+pub fn panorama_preview_release(app: AppHandle) {
+    let st = app.state::<AppState>();
+    crate::panorama::clear_preview_cache(&st);
+}
+
 // ---------- Panorama detection ----------
 
 /// Run (or resume) a whole-library panorama-detection scan. Resolves with the accumulated count of

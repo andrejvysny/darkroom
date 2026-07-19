@@ -202,6 +202,7 @@ pub fn run() {
             commands::panorama_merge,
             commands::panorama_cancel,
             commands::panorama_status,
+            commands::panorama_preview_release,
             commands::pano_detect_run,
             commands::pano_detect_cancel,
             commands::pano_detect_status,

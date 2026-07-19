@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../../store/app";
-import { panoramaPreview, type PanoramaProjection } from "../../lib/ipc";
+import {
+  panoramaPreview,
+  panoramaPreviewRelease,
+  type PanoramaProjection,
+} from "../../lib/ipc";
 import { panoramaErrorMessage, usePanorama } from "../../lib/usePanorama";
 
 const PROJECTIONS: { value: PanoramaProjection; label: string }[] = [
@@ -74,6 +78,15 @@ export default function PanoramaModal() {
     setPreviewError(null);
     setBusy(false);
   }, [open_, sourceIds]);
+
+  // The backend caches decoded source frames only to serve option-toggle re-stitches while the
+  // dialog is up — release them when it closes (merge re-decodes at full res regardless).
+  useEffect(() => {
+    if (!open_) return;
+    return () => {
+      void panoramaPreviewRelease().catch(() => {});
+    };
+  }, [open_]);
 
   // Debounced preview: fires on open + on any option change.
   useEffect(() => {

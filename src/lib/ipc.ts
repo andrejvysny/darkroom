@@ -1843,6 +1843,11 @@ export function panoramaCancel(): Promise<void> {
   return invoke<void>("panorama_cancel", {});
 }
 
+/** Drop the merge dialog's cached preview frames (called when the modal closes). */
+export function panoramaPreviewRelease(): Promise<void> {
+  return invoke<void>("panorama_preview_release", {});
+}
+
 // ── Panorama detection ───────────────────────────────────────────────────────
 
 /** One source image within a detected panorama group, ordered by capture time (`position`). */
