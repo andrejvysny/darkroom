@@ -170,11 +170,13 @@ fn main() {
                 .collect();
             match stitch(&sub, &opt, &progress) {
                 Ok(res) => {
+                    // Inputs here are display-referred JPEG/PNG values (already sRGB-encoded, /255),
+                    // so unlike stitch_dir's camera-native path no exposure gain or gamma is applied.
                     let mut buf = vec![0u8; res.width * res.height * 3];
                     for i in 0..res.width * res.height {
                         for c in 0..3 {
-                            let v = (res.rgb[i * 3 + c] * 4.0).clamp(0.0, 1.0);
-                            buf[i * 3 + c] = (v.powf(1.0 / 2.2) * 255.0).round() as u8;
+                            let v = res.rgb[i * 3 + c].clamp(0.0, 1.0);
+                            buf[i * 3 + c] = (v * 255.0).round() as u8;
                         }
                     }
                     let out = format!("/tmp/detect_{gi}.png");
