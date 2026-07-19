@@ -57,6 +57,53 @@ pub fn make_base() -> Vec<f32> {
     base
 }
 
+/// Procedural base texture with a caller-chosen seed. Same recipe as [`make_base`] (which is pinned to
+/// seed 7); a different seed yields a statistically independent scene whose corners will not
+/// cross-match the seed-7 sequence — used to build burst twins and unrelated negatives.
+pub fn make_base_seeded(seed: u64) -> Vec<f32> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut base = vec![0.05f32; BASE_W * BASE_H * 3];
+    for _ in 0..900 {
+        let x0 = rng.gen_range(0..BASE_W);
+        let y0 = rng.gen_range(0..BASE_H);
+        let w = rng.gen_range(6..60);
+        let h = rng.gen_range(6..60);
+        let col = [
+            rng.gen_range(0.02..0.18f32),
+            rng.gen_range(0.02..0.18f32),
+            rng.gen_range(0.02..0.18f32),
+        ];
+        for y in y0..(y0 + h).min(BASE_H) {
+            for x in x0..(x0 + w).min(BASE_W) {
+                let idx = (y * BASE_W + x) * 3;
+                base[idx] = col[0];
+                base[idx + 1] = col[1];
+                base[idx + 2] = col[2];
+            }
+        }
+    }
+    base
+}
+
+/// Three burst / near-duplicate frames: an independent scene shot from the *identical* pose (pan 0°),
+/// differing only by a tiny exposure scale. They overlap almost completely with negligible centre
+/// shift, so `detect` must classify their edges as [`EdgeClass::Burst`](core_pano::EdgeClass::Burst)
+/// and never group them. The distinct seed keeps them from cross-matching the seed-7 rotating sequence.
+pub fn burst_frames() -> Vec<Frame> {
+    let base = make_base_seeded(202);
+    vec![
+        render_view(&base, 0.0, 1.0),
+        render_view(&base, 0.0, 1.02),
+        render_view(&base, 0.0, 0.98),
+    ]
+}
+
+/// A single unrelated frame (independent seed-99 scene) that must not verify against anything.
+pub fn unrelated_frame() -> Frame {
+    let base = make_base_seeded(99);
+    render_view(&base, 0.0, 1.0)
+}
+
 fn sample_base(base: &[f32], u: f64, v: f64) -> [f32; 3] {
     if u < 0.0 || v < 0.0 || u >= (BASE_W - 1) as f64 || v >= (BASE_H - 1) as f64 {
         return [0.0, 0.0, 0.0];

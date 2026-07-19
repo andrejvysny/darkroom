@@ -24,6 +24,7 @@ mod blend;
 mod bundle;
 mod camera;
 mod crop;
+mod detect;
 mod exposure;
 mod features;
 mod graph;
@@ -34,6 +35,10 @@ mod rectangle;
 mod rng;
 mod seam;
 mod wave;
+
+pub use detect::{
+    detect_groups, DetectOptions, DetectReport, DetectedGroup, EdgeClass, VerifiedEdge,
+};
 
 use nalgebra::{Matrix3, Point2};
 use rayon::prelude::*;
