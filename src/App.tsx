@@ -8,8 +8,11 @@ import { effectivePreviewEdge } from "./lib/ipc";
 import TopBar from "./components/TopBar";
 import CommandPalette from "./components/CommandPalette";
 import ExportModal from "./views/Export/ExportModal";
+import PanoramaModal from "./views/Panorama/PanoramaModal";
+import PanoSuggestions from "./views/Panorama/PanoSuggestions";
 import ModelManagerModal from "./views/Library/ModelManagerModal";
 import DownloadPill from "./components/DownloadPill";
+import PanoramaPill from "./components/PanoramaPill";
 import UpdateBanner from "./components/UpdateBanner";
 import Toast from "./components/Toast";
 import LibraryView from "./views/Library/LibraryView";
@@ -45,8 +48,11 @@ export default function App() {
       {view === "dedup" && <DedupView />}
       <CommandPalette />
       <ExportModal />
+      <PanoramaModal />
+      <PanoSuggestions />
       <ModelManagerModal />
       <DownloadPill />
+      <PanoramaPill />
       <UpdateBanner />
       <Toast />
     </div>

@@ -75,6 +75,53 @@ bracket detection; hand-held merge; fp16 DNG export (Lightroom interop); HEIF *e
 stub ships); embedded-thumbnail fast path for HIF thumbs; `hdr_sources` DB table + "show source
 frames" UI (parentage lives in the EXR's `darkroom:sources` attr); HDR/EDR display output.
 
+## IN PROGRESS: Panorama merge (branch `claude/darkroom-panorama-research-ruvw38`, 2026-07-18)
+
+P0–P4 landed + headless-green (see `CURRENT_STATE.md` top section for the full map). Remaining:
+
+1. **Visual QA on real panos (BLOCKING before merge to main)** — needs the dev machine's CR3 sets:
+   `cargo run --release -p core-raw --example stitch_cr3 -- <dir> /tmp/o.dng`, eyeball the proof
+   JPEG + open the DNG in Develop (WB slider must behave raw-like; check seam quality on real
+   parallax/exposure drift), ideally `dng_validate` from Adobe DNG SDK. Then in-app: select →
+   merge dialog → preview → merge → pano appears linked + editable.
+2. ~~P5 Boundary Warp~~ **DONE** — `core-pano/src/rectangle.rs`: inverse bilinear mesh warp
+   (boundary attraction + membrane shape-preservation, CG solve, distance-gated interior anchor so
+   the warp has compact support, global-factor bisection guarantees no quad folds). Synthetic:
+   crop area ×1.179 at warp=100, interior correlation 1.0000, warp=0 byte-identical. Line
+   preservation deliberately out of scope v1.
+3. ~~P5 seam/ghost quality~~ **DONE (with a measured verdict)** — graph-cut seam implemented
+   (`pathfinding` Edmonds-Karp, ≤150k nodes) but **DP stays default**: benchmark showed ~35 ms
+   (DP) vs ~42 s (graph-cut) at identical seam quality on the synthetic scenes; kept behind the
+   internal `SEAM_METHOD` const with an `#[ignore]`d benchmark test. Deghosting: gain-corrected
+   diff + 8×median ghost mask (3px dilated) as hard seam penalty — moving objects render from a
+   single source. Re-benchmark graph-cut on real parallax captures before reconsidering.
+4. **Memory follow-up** — streaming decode-on-demand `Frame` source so `merge` never holds all
+   full-res sources (~4 GB at 10 R7 frames today); band-tiled compositing if gigapixel ever matters
+   (cap is 12000px now so the develop pipeline can open the result).
+5. **Small leftovers** — ~~free the preview cache on modal close~~ **DONE 2026-07-19**
+   (`panorama_preview_release` command, called from PanoramaModal's close cleanup);
+   `panorama_status` has no frontend consumer yet (reconnect-after-restart UX); HDR-pano
+   (bracketed) explicitly out of scope for v1.
+
+## IN PROGRESS: Panorama detection (branch `claude/panorama-detection-ob1jjq`, 2026-07-19)
+
+"Detect panoramas" landed end-to-end — migration 019, `core_pano::detect_groups`,
+`core_library::pano_detect`, `src-tauri/pano_detect.rs` job + 6 commands, `PanoSuggestions` review
+UI with merge handoff — and is **validated on real photos** (4/4 ground-truth groups, 0 false pairs;
+see `CURRENT_STATE.md` top section). Remaining:
+
+1. **In-app QA on the dev machine's real CR3 library** — run Detect from the LeftNav Panoramas
+   section; confirm real sweeps group (typical pano: 2–10 frames seconds apart at fixed focal),
+   dismiss/undo persistence across restarts, merge handoff → `pano_detect_mark_merged`, and that an
+   incremental re-run after new imports only scans the new clusters. (Container validation used
+   JPEG corpora + mocked UI; the thumb-based detection path is format-agnostic.)
+2. **Threshold audit on messier corpora** — hand-held multi-row panos, moving subjects, zoom drift.
+   Knobs: `core_pano::DetectOptions`, `core_library::pano_detect::ClusterParams`. Bump
+   `ALGO_VERSION` on ANY change so the incremental scan invalidates.
+3. Optional: surface Burst edges as a "burst stack" suggestion category (already classified in
+   `DetectReport.edges`, currently not persisted).
+4. Tier-3 e2e (real backend) of detect → review → merge, macOS.
+
 ## Repo state sync (2026-07-02) — CURRENT
 
 - **`main` = `8c1072c`** (unpushed to origin), version **`0.2.0` (beta-2.0) RELEASED**. Since the

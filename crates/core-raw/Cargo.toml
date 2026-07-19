@@ -26,3 +26,4 @@ libheif-rs = { version = "=2.7.0", default-features = false, features = ["v1_17"
 
 [dev-dependencies]
 anyhow = "1"
+core-pano = { path = "../core-pano" }

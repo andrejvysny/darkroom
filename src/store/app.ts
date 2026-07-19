@@ -35,6 +35,21 @@ interface AppState {
   /** Images queued in the Export modal; null = modal closed. */
   exportTargets: ExportTarget[] | null;
   setExportTargets: (t: ExportTarget[] | null) => void;
+  /** Image ids queued for the Panorama merge modal; null = modal closed. */
+  panoramaSources: number[] | null;
+  setPanoramaSources: (ids: number[] | null) => void;
+  /** Active panorama merge job (current backend phase); null = no merge in flight. Drives the
+   *  PanoramaPill; fed by the `panorama:progress` event, cleared on `panorama:done`/`panorama:error`. */
+  panoramaJob: { phase: string } | null;
+  setPanoramaJob: (job: { phase: string } | null) => void;
+  /** Panorama-suggestions review overlay open state (see `views/Panorama/PanoSuggestions.tsx`). */
+  panoSuggestOpen: boolean;
+  setPanoSuggestOpen: (b: boolean) => void;
+  /** Detected panorama group currently staged into the merge modal (`PanoramaModal`), so
+   *  `usePanorama`'s `panorama:done` handler knows to call `panoDetectMarkMerged` once the stitch
+   *  lands. null = no detected-group merge in flight (e.g. a manual multi-select merge). */
+  activePanoDetectGroupId: number | null;
+  setActivePanoDetectGroup: (id: number | null) => void;
   /** AI Models manager modal open state. */
   modelManagerOpen: boolean;
   setModelManagerOpen: (b: boolean) => void;
@@ -93,6 +108,14 @@ export const useAppStore = create<AppState>((set) => ({
   setGridMode: (m) => set({ gridMode: m }),
   exportTargets: null,
   setExportTargets: (t) => set({ exportTargets: t }),
+  panoramaSources: null,
+  setPanoramaSources: (ids) => set({ panoramaSources: ids }),
+  panoramaJob: null,
+  setPanoramaJob: (job) => set({ panoramaJob: job }),
+  panoSuggestOpen: false,
+  setPanoSuggestOpen: (b) => set({ panoSuggestOpen: b }),
+  activePanoDetectGroupId: null,
+  setActivePanoDetectGroup: (id) => set({ activePanoDetectGroupId: id }),
   modelManagerOpen: false,
   setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
   onImport: null,

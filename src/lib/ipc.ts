@@ -1800,6 +1800,135 @@ export function facesDeleteAll(): Promise<void> {
   return invoke<void>("faces_delete_all", {});
 }
 
+// ── Panorama merge ───────────────────────────────────────────────────────────
+
+/** Stitch projection surface. "auto" lets the backend pick from the source images' overlap/FOV. */
+export type PanoramaProjection =
+  | "auto"
+  | "spherical"
+  | "cylindrical"
+  | "perspective";
+
+/** Shared option set for `panoramaPreview`/`panoramaMerge` (mirrors the fixed Rust IPC contract —
+ *  `panorama_preview`/`panorama_merge` take these four fields; Tauri auto-converts the camelCase JS
+ *  keys below to the Rust commands' snake_case params). */
+export type PanoramaOptions = {
+  imageIds: number[];
+  projection: PanoramaProjection;
+  /** 0..100; the backend clamps. Blends the seam boundary to hide parallax/exposure mismatches. */
+  boundaryWarp: number;
+  autoCrop: boolean;
+};
+
+/** Fast low-res preview of a panorama merge for the given options. Returns an object URL backed by
+ *  JPEG bytes (caller must revoke). The command doesn't exist on the backend yet — an invoke failure
+ *  (e.g. "command not found") should be handled by the caller via `isMergeEngineUnavailable`. */
+export async function panoramaPreview(opts: PanoramaOptions): Promise<string> {
+  const buf = await invoke<ArrayBuffer>("panorama_preview", {
+    imageIds: opts.imageIds,
+    projection: opts.projection,
+    boundaryWarp: opts.boundaryWarp,
+    autoCrop: opts.autoCrop,
+  });
+  return URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+}
+
+/** Run the full panorama merge for the given options. Resolves with the new image's id only once the
+ *  whole merge finishes (register → bundle-adjust → warp → blend → crop → rectangle → encode);
+ *  progress arrives via the `panorama:progress`/`panorama:done`/`panorama:error` events in the
+ *  meantime (see `lib/usePanorama.ts`). */
+export function panoramaMerge(opts: PanoramaOptions): Promise<number> {
+  return invoke<number>("panorama_merge", {
+    imageIds: opts.imageIds,
+    projection: opts.projection,
+    boundaryWarp: opts.boundaryWarp,
+    autoCrop: opts.autoCrop,
+  });
+}
+
+/** Request the running panorama merge to stop. */
+export function panoramaCancel(): Promise<void> {
+  return invoke<void>("panorama_cancel", {});
+}
+
+/** Drop the merge dialog's cached preview frames (called when the modal closes). */
+export function panoramaPreviewRelease(): Promise<void> {
+  return invoke<void>("panorama_preview_release", {});
+}
+
+// ── Panorama detection ───────────────────────────────────────────────────────
+
+/** One source image within a detected panorama group, ordered by capture time (`position`). */
+export type PanoMemberRow = {
+  imageId: number;
+  contentHash: string;
+  filename: string;
+  captureDate: number | null;
+  format: string | null;
+  position: number;
+};
+
+/** A detected group of images the backend believes can be stitched into one panorama. */
+export type PanoGroupRow = {
+  id: number;
+  /** Brown-Lowe confidence — the min necessary link on the group's max-confidence spanning tree. */
+  confidence: number;
+  status: "suggested" | "dismissed" | "merged";
+  detectedAt: number;
+  /** Set once the group has been merged (see `panoDetectMarkMerged`). */
+  mergedImageId: number | null;
+  /** True only when every member is a RAW source — the merge flow requires RAW inputs. */
+  allRaw: boolean;
+  members: PanoMemberRow[];
+};
+
+export type PanoDetectStatus = {
+  running: boolean;
+  /** Count of groups awaiting review (`status === "suggested"`). */
+  suggested: number;
+};
+
+/** Kick off (or resume) the whole-library panorama-group scan in the background. Resolves with the
+ *  number of suggested groups found once the pass completes; progress arrives via the
+ *  `pano_detect:progress`/`pano_detect:done`/`pano_detect:error` events in the meantime (see
+ *  `lib/usePanoDetect.ts`). `force` bypasses the per-image scan markers and rescans everything. */
+export function panoDetectRun(force = false): Promise<number> {
+  return invoke<number>("pano_detect_run", { force });
+}
+
+/** Request the running panorama-detection scan to stop. */
+export function panoDetectCancel(): Promise<void> {
+  return invoke<void>("pano_detect_cancel", {});
+}
+
+/** Current scan state + count of groups awaiting review. */
+export function panoDetectStatus(): Promise<PanoDetectStatus> {
+  return invoke<PanoDetectStatus>("pano_detect_status", {});
+}
+
+/** Detected panorama groups, most-recently-detected first. `includeDismissed` also returns groups
+ *  the user has dismissed (still excludes nothing else — merged groups are always included). */
+export function panoDetectGroups(includeDismissed = false): Promise<PanoGroupRow[]> {
+  return invoke<PanoGroupRow[]>("pano_detect_groups", { includeDismissed });
+}
+
+/** Dismiss (or restore) a suggested panorama group without merging it. */
+export function panoDetectDismiss(
+  groupId: number,
+  dismissed: boolean,
+): Promise<void> {
+  return invoke<void>("pano_detect_dismiss", { groupId, dismissed });
+}
+
+/** Mark a group merged once its handoff into the panorama merge flow lands a new image
+ *  (`usePanorama`'s `panorama:done` handler calls this automatically). */
+export function panoDetectMarkMerged(
+  groupId: number,
+  mergedImageId: number,
+): Promise<void> {
+  return invoke<void>("pano_detect_mark_merged", { groupId, mergedImageId });
+}
+
 /** Inline-style props that crop a face out of its image thumbnail (a CSS sprite crop), padded for a
  *  pleasant headshot. `bbox` is normalized `[x1,y1,x2,y2]`; the thumbnail is aspect-preserving and
  *  EXIF-oriented, matching the (also oriented) face coordinates. */

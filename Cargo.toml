@@ -11,6 +11,7 @@ members = [
     "crates/core-analyze",
     "crates/core-preset",
     "crates/core-hdr",
+    "crates/core-pano",
 ]
 
 [workspace.package]

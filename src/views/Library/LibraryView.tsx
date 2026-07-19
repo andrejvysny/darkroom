@@ -30,6 +30,7 @@ import { useCulling } from "../../hooks/useCulling";
 import { openExport } from "../../lib/export";
 import { useAnalysis } from "../../lib/useAnalysis";
 import { useHdrMerge } from "../../lib/useHdrMerge";
+import { usePanoDetect } from "../../lib/usePanoDetect";
 import LeftNav from "./LeftNav";
 import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
@@ -73,6 +74,7 @@ export default function LibraryView() {
   const gridMode = useAppStore((s) => s.gridMode);
   const setGridMode = useAppStore((s) => s.setGridMode);
   const setLibraryImages = useAppStore((s) => s.setLibraryImages);
+  const setPanoramaSources = useAppStore((s) => s.setPanoramaSources);
   const thumbVersions = useAppStore((s) => s.thumbVersions);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnMergeHdr = useAppStore((s) => s.setOnMergeHdr);
@@ -89,6 +91,8 @@ export default function LibraryView() {
   const lib = useLibrary();
   const analysis = useAnalysis();
   const hdr = useHdrMerge();
+  const panoDetect = usePanoDetect();
+  const setPanoSuggestOpen = useAppStore((s) => s.setPanoSuggestOpen);
   const [stoppingAnalysis, setStoppingAnalysis] = useState(false);
 
   // While analysis runs (doneVersion bumps as batches commit), keep the filtered grid in sync so
@@ -459,6 +463,11 @@ export default function LibraryView() {
     openExport(selectedIds);
   }, [selectedIds]);
 
+  const batchMergePanorama = useCallback(() => {
+    if (selectedIds.length < 2 || selectedIds.length > 10) return;
+    setPanoramaSources(selectedIds);
+  }, [selectedIds, setPanoramaSources]);
+
   const collapseSelection = useCallback(() => {
     setSelectedId(selectedId);
   }, [selectedId, setSelectedId]);
@@ -529,6 +538,8 @@ export default function LibraryView() {
           onRenameCollection={handleRenameCollection}
           onDeleteKeyword={handleDeleteKeyword}
           analysis={analysis}
+          panoSuggested={panoDetect.status?.suggested ?? 0}
+          onOpenPanoSuggestions={() => setPanoSuggestOpen(true)}
         />
       </div>
 
@@ -570,6 +581,8 @@ export default function LibraryView() {
                 onExport={batchExport}
                 onMergeHdr={handleMergeHdr}
                 merging={hdr.merging}
+                onMergePanorama={batchMergePanorama}
+                canMergePanorama={selectedIds.length >= 2 && selectedIds.length <= 10}
                 onClear={collapseSelection}
               />
             </div>

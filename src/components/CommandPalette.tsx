@@ -22,6 +22,7 @@ export default function CommandPalette() {
   const onMergeHdr = useAppStore((s) => s.onMergeHdr);
   const onOpenSettings = useAppStore((s) => s.onOpenSettings);
   const setModelManagerOpen = useAppStore((s) => s.setModelManagerOpen);
+  const setPanoSuggestOpen = useAppStore((s) => s.setPanoSuggestOpen);
   const onSavePreset = useAppStore((s) => s.onSavePreset);
   const onCopySettings = useAppStore((s) => s.onCopySettings);
   const onPasteSettings = useAppStore((s) => s.onPasteSettings);
@@ -79,6 +80,12 @@ export default function CommandPalette() {
       label: "AI Models…",
       shortcut: "",
       run: () => setModelManagerOpen(true),
+    },
+    {
+      icon: "stack",
+      label: "Detect panoramas",
+      shortcut: "",
+      run: () => setPanoSuggestOpen(true),
     },
     {
       icon: "reset",

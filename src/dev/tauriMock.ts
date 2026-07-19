@@ -25,6 +25,8 @@ import {
   LABEL_NONE,
   type ImageRow,
   type QueryParams,
+  type PanoGroupRow,
+  type PanoMemberRow,
 } from "../lib/ipc";
 
 const LIB_ROOT = "/Users/you/Pictures/Darkroom";
@@ -112,6 +114,45 @@ const DUP_GROUPS = [
     [33, 12.2],
     [34, 12.0],
   ]),
+];
+
+// ── Panorama detection fixtures (PanoGroupRow[], built from the `rows` fixtures above so
+//    thumbUrl mocking — which keys off contentHash — works for the review overlay) ───────────────
+
+function panoMember(
+  row: ImageRow,
+  position: number,
+  format: string | null = row.format,
+): PanoMemberRow {
+  return {
+    imageId: row.id,
+    contentHash: row.contentHash,
+    filename: row.filename,
+    captureDate: row.captureDate,
+    format,
+    position,
+  };
+}
+
+const PANO_GROUPS: PanoGroupRow[] = [
+  {
+    id: 1,
+    confidence: 2.41,
+    status: "suggested",
+    detectedAt: Math.floor(Date.UTC(2026, 6, 18, 9, 0) / 1000),
+    mergedImageId: null,
+    allRaw: true,
+    members: [panoMember(rows[0], 0), panoMember(rows[1], 1), panoMember(rows[2], 2)],
+  },
+  {
+    id: 2,
+    confidence: 1.32,
+    status: "suggested",
+    detectedAt: Math.floor(Date.UTC(2026, 6, 17, 15, 30) / 1000),
+    mergedImageId: null,
+    allRaw: false,
+    members: [panoMember(rows[3], 0), panoMember(rows[4], 1, "jpeg")],
+  },
 ];
 
 // ── Query / filter / sort ────────────────────────────────────────────────────
@@ -429,6 +470,31 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   dedup_scan_perceptual: () => [DUP_GROUPS[3]],
   dedup_resolve: (p) => ids(p.trashIds).length,
   dedup_resolve_bulk: () => 1,
+
+  // Panorama detection
+  pano_detect_status: () => ({
+    running: false,
+    suggested: PANO_GROUPS.filter((g) => g.status === "suggested").length,
+  }),
+  pano_detect_run: () => PANO_GROUPS.filter((g) => g.status === "suggested").length,
+  pano_detect_cancel: () => undefined,
+  pano_detect_groups: (p) => {
+    const includeDismissed = Boolean(p.includeDismissed);
+    return PANO_GROUPS.filter(
+      (g) => includeDismissed || g.status !== "dismissed",
+    );
+  },
+  pano_detect_dismiss: (p) => {
+    const g = PANO_GROUPS.find((g) => g.id === num(p.groupId));
+    if (g) g.status = p.dismissed ? "dismissed" : "suggested";
+  },
+  pano_detect_mark_merged: (p) => {
+    const g = PANO_GROUPS.find((g) => g.id === num(p.groupId));
+    if (g) {
+      g.status = "merged";
+      g.mergedImageId = num(p.mergedImageId);
+    }
+  },
 
   // Thumb cache settings
   thumb_cache_cap: () => 8 * 1024 * 1024 * 1024,

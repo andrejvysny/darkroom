@@ -37,6 +37,7 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 core-db = { path = "../crates/core-db" }
 core-raw = { path = "../crates/core-raw" }
 core-library = { path = "../crates/core-library" }
+core-pano = { path = "../crates/core-pano" }
 core-pipeline = { path = "../crates/core-pipeline" }
 core-dedup = { path = "../crates/core-dedup" }
 core-import = { path = "../crates/core-import" }

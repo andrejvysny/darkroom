@@ -10,12 +10,16 @@ pub mod hash;
 pub mod hdr_file;
 pub mod heif;
 pub mod meta;
+pub mod pano;
 pub mod thumb;
 
 pub use color::HDR_DIFFUSE_WHITE_NITS;
 pub use develop::{
     as_shot_wb, develop_linear, develop_linear_denoised, develop_linear_preview, develop_linear_wb,
     DenoiseOutput, LinearImage, MosaicDenoiser, MosaicInfo,
+};
+pub use pano::{
+    develop_camera_native, native_to_srgb_jpeg, write_pano_dng, CameraNativeImage, PanoColorMeta,
 };
 pub use display::{classify, is_display, ImageKind};
 pub use error::RawError;
