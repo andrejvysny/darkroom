@@ -15,6 +15,11 @@ mod analysis;
 #[path = "analysis_stub.rs"]
 mod analysis;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+mod denoise;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[path = "denoise_stub.rs"]
+mod denoise;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 mod faces;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[path = "faces_stub.rs"]
@@ -24,11 +29,6 @@ mod segment;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[path = "segment_stub.rs"]
 mod segment;
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-mod denoise;
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-#[path = "denoise_stub.rs"]
-mod denoise;
 
 use state::AppState;
 use tauri::Manager;
@@ -183,6 +183,7 @@ pub fn run() {
             commands::import_dedup,
             commands::import_thumb,
             commands::import_commit,
+            commands::hdr_merge,
             commands::thumb_cache_cap,
             commands::thumb_cache_size,
             commands::set_thumb_cache_cap,

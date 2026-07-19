@@ -11,6 +11,8 @@ export interface GridImage {
   label?: string;
   width?: number | null;
   height?: number | null;
+  /** Catalog format bucket ("raw" | "jpeg" | "png" | "heif" | "hdr") — drives the HDR chip. */
+  format?: string | null;
 }
 
 export interface SelectMods {
@@ -153,7 +155,9 @@ export default function ThumbGrid({
               {rowImages.map((img) => {
                 const sel = selectedSet.has(img.id);
                 const primary = img.id === selectedId;
-                const hasOverlay = !!img.label || !!img.flag || img.stars > 0;
+                const isHdr = img.format === "hdr";
+                const hasOverlay =
+                  !!img.label || !!img.flag || img.stars > 0 || isHdr;
                 return (
                   <div
                     key={img.id}
@@ -226,6 +230,23 @@ export default function ThumbGrid({
                               display: "block",
                             }}
                           />
+                        )}
+                        {isHdr && (
+                          <span
+                            style={{
+                              marginLeft: img.label ? 6 : 0,
+                              fontSize: 9,
+                              fontWeight: 700,
+                              letterSpacing: ".06em",
+                              color: "var(--color-accent)",
+                              border: "1px solid var(--color-accent-line)",
+                              borderRadius: 3,
+                              padding: "1px 4px",
+                              background: "rgba(0,0,0,.35)",
+                            }}
+                          >
+                            HDR
+                          </span>
                         )}
                         {img.flag === "pick" && (
                           <span

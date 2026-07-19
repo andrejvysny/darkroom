@@ -41,6 +41,8 @@ interface AppState {
   // Library action callbacks registered by LibraryView
   onImport: (() => void) | null;
   setOnImport: (fn: (() => void) | null) => void;
+  onMergeHdr: (() => void) | null;
+  setOnMergeHdr: (fn: (() => void) | null) => void;
   onOpenSettings: (() => void) | null;
   setOnOpenSettings: (fn: (() => void) | null) => void;
   onSearch: ((query: string) => void) | null;
@@ -95,6 +97,8 @@ export const useAppStore = create<AppState>((set) => ({
   setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
   onImport: null,
   setOnImport: (fn) => set({ onImport: fn }),
+  onMergeHdr: null,
+  setOnMergeHdr: (fn) => set({ onMergeHdr: fn }),
   onOpenSettings: null,
   setOnOpenSettings: (fn) => set({ onOpenSettings: fn }),
   onSearch: null,

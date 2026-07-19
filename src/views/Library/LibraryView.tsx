@@ -29,6 +29,7 @@ import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
 import { openExport } from "../../lib/export";
 import { useAnalysis } from "../../lib/useAnalysis";
+import { useHdrMerge } from "../../lib/useHdrMerge";
 import LeftNav from "./LeftNav";
 import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
@@ -59,6 +60,7 @@ function toGridImage(r: ImageRow, token?: number): GridImage {
       : undefined,
     width: r.width,
     height: r.height,
+    format: r.format,
   };
 }
 
@@ -73,6 +75,8 @@ export default function LibraryView() {
   const setLibraryImages = useAppStore((s) => s.setLibraryImages);
   const thumbVersions = useAppStore((s) => s.thumbVersions);
   const setOnImport = useAppStore((s) => s.setOnImport);
+  const setOnMergeHdr = useAppStore((s) => s.setOnMergeHdr);
+  const setToast = useAppStore((s) => s.setToast);
   const setOnOpenSettings = useAppStore((s) => s.setOnOpenSettings);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [importOpen, setImportOpen] = useState(false);
@@ -84,6 +88,7 @@ export default function LibraryView() {
 
   const lib = useLibrary();
   const analysis = useAnalysis();
+  const hdr = useHdrMerge();
   const [stoppingAnalysis, setStoppingAnalysis] = useState(false);
 
   // While analysis runs (doneVersion bumps as batches commit), keep the filtered grid in sync so
@@ -458,6 +463,29 @@ export default function LibraryView() {
     setSelectedId(selectedId);
   }, [selectedId, setSelectedId]);
 
+  // ---- Merge to HDR (tripod bracket -> scene-referred EXR in the library) ----
+  const handleMergeHdr = useCallback(async () => {
+    const ids = useAppStore.getState().selectedIds;
+    if (ids.length < 2 || ids.length > 9) {
+      setToast("Select 2\u20139 bracketed RAW frames to merge");
+      return;
+    }
+    const { row, error } = await hdr.merge(ids);
+    if (row) {
+      setToast(`Merged to HDR: ${row.filename}`);
+      await lib.refresh();
+      setSelectedId(row.id);
+    } else {
+      setToast(error ? `HDR merge failed: ${error}` : "HDR merge failed");
+    }
+  }, [hdr.merge, lib.refresh, setSelectedId, setToast]);
+
+  // Register for the command palette (the SelectionBar calls the handler directly).
+  useEffect(() => {
+    setOnMergeHdr(handleMergeHdr);
+    return () => setOnMergeHdr(null);
+  }, [handleMergeHdr, setOnMergeHdr]);
+
   const rightInfoHandlers: RightInfoHandlers = {
     onSetRating: handleSetRating,
     onSetFlag: handleSetFlag,
@@ -540,6 +568,8 @@ export default function LibraryView() {
                 onAddKeyword={batchAddKeyword}
                 onAddToCollection={batchAddToCollection}
                 onExport={batchExport}
+                onMergeHdr={handleMergeHdr}
+                merging={hdr.merging}
                 onClear={collapseSelection}
               />
             </div>
@@ -612,6 +642,27 @@ export default function LibraryView() {
                   {stoppingAnalysis ? "Stopping…" : "Stop"}
                 </button>
               )}
+            </div>
+          )}
+
+          {hdr.progress && (
+            <div
+              style={{
+                position: "absolute",
+                top: 10 + (lib.indexing ? 36 : 0) + (analysis.progress ? 36 : 0),
+                left: "50%",
+                transform: "translateX(-50%)",
+                zIndex: 10,
+                background: "var(--color-elev)",
+                border: "1px solid var(--color-line)",
+                borderRadius: "var(--radius-sm)",
+                padding: "6px 14px",
+                fontSize: 12,
+                color: "var(--color-t2)",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {`Merging to HDR ${hdr.progress.done} / ${hdr.progress.total}\u2026`}
             </div>
           )}
 

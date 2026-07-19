@@ -28,15 +28,21 @@ pub enum ImageKind {
     Raw,
     Jpeg,
     Png,
+    /// HDR PQ HEIF (`.hif`, Canon 10-bit BT.2020/ST-2084) — scene-referred, decoded in `heif`.
+    Heif,
+    /// Merged-HDR OpenEXR (`.exr`, linear ProPhoto fp16) — scene-referred, decoded in `hdr_file`.
+    Hdr,
 }
 
 impl ImageKind {
-    /// Catalog/UI string (`"raw" | "jpeg" | "png"`).
+    /// Catalog/UI string (`"raw" | "jpeg" | "png" | "heif" | "hdr"`).
     pub fn as_str(self) -> &'static str {
         match self {
             ImageKind::Raw => "raw",
             ImageKind::Jpeg => "jpeg",
             ImageKind::Png => "png",
+            ImageKind::Heif => "heif",
+            ImageKind::Hdr => "hdr",
         }
     }
 }
@@ -52,14 +58,19 @@ pub fn classify(path: &Path) -> ImageKind {
     {
         Some("jpg") | Some("jpeg") => ImageKind::Jpeg,
         Some("png") => ImageKind::Png,
+        Some("hif") => ImageKind::Heif,
+        Some("exr") => ImageKind::Hdr,
         _ => ImageKind::Raw,
     }
 }
 
-/// `true` when the path is an already-developed display image (JPEG/PNG) that must skip the rawler
-/// decode path.
+/// `true` when the path is an already-developed **display-referred** image (JPEG/PNG): the camera
+/// tone curve is baked in, so the develop pipeline bypasses the scene-referred base tone operator
+/// (`DevelopParams.display_referred`). HEIF (`.hif`) and merged-HDR EXR are **scene-referred** —
+/// they decode to linear light with >1.0 headroom and MUST go through the base tone operator, so
+/// they are deliberately NOT "display" despite skipping the rawler path (dispatch on [`classify`]).
 pub fn is_display(path: &Path) -> bool {
-    !matches!(classify(path), ImageKind::Raw)
+    matches!(classify(path), ImageKind::Jpeg | ImageKind::Png)
 }
 
 /// The shader's linear-ProPhoto → linear-sRGB matrix (`develop.wgsl:pp_to_srgb`), row-major. We
@@ -82,6 +93,50 @@ fn srgb_eotf(c: f32) -> f32 {
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// sRGB OETF (gamma encode): linear [0,1] → display-encoded [0,1].
+fn srgb_oetf(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Convert a linear-ProPhoto [`LinearImage`] to clamped SDR sRGB 8-bit (the shader's display
+/// transition on the CPU: `pp_to_srgb` · clamp · sRGB OETF). Scene-referred headroom >1.0 is
+/// hard-clipped — callers that need proper HDR→SDR tone mapping use the GPU canonical render; this
+/// serves the transient thumbnail/preview paths for formats without an embedded SDR preview
+/// (HEIF / merged-HDR EXR).
+pub(crate) fn linear_to_srgb_rgb8(img: &LinearImage) -> image::RgbImage {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let mut rgb8 = Vec::with_capacity(w * h * 3);
+    for px in img.data.chunks_exact(3) {
+        for row in &PP_TO_SRGB {
+            let lin = row[0] * px[0] + row[1] * px[1] + row[2] * px[2];
+            rgb8.push((srgb_oetf(lin) * 255.0).round() as u8);
+        }
+    }
+    image::RgbImage::from_raw(img.width, img.height, rgb8)
+        .expect("buffer length matches dims by construction")
+}
+
+/// [`linear_to_srgb_rgb8`] encoded as JPEG at `quality`.
+pub(crate) fn linear_to_srgb_jpeg(img: &LinearImage, quality: u8) -> Result<Vec<u8>, RawError> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ExtendedColorType;
+
+    let rgb8 = linear_to_srgb_rgb8(img);
+    let mut buf = Vec::new();
+    JpegEncoder::new_with_quality(&mut buf, quality).encode(
+        rgb8.as_raw(),
+        rgb8.width(),
+        rgb8.height(),
+        ExtendedColorType::Rgb8,
+    )?;
+    Ok(buf)
 }
 
 /// Decode JPEG/PNG bytes → linear-ProPhoto [`LinearImage`], uprighted to `orientation`.
@@ -199,7 +254,12 @@ pub fn read_display_meta(bytes: &[u8]) -> RawMeta {
     let Some(exif) = read_exif(bytes) else {
         return RawMeta::default();
     };
+    meta_from_exif(&exif)
+}
 
+/// Map a parsed EXIF block to [`RawMeta`] — shared by the JPEG/PNG container path above and the
+/// HEIF path (which extracts the raw Exif payload via libheif and parses it separately).
+pub(crate) fn meta_from_exif(exif: &exif::Exif) -> RawMeta {
     let ascii = |tag: exif::Tag| -> Option<String> {
         exif.get_field(tag, exif::In::PRIMARY).and_then(|f| {
             if let exif::Value::Ascii(ref v) = f.value {
@@ -274,7 +334,11 @@ mod tests {
         assert_eq!(classify(Path::new("a.PNG")), ImageKind::Png);
         assert_eq!(classify(Path::new("a.cr3")), ImageKind::Raw);
         assert_eq!(classify(Path::new("a.nef")), ImageKind::Raw);
+        assert_eq!(classify(Path::new("a.HIF")), ImageKind::Heif);
+        assert_eq!(classify(Path::new("a.exr")), ImageKind::Hdr);
         assert!(is_display(Path::new("a.png")) && !is_display(Path::new("a.dng")));
+        // HEIF/HDR are scene-referred: NOT display, despite skipping the rawler path.
+        assert!(!is_display(Path::new("a.hif")) && !is_display(Path::new("a.exr")));
     }
 
     /// Apply the shader's display transition (linear ProPhoto → linear sRGB → sRGB OETF → 8-bit),

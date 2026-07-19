@@ -86,7 +86,7 @@ export type QueryParams = {
   detectedCategory?: string | null;
   /** Restrict to images containing a (confirmed or suggested) face of this person. */
   personId?: number | null;
-  /** Source format bucket filter: "raw" | "jpeg" | "png". */
+  /** Source format bucket filter: "raw" | "jpeg" | "png" | "heif" | "hdr". */
   format?: string | null;
   search?: string | null;
   sort?: SortKey;
@@ -164,7 +164,8 @@ export type ImageRow = {
   /** When the image was catalogued (epoch seconds): keyset cursor for import-date sorts + a live
    *  sorted-merge comparator key. */
   importedAt: number;
-  /** Source format bucket ("raw" | "jpeg" | "png"); null for legacy rows predating the column. */
+  /** Source format bucket ("raw" | "jpeg" | "png" | "heif" | "hdr"); null for legacy rows
+   *  predating the column. */
   format: string | null;
 };
 
@@ -368,6 +369,13 @@ export function importCommit(
     selected,
     options,
   });
+}
+
+/** Merge 2–9 bracketed RAW frames (tripod) into a scene-referred HDR EXR in the library.
+ *  Long-running: emits `hdr:progress {done,total,stage}` then `hdr:done {image}` +
+ *  `library:changed`; resolves with the new catalog row (format "hdr"). */
+export function hdrMerge(imageIds: number[]): Promise<ImageRow> {
+  return invoke<ImageRow>("hdr_merge", { imageIds });
 }
 
 export function dedupScan(category: "byte" | "capture"): Promise<DupGroup[]> {

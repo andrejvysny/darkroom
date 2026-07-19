@@ -2,21 +2,26 @@
 //!
 //! All `rawler` calls are isolated in this crate (rawler's API is non-SemVer; pinned `=0.7.2`).
 
+pub mod color;
 pub mod develop;
 pub mod display;
 pub mod error;
 pub mod hash;
+pub mod hdr_file;
+pub mod heif;
 pub mod meta;
 pub mod thumb;
 
+pub use color::HDR_DIFFUSE_WHITE_NITS;
 pub use develop::{
-    as_shot_wb, develop_linear, develop_linear_denoised, develop_linear_preview, DenoiseOutput,
-    LinearImage, MosaicDenoiser, MosaicInfo,
+    as_shot_wb, develop_linear, develop_linear_denoised, develop_linear_preview, develop_linear_wb,
+    DenoiseOutput, LinearImage, MosaicDenoiser, MosaicInfo,
 };
 pub use display::{classify, is_display, ImageKind};
 pub use error::RawError;
 pub use hash::{content_hash, hash_file, hex};
-pub use meta::{capture_fingerprint, read_metadata, RawMeta};
+pub use hdr_file::{read_hdr_sources, write_hdr_exr, HdrSourceInfo, HdrSources};
+pub use meta::{capture_fingerprint, read_exposure_numeric, read_metadata, RawMeta};
 pub use thumb::{oriented_preview, preview_image, preview_with_orientation, thumbnail_jpeg, Thumb};
 
 pub use rawler::rawsource::RawSource;

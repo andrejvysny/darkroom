@@ -29,8 +29,14 @@ fn de(e: impl std::fmt::Display) -> RawError {
 
 /// Decode the largest embedded preview to pixels (preview → full-image fallback chain).
 pub fn preview_image(src: &RawSource) -> Result<DynamicImage, RawError> {
-    if crate::display::is_display(src.path()) {
-        return crate::display::decode_display_preview(&src.as_vec()?);
+    use crate::display::ImageKind;
+    match crate::display::classify(src.path()) {
+        ImageKind::Jpeg | ImageKind::Png => {
+            return crate::display::decode_display_preview(&src.as_vec()?)
+        }
+        ImageKind::Heif => return crate::heif::decode_heif_preview(&src.as_vec()?),
+        ImageKind::Hdr => return crate::hdr_file::decode_hdr_preview(&src.as_vec()?),
+        ImageKind::Raw => {}
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let params = RawDecodeParams::default();
@@ -51,8 +57,16 @@ pub fn preview_image(src: &RawSource) -> Result<DynamicImage, RawError> {
 pub fn preview_with_orientation(
     src: &RawSource,
 ) -> Result<(DynamicImage, Option<Orientation>), RawError> {
-    if crate::display::is_display(src.path()) {
-        return crate::display::decode_display_preview_native(&src.as_vec()?);
+    use crate::display::ImageKind;
+    match crate::display::classify(src.path()) {
+        ImageKind::Jpeg | ImageKind::Png => {
+            return crate::display::decode_display_preview_native(&src.as_vec()?)
+        }
+        // HEIF/HDR previews are decoded already-upright (libheif applies container transforms;
+        // EXR has no orientation concept), so the native view IS the display view.
+        ImageKind::Heif => return Ok((crate::heif::decode_heif_preview(&src.as_vec()?)?, None)),
+        ImageKind::Hdr => return Ok((crate::hdr_file::decode_hdr_preview(&src.as_vec()?)?, None)),
+        ImageKind::Raw => {}
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let params = RawDecodeParams::default();
@@ -90,10 +104,20 @@ pub fn oriented_preview(src: &RawSource) -> Result<DynamicImage, RawError> {
 /// returned `src_*` dims are the *native* preview dimensions (pre-orientation) so the capture
 /// fingerprint stays stable across this change.
 pub fn thumbnail_jpeg(src: &RawSource, max_edge: u32, quality: u8) -> Result<Thumb, RawError> {
-    if crate::display::is_display(src.path()) {
-        let bytes = src.as_vec()?;
-        let orientation = crate::display::exif_orientation(&bytes);
-        return crate::display::decode_display_thumb(&bytes, orientation, max_edge, quality);
+    use crate::display::ImageKind;
+    match crate::display::classify(src.path()) {
+        ImageKind::Jpeg | ImageKind::Png => {
+            let bytes = src.as_vec()?;
+            let orientation = crate::display::exif_orientation(&bytes);
+            return crate::display::decode_display_thumb(&bytes, orientation, max_edge, quality);
+        }
+        ImageKind::Heif => {
+            return crate::heif::decode_heif_thumb(&src.as_vec()?, max_edge, quality)
+        }
+        ImageKind::Hdr => {
+            return crate::hdr_file::decode_hdr_thumb(&src.as_vec()?, max_edge, quality)
+        }
+        ImageKind::Raw => {}
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let params = RawDecodeParams::default();

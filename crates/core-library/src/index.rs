@@ -14,12 +14,17 @@ use std::sync::Arc;
 use walkdir::WalkDir;
 
 /// Extensions indexed: RAW (CR3 validated; others latent via rawler) + display-referred JPEG/PNG
-/// (decoded via the `image` crate in `core-raw::display`). Single source of truth for indexing,
-/// folder scan/watch, and import listing.
-pub const SUPPORTED_EXT: &[&str] = &["cr3", "cr2", "arw", "nef", "dng", "jpg", "jpeg", "png"];
+/// (decoded via the `image` crate in `core-raw::display`) + scene-referred HDR: Canon 10-bit PQ
+/// HEIF (`hif`, via libheif in `core-raw::heif`) and merged-HDR OpenEXR (`exr`,
+/// `core-raw::hdr_file`). Single source of truth for indexing, folder scan/watch, and import
+/// listing.
+pub const SUPPORTED_EXT: &[&str] = &[
+    "cr3", "cr2", "arw", "nef", "dng", "jpg", "jpeg", "png", "hif", "exr",
+];
 
-/// Catalog format bucket for a path (`"raw" | "jpeg" | "png"`), via `core_raw::classify`. The single
-/// extension→kind classifier used by the `images.format` column and the by-type filters.
+/// Catalog format bucket for a path (`"raw" | "jpeg" | "png" | "heif" | "hdr"`), via
+/// `core_raw::classify`. The single extension→kind classifier used by the `images.format` column
+/// and the by-type filters.
 pub fn image_kind(path: &Path) -> &'static str {
     core_raw::classify(path).as_str()
 }

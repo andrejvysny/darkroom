@@ -21,6 +21,10 @@ interface SelectionBarProps {
   onAddKeyword: (name: string) => void;
   onAddToCollection: (collectionId: number) => void;
   onExport: () => void;
+  /** Merge the selected bracketed RAW frames into one HDR image (2\u20139 frames, tripod sets). */
+  onMergeHdr: () => void;
+  /** True while a merge is running (disables the button \u2014 merges are single-flight). */
+  merging: boolean;
   onClear: () => void;
 }
 
@@ -73,6 +77,8 @@ export default function SelectionBar({
   onAddKeyword,
   onAddToCollection,
   onExport,
+  onMergeHdr,
+  merging,
   onClear,
 }: SelectionBarProps) {
   const [kw, setKw] = useState("");
@@ -277,6 +283,14 @@ export default function SelectionBar({
       )}
 
       <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+        <button
+          style={{ ...btn(), opacity: merging ? 0.5 : 1 }}
+          disabled={merging}
+          onClick={onMergeHdr}
+          title="Merge selected bracketed RAW frames into one HDR image (tripod sets, 2\u20139 frames)"
+        >
+          <Icon name="photos" size={12} /> Merge to HDR
+        </button>
         <button style={btn()} onClick={onExport}>
           <Icon name="export" size={12} /> Export
         </button>

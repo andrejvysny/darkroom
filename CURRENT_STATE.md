@@ -3,6 +3,11 @@
 > Snapshot for resuming in a new session. Pairs with `TODO.md` (what's next + leftovers), `README.md`
 > (overview), `SPEC_V1.md` (full spec).
 
+> **2026-07-18 — HDR pass (branch `claude/hdr-heif-support-5r5ztx`): Canon HDR PQ HEIF (`.hif`)
+> full develop support + Merge-to-HDR (tripod v1, fp16 linear-ProPhoto EXR). See "Latest pass — HDR"
+> below. Binding-map correction: bindings 0–15 are ALL used (15 = `ChanMix`); next free = 16 — any
+> older "next free = 15" note below is stale.**
+
 > **2026-07-02 — READ `TODO.md` top "Repo state sync (2026-07-02)" FIRST.** `main` is now `8c1072c`
 > (0.2.0 released; presets-history / windows-hardening / jpeg-png all merged; render overhaul landed).
 > Branch `feat/lens-corrections` (in progress) adds lens distortion/CA + pre-release signing scaffolding.
@@ -71,6 +76,54 @@ local masks (parametric/radial/brush/range), and **full-res viewport render** (c
 fixture/Metal. **Biggest pending item: in-app visual QA** (`npm run tauri dev`) of the develop look on
 varied real photos — the math is verified headless, but the ACR brightness / grading / crop _feel_ is
 subjective (`BASELINE_GAIN` in `params.rs` is the one brightness knob).
+
+## Latest pass — HDR: Canon PQ HEIF (.hif) + Merge-to-HDR (2026-07-18)
+
+Branch `claude/hdr-heif-support-5r5ztx`. Plan: `~/.claude/plans/i-need-you-to-compiled-wirth.md`.
+
+- **`.hif` decode (Feature A, full develop):** `core-raw/src/heif.rs` (ALL libheif calls isolated
+  there, mirroring the rawler rule; `libheif-rs =2.7.0` `v1_17`, cfg'd out on Windows with a clean
+  error stub). Chain: 10-bit HEVC 4:2:2 → libheif upsample+YCbCr→RGB (`HdrRgbLe`) → **PQ EOTF** via
+  per-code LUT → linear BT.2020 scaled so **BT.2408 diffuse white (203 nits) = 1.0** (speculars ≈49×
+  headroom; the single calibration knob `HDR_DIFFUSE_WHITE_NITS` in `core-raw/src/color.rs`) →
+  Bradford D65→D50 + BT.2020→ProPhoto → `LinearImage`. Strict nclx gate (non-BT.2020-PQ → clean
+  error). libheif applies container transforms → EXIF orientation deliberately NOT re-applied.
+  Exif via the container's metadata block → kamadak `read_raw` → shared `meta_from_exif`.
+  `ImageKind::{Heif,Hdr}` added; **`is_display` still means strictly JPEG/PNG** (HEIF/EXR are
+  scene-referred, base tone operator active) — internal dispatch switched to `match classify`.
+- **Merged-HDR storage:** `core-raw/src/hdr_file.rs` — fp16 RGB ZIP16 EXR **in the working format**
+  (linear ProPhoto D50); reading back is a channel copy. Self-describing attrs: `chromaticities`
+  (ProPhoto+D50), `darkroom:meta` (reference RawMeta JSON → `read_metadata`/`process_file` catalog a
+  merged file with zero plumbing), `darkroom:sources` (ids/hashes/relative EVs + reference index).
+  `.part`+rename durability. **No DB migration** (format TEXT takes `'heif'`/`'hdr'`).
+- **Merge math (Feature B, tripod v1):** new leaf crate **`core-hdr`** — EV₁₀₀, `relative_scale`,
+  median-EV reference, streaming `MergeAccumulator` (hat weights on each frame's own unscaled
+  max-RGB, zero near clip, floored shadows; scaled-shortest-exposure fallback where all frames
+  clip; ~7 f32/px any N). `core-raw` adds `read_exposure_numeric` (rawler rationals) +
+  `develop_linear_wb` (reference-WB override so auto-WB brackets don't color-shift).
+- **IPC:** `hdr_merge(image_ids) → ImageRow` (single-flight `AtomicBool`, ImportGuard around the
+  write, validates 2–9 present RAW frames + varying exposure; dest `library_root/YYYY/YYYY-MM-DD/`
+  else next-to-reference, `{ref_stem}_HDR.exr` via `unique_dest`). Events `hdr:progress
+  {done,total,stage}` / `hdr:done {image}` / `library:changed`. FE: `useHdrMerge` hook, SelectionBar
+  "Merge to HDR" + palette row, progress pill, HDR grid chip, format-aware TopBar badge, HEIF/HDR
+  file-type filter chips. `SUPPORTED_EXT` += `hif`, `exr`.
+- **Validated here (Linux):** synthetic 10-bit PQ HEIF fixtures (committed; 4:2:0 AND
+  **4:2:2 — the exact Canon codec profile, retiring risk R1 at codec level**) decode byte-exact
+  through `develop_linear` (diffuse white ≈1.0, max ≈49.26); a committed real iPhone gain-map HEIC
+  is rejected with the clean profile error (negative test); 51-file Nokia conformance survey via
+  the now fault-tolerant `heif_gate` (35 decode, 16 clean container errors, 0 crashes; all 8-bit);
+  EXR round-trip; all merge math tests; full merge plumbing on a fabricated ±2 EV bracket of the
+  committed R7 CR3 (exiftool-rewritten ExposureTime; 3×32.3 MP decode → 107 MB EXR → read-back);
+  clippy/fmt/tsc green; `cargo check -p darkroom` green (GTK + pip-onnxruntime shims).
+  **Real-file round (2026-07-19, user's actual R7 HDR shot):** S1 PASSED on the real .HIF
+  (container/nclx/Exif/thumbnails all as assumed; no crash, 10-bit decode exact); S2 calibrated —
+  anchor now **HDR_DIFFUSE_WHITE_NITS = 300** (+0.572 EV measured vs the metered CR3; record in
+  color.rs); real ±3 EV bracket merged with no ghosting vs the camera's own HDR composite.
+  Optimizations landed from the analysis: embedded 10-bit thumbnail fast path for HIF
+  thumbs/previews (~10× faster) + rayon-parallel PQ conversion (core-raw now depends on rayon).
+  **Pending on the dev Mac:** in-app QA, `.dmg` dylib bundling (`bundle.macOS.frameworks`,
+  `libheif.1.dylib` + `libde265.0.dylib`); portrait-.HIF irot check + clipped-highlight bracket +
+  plain RAW+HIF pair when such fixtures appear.
 
 ## Latest AI work — Unified AI pipeline (branch `feat/unified-ai-pipeline`, MERGED `f663ee0`)
 
@@ -274,6 +327,8 @@ replace_all) → DevelopParams` (merged, NOT persisted — FE commits), `presets
 - History / snapshots (**NEW**): `snapshots_list`, `snapshot_create`, `snapshot_restore` (→ params,
   FE commits), `snapshot_rename`, `snapshot_delete`. Session undo/redo is **frontend-only** (no IPC).
 - Export: `export_image`
+- HDR: `hdr_merge(image_ids) → ImageRow` (Merge-to-HDR, tripod v1; events `hdr:progress
+  {done,total,stage}` + `hdr:done {image}` + `library:changed`)
 - Culling: `cull_set_rating`, `cull_set_flag`, `cull_set_label`,
   `cull_set_rating_many`, `cull_set_flag_many`, `cull_set_label_many` (batch)
 - Keywords: `keywords_list`, `keywords_for_image`, `keyword_add_to_image`,
@@ -371,9 +426,8 @@ operator fit to the real ACR default** (`@binding(10/11)`, `base_curve_ref.rs`; 
 **Crop/straighten — DONE (visual-QA pending), as of `feat/tone-operator-crop`:** GeomUniform
 `@binding(12)` + `crop_to_source`/`sample_bilinear` (the bilinear-remap "helper" the old note asked
 for already exists, `develop.wgsl`), interactive `CropOverlay.tsx`, aspect presets + straighten slider,
-export at true dims via `Crop::export_rect`. **Still UI-absent / NOT wired:** Lens distortion /
-chromatic-aberration only (greenfield — no shader math, no UI controls yet). **Bindings 0–14 all used;
-next free = 15.**
+export at true dims via `Crop::export_rect`. **Bindings 0–15 all used (15 = `ChanMix`
+channel mixer); next free = 16.**
 
 **Windows packaging — WIRED (branch `feat/windows-packaging`):** NSIS per-user `.exe` target
 (`tauri.conf.json` `bundle.windows`), DirectML EP for AI (`core-analyze` per-target `ort` features +

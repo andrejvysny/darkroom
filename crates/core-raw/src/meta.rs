@@ -85,14 +85,53 @@ impl RawMeta {
 
 /// Read metadata from an open [`RawSource`] WITHOUT decoding pixels (fast indexing path).
 pub fn read_metadata(src: &RawSource) -> Result<RawMeta, RawError> {
-    if crate::display::is_display(src.path()) {
-        return Ok(crate::display::read_display_meta(&src.as_vec()?));
+    use crate::display::ImageKind;
+    match crate::display::classify(src.path()) {
+        ImageKind::Jpeg | ImageKind::Png => {
+            return Ok(crate::display::read_display_meta(&src.as_vec()?))
+        }
+        ImageKind::Heif => return Ok(crate::heif::read_heif_meta(&src.as_vec()?)),
+        ImageKind::Hdr => return Ok(crate::hdr_file::read_hdr_meta(&src.as_vec()?)),
+        ImageKind::Raw => {}
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let md = decoder
         .raw_metadata(src, &RawDecodeParams::default())
         .map_err(de)?;
     Ok(RawMeta::from_metadata(&md))
+}
+
+/// Numeric exposure triple `(exposure_time_s, f_number, iso)` for EV math (HDR merge), straight
+/// from rawler's EXIF rationals — never parsed from the formatted display strings. `Ok(None)` when
+/// the source is not a rawler-decoded RAW or any component is missing/zero.
+pub fn read_exposure_numeric(src: &RawSource) -> Result<Option<(f64, f64, f64)>, RawError> {
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
+        return Ok(None);
+    }
+    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let md = decoder
+        .raw_metadata(src, &RawDecodeParams::default())
+        .map_err(de)?;
+    let exif = &md.exif;
+    let t = exif
+        .exposure_time
+        .as_ref()
+        .filter(|r| r.n != 0 && r.d != 0)
+        .map(|r| r.n as f64 / r.d as f64);
+    let n = exif
+        .fnumber
+        .as_ref()
+        .map(|r| r.as_f32() as f64)
+        .filter(|v| *v > 0.0);
+    let iso = exif
+        .iso_speed_ratings
+        .map(|v| v as f64)
+        .or(exif.iso_speed.map(|v| v as f64))
+        .filter(|v| *v > 0.0);
+    Ok(match (t, n, iso) {
+        (Some(t), Some(n), Some(iso)) => Some((t, n, iso)),
+        _ => None,
+    })
 }
 
 /// EXIF "YYYY:MM:DD HH:MM:SS" → ISO-8601 "YYYY-MM-DDTHH:MM:SS" (for the fingerprint canonical form).

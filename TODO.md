@@ -2,6 +2,79 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## HDR pass follow-ups (2026-07-18, branch `claude/hdr-heif-support-5r5ztx`) — CURRENT
+
+Landed: Canon HDR PQ `.hif` full develop support (libheif → PQ → linear ProPhoto) + Merge-to-HDR
+tripod v1 (fp16 linear-ProPhoto EXR, `hdr_merge` IPC, SelectionBar/palette UI). All Linux-runnable
+gates green (incl. a committed synthetic 10-bit PQ HEIF fixture decoding byte-exact). Details:
+`CURRENT_STATE.md` "Latest pass — HDR". **Binding-map correction: 0–15 all used (15 = ChanMix);
+next free = @binding(16).**
+
+**Sample-based validation round (2026-07-18, same branch — user has no R7 files yet, so public
+GitHub samples + synthesis were used; downloads live UNCOMMITTED in `library/fixtures-samples/`,
+already gitignored):**
+
+- **R1 (libde265 vs Canon's HEVC Main 4:2:2 10 intra) retired at codec level:** a second committed
+  fixture `synthetic_pq422.hif` (591 B, heif-enc `-p chroma=422`, verified `YCbCr 4:2:2 / 10-bit`
+  via heif-info) decodes byte-exact through `develop_linear` — CI-guarded by
+  `synthetic_pq422_heif_round_trips`. What this does NOT cover: Canon's real container (heix brand,
+  grid/tiled layout, embedded thumb, irot) — still a Mac+fixture item.
+- **Negative-profile test committed:** `apple_hdr_gainmap.hif` (real iPhone 13 Pro gain-map HEIC,
+  MIT — `APPLE_HDR_LICENSE`) → clean "expected BT.2020 PQ" rejection, metadata still readable
+  (`non_pq_heif_rejected_cleanly`).
+- **Corpus survey:** all 51 Nokia `heif_conformance` stills through `heif_gate` (now
+  per-file fault-tolerant): 35 decode OK, 16 fail with clean libheif errors (sequences /
+  intentionally-broken items), zero crashes. All decodable ones are 8-bit — the suite has no
+  10-bit stills, hence the synthesized 4:2:2 fixture above.
+- **Merge plumbing validated on real sensor data:** fabricated ±2 EV bracket (3 copies of the
+  committed `_55A3947.CR3`, `ExposureTime` rewritten via exiftool 12.76 — rawler parses the
+  rewritten files fine) through `merge_one`: EV math exact, median reference picked, 3×32.3 MP
+  reference-WB decodes, streaming merge, 107 MB EXR written + read back via the thumbnail path.
+  NOTE: frames share identical pixels, so output brightness is a scale-blend (~×1.75 midtones) —
+  plumbing proof only, NOT an HDR-look check. Recreate with:
+  `cp` ×3 + `exiftool -overwrite_original -ExposureTime=… frame_m2ev.CR3` (one file per invocation)
+  + `cargo run -p core-hdr --example merge_one library/fixtures-samples/bracket`.
+
+**Real-file validation round (2026-07-19, DONE here on Linux with the user's real R7 HDR shot —
+`855A6554.HIF` + 3 bracketed CR3s `_55A6551–3.CR3`, ±3 EV, staged from the repo's `HDR/` folder on
+`main` into `library/fixtures-hdr/`):**
+
+- [x] S1 real-file gate PASSED: real R7 .HIF (6960×4640, 10-bit, nclx BT.2020/PQ/full-range)
+      decodes via libde265; Exif parses (model/ISO/shutter); no irot on landscape files; carries
+      embedded 10-bit PQ thumbnails (320×214 + 1620×1080). → Implemented: embedded-thumbnail fast
+      path for thumb/preview duty (~10× faster grid thumbs, primary still used when the requested
+      edge exceeds the thumb) + rayon-parallel PQ→ProPhoto conversion.
+- [x] S2 calibration DONE: metered CR3 vs camera HIF measured **+0.572 EV** → anchor adopted
+      **HDR_DIFFUSE_WHITE_NITS = 300** (measurement + composite-source caveat recorded in
+      color.rs; refine against a plain RAW+HIF simultaneous-recording pair if one appears).
+- [x] merge_one on the real bracket: EV math exact (×7.81/×0.125), no visible ghosting vs the
+      camera HIF (geometry identical), merged EXR + SDR preview produced. Note: this scene never
+      clips the metered frame (f/22 sunset, max ≈275 nits), so it exercises shadow-noise merging,
+      not highlight recovery.
+
+**Still needs the dev Mac (or more fixtures):**
+
+- [ ] PORTRAIT .HIF check (no portrait fixture yet): if with/without-transform dims match but the
+      EXIF tag says 6/8, add `.oriented()` in `heif.rs` (risk R4).
+- [ ] A bracket with CLIPPED highlights to visually confirm highlight recovery (this set had none).
+- [ ] A plain RAW+HIF simultaneous-recording pair to refine the 300-nit anchor (current pair is an
+      HDR-mode composite, which may bias mid-tones).
+- [ ] In-app QA (`npm run tauri dev`): HIF opens in Develop (side-by-side vs CR3 sibling ≈ same
+      brightness under defaults); WB/exposure/all modules respond; thumbs + `develop_preview_jpeg`
+      latency acceptable on 33 MP HIF (full decode, no embedded preview fast path yet); select
+      bracket → Merge to HDR → pill → new `_HDR.exr` row with HDR chip → develop (Highlights slider
+      recovers headroom) → export JPEG; HEIF/HDR filter chips; dedup scan on the CR3+HIF pair
+      (same-capture groups like RAW+JPEG — expected, manual resolve only).
+- [ ] Release checklist: bundle `libheif.1.dylib` + `libde265.0.dylib` (otool -L closure) via
+      `tauri.conf.json` `bundle.macOS.frameworks`; CI macOS job needs `brew install libheif`,
+      Linux jobs `apt-get install libheif-dev libde265-dev`.
+
+**Deferred increments (do NOT creep into this pass):** alignment (MTB) + deghosting + auto
+bracket detection; hand-held merge; fp16 DNG export (Lightroom interop); HEIF *export*; general
+`.heic`/iPhone (non-PQ profiles get a clean error today); Windows HIF decode (vcpkg libheif — cfg
+stub ships); embedded-thumbnail fast path for HIF thumbs; `hdr_sources` DB table + "show source
+frames" UI (parentage lives in the EXR's `darkroom:sources` attr); HDR/EDR display output.
+
 ## Repo state sync (2026-07-02) — CURRENT
 
 - **`main` = `8c1072c`** (unpushed to origin), version **`0.2.0` (beta-2.0) RELEASED**. Since the

@@ -131,10 +131,19 @@ impl LinearImage {
 /// uprighted to its EXIF orientation. One decoder serves both the metadata (orientation) read and the
 /// pixel decode.
 pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
-    if crate::display::is_display(src.path()) {
-        let bytes = src.as_vec()?;
-        let orientation = crate::display::exif_orientation(&bytes);
-        return crate::display::decode_display_linear(&bytes, orientation);
+    match crate::display::classify(src.path()) {
+        crate::display::ImageKind::Jpeg | crate::display::ImageKind::Png => {
+            let bytes = src.as_vec()?;
+            let orientation = crate::display::exif_orientation(&bytes);
+            return crate::display::decode_display_linear(&bytes, orientation);
+        }
+        crate::display::ImageKind::Heif => {
+            return crate::heif::decode_heif_linear(&src.as_vec()?);
+        }
+        crate::display::ImageKind::Hdr => {
+            return crate::hdr_file::read_hdr_linear(&src.as_vec()?);
+        }
+        crate::display::ImageKind::Raw => {}
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;
     let params = RawDecodeParams::default();
@@ -145,6 +154,35 @@ pub fn develop_linear(src: &RawSource) -> Result<LinearImage, RawError> {
         .and_then(|md| md.exif.orientation);
     let raw = decoder.raw_image(src, &params, false).map_err(de)?;
     Ok(develop_linear_from(&raw)?.oriented(orientation))
+}
+
+/// [`develop_linear`] with an optional white-balance override, returning the WB actually applied.
+///
+/// The HDR merge decodes every bracket frame with the REFERENCE frame's as-shot WB (auto-WB can
+/// drift between frames of a bracket, which would blend mismatched colors): decode the reference
+/// with `None` (capturing its as-shot WB from the returned tuple), then each other frame with
+/// `Some(ref_wb)`.
+///
+/// The override reaches only the headroom-preserving RGB-Bayer path (`map_3ch_to_rgb`); the
+/// calibrated fallback (X-Trans/4-color/mono) bakes rawler's own WB and reports neutral `[1;4]`.
+/// Non-RAW sources decode normally and report neutral. `develop_linear(src)` ≡
+/// `develop_linear_wb(src, None).0` byte-for-byte.
+pub fn develop_linear_wb(
+    src: &RawSource,
+    wb_override: Option<[f32; 4]>,
+) -> Result<(LinearImage, [f32; 4]), RawError> {
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
+        return Ok((develop_linear(src)?, [1.0; 4]));
+    }
+    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let params = RawDecodeParams::default();
+    let orientation = decoder
+        .raw_metadata(src, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation);
+    let raw = decoder.raw_image(src, &params, false).map_err(de)?;
+    let (img, wb) = develop_linear_from_wb(&raw, wb_override)?;
+    Ok((img.oriented(orientation), wb))
 }
 
 /// Plain-typed view of a decoded Bayer mosaic handed to a [`MosaicDenoiser`]. Carries everything a
@@ -196,8 +234,9 @@ pub fn develop_linear_denoised(
     src: &RawSource,
     denoiser: &dyn MosaicDenoiser,
 ) -> Result<DenoiseOutput, RawError> {
-    // Already-developed display images have no mosaic; return the clean decode only.
-    if crate::display::is_display(src.path()) {
+    // Only rawler-decoded RAW files have a mosaic; every other kind (display JPEG/PNG, HEIF,
+    // merged-HDR EXR) returns the clean decode only.
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
         return Ok(DenoiseOutput {
             clean: develop_linear(src)?,
             denoised: None,
@@ -274,8 +313,8 @@ pub fn develop_linear_denoised(
 /// As-shot white-balance coefficients `[r, g, b, g2]` from the camera (neutral `[1;4]` if absent).
 /// Used as a model input for learned auto-white-balance / lighting normalization. One raw decode.
 pub fn as_shot_wb(src: &RawSource) -> Result<[f32; 4], RawError> {
-    if crate::display::is_display(src.path()) {
-        // Display images carry no camera white-balance; treat as neutral.
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
+        // Non-RAW images carry no camera white-balance coefficients; treat as neutral.
         return Ok([1.0; 4]);
     }
     let raw = rawler::decode(src, &RawDecodeParams::default()).map_err(de)?;
@@ -327,6 +366,15 @@ fn wb_or_neutral(raw: &RawImage) -> [f32; 4] {
 /// demosaic, so fine colored detail is not bit-identical). 4-colour / monochrome / matrix-less
 /// sensors fall back to rawler's calibrated develop.
 fn develop_linear_from(raw: &RawImage) -> Result<LinearImage, RawError> {
+    Ok(develop_linear_from_wb(raw, None)?.0)
+}
+
+/// [`develop_linear_from`] with an optional WB override; returns the WB coefficients actually
+/// applied (neutral for the calibrated fallback, where rawler bakes its own WB).
+fn develop_linear_from_wb(
+    raw: &RawImage,
+    wb_override: Option<[f32; 4]>,
+) -> Result<(LinearImage, [f32; 4]), RawError> {
     if let Some(xyz2cam) = cam_xyz2cam(raw) {
         let dev = RawDevelop {
             steps: vec![
@@ -337,16 +385,19 @@ fn develop_linear_from(raw: &RawImage) -> Result<LinearImage, RawError> {
             ],
         };
         if let Intermediate::ThreeColor(px) = dev.develop_intermediate(raw).map_err(de)? {
-            let wb = wb_or_neutral(raw);
+            let wb = wb_override.unwrap_or_else(|| wb_or_neutral(raw));
             let rgb = map_3ch_to_rgb(&px, &wb, xyz2cam);
-            return Ok(LinearImage {
-                width: rgb.width as u32,
-                height: rgb.height as u32,
-                data: rgb.flatten(),
-            });
+            return Ok((
+                LinearImage {
+                    width: rgb.width as u32,
+                    height: rgb.height as u32,
+                    data: rgb.flatten(),
+                },
+                wb,
+            ));
         }
     }
-    develop_calibrated(raw)
+    Ok((develop_calibrated(raw)?, [1.0; 4]))
 }
 
 /// rawler's calibrated develop (clips highlights via `clip_euclidean_norm_avg`). Fallback for
@@ -413,8 +464,8 @@ fn develop_calibrated(raw: &RawImage) -> Result<LinearImage, RawError> {
 /// or any image whose color matrix is missing/malformed, transparently falls back to the
 /// full-quality [`develop_linear`].
 pub fn develop_linear_preview(src: &RawSource) -> Result<LinearImage, RawError> {
-    if crate::display::is_display(src.path()) {
-        // No superpixel fast path for an already-developed image; decode it directly.
+    if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
+        // No superpixel fast path for a non-mosaic source; decode it directly.
         return develop_linear(src);
     }
     let decoder = rawler::get_decoder(src).map_err(de)?;

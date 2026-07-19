@@ -78,6 +78,8 @@ pub struct AppState {
     /// Memo of `(image_id, is_display_referred)` so the per-slider-move `develop_render` doesn't hit
     /// the DB to learn whether the source is a JPEG/PNG (recomputed only on image change).
     pub display_referred_memo: Mutex<Option<(i64, bool)>>,
+    /// Single-flight guard for `hdr_merge` (a merge decodes N full-res RAWs — one at a time).
+    pub hdr_running: AtomicBool,
     /// Histogram of the most recent successful render, for a reliable pull (the event can be missed).
     pub last_histogram: Mutex<Option<Histogram>>,
     /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
@@ -207,6 +209,7 @@ impl AppState {
             preview_linear_lru: Mutex::new(crate::prefetch::PreviewLru::default()),
             prefetch_gen: AtomicU64::new(0),
             display_referred_memo: Mutex::new(None),
+            hdr_running: AtomicBool::new(false),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
             import_active: AtomicUsize::new(0),
