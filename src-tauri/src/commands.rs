@@ -2305,6 +2305,88 @@ pub async fn panorama_status(app: AppHandle) -> Result<crate::panorama::PanoStat
     .map_err(|e| e.to_string())?
 }
 
+// ---------- Panorama detection ----------
+
+/// Run (or resume) a whole-library panorama-detection scan. Resolves with the accumulated count of
+/// freshly-`suggested` groups when the scan finishes; progress streams via `pano_detect:progress` /
+/// `pano_detect:done`, failures also emit `pano_detect:error` so the UI clears even if the caller
+/// dropped the promise.
+#[tauri::command]
+pub async fn pano_detect_run(app: AppHandle, force: bool) -> Result<usize, String> {
+    let emitter = app.clone();
+    let result =
+        tauri::async_runtime::spawn_blocking(move || crate::pano_detect::run(&app, force))
+            .await
+            .map_err(|e| e.to_string())?;
+    if let Err(msg) = &result {
+        let _ = emitter.emit("pano_detect:error", serde_json::json!({ "message": msg }));
+    }
+    result
+}
+
+/// Request cancellation of the running scan (honored between clusters).
+#[tauri::command]
+pub fn pano_detect_cancel(app: AppHandle) {
+    let st = app.state::<AppState>();
+    crate::pano_detect::cancel(&st);
+}
+
+#[tauri::command]
+pub async fn pano_detect_status(
+    app: AppHandle,
+) -> Result<crate::pano_detect::PanoDetectStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        crate::pano_detect::status(&st)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Suggestion groups for the review panel.
+#[tauri::command]
+pub async fn pano_detect_groups(
+    app: AppHandle,
+    include_dismissed: bool,
+) -> Result<Vec<core_library::pano_detect::PanoGroupRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        crate::pano_detect::groups(&st, include_dismissed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Dismiss (or undo a dismissal of) a suggestion group.
+#[tauri::command]
+pub async fn pano_detect_dismiss(
+    app: AppHandle,
+    group_id: i64,
+    dismissed: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        crate::pano_detect::dismiss(&st, group_id, dismissed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Record that a suggestion group was merged into `merged_image_id` (the merge-flow handoff).
+#[tauri::command]
+pub async fn pano_detect_mark_merged(
+    app: AppHandle,
+    group_id: i64,
+    merged_image_id: i64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        crate::pano_detect::mark_merged(&st, group_id, merged_image_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Manager overview of every AI model capability (Detection & Scene / People / AI Masking): install
 /// state, on-disk size, and per-file + per-tier detail. Drives the AI Models manager UI.
 #[tauri::command]

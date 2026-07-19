@@ -6,6 +6,7 @@ mod model_mgmt;
 mod prefetch;
 mod protocol;
 mod panorama;
+mod pano_detect;
 mod state;
 mod thumb_queue;
 mod watch;
@@ -201,6 +202,12 @@ pub fn run() {
             commands::panorama_merge,
             commands::panorama_cancel,
             commands::panorama_status,
+            commands::pano_detect_run,
+            commands::pano_detect_cancel,
+            commands::pano_detect_status,
+            commands::pano_detect_groups,
+            commands::pano_detect_dismiss,
+            commands::pano_detect_mark_merged,
             commands::mask_ai_models_ensure,
             commands::mask_ai_ready,
             commands::mask_ai_encode,
