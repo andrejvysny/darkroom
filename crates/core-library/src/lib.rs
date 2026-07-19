@@ -12,6 +12,7 @@ pub mod features;
 pub mod index;
 pub mod keywords;
 pub mod maintenance;
+pub mod pano_detect;
 pub mod presets;
 pub mod query;
 pub mod reconcile;
