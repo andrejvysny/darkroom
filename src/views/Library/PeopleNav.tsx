@@ -1,6 +1,5 @@
 import { useState } from "react";
 import Icon from "../../components/Icon";
-import { ProgressBar as Bar } from "../../components/ProgressBar";
 import {
   clearedFilters,
   faceCropStyle,
@@ -19,18 +18,21 @@ interface PeopleNavProps {
 }
 
 /** "People" sidebar section: clustered people (named first, then unnamed "Suggested"), each a
- *  face-cropped avatar. Click filters the library by person; the pencil names a cluster. The header
- *  "Find People" button runs the (manual) face pass. Owns its own data + the Review/merge modal. */
+ *  face-cropped avatar. Click filters the library by person; the pencil names a cluster. Scanning is
+ *  started from the "Run AI scan…" modal. Owns its own data + the Review/merge modal. */
 export default function PeopleNav({
   params,
   patchParams,
   clearFilters,
 }: PeopleNavProps) {
   const faces = useFaces();
+  // Faces that exist but belong to no person — a deliberately-deferred singleton, or a clustering
+  // pass that was interrupted. Read from status rather than drilled through LeftNav: this component
+  // already owns the faces hook.
+  const ungroupedFaces = faces.status?.ungrouped ?? 0;
   const [showSuggested, setShowSuggested] = useState(true);
   const [reviewPerson, setReviewPerson] = useState<PersonRow | null>(null);
   const onReviewPerson = (p: PersonRow) => setReviewPerson(p);
-  const running = faces.status?.running === true || faces.progress !== null;
   const named = faces.people.filter((p) => p.name != null);
   const suggested = faces.people.filter((p) => p.name == null);
 
@@ -55,23 +57,21 @@ export default function PeopleNav({
         }}
       >
         <span>People</span>
-        <FindButton
-          running={running}
-          onFind={() => void faces.findPeople(false)}
-          onCancel={() => void faces.cancel()}
-        />
       </div>
 
-      {faces.progress && (
-        <ProgressBar
-          label={
-            faces.progress.kind === "models"
-              ? "Downloading models"
-              : "Finding people"
-          }
-          done={faces.progress.done}
-          total={faces.progress.total}
-        />
+      {ungroupedFaces > 0 && (
+        <div
+          data-testid="ungrouped-faces"
+          title="Detected faces that aren't grouped into a person yet. Running a scan again groups them."
+          style={{
+            fontSize: 11,
+            color: "var(--color-t3)",
+            padding: "0 8px 6px",
+          }}
+        >
+          {ungroupedFaces.toLocaleString()} ungrouped face
+          {ungroupedFaces === 1 ? "" : "s"}
+        </div>
       )}
 
       {named.map((p) => (
@@ -130,13 +130,13 @@ export default function PeopleNav({
         </>
       )}
 
-      {faces.people.length === 0 && !running && (
+      {faces.people.length === 0 && ungroupedFaces === 0 && (
         <div
           style={{ fontSize: 12, color: "var(--color-t3)", padding: "4px 8px" }}
         >
           {faces.status && faces.status.processed > 0
             ? "No people found yet"
-            : "Find People to detect faces"}
+            : "Run an AI scan with Faces enabled"}
         </div>
       )}
 
@@ -337,62 +337,6 @@ function Avatar({ person }: { person: PersonRow }) {
     >
       <Icon name="scan" size={12} />
     </div>
-  );
-}
-
-function ProgressBar({
-  label,
-  done,
-  total,
-}: {
-  label: string;
-  done: number;
-  total: number;
-}) {
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-  return (
-    <div style={{ padding: "2px 8px 6px" }}>
-      <div
-        style={{ fontSize: 10.5, color: "var(--color-t3)", marginBottom: 3 }}
-      >
-        {label} {done}/{total}
-      </div>
-      <Bar pct={pct} />
-    </div>
-  );
-}
-
-function FindButton({
-  running,
-  onFind,
-  onCancel,
-}: {
-  running: boolean;
-  onFind: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <button
-      onClick={(e) => {
-        e.stopPropagation();
-        if (running) onCancel();
-        else onFind();
-      }}
-      title={running ? "Stop" : "Detect faces in your library"}
-      aria-label={running ? "Stop finding people" : "Find people"}
-      style={{
-        fontSize: 10,
-        padding: "1px 6px",
-        borderRadius: "var(--radius-sm)",
-        border: "1px solid var(--color-line)",
-        background: "transparent",
-        color: "var(--color-t2)",
-        cursor: "pointer",
-        lineHeight: 1.5,
-      }}
-    >
-      {running ? "Stop" : "Find People"}
-    </button>
   );
 }
 

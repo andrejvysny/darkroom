@@ -9,6 +9,9 @@ import {
   setImageUserLabel,
   imageHistogram,
   imageFaces,
+  imageScanState,
+  SCAN_STAGES,
+  type ImageScanState,
   imageSources,
   imagePair,
   imagePairUnlink,
@@ -140,6 +143,7 @@ export default function RightInfo({
   const [aiDetections, setAiDetections] = useState<Detection[]>([]);
   const [aiPresence, setAiPresence] = useState<Presence | null>(null);
   const [aiFaces, setAiFaces] = useState<ImageFace[]>([]);
+  const [scanState, setScanState] = useState<ImageScanState | null>(null);
   const [labels, setLabels] = useState<UserLabels>({
     containsPerson: null,
     containsAnimal: null,
@@ -180,13 +184,15 @@ export default function RightInfo({
       imagePresence(meta.id),
       imageUserLabels(meta.id),
       imageFaces(meta.id),
-    ]).then(([cap, dets, pres, lab, faces]) => {
+      imageScanState(meta.id),
+    ]).then(([cap, dets, pres, lab, faces, scan]) => {
       if (!cancelled) {
         setAiCaption(cap);
         setAiDetections(dets);
         setAiPresence(pres);
         setLabels(lab);
         setAiFaces(faces);
+        setScanState(scan);
       }
     });
     return () => {
@@ -862,14 +868,26 @@ export default function RightInfo({
           <div style={{ fontSize: 12, color: "var(--color-t3)" }}>
             No image selected
           </div>
-        ) : aiCaption === null &&
-          aiDetections.length === 0 &&
-          aiPresence === null &&
-          aiFaces.length === 0 ? (
-          <div style={{ fontSize: 11.5, color: "var(--color-t3)" }}>
-            Not analyzed yet
-          </div>
         ) : (
+          <>
+            <ScanRecord state={scanState} />
+            {aiCaption === null &&
+              aiDetections.length === 0 &&
+              aiPresence === null &&
+              aiFaces.length === 0 && (
+                <div
+                  style={{
+                    fontSize: 11.5,
+                    color: "var(--color-t3)",
+                    marginBottom: 10,
+                  }}
+                >
+                  Nothing detected in this photo
+                </div>
+              )}
+          </>
+        )}
+        {meta !== null && (
           <>
             {aiCaption !== null && (
               <>
@@ -1140,5 +1158,67 @@ export default function RightInfo({
         )}
       </div>
     </aside>
+  );
+}
+
+/** Relative time for a scan timestamp ("2h ago"), falling back to a date past a week. */
+function whenLabel(epoch: number): string {
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - epoch);
+  if (secs < 60) return "just now";
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+  if (secs < 604800) return `${Math.floor(secs / 86400)}d ago`;
+  return new Date(epoch * 1000).toLocaleDateString();
+}
+
+/**
+ * Per-photo scan record: which stages ran, when, and which failed.
+ *
+ * Before this existed the panel inferred "Not analyzed yet" from empty results, so a photo that was
+ * scanned and genuinely contains nothing looked identical to one that was never scanned — and to one
+ * whose decode failed on every attempt.
+ */
+function ScanRecord({ state }: { state: ImageScanState | null }) {
+  if (!state) return null;
+  const label = (id: string) =>
+    SCAN_STAGES.find((s) => s.id === id)?.label ?? id;
+  const mark = { ok: "✓", error: "✗", pending: "—" } as const;
+  const color = {
+    ok: "var(--color-t2)",
+    error: "var(--color-danger, #e5685f)",
+    pending: "var(--color-t3)",
+  } as const;
+
+  return (
+    <div style={{ marginBottom: 12 }} data-testid="scan-record">
+      {state.stages.map((s) => (
+        <div
+          key={s.id}
+          title={s.error ?? undefined}
+          style={{
+            display: "flex",
+            alignItems: "baseline",
+            gap: 8,
+            fontSize: 11.5,
+            lineHeight: 1.7,
+            color: color[s.status],
+          }}
+        >
+          <span style={{ width: 10, flex: "none" }}>{mark[s.status]}</span>
+          <span style={{ flex: 1, minWidth: 0 }}>{label(s.id)}</span>
+          <span style={{ color: "var(--color-t3)", flex: "none" }}>
+            {s.status === "error"
+              ? "failed"
+              : s.status === "pending"
+                ? s.attemptedAt
+                  ? "older model"
+                  : "not run"
+                : s.attemptedAt
+                  ? whenLabel(s.attemptedAt)
+                  : ""}
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }

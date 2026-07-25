@@ -40,9 +40,71 @@ pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Err(unavailable())
 }
 
-pub fn run_pass<R: Runtime>(app: &AppHandle<R>, _force: bool) -> Result<RunStats, String> {
+/// No AI stage can run on this target, but panorama detection is pure geometry over cached
+/// thumbnails — so a panorama-only scan stays available here.
+pub fn stage_models_ready(_st: &AppState, stage: core_library::StageId) -> bool {
+    matches!(stage, core_library::StageId::Panoramas)
+}
+
+pub fn run_pass<R: Runtime>(
+    app: &AppHandle<R>,
+    _force: bool,
+    _scope: &core_library::ScanScope,
+    _stages: &[core_library::StageId],
+) -> Result<RunStats, String> {
     let _ = app.state::<AppState>();
     Err(unavailable())
+}
+
+/// Scope sizing still works without AI: the image count is a plain catalog query. Every AI stage
+/// reports "models not ready" so the modal disables those rows; panorama stays usable.
+pub fn scope_counts(
+    st: &AppState,
+    scope: &core_library::ScanScope,
+) -> Result<core_library::ScopeCounts, String> {
+    use core_library::StageId;
+    let db = st.db.lock().map_err(|e| e.to_string())?;
+    let total = core_library::scope_image_ids(&db.conn, scope)
+        .map_err(|e| e.to_string())?
+        .len() as i64;
+    let stages = StageId::ALL
+        .iter()
+        .map(|&stage| {
+            let ready = stage_models_ready(st, stage);
+            core_library::StagePending {
+                stage,
+                pending: if stage == StageId::Panoramas {
+                    core_library::pano_detect::pending_count(
+                        &db.conn,
+                        core_library::pano_detect::ALGO_VERSION,
+                    )
+                    .ok()
+                } else {
+                    None
+                },
+                models_ready: ready,
+                library_wide: stage == StageId::Panoramas,
+            }
+        })
+        .collect();
+    Ok(core_library::ScopeCounts { total, stages })
+}
+
+/// Panorama state is still recorded on this target, so the per-photo readout works.
+pub fn image_scan_state(
+    st: &AppState,
+    image_id: i64,
+) -> Result<core_library::ImageScanState, String> {
+    let db = st.db.lock().map_err(|e| e.to_string())?;
+    core_library::image_scan_state(
+        &db.conn,
+        image_id,
+        &[(
+            core_library::PANORAMA_STAGE_ID,
+            core_library::pano_detect::ALGO_VERSION,
+        )],
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub fn overview(_st: &AppState) -> crate::model_mgmt::ModelGroup {

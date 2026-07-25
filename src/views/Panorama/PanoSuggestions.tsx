@@ -2,7 +2,6 @@ import { useState } from "react";
 import { useAppStore } from "../../store/app";
 import { thumbUrl, type PanoGroupRow, type PanoMemberRow } from "../../lib/ipc";
 import { usePanoDetect, panoDetectProgressLabel } from "../../lib/usePanoDetect";
-import Icon from "../../components/Icon";
 
 const PREVIEW_CAP = 5;
 
@@ -270,7 +269,6 @@ export default function PanoSuggestions() {
 
   if (!open) return null;
 
-  const busy = panoDetect.running || panoDetect.progress !== null;
   const visibleGroups = panoDetect.groups.filter(
     (g) => g.status !== "dismissed" || showDismissed,
   );
@@ -303,33 +301,9 @@ export default function PanoSuggestions() {
             </div>
           </div>
 
-          <button
-            className="tbtn ghost"
-            onClick={() => void panoDetect.detect(false)}
-            disabled={busy}
-            style={{ fontSize: 12.5 }}
-          >
-            {busy ? "Detecting…" : "Detect"}
-          </button>
-          <button
-            onClick={() => void panoDetect.detect(true)}
-            disabled={busy}
-            title="Re-scan entire library"
-            aria-label="Re-scan entire library"
-            style={{
-              display: "flex",
-              alignItems: "center",
-              border: "1px solid var(--color-line-2)",
-              background: "var(--color-elev)",
-              color: "var(--color-t2)",
-              borderRadius: "var(--radius-sm)",
-              padding: "6px 7px",
-              cursor: busy ? "default" : "pointer",
-              opacity: busy ? 0.5 : 1,
-            }}
-          >
-            <Icon name="reset" size={13} />
-          </button>
+          {/* Detection is started from the "Run AI scan…" modal. The Detect/↺ buttons that used to
+              sit here bypassed the unified scan job entirely, so they could launch a second
+              CPU-heavy pass while one was already running. */}
 
           <label
             style={{

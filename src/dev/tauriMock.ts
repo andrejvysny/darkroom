@@ -773,6 +773,48 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   analysis_models_ensure: () => undefined,
   analysis_run: () => ({ analyzed: 0, failed: 0 }),
   analysis_cancel: () => undefined,
+  // Scoped counts: reuse the grid filter so the modal's numbers move with the nav selection.
+  // Nothing is analyzed in the mock, so every in-scope image counts as pending. `faces` reports
+  // models-not-ready so the disabled-row + Install… path is exercisable without real models.
+  scan_scope_counts: (p) => {
+    const n = filterRows((p.scope as QueryParams) ?? {}).length;
+    const stage = (id: string, ready = true, libraryWide = false) => ({
+      stage: id,
+      pending: ready ? n : null,
+      modelsReady: ready,
+      libraryWide,
+    });
+    return {
+      total: n,
+      stages: [
+        stage("objects"),
+        stage("animals"),
+        stage("faces", false),
+        stage("captions"),
+        stage("panoramas", true, true),
+      ],
+    };
+  },
+  scan_run: () => ({
+    cancelled: false,
+    analyzed: 0,
+    failed: 0,
+    panoramasFound: 0,
+  }),
+  scan_cancel: () => undefined,
+  scan_running: () => false,
+  scan_prefs_get: () => ["objects", "animals", "captions"],
+  scan_prefs_set: () => undefined,
+  image_scan_state: () => ({
+    lastScanAt: null,
+    stages: [
+      { id: "object_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
+      { id: "animal_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
+      { id: "face_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
+      { id: "caption", status: "pending", attemptedAt: null, modelVersion: null, error: null },
+      { id: "panorama", status: "pending", attemptedAt: null, modelVersion: null, error: null },
+    ],
+  }),
   features_backfill: () => 0,
   analysis_facets: () => [],
   image_detections: () => [],
@@ -792,6 +834,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     running: false,
     faces: 7,
     people: 3,
+    ungrouped: 2,
   }),
   faces_models_ensure: () => undefined,
   faces_run: () => ({

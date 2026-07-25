@@ -23,7 +23,9 @@ use crate::state::AppState;
 pub(crate) const FACE_DECODE_EDGE: u32 = 1536;
 
 /// Marker analyzer id + version stored in `analysis_results` to gate incremental face re-processing.
-pub const FACE_ANALYZER_ID: &str = "face_detection";
+/// The id itself lives in `core-library` so the catalog layer can describe the stage without
+/// depending on the ML crate.
+pub use core_library::analysis::FACE_DETECTION_ID as FACE_ANALYZER_ID;
 pub const FACE_MODEL_VERSION: &str = "scrfd10g+arcface_w600k_r50_v1";
 /// Embedding tag on `face_embedding.model_tag`; a change invalidates vectors → re-embed + re-cluster.
 pub const FACE_MODEL_TAG: &str = "scrfd10g+arcface_w600k_r50_v1";
@@ -38,6 +40,9 @@ pub struct FacesStatus {
     pub running: bool,
     pub faces: i64,
     pub people: i64,
+    /// Faces that exist but belong to no person — a deliberately-deferred singleton, or a
+    /// clustering pass that was interrupted. Surfaced so a detected face is never invisible.
+    pub ungrouped: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -156,8 +161,14 @@ pub(crate) fn to_input(r: FaceRecord) -> FaceInput {
 /// "Find People": delegates to the unified scan (faces run as a gated stage when enabled + models
 /// present). Kept as a shim so the existing `faces_run` IPC + People UI keep working unchanged; the
 /// real per-run face counts surface via `faces:done` + [`status`].
-pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<FacesRunStats, String> {
-    let stats = crate::analysis::run_pass(app, force)?;
+pub fn run_pass<R: Runtime>(
+    app: &AppHandle<R>,
+    force: bool,
+    scope: &core_library::ScanScope,
+) -> Result<FacesRunStats, String> {
+    // Faces-only: the shim exists so the legacy `faces_run` IPC keeps working; the modal drives
+    // stage selection through `scan_run` instead.
+    let stats = crate::analysis::run_pass(app, force, scope, &[core_library::StageId::Faces])?;
     Ok(FacesRunStats {
         images: stats.analyzed,
         faces: 0,
@@ -167,12 +178,14 @@ pub fn run_pass<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<FacesRunS
 
 /// People status for the UI: present-image total, how many have been face-processed, and counts.
 pub fn status(st: &AppState) -> Result<FacesStatus, String> {
-    let (total, processed, faces, people) = {
+    let (total, processed, faces, people, ungrouped) = {
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let total = core_library::present_image_count(&db.conn).map_err(|e| e.to_string())?;
         let seen = existing_analysis(&db.conn).map_err(|e| e.to_string())?;
         let targets = present_images(&db.conn).map_err(|e| e.to_string())?;
         let (faces, people) = core_library::faces_summary(&db.conn).map_err(|e| e.to_string())?;
+        let ungrouped = core_library::ungrouped_face_count(&db.conn, FACE_MODEL_TAG)
+            .map_err(|e| e.to_string())?;
         let processed = targets
             .iter()
             .filter(|t| {
@@ -183,7 +196,7 @@ pub fn status(st: &AppState) -> Result<FacesStatus, String> {
                 ))
             })
             .count() as i64;
-        (total, processed, faces, people)
+        (total, processed, faces, people, ungrouped)
     };
     Ok(FacesStatus {
         total,
@@ -194,5 +207,6 @@ pub fn status(st: &AppState) -> Result<FacesStatus, String> {
         running: st.analysis_running.load(Ordering::SeqCst),
         faces,
         people,
+        ungrouped,
     })
 }

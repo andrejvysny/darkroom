@@ -25,11 +25,13 @@ pub mod thumbs;
 pub mod trash;
 
 pub use analysis::{
-    analysis_facets, caption_for_image, detections_for_image, existing_analysis, insert_analysis,
-    labeled_images, presence_for_image, present_image_count, present_images, present_targets_after,
-    set_user_label, set_user_label_many, stale_count, stale_targets, user_labels, AnalysisInput,
-    AnalyzeTarget, CaptionRow, DetectionRow, FacetRow, LabeledImage, PresenceRow, StageSpec,
-    StaleTarget, UserLabels,
+    analysis_facets, caption_for_image, detections_for_image, existing_analysis, image_scan_state,
+    insert_analysis, labeled_images, presence_for_image, present_image_count, present_images,
+    present_targets_after, present_targets_in, record_attempts, scope_image_ids, set_user_label,
+    set_user_label_many, stale_count, stale_count_in, stale_targets, stale_targets_in, user_labels,
+    AnalysisInput, AnalyzeTarget, CaptionRow, DetectionRow, FacetRow, ImageScanState, LabeledImage,
+    PresenceRow, ScanScope, ScopeCounts, StageAttempt, StageId, StagePending, StageSpec,
+    StageState, StaleTarget, UserLabels, FACE_DETECTION_ID, PANORAMA_STAGE_ID, SCOPE_CHUNK,
 };
 pub use collections::{
     add_images_to_collection, collections_for_image, create_collection, delete_collection,
@@ -45,7 +47,10 @@ pub use face::{
     reconcile_faces, reject_face, set_person_cover, set_person_hidden, set_person_name, FaceInput,
     ImageFaceRow, PersonFaceRow, PersonRow,
 };
-pub use face_cluster::{cluster_assign, has_dirty_faces, ClusterParams, ClusterStats};
+pub use face_cluster::{
+    apply_cluster_plan, cluster_assign, cluster_snapshot, has_dirty_faces, plan_clusters,
+    ungrouped_face_count, ClusterParams, ClusterPlan, ClusterSnapshot, ClusterStats,
+};
 pub use features::{
     compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
 };
@@ -73,10 +78,11 @@ pub use reject::{
     delete_rejected, delete_rejected_with, summarize_rejected, RejectDeleteResult, RejectSummary,
 };
 pub use settings::{
-    animal_detector_size, face_stage_enabled, get_meta, library_root, mask_ai_tier, preview_edge,
-    set_animal_detector_size, set_face_stage_enabled, set_library_root, set_mask_ai_tier, set_meta,
-    set_preview_edge, set_thumb_cache_cap, thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE,
-    DEFAULT_THUMB_CACHE_CAP, PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
+    animal_detector_size, default_scan_stages, face_stage_enabled, get_meta, library_root,
+    mask_ai_tier, preview_edge, scan_stages, set_animal_detector_size, set_face_stage_enabled,
+    set_library_root, set_mask_ai_tier, set_meta, set_preview_edge, set_scan_stages,
+    set_thumb_cache_cap, thumb_cache_cap, DEFAULT_ANIMAL_DETECTOR_SIZE, DEFAULT_THUMB_CACHE_CAP,
+    PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
 };
 pub use sidecar::{
     hydrate_if_blank, rebuild_from_sidecars, write_all_sidecars, write_sidecar, Sidecar,

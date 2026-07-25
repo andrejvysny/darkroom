@@ -78,6 +78,11 @@ interface AppState {
   /** AI Models manager modal open state. */
   modelManagerOpen: boolean;
   setModelManagerOpen: (b: boolean) => void;
+  /** Human label of the container the RUNNING AI scan was launched against ("2026-06-22"), or null
+   *  for a whole-library run. Set by the nav button that starts the scan, cleared on
+   *  `analysis:done`; the progress pill reads it so the user can see what is being scanned. */
+  scanScopeLabel: string | null;
+  setScanScopeLabel: (label: string | null) => void;
   // Library action callbacks registered by LibraryView
   onImport: (() => void) | null;
   setOnImport: (fn: (() => void) | null) => void;
@@ -85,6 +90,9 @@ interface AppState {
   setOnMergeHdr: (fn: (() => void) | null) => void;
   onOpenSettings: (() => void) | null;
   setOnOpenSettings: (fn: (() => void) | null) => void;
+  /** Opens the "Run AI scan…" modal; registered by LibraryView so the command palette can reach it. */
+  onOpenScan: (() => void) | null;
+  setOnOpenScan: (fn: (() => void) | null) => void;
   onSearch: ((query: string) => void) | null;
   setOnSearch: (fn: ((query: string) => void) | null) => void;
   onDevelopReset: (() => void) | null;
@@ -144,12 +152,16 @@ export const useAppStore = create<AppState>((set) => ({
     set((s) => ({ panoDetect: { ...s.panoDetect, ...patch } })),
   modelManagerOpen: false,
   setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
+  scanScopeLabel: null,
+  setScanScopeLabel: (label) => set({ scanScopeLabel: label }),
   onImport: null,
   setOnImport: (fn) => set({ onImport: fn }),
   onMergeHdr: null,
   setOnMergeHdr: (fn) => set({ onMergeHdr: fn }),
   onOpenSettings: null,
   setOnOpenSettings: (fn) => set({ onOpenSettings: fn }),
+  onOpenScan: null,
+  setOnOpenScan: (fn) => set({ onOpenScan: fn }),
   onSearch: null,
   setOnSearch: (fn) => set({ onSearch: fn }),
   onDevelopReset: null,

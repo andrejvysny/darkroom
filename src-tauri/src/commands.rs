@@ -2254,14 +2254,111 @@ pub async fn analysis_models_ensure(app: AppHandle) -> Result<(), String> {
 }
 
 /// Run the background analysis pass. `force` re-analyzes everything. Emits `analysis:progress`/`:done`.
+///
+/// `scope` narrows the pass to the container the grid is showing. The frontend may post its whole
+/// filter — `ScanScope` deserializes only the container dimensions, so rating/flag/search and the
+/// scan-derived `detectedCategory`/`personId` are dropped by the type. Omitted ⇒ whole library.
+///
+/// Legacy entry point: it runs every AI stage. The Run-AI-scan modal calls `scan_run` instead, which
+/// owns stage selection and sequences panorama detection in the same job.
 #[tauri::command]
 pub async fn analysis_run(
     app: AppHandle,
     force: bool,
+    scope: Option<core_library::ScanScope>,
 ) -> Result<crate::analysis::RunStats, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::analysis::run_pass(&app, force))
+    let scope = scope.unwrap_or_default();
+    let stages = crate::scan::AI_STAGES.to_vec();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::analysis::run_pass(&app, force, &scope, &stages)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Run the unified AI scan: the selected stages, in one job, with one cancel.
+///
+/// This is what the "Run AI scan…" modal calls. Unlike `analysis_run` it also sequences panorama
+/// detection, and its cancel works during the model download — the window in which `analysis_cancel`
+/// is still a no-op.
+#[tauri::command]
+pub async fn scan_run(
+    app: AppHandle,
+    selection: crate::scan::ScanSelection,
+) -> Result<crate::scan::ScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::scan::run(&app, &selection))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Request the running unified scan to stop, whatever phase it is in. Everything already committed
+/// is kept. No-op if idle.
+#[tauri::command]
+pub fn scan_cancel(app: AppHandle) {
+    crate::scan::cancel(&app.state::<AppState>());
+}
+
+/// Whether a unified scan is in flight. Lets the UI re-attach after a reload rather than showing an
+/// idle button while a scan is still running.
+#[tauri::command]
+pub fn scan_running(app: AppHandle) -> bool {
+    crate::scan::is_running(&app.state::<AppState>())
+}
+
+/// The scan modal's remembered stage ticks. Typed + validated in Rust rather than letting the
+/// frontend write `app_meta` directly — the IPC boundary is the contract, and an unrecognised stage
+/// id must never reach a run.
+#[tauri::command]
+pub async fn scan_prefs_get(app: AppHandle) -> Result<Vec<core_library::StageId>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::scan_stages(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn scan_prefs_set(
+    app: AppHandle,
+    stages: Vec<core_library::StageId>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::set_scan_stages(&db.conn, &stages).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The per-photo scan record for the info panel: which stages ran, when, and which failed.
+#[tauri::command]
+pub async fn image_scan_state(
+    app: AppHandle,
+    image_id: i64,
+) -> Result<core_library::ImageScanState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::analysis::image_scan_state(&app.state::<AppState>(), image_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// How much work the AI scans have inside `scope` — sizes the "Analyze · N" / "Find People · N"
+/// buttons. Read-only and model-free, so it is safe to call on every filter change.
+#[tauri::command]
+pub async fn scan_scope_counts(
+    app: AppHandle,
+    scope: Option<core_library::ScanScope>,
+) -> Result<core_library::ScopeCounts, String> {
+    let scope = scope.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::analysis::scope_counts(&app.state::<AppState>(), &scope)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Request the running analysis pass to stop after the current batch commits. Results already
@@ -2653,9 +2750,18 @@ pub async fn faces_models_ensure(app: AppHandle) -> Result<(), String> {
 
 /// Run the "Find People" pass (detect → align → embed → cluster). `force` re-processes everything.
 /// Emits `faces:progress`/`faces:done`.
+///
+/// `scope` narrows *detection + embedding* to the container the grid is showing (see
+/// [`analysis_run`]). Clustering stays library-wide by design: a face found in one folder must still
+/// be matchable against people discovered anywhere else.
 #[tauri::command]
-pub async fn faces_run(app: AppHandle, force: bool) -> Result<crate::faces::FacesRunStats, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::faces::run_pass(&app, force))
+pub async fn faces_run(
+    app: AppHandle,
+    force: bool,
+    scope: Option<core_library::ScanScope>,
+) -> Result<crate::faces::FacesRunStats, String> {
+    let scope = scope.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || crate::faces::run_pass(&app, force, &scope))
         .await
         .map_err(|e| e.to_string())?
 }

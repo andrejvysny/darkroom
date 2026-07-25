@@ -19,6 +19,7 @@ export default function CommandPalette() {
   const view = useAppStore((s) => s.view);
   const selectedId = useAppStore((s) => s.selectedId);
   const onImport = useAppStore((s) => s.onImport);
+  const onOpenScan = useAppStore((s) => s.onOpenScan);
   const onMergeHdr = useAppStore((s) => s.onMergeHdr);
   const onOpenSettings = useAppStore((s) => s.onOpenSettings);
   const setModelManagerOpen = useAppStore((s) => s.setModelManagerOpen);
@@ -82,8 +83,15 @@ export default function CommandPalette() {
       run: () => setModelManagerOpen(true),
     },
     {
+      icon: "scan",
+      label: "Run AI scan…",
+      shortcut: "",
+      run: () => onOpenScan?.(),
+    },
+    {
       icon: "stack",
-      label: "Detect panoramas",
+      // Renamed: detection is started from the scan modal; this only opens the review overlay.
+      label: "Panorama suggestions…",
       shortcut: "",
       run: () => setPanoSuggestOpen(true),
     },

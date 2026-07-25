@@ -15,7 +15,7 @@ import {
   type FacetRow,
 } from "../../lib/ipc";
 import type { AnalysisState, AnalysisActions } from "../../lib/useAnalysis";
-import { usePanoDetect } from "../../lib/usePanoDetect";
+import { useScan } from "../../lib/useScan";
 
 interface LeftNavProps {
   dateTree: DateTreeYear[];
@@ -38,6 +38,8 @@ interface LeftNavProps {
   panoSuggested: number;
   /** Opens the PanoSuggestions review overlay. */
   onOpenPanoSuggestions: () => void;
+  /** Opens the "Run AI scan…" modal — the single entry point for every detection pass. */
+  onOpenScan: () => void;
 }
 
 function SectionHeading({
@@ -84,15 +86,15 @@ export default function LeftNav({
   analysis,
   panoSuggested,
   onOpenPanoSuggestions,
+  onOpenScan,
 }: LeftNavProps) {
   const noFilters = !hasActiveFilters(params);
   const picksActive = params.flag === "pick";
   const rejectsActive = params.flag === "reject";
   const recentActive = params.sort === "imported_desc";
-  // Safe to call here too (module-singleton listeners — see usePanoDetect.ts): LibraryView already
-  // calls this hook for `panoSuggested`/`onOpenPanoSuggestions`; this instance reads the same shared
-  // store slice, just to drive the Detect/Re-detect header button below.
-  const panoDetect = usePanoDetect();
+  // Module-singleton listeners (see useScan.ts), so calling it here as well as in LibraryView is
+  // safe — both read the same shared state.
+  const scan = useScan();
 
   const staticCollections = collections.filter((c) => !c.isSmart);
   const smartCollections = collections.filter((c) => c.isSmart);
@@ -253,6 +255,36 @@ export default function LeftNav({
         </div>
       )}
 
+      {/* The single scan control, sitting directly above the sections it fills: People, Panoramas
+          and Detected. */}
+      <button
+        data-testid="run-scan"
+        onClick={onOpenScan}
+        disabled={scan.running}
+        title={
+          scan.running ? "A scan is running" : "Choose what to detect, then run"
+        }
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 6,
+          width: "100%",
+          padding: "6px 8px",
+          marginTop: 14,
+          fontSize: 12,
+          fontWeight: 500,
+          borderRadius: "var(--radius-sm)",
+          border: "1px solid var(--color-line-2)",
+          background: "var(--color-elev)",
+          color: scan.running ? "var(--color-t3)" : "var(--color-t1)",
+          cursor: scan.running ? "default" : "pointer",
+        }}
+      >
+        <Icon name="scan" size={12} />
+        {scan.running ? "Scanning…" : "Run AI scan…"}
+      </button>
+
       {/* People section */}
       <PeopleNav
         params={params}
@@ -260,44 +292,12 @@ export default function LeftNav({
         clearFilters={clearFilters}
       />
 
-      {/* Panoramas section — detected groups awaiting review (see PanoSuggestions.tsx). */}
+      {/* Panoramas section — detected groups awaiting review (see PanoSuggestions.tsx).
+          Detection is started from the "Run AI scan…" modal; the "Review" button that used to sit
+          here was removed as a duplicate of the Suggestions row below, which opens the same
+          overlay. */}
       <div>
-        <SectionHeading
-          action={
-            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <RunButton
-                running={panoDetect.running}
-                onRun={() => void panoDetect.detect(false)}
-                onRerun={() => void panoDetect.detect(true)}
-                label="Detect"
-                runTitle="Detect panorama sequences"
-                rerunTitle="Re-scan entire library"
-              />
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onOpenPanoSuggestions();
-                }}
-                title="Review panorama suggestions"
-                aria-label="Review panorama suggestions"
-                style={{
-                  fontSize: 10,
-                  padding: "1px 6px",
-                  borderRadius: "var(--radius-sm)",
-                  border: "1px solid var(--color-line)",
-                  background: "transparent",
-                  color: "var(--color-t2)",
-                  cursor: "pointer",
-                  lineHeight: 1.5,
-                }}
-              >
-                Review
-              </button>
-            </span>
-          }
-        >
-          Panoramas
-        </SectionHeading>
+        <SectionHeading>Panoramas</SectionHeading>
         <NavRow
           icon="stack"
           label="Suggestions"
@@ -306,24 +306,9 @@ export default function LeftNav({
         />
       </div>
 
-      {/* Detected section */}
+      {/* Detected section — counts only; scanning is started from the "Run AI scan…" modal. */}
       <div>
-        <SectionHeading
-          action={
-            <RunButton
-              running={
-                analysis.status?.running === true || analysis.progress !== null
-              }
-              onRun={() => void analysis.triggerAnalysis(false)}
-              onRerun={() => void analysis.triggerAnalysis(true)}
-              label="Analyze"
-              runTitle="Analyze new images"
-              rerunTitle="Re-analyze all images"
-            />
-          }
-        >
-          Detected
-        </SectionHeading>
+        <SectionHeading>Detected</SectionHeading>
         {DETECTION_CATEGORIES.map((cat) => {
           const row: FacetRow | undefined = analysis.facets.find(
             (f) => f.category === cat,
@@ -369,9 +354,7 @@ export default function LeftNav({
           label="Show paired JPEGs"
           count=""
           active={params.includePaired === true}
-          onClick={() =>
-            patchParams({ includePaired: !params.includePaired })
-          }
+          onClick={() => patchParams({ includePaired: !params.includePaired })}
         />
       </div>
     </aside>
@@ -813,77 +796,4 @@ function iconBtn(): React.CSSProperties {
     cursor: "pointer",
     padding: "0 2px",
   };
-}
-
-/** Small header-action button pair (primary run + rescan-icon toggle). Shared by the Detected
- *  section (AI analysis) and the Panoramas section (detection scan) headers — same behavior
- *  (label flips to "Running…" + disables/dims while running) and style, just different labels. */
-function RunButton({
-  running,
-  onRun,
-  onRerun,
-  label,
-  runTitle,
-  rerunTitle,
-}: {
-  running: boolean;
-  onRun: () => void;
-  onRerun: () => void;
-  label: string;
-  runTitle: string;
-  rerunTitle: string;
-}) {
-  const [hover, setHover] = useState(false);
-
-  return (
-    <span style={{ display: "flex", gap: 3 }}>
-      <button
-        disabled={running}
-        onClick={(e) => {
-          e.stopPropagation();
-          onRun();
-        }}
-        onMouseEnter={() => setHover(false)}
-        title={runTitle}
-        aria-label={runTitle}
-        style={{
-          fontSize: 10,
-          padding: "1px 6px",
-          borderRadius: "var(--radius-sm)",
-          border: "1px solid var(--color-line)",
-          background: "transparent",
-          color: running ? "var(--color-t3)" : "var(--color-t2)",
-          cursor: running ? "default" : "pointer",
-          lineHeight: 1.5,
-          opacity: running ? 0.5 : 1,
-        }}
-      >
-        {running ? "Running…" : label}
-      </button>
-      {!running && (
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onRerun();
-          }}
-          onMouseEnter={() => setHover(true)}
-          onMouseLeave={() => setHover(false)}
-          title={rerunTitle}
-          aria-label={rerunTitle}
-          style={{
-            fontSize: 10,
-            padding: "1px 5px",
-            borderRadius: "var(--radius-sm)",
-            border: "1px solid var(--color-line)",
-            background: hover ? "var(--color-hover)" : "transparent",
-            color: "var(--color-t3)",
-            cursor: "pointer",
-            lineHeight: 1.5,
-          }}
-        >
-          ↺
-        </button>
-      )}
-    </span>
-  );
 }

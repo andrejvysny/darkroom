@@ -43,7 +43,12 @@ pub fn ensure_face_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> 
     Err(unavailable())
 }
 
-pub fn run_pass<R: Runtime>(app: &AppHandle<R>, _force: bool) -> Result<FacesRunStats, String> {
+pub fn run_pass<R: Runtime>(
+    app: &AppHandle<R>,
+    _force: bool,
+    _scope: &core_library::ScanScope,
+) -> Result<FacesRunStats, String> {
+    // Signature intentionally matches the real shim; stages are fixed to Faces there.
     let _ = app.state::<AppState>();
     Err(unavailable())
 }

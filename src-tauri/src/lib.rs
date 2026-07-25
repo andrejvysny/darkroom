@@ -7,6 +7,7 @@ mod pano_detect;
 mod panorama;
 mod prefetch;
 mod protocol;
+mod scan;
 mod state;
 mod thumb_queue;
 mod watch;
@@ -202,6 +203,13 @@ pub fn run() {
             commands::analysis_models_ensure,
             commands::analysis_run,
             commands::analysis_cancel,
+            commands::scan_scope_counts,
+            commands::scan_run,
+            commands::scan_cancel,
+            commands::scan_running,
+            commands::scan_prefs_get,
+            commands::scan_prefs_set,
+            commands::image_scan_state,
             commands::denoise_status,
             commands::denoise_apply,
             commands::denoise_clear,

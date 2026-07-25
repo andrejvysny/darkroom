@@ -111,11 +111,23 @@ pub struct AppState {
     /// AI analyzer registry, lazily built on first analysis run (loading ~300 MB of ONNX is deferred
     /// until the user actually analyzes). `None` until then.
     #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-    pub analyzers: Mutex<Option<Arc<AnalyzerRegistry>>>,
+    /// Cached Phase-A registry plus the stage bitmask it was built for — a run selecting a different
+    /// set of detectors must rebuild rather than silently reuse the wrong analyzers.
+    pub analyzers: Mutex<Option<(u8, Arc<AnalyzerRegistry>)>>,
+    /// Guards the unified scan job (model download → analysis → panorama) as ONE operation.
+    /// Separate from `analysis_running` because the job starts before any pass does — that gap is
+    /// exactly where a Stop during a model download used to be silently ignored.
+    pub scan_running: AtomicBool,
+    /// Cancels the unified scan job in whatever phase it is currently in.
+    pub scan_cancel: AtomicBool,
     /// Guards against two analysis passes running at once.
     pub analysis_running: AtomicBool,
     /// Set by `analysis_cancel` to request the running pass stop between batches.
     pub analysis_cancel: AtomicBool,
+    /// Aborts the face-clustering ("Finalising faces…") phase. Deliberately SEPARATE from
+    /// `analysis_cancel`: clustering also runs *after* a cancelled scan, to place the faces that
+    /// scan just found, and reusing the already-set analysis flag would abort it instantly.
+    pub cluster_cancel: AtomicBool,
     /// Set by `models_cancel("analysis")` to abort an in-flight Detection & Scene model download
     /// (checked between read chunks). Reset at the start of each ensure.
     pub analysis_dl_cancel: AtomicBool,
@@ -240,6 +252,9 @@ impl AppState {
             analyzers: Mutex::new(None),
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),
+            cluster_cancel: AtomicBool::new(false),
+            scan_running: AtomicBool::new(false),
+            scan_cancel: AtomicBool::new(false),
             analysis_dl_cancel: AtomicBool::new(false),
             faces_dl_cancel: AtomicBool::new(false),
             mask_ai_dl_cancel: AtomicBool::new(false),

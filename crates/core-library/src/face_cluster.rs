@@ -56,90 +56,152 @@ fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
     1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
 }
 
-/// True if any face at `model_tag` still needs clustering (unassigned + non-sticky). Lets the caller
-/// skip the whole pass when nothing changed — clustering is otherwise re-run on every scan.
-pub fn has_dirty_faces(conn: &Connection, model_tag: &str) -> Result<bool, LibError> {
-    let n: i64 = conn.query_row(
+/// Faces at `model_tag` that are detected and durable but belong to no person yet.
+///
+/// Non-zero for two legitimate reasons: a face too isolated to clear `new_min` (deliberately
+/// deferred), or a clustering pass that was interrupted. Either way the face exists and must not be
+/// invisible — the People sidebar reports this as "N ungrouped faces".
+pub fn ungrouped_face_count(conn: &Connection, model_tag: &str) -> Result<i64, LibError> {
+    Ok(conn.query_row(
         "SELECT COUNT(*) FROM face f JOIN face_embedding e ON e.face_id = f.id
           WHERE e.model_tag = ?1 AND f.person_id IS NULL
             AND f.status NOT IN ('rejected','ignored')",
         params![model_tag],
         |r| r.get(0),
-    )?;
-    Ok(n > 0)
+    )?)
 }
 
-/// Run one incremental clustering pass over every embedded face at `model_tag`. Assigned/confirmed
-/// faces are left in place; only unassigned (`person_id IS NULL`) non-rejected faces are placed.
-/// `cancel` is polled periodically — on cancellation the work done so far is committed and the pass
-/// returns early (remaining dirty faces resume on the next run).
-pub fn cluster_assign(
-    conn: &mut Connection,
-    model_tag: &str,
-    now: i64,
+/// True if any face at `model_tag` still needs clustering (unassigned + non-sticky). Lets the caller
+/// skip the whole pass when nothing changed — clustering is otherwise re-run on every scan.
+pub fn has_dirty_faces(conn: &Connection, model_tag: &str) -> Result<bool, LibError> {
+    Ok(ungrouped_face_count(conn, model_tag)? > 0)
+}
+
+/// Everything the clustering pass needs, read once so the expensive scan can run with no DB lock
+/// held. Faces are quality-sorted (best seed clusters first) exactly as the query returns them.
+pub struct ClusterSnapshot {
+    pub faces: Vec<crate::face::ClusterFace>,
+    pub rejected: HashSet<(i64, i64)>,
+}
+
+/// Which person an assignment targets. `New(k)` refers to the k-th person the plan asks to create —
+/// it cannot be a real id yet, because the pure pass has no DB to create one in. A face may join a
+/// cluster seeded earlier in the same pass, so this indirection is load-bearing, not cosmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonRef {
+    Existing(i64),
+    New(usize),
+}
+
+/// The outcome of a pure clustering pass: create `new_people` persons, apply `assignments`, mark
+/// `deferred`. Holding this as data (rather than writing as we go) is what lets the expensive
+/// neighbour scan run outside the DB lock.
+#[derive(Debug, Default)]
+pub struct ClusterPlan {
+    pub new_people: usize,
+    pub assignments: Vec<(i64, PersonRef)>,
+    pub deferred: Vec<i64>,
+}
+
+impl ClusterPlan {
+    pub fn stats(&self) -> ClusterStats {
+        ClusterStats {
+            assigned: self.assignments.len(),
+            new_people: self.new_people,
+            deferred: self.deferred.len(),
+        }
+    }
+}
+
+/// Step 1 of 3 — read the clustering input. **Hold the DB lock only for this.**
+pub fn cluster_snapshot(conn: &Connection, model_tag: &str) -> Result<ClusterSnapshot, LibError> {
+    Ok(ClusterSnapshot {
+        // Quality-sorted so the best faces seed clusters first.
+        faces: faces_for_clustering(conn, model_tag)?,
+        rejected: rejection_pairs(conn)?.into_iter().collect(),
+    })
+}
+
+/// Step 2 of 3 — the actual clustering. **Pure: no DB access, so run it with NO lock held.**
+///
+/// This is `O(dirty × n)` float work; running it under the single shared connection is what used to
+/// make a long clustering phase block every other DB-backed UI action. `cancel` is polled every
+/// [`CANCEL_CHECK_EVERY`] candidates and `on_progress(done, total)` fires at the same cadence, so a
+/// long pass is both visible and interruptible. Cancelling returns the plan built so far —
+/// assignments are independent and idempotent, and unprocessed faces simply stay unassigned.
+///
+/// Vectors are compared IN PLACE (no n×dim matrix copy) — the neighbour scan stays EXACT pairwise,
+/// so the validated 0.45 threshold needs no recalibration, and an incremental pass over a 100k-image
+/// library doesn't allocate hundreds of MB. For >~200k faces, swap this exact scan for an ANN index
+/// (e.g. instant-distance HNSW).
+///
+/// A face whose embedding length differs from the model's dim (corrupt / mixed model) is EXCLUDED
+/// rather than zero-padded: padding would shrink cosine distance and cause false merges.
+pub fn plan_clusters(
+    snap: &ClusterSnapshot,
     p: ClusterParams,
     cancel: &AtomicBool,
-) -> Result<ClusterStats, LibError> {
-    // Quality-sorted so the best faces seed clusters first.
-    let mut faces = faces_for_clustering(conn, model_tag)?;
-    let rejected: HashSet<(i64, i64)> = rejection_pairs(conn)?.into_iter().collect();
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> ClusterPlan {
+    let faces = &snap.faces;
     let n = faces.len();
-    let mut stats = ClusterStats::default();
+    let mut plan = ClusterPlan::default();
 
-    // Vectors are read IN PLACE (no n×dim matrix copy) — the neighbor scan stays EXACT pairwise, so
-    // the validated 0.45 threshold needs no recalibration, and an incremental pass over a 100k-image
-    // library doesn't allocate hundreds of MB. The outer loop only visits dirty (unassigned,
-    // non-sticky) faces → O(dirty × n); a one-time bulk cluster is O(n²), dwarfed by detection at
-    // scale — for >~200k faces, swap this exact scan for an ANN index (e.g. instant-distance HNSW).
-    //
-    // A face whose embedding length differs from the model's dim (corrupt / mixed model) is EXCLUDED
-    // rather than zero-padded: padding would shrink cosine distance and cause false merges.
     let dim = faces.first().map(|f| f.vector.len()).unwrap_or(0);
     let valid: Vec<bool> = faces
         .iter()
         .map(|f| dim > 0 && f.vector.len() == dim)
         .collect();
 
-    let tx = conn.transaction()?;
+    // Working copy of each face's owner, updated as the pass places faces — a face seeded into a new
+    // cluster must look "assigned" to later candidates, exactly as before.
+    let mut owner: Vec<Option<PersonRef>> = faces
+        .iter()
+        .map(|f| f.person_id.map(PersonRef::Existing))
+        .collect();
+    let skip =
+        |i: usize| !valid[i] || faces[i].status == "rejected" || faces[i].status == "ignored";
+
+    let dirty_total = (0..n).filter(|&i| !skip(i) && owner[i].is_none()).count();
+    let mut visited = 0usize;
     let mut since_poll = 0usize;
     for i in 0..n {
-        if !valid[i]
-            || faces[i].person_id.is_some()
-            || faces[i].status == "rejected"
-            || faces[i].status == "ignored"
-        {
+        if skip(i) || owner[i].is_some() {
             continue;
         }
-        // Cooperative cancel: commit the (independent, idempotent) assignments done so far.
+        visited += 1;
         since_poll += 1;
         if since_poll >= CANCEL_CHECK_EVERY {
             since_poll = 0;
+            on_progress(visited, dirty_total);
             if cancel.load(Ordering::SeqCst) {
                 break;
             }
         }
-        // Tally neighbors within threshold (exact cosine distance = 1 − dot).
+        // Tally neighbours within threshold (exact cosine distance = 1 − dot).
         let mut person_count: HashMap<i64, usize> = HashMap::new();
         let mut person_best: HashMap<i64, f32> = HashMap::new();
         let mut unassigned_neighbors: Vec<usize> = Vec::new();
         for j in 0..n {
-            if j == i || !valid[j] || faces[j].status == "rejected" || faces[j].status == "ignored"
-            {
+            if j == i || skip(j) {
                 continue;
             }
             let d = cosine_dist(&faces[i].vector, &faces[j].vector);
             if d > p.max_distance {
                 continue;
             }
-            match faces[j].person_id {
-                Some(pid) => {
-                    if rejected.contains(&(faces[i].id, pid)) {
+            match owner[j] {
+                // Only an already-existing person can carry a rejection pair; a person created by
+                // this very pass cannot have been rejected against yet.
+                Some(PersonRef::Existing(pid)) => {
+                    if snap.rejected.contains(&(faces[i].id, pid)) {
                         continue;
                     }
                     *person_count.entry(pid).or_default() += 1;
                     let e = person_best.entry(pid).or_insert(f32::MAX);
                     *e = e.min(d);
                 }
+                Some(PersonRef::New(_)) => {}
                 None => unassigned_neighbors.push(j),
             }
         }
@@ -154,41 +216,78 @@ pub fn cluster_assign(
             })
             .map(|(&pid, _)| pid);
         if let Some(pid) = best_person {
-            assign(&tx, faces[i].id, pid)?;
-            faces[i].person_id = Some(pid);
-            stats.assigned += 1;
+            let r = PersonRef::Existing(pid);
+            plan.assignments.push((faces[i].id, r));
+            owner[i] = Some(r);
             continue;
         }
-        // Otherwise seed a new cluster from still-unassigned mutual neighbors.
+        // Otherwise seed a new cluster from still-unassigned mutual neighbours.
         let fresh: Vec<usize> = unassigned_neighbors
             .into_iter()
-            .filter(|&j| faces[j].person_id.is_none())
+            .filter(|&j| owner[j].is_none())
             .collect();
         if fresh.len() + 1 >= p.new_min {
-            let pid = create_person(&tx, now)?;
-            stats.new_people += 1;
-            assign(&tx, faces[i].id, pid)?;
-            faces[i].person_id = Some(pid);
-            stats.assigned += 1;
+            let r = PersonRef::New(plan.new_people);
+            plan.new_people += 1;
+            plan.assignments.push((faces[i].id, r));
+            owner[i] = Some(r);
             for &j in &fresh {
-                if faces[j].person_id.is_none() {
-                    assign(&tx, faces[j].id, pid)?;
-                    faces[j].person_id = Some(pid);
-                    stats.assigned += 1;
+                if owner[j].is_none() {
+                    plan.assignments.push((faces[j].id, r));
+                    owner[j] = Some(r);
                 }
             }
         } else {
-            tx.execute(
-                "UPDATE face SET deferred = 1 WHERE id = ?1",
-                params![faces[i].id],
-            )?;
-            stats.deferred += 1;
+            plan.deferred.push(faces[i].id);
         }
     }
+    on_progress(visited, dirty_total);
+    plan
+}
+
+/// Step 3 of 3 — write the plan. **Hold the DB lock only for this**: it is a flat sequence of
+/// keyed UPDATEs, not the quadratic scan.
+pub fn apply_cluster_plan(
+    conn: &mut Connection,
+    now: i64,
+    plan: &ClusterPlan,
+) -> Result<ClusterStats, LibError> {
+    let tx = conn.transaction()?;
+    let mut created: Vec<i64> = Vec::with_capacity(plan.new_people);
+    for _ in 0..plan.new_people {
+        created.push(create_person(&tx, now)?);
+    }
+    for (face_id, who) in &plan.assignments {
+        let pid = match who {
+            PersonRef::Existing(id) => *id,
+            PersonRef::New(k) => created[*k],
+        };
+        assign(&tx, *face_id, pid)?;
+    }
+    for face_id in &plan.deferred {
+        tx.execute(
+            "UPDATE face SET deferred = 1 WHERE id = ?1",
+            params![face_id],
+        )?;
+    }
     prune_empty_unnamed(&tx)?;
-    let _ = now; // reserved for future per-assignment timestamps
     tx.commit()?;
-    Ok(stats)
+    Ok(plan.stats())
+}
+
+/// All three steps against one connection. **Holds the lock for the whole pass**, so callers that
+/// share the connection with the UI (i.e. the app) must use the three steps separately; this
+/// convenience wrapper is for tests and offline tools.
+pub fn cluster_assign(
+    conn: &mut Connection,
+    model_tag: &str,
+    now: i64,
+    p: ClusterParams,
+    cancel: &AtomicBool,
+) -> Result<ClusterStats, LibError> {
+    let snap = cluster_snapshot(conn, model_tag)?;
+    let plan = plan_clusters(&snap, p, cancel, &mut |_, _| {});
+    apply_cluster_plan(conn, now, &plan)
 }
 
 fn assign(conn: &Connection, face_id: i64, person_id: i64) -> Result<(), LibError> {
@@ -332,5 +431,205 @@ mod tests {
             1,
             "valid faces still cluster"
         );
+    }
+
+    /// Seeds `n` images each carrying one face at `embeddings[i]`.
+    fn seed(db: &mut Db, embeddings: &[Vec<f32>]) {
+        for id in 1..=embeddings.len() as i64 {
+            db.conn
+                .execute(
+                    "INSERT INTO images(id, content_hash, file_size, path, original_filename, status, imported_at)
+                     VALUES (?1, X'00', 1, ?2, 'f', 'present', 0)",
+                    params![id, format!("/img{id}")],
+                )
+                .unwrap();
+        }
+        let tx = db.conn.transaction().unwrap();
+        for (i, e) in embeddings.iter().enumerate() {
+            reconcile_faces(&tx, i as i64 + 1, "mv", TAG, 0, &[face_with(e.clone())]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// The plan is pure: producing it must not touch the DB, so a caller can hold no lock while the
+    /// quadratic scan runs. Nothing is written until `apply_cluster_plan`.
+    #[test]
+    fn planning_writes_nothing_until_applied() {
+        let mut db = Db::open_in_memory().unwrap();
+        seed(
+            &mut db,
+            &[
+                vec![1.0, 0.02, 0.0],
+                vec![1.0, 0.0, 0.03],
+                vec![0.99, 0.01, 0.0],
+            ],
+        );
+        let snap = cluster_snapshot(&db.conn, TAG).unwrap();
+        let plan = plan_clusters(
+            &snap,
+            ClusterParams::default(),
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+        );
+        assert_eq!(plan.new_people, 1);
+        assert_eq!(plan.assignments.len(), 3);
+        assert_eq!(
+            list_people(&db.conn, false).unwrap().len(),
+            0,
+            "planning must not create people — it has no DB access at all"
+        );
+
+        apply_cluster_plan(&mut db.conn, 0, &plan).unwrap();
+        assert_eq!(list_people(&db.conn, false).unwrap().len(), 1);
+        assert_eq!(ungrouped_face_count(&db.conn, TAG).unwrap(), 0);
+    }
+
+    /// A face may join a cluster seeded EARLIER in the same pass, before that person exists in the
+    /// DB. The `PersonRef::New` indirection is what keeps that correct.
+    #[test]
+    fn a_face_can_join_a_cluster_seeded_in_the_same_pass() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Four near-identical faces: the first three seed a cluster, the fourth must join it.
+        seed(
+            &mut db,
+            &[
+                vec![1.0, 0.02, 0.0],
+                vec![1.0, 0.0, 0.03],
+                vec![0.99, 0.01, 0.0],
+                vec![1.0, 0.015, 0.01],
+            ],
+        );
+        let snap = cluster_snapshot(&db.conn, TAG).unwrap();
+        let plan = plan_clusters(
+            &snap,
+            ClusterParams::default(),
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+        );
+        assert_eq!(plan.new_people, 1, "exactly one person for all four faces");
+        assert!(
+            plan.assignments
+                .iter()
+                .all(|(_, who)| *who == PersonRef::New(0)),
+            "every face lands in the same new cluster"
+        );
+        apply_cluster_plan(&mut db.conn, 0, &plan).unwrap();
+        let people = list_people(&db.conn, false).unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].face_count, 4);
+    }
+
+    /// Interrupting the pass yields a valid PARTIAL plan and loses nothing.
+    ///
+    /// Cancellation is polled every [`CANCEL_CHECK_EVERY`] candidates, so this needs enough
+    /// mutually-distant faces to cross that boundary — a handful of faces would finish before the
+    /// first poll and the cancel would (correctly) never be observed.
+    #[test]
+    fn cancelling_the_pass_yields_a_partial_plan_and_loses_no_faces() {
+        let n = CANCEL_CHECK_EVERY + 20;
+        // One-hot vectors: every pair is at cosine distance 1.0, far beyond max_distance, so no face
+        // ever clusters and each one is visited as its own candidate.
+        let embeddings: Vec<Vec<f32>> = (0..n)
+            .map(|k| {
+                let mut v = vec![0.0; n];
+                v[k] = 1.0;
+                v
+            })
+            .collect();
+        let mut db = Db::open_in_memory().unwrap();
+        seed(&mut db, &embeddings);
+        let snap = cluster_snapshot(&db.conn, TAG).unwrap();
+
+        let full = plan_clusters(
+            &snap,
+            ClusterParams::default(),
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+        );
+        let partial = plan_clusters(
+            &snap,
+            ClusterParams::default(),
+            &AtomicBool::new(true),
+            &mut |_, _| {},
+        );
+        assert_eq!(
+            full.deferred.len(),
+            n,
+            "an uninterrupted pass visits every face"
+        );
+        assert!(
+            partial.deferred.len() < full.deferred.len(),
+            "cancelling must stop the pass early ({} vs {})",
+            partial.deferred.len(),
+            full.deferred.len()
+        );
+
+        apply_cluster_plan(&mut db.conn, 0, &partial).unwrap();
+        assert_eq!(
+            faces_for_clustering(&db.conn, TAG).unwrap().len(),
+            n,
+            "every face row and embedding survives an interrupted pass"
+        );
+        assert_eq!(
+            ungrouped_face_count(&db.conn, TAG).unwrap(),
+            n as i64,
+            "and all are reported as ungrouped rather than silently vanishing"
+        );
+    }
+
+    /// A deliberately-deferred singleton is ungrouped too — the count covers both reasons.
+    #[test]
+    fn deferred_singleton_counts_as_ungrouped() {
+        let mut db = Db::open_in_memory().unwrap();
+        seed(
+            &mut db,
+            &[
+                vec![1.0, 0.02, 0.0],
+                vec![1.0, 0.0, 0.03],
+                vec![0.99, 0.01, 0.0],
+                vec![0.0, 0.0, 1.0], // isolated
+            ],
+        );
+        cluster_assign(
+            &mut db.conn,
+            TAG,
+            0,
+            ClusterParams::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(ungrouped_face_count(&db.conn, TAG).unwrap(), 1);
+    }
+
+    /// Progress must be reported against the DIRTY count, not the whole table, or the pill would
+    /// stall at a fraction of a library that is mostly already clustered.
+    #[test]
+    fn progress_reports_against_the_dirty_total() {
+        let mut db = Db::open_in_memory().unwrap();
+        let mut embeddings: Vec<Vec<f32>> = (0..CANCEL_CHECK_EVERY + 20)
+            .map(|k| vec![1.0, k as f32 * 0.0001, 0.0])
+            .collect();
+        embeddings.push(vec![0.0, 1.0, 0.0]);
+        seed(&mut db, &embeddings);
+        let snap = cluster_snapshot(&db.conn, TAG).unwrap();
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let plan = plan_clusters(
+            &snap,
+            ClusterParams::default(),
+            &AtomicBool::new(false),
+            &mut |done, total| seen.push((done, total)),
+        );
+        assert!(!seen.is_empty(), "a long pass must report progress");
+        let total = seen[0].1;
+        assert_eq!(
+            total,
+            embeddings.len(),
+            "total is the number of faces needing placement"
+        );
+        assert!(
+            seen.iter().all(|(done, _)| *done <= total),
+            "progress never exceeds its total"
+        );
+        apply_cluster_plan(&mut db.conn, 0, &plan).unwrap();
     }
 }

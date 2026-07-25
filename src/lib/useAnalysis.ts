@@ -8,8 +8,10 @@ import {
   analysisFacets,
   type AnalysisStatus,
   type FacetRow,
+  type ScanScope,
 } from "./ipc";
 import { log } from "./logger";
+import { useAppStore } from "../store/app";
 
 export type AnalysisProgress =
   | { kind: "models"; done: number; total: number }
@@ -25,7 +27,13 @@ export interface AnalysisState {
 }
 
 export interface AnalysisActions {
-  triggerAnalysis: (force?: boolean) => Promise<void>;
+  /** `scope` narrows the pass to one container; omit/null runs the whole library. `scopeLabel` is
+   *  that container's display name, shown in the progress pill. */
+  triggerAnalysis: (
+    force?: boolean,
+    scope?: ScanScope | null,
+    scopeLabel?: string | null,
+  ) => Promise<void>;
   cancelAnalysis: () => Promise<void>;
   reloadFacets: () => Promise<void>;
 }
@@ -77,11 +85,17 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
   }, []);
 
   const triggerAnalysis = useCallback(
-    async (force = false) => {
+    async (
+      force = false,
+      scope: ScanScope | null = null,
+      scopeLabel: string | null = null,
+    ) => {
       try {
         const st = await analysisStatus();
         setStatus(st);
         if (st.running) return; // already in flight
+        // Surfaced by the progress pill; cleared in `finally` so a cancel/throw can't strand it.
+        useAppStore.getState().setScanScopeLabel(scope ? scopeLabel : null);
 
         if (!st.modelsReady) {
           // Download models first; progress events drive the UI
@@ -91,12 +105,13 @@ export function useAnalysis(): AnalysisState & AnalysisActions {
         setStatus((prev) =>
           prev ? { ...prev, running: true } : { ...st, running: true },
         );
-        await analysisRun(force);
+        await analysisRun(force, scope);
       } catch (err) {
         log.warn("analysis", "run failed", { force, ...log.errorSummary(err) });
       } finally {
         setProgress(null);
         setDoneVersion((v) => v + 1);
+        useAppStore.getState().setScanScopeLabel(null);
         await Promise.all([reloadStatus(), reloadFacets()]);
       }
     },

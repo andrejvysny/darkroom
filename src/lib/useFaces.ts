@@ -8,8 +8,10 @@ import {
   peopleList,
   type FacesStatus,
   type PersonRow,
+  type ScanScope,
 } from "./ipc";
 import { log } from "./logger";
+import { useAppStore } from "../store/app";
 
 export type FacesProgress =
   | { kind: "models"; done: number; total: number }
@@ -25,7 +27,13 @@ export interface FacesState {
 }
 
 export interface FacesActions {
-  findPeople: (force?: boolean) => Promise<void>;
+  /** `scope` narrows detection+embedding to one container; clustering stays library-wide.
+   *  `scopeLabel` is that container's display name, shown in the progress pill. */
+  findPeople: (
+    force?: boolean,
+    scope?: ScanScope | null,
+    scopeLabel?: string | null,
+  ) => Promise<void>;
   cancel: () => Promise<void>;
   reload: () => Promise<void>;
 }
@@ -50,22 +58,29 @@ export function useFaces(): FacesState & FacesActions {
   }, []);
 
   const findPeople = useCallback(
-    async (force = false) => {
+    async (
+      force = false,
+      scope: ScanScope | null = null,
+      scopeLabel: string | null = null,
+    ) => {
       try {
         const st = await facesStatus();
         setStatus(st);
         if (st.running) return;
+        // Surfaced by the progress pill; cleared in `finally` so a cancel/throw can't strand it.
+        useAppStore.getState().setScanScopeLabel(scope ? scopeLabel : null);
         if (!st.modelsReady) {
           setProgress({ kind: "models", done: 0, total: 2 });
           await facesModelsEnsure();
         }
         setStatus((prev) => (prev ? { ...prev, running: true } : prev));
-        await facesRun(force);
+        await facesRun(force, scope);
       } catch (err) {
         log.warn("faces", "find people failed", { force, ...log.errorSummary(err) });
       } finally {
         setProgress(null);
         setDoneVersion((v) => v + 1);
+        useAppStore.getState().setScanScopeLabel(null);
         await reload();
       }
     },

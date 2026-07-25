@@ -143,6 +143,56 @@ export function clearedFilters(): Partial<QueryParams> {
   };
 }
 
+/**
+ * The container-only subset of {@link QueryParams} an AI scan may be narrowed to. Mirrors the Rust
+ * `ScanScope`, which deserializes exactly these keys — anything else posted alongside is dropped
+ * backend-side, so this type is a convenience, not the security boundary.
+ */
+export type ScanScope = Pick<
+  QueryParams,
+  | "folderId"
+  | "captureYear"
+  | "captureDate"
+  | "collectionId"
+  | "keywordId"
+  | "importSessionId"
+  | "format"
+>;
+
+/**
+ * Filter dimensions that describe a *container* of photos, and so may scope a scan.
+ *
+ * Deliberately excludes `minStars` / `flag` / `colorLabel` / `search` (triage state, not a place)
+ * and `detectedCategory` / `personId` — those two are produced BY the scans, so scoping a scan to
+ * them would make its input depend on its own previous output.
+ */
+export const SCAN_SCOPE_DIMENSIONS: (keyof ScanScope)[] = [
+  "folderId",
+  "captureYear",
+  "captureDate",
+  "collectionId",
+  "keywordId",
+  "importSessionId",
+  "format",
+];
+
+/**
+ * The scan scope implied by the current library filter, or `null` when the view is the whole
+ * library (⇒ the caller runs unscoped and hides its scope UI).
+ */
+export function scopeFromParams(p: QueryParams): ScanScope | null {
+  const scope: ScanScope = {};
+  let any = false;
+  for (const k of SCAN_SCOPE_DIMENSIONS) {
+    const v = p[k];
+    if (v != null) {
+      (scope as Record<string, unknown>)[k] = v;
+      any = true;
+    }
+  }
+  return any ? scope : null;
+}
+
 export type ImageRow = {
   id: number;
   contentHash: string;
@@ -1519,14 +1569,119 @@ export function analysisModelsEnsure(): Promise<void> {
   return invoke<void>("analysis_models_ensure", {});
 }
 
-/** Run the background analysis pass. Emits `analysis:progress` `{done,total}` then `analysis:done`. */
-export function analysisRun(force = false): Promise<AnalysisRunStats> {
-  return invoke<AnalysisRunStats>("analysis_run", { force });
+/**
+ * Run the background analysis pass. Emits `analysis:progress` `{done,total}` then `analysis:done`.
+ * `scope` narrows it to one container (see {@link scopeFromParams}); omit for the whole library.
+ */
+export function analysisRun(
+  force = false,
+  scope: ScanScope | null = null,
+): Promise<AnalysisRunStats> {
+  return invoke<AnalysisRunStats>("analysis_run", { force, scope });
 }
 
 /** Request the running pass to stop after the current batch (keeps work already committed). */
 export function analysisCancel(): Promise<void> {
   return invoke<void>("analysis_cancel", {});
+}
+
+// ── Unified AI scan ──────────────────────────────────────────────────────────
+
+/** A selectable scan stage. Mirrors the Rust `StageId`; the backend rejects anything else. */
+export type StageId = "objects" | "animals" | "faces" | "captions" | "panoramas";
+
+/** Stage order + labels for the scan modal and the per-photo readout. */
+export const SCAN_STAGES: { id: StageId; label: string; hint?: string }[] = [
+  { id: "objects", label: "People & Vehicles" },
+  { id: "animals", label: "Animals", hint: "slower — about 1s per photo" },
+  { id: "faces", label: "Faces", hint: "groups people in the People sidebar" },
+  { id: "captions", label: "Captions & keywords" },
+  {
+    id: "panoramas",
+    label: "Panorama suggestions",
+    hint: "always scans the whole library",
+  },
+];
+
+export type StagePending = {
+  stage: StageId;
+  /** null = this stage's models aren't installed, so no figure is meaningful. */
+  pending: number | null;
+  modelsReady: boolean;
+  /** True when `pending` ignores the scope (panorama has no scoped entry point). */
+  libraryWide: boolean;
+};
+
+/** How many images a scope holds and how much work each stage still has there. */
+export type ScopeCounts = {
+  total: number;
+  stages: StagePending[];
+};
+
+/** Size the scan modal's rows for `scope` (null = whole library). Read-only; loads no models. */
+export function scanScopeCounts(scope: ScanScope | null = null): Promise<ScopeCounts> {
+  return invoke<ScopeCounts>("scan_scope_counts", { scope });
+}
+
+export type ScanSelection = {
+  stages: StageId[];
+  scope?: ScanScope | null;
+  force?: boolean;
+};
+
+export type ScanResult = {
+  /** Stopped early at the user's request — not an error; committed work is kept. */
+  cancelled: boolean;
+  analyzed: number;
+  failed: number;
+  panoramasFound: number;
+};
+
+/**
+ * Run the selected stages as ONE job. Unlike `analysisRun` this also sequences panorama detection
+ * and its cancel works during the model download.
+ */
+export function scanRun(selection: ScanSelection): Promise<ScanResult> {
+  return invoke<ScanResult>("scan_run", { selection });
+}
+
+/** Stop the running scan in whatever phase it is in. Committed work is kept. */
+export function scanCancel(): Promise<void> {
+  return invoke<void>("scan_cancel", {});
+}
+
+/** Whether a scan is in flight — used to re-attach after a reload. */
+export function scanRunning(): Promise<boolean> {
+  return invoke<boolean>("scan_running", {});
+}
+
+/** The modal's remembered stage ticks (validated backend-side). */
+export function scanPrefsGet(): Promise<StageId[]> {
+  return invoke<StageId[]>("scan_prefs_get", {});
+}
+
+export function scanPrefsSet(stages: StageId[]): Promise<void> {
+  return invoke<void>("scan_prefs_set", { stages });
+}
+
+/** One stage's state for a single photo. */
+export type StageState = {
+  id: string;
+  status: "ok" | "error" | "pending";
+  /** Present even when `pending`, if an older model version was attempted. */
+  attemptedAt: number | null;
+  modelVersion: string | null;
+  error: string | null;
+};
+
+export type ImageScanState = {
+  lastScanAt: number | null;
+  stages: StageState[];
+};
+
+/** Per-photo scan record: what ran, when, and what failed. */
+export function imageScanState(imageId: number): Promise<ImageScanState> {
+  return invoke<ImageScanState>("image_scan_state", { imageId });
 }
 
 // ── AI denoise ───────────────────────────────────────────────────────────────
@@ -1817,6 +1972,8 @@ export type FacesStatus = {
   running: boolean;
   faces: number;
   people: number;
+  /** Faces belonging to no person — a deferred singleton, or an interrupted clustering pass. */
+  ungrouped: number;
 };
 
 export type ClusterStats = {
@@ -1840,9 +1997,16 @@ export function facesModelsEnsure(): Promise<void> {
   return invoke<void>("faces_models_ensure", {});
 }
 
-/** Run "Find People" (detect → align → embed → cluster). Emits `faces:progress`/`faces:done`. */
-export function facesRun(force = false): Promise<FacesRunStats> {
-  return invoke<FacesRunStats>("faces_run", { force });
+/**
+ * Run "Find People" (detect → align → embed → cluster). Emits `faces:progress`/`faces:done`.
+ * `scope` narrows *detection + embedding* to one container; clustering stays library-wide so a face
+ * found in one folder still matches people discovered elsewhere.
+ */
+export function facesRun(
+  force = false,
+  scope: ScanScope | null = null,
+): Promise<FacesRunStats> {
+  return invoke<FacesRunStats>("faces_run", { force, scope });
 }
 
 /** Request the running face pass to stop after the current batch. */

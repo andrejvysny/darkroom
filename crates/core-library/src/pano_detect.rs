@@ -149,6 +149,30 @@ pub fn cluster_candidates(cands: &[Candidate], p: &ClusterParams) -> Vec<Vec<usi
     out
 }
 
+/// How many images panorama detection still has work for.
+///
+/// Uses the **same eligibility rule as the scan itself** — `cluster_candidates` drops runs shorter
+/// than `min_cluster`, and only frames that survive clustering are ever `mark_scanned`. Counting
+/// every dated-but-unmarked image instead would leave lone photos "pending" forever, since nothing
+/// will ever mark them.
+pub fn pending_count(conn: &Connection, algo: &str) -> Result<i64, LibError> {
+    let cands = detect_candidates(conn)?;
+    let clusters = cluster_candidates(&cands, &ClusterParams::default());
+    let ids: Vec<i64> = clusters
+        .iter()
+        .flatten()
+        .map(|&i| cands[i].id)
+        .collect::<Vec<_>>();
+    let mut pending = 0i64;
+    // Chunked: `images_scanned_at` binds one parameter per id, and a large library would otherwise
+    // blow past SQLite's variable limit.
+    for chunk in ids.chunks(crate::analysis::SCOPE_CHUNK) {
+        let scanned = images_scanned_at(conn, chunk, algo)?;
+        pending += chunk.iter().filter(|id| !scanned.contains(id)).count() as i64;
+    }
+    Ok(pending)
+}
+
 /// Emit one raw run: drop if too small, pass through if within bounds, else largest-gap split.
 fn flush_run(run: &[usize], cands: &[Candidate], p: &ClusterParams, out: &mut Vec<Vec<usize>>) {
     if run.len() < p.min_cluster {
@@ -238,6 +262,11 @@ pub fn images_scanned_at(
 
 /// Mark `ids` scanned at `algo`/`now` (INSERT OR REPLACE — the scan marker is per-image, latest wins).
 /// Caller owns the transaction.
+///
+/// Also records the attempt under the shared [`crate::analysis::PANORAMA_STAGE_ID`] stage, in the
+/// same transaction, so the per-photo scan readout shows panorama beside the AI stages instead of
+/// this table's state being invisible to it. `pano_detect_scan` stays the authoritative skip-set for
+/// the scan itself — this is the reporting projection.
 pub fn mark_scanned(tx: &Transaction, ids: &[i64], algo: &str, now: i64) -> Result<(), LibError> {
     let mut stmt = tx.prepare(
         "INSERT OR REPLACE INTO pano_detect_scan(image_id, algo_version, scanned_at)
@@ -245,6 +274,15 @@ pub fn mark_scanned(tx: &Transaction, ids: &[i64], algo: &str, now: i64) -> Resu
     )?;
     for &id in ids {
         stmt.execute(params![id, algo, now])?;
+    }
+    drop(stmt);
+    let attempt = [crate::analysis::StageAttempt {
+        stage_id: crate::analysis::PANORAMA_STAGE_ID,
+        model_version: algo,
+        error: None,
+    }];
+    for &id in ids {
+        crate::analysis::record_attempts(tx, id, now, &attempt)?;
     }
     Ok(())
 }

@@ -38,6 +38,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/019_pano_detect.sql"),
     include_str!("../migrations/020_hdr_sources.sql"),
     include_str!("../migrations/021_image_pairs.sql"),
+    include_str!("../migrations/022_image_stage_attempt.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -136,7 +137,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 21, "expected 21 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 22, "expected 22 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -467,6 +468,120 @@ mod tests {
         );
     }
 
+    /// A real v21 → v22 upgrade over populated data: the backfill must reconstruct scan history
+    /// from the tables that already recorded it, and must not invent history that was never kept.
+    #[test]
+    fn migration_022_backfills_from_existing_scan_history() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        MIGRATIONS.to_version(&mut conn, 21).unwrap();
+
+        let img = insert_folder_and_image(&conn, 1);
+        let other = insert_folder_and_image(&conn, 2);
+        let mut ar = |image: i64, analyzer: &str, version: &str, ran_at: i64, status: &str| {
+            conn.execute(
+                "INSERT INTO analysis_results
+                     (image_id, analyzer_id, model_version, ran_at, status, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '{}')",
+                rusqlite::params![image, analyzer, version, ran_at, status],
+            )
+            .unwrap();
+        };
+        // Same stage at two model versions — the NEWER attempt must win. Rows for superseded
+        // versions accumulate (nothing deletes them), so picking arbitrarily would be wrong.
+        ar(img, "object_detection", "v1", 100, "ok");
+        ar(img, "object_detection", "v2", 200, "ok");
+        // A different stage, and a failure that predates this table: never recorded, so the
+        // backfill must not claim it succeeded.
+        ar(img, "caption", "v1", 150, "ok");
+        ar(other, "caption", "v1", 300, "error");
+        conn.execute(
+            "INSERT INTO pano_detect_scan(image_id, algo_version, scanned_at)
+             VALUES (?1, 'panodetect-v1', 400)",
+            rusqlite::params![img],
+        )
+        .unwrap();
+
+        MIGRATIONS.to_version(&mut conn, 22).unwrap();
+
+        let attempt = |image: i64, stage: &str| -> Option<(String, i64, String)> {
+            conn.query_row(
+                "SELECT model_version, attempted_at, status FROM image_stage_attempt
+                  WHERE image_id = ?1 AND stage_id = ?2",
+                rusqlite::params![image, stage],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+        };
+        assert_eq!(
+            attempt(img, "object_detection"),
+            Some(("v2".into(), 200, "ok".into())),
+            "the newest successful attempt must win, with ITS model_version"
+        );
+        assert_eq!(
+            attempt(img, "caption"),
+            Some(("v1".into(), 150, "ok".into()))
+        );
+        assert_eq!(
+            attempt(img, "panorama"),
+            Some(("panodetect-v1".into(), 400, "ok".into())),
+            "pano_detect_scan projects in as the `panorama` stage"
+        );
+        assert_eq!(
+            attempt(other, "caption"),
+            None,
+            "an `error` row must NOT backfill as a successful attempt"
+        );
+
+        // STRICT: attempted_at is INTEGER, so a text timestamp is rejected outright.
+        assert!(
+            conn.execute(
+                "INSERT INTO image_stage_attempt
+                     (image_id, stage_id, model_version, attempted_at, status)
+                 VALUES (?1, 'faces', 'v1', 'not-a-number', 'ok')",
+                rusqlite::params![other],
+            )
+            .is_err(),
+            "STRICT must reject a non-integer attempted_at"
+        );
+        // CHECK: only 'ok' / 'error'.
+        assert!(
+            conn.execute(
+                "INSERT INTO image_stage_attempt
+                     (image_id, stage_id, model_version, attempted_at, status)
+                 VALUES (?1, 'faces', 'v1', 1, 'maybe')",
+                rusqlite::params![other],
+            )
+            .is_err(),
+            "status must be constrained to ok/error"
+        );
+        // PK (image_id, stage_id): one row per stage, latest wins on upsert.
+        conn.execute(
+            "INSERT OR REPLACE INTO image_stage_attempt
+                 (image_id, stage_id, model_version, attempted_at, status, error)
+             VALUES (?1, 'caption', 'v2', 999, 'error', 'onnx blew up')",
+            rusqlite::params![img],
+        )
+        .unwrap();
+        assert_eq!(
+            attempt(img, "caption"),
+            Some(("v2".into(), 999, "error".into())),
+            "a later attempt replaces the earlier one for the same (image, stage)"
+        );
+
+        // FK cascade: deleting the image drops its attempt rows.
+        conn.execute("DELETE FROM images WHERE id = ?1", rusqlite::params![img])
+            .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM image_stage_attempt WHERE image_id = ?1",
+                rusqlite::params![img],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "deleting an image must cascade its attempt rows");
+    }
+
     #[test]
     fn opens_and_creates_all_tables() {
         let db = Db::open_in_memory().unwrap();
@@ -503,6 +618,7 @@ mod tests {
             "image_pairs",
             "image_presence",
             "image_similarity_features",
+            "image_stage_attempt",
             "image_user_labels",
             "images",
             "import_sessions",

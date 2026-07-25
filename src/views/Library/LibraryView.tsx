@@ -32,6 +32,8 @@ import { openExport } from "../../lib/export";
 import { useAnalysis } from "../../lib/useAnalysis";
 import { useHdrMerge } from "../../lib/useHdrMerge";
 import { usePanoDetect } from "../../lib/usePanoDetect";
+import { useScan, scanProgressLabel } from "../../lib/useScan";
+import { useScanScope } from "../../lib/useScanScope";
 import LeftNav from "./LeftNav";
 import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
@@ -41,6 +43,7 @@ import Loupe from "./Loupe";
 import ImportDialog from "./ImportDialog";
 import SettingsModal from "./SettingsModal";
 import DeleteRejectedModal from "./DeleteRejectedModal";
+import ScanModal from "./ScanModal";
 
 // Map color label name to CSS var for the dot color in ThumbGrid
 const LABEL_COLOR_MAP: Record<string, string> = {
@@ -79,14 +82,17 @@ export default function LibraryView() {
   const setLibraryImages = useAppStore((s) => s.setLibraryImages);
   const setPanoramaSources = useAppStore((s) => s.setPanoramaSources);
   const thumbVersions = useAppStore((s) => s.thumbVersions);
+  const scanScopeLabel = useAppStore((s) => s.scanScopeLabel);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnMergeHdr = useAppStore((s) => s.setOnMergeHdr);
   const setToast = useAppStore((s) => s.setToast);
   const setOnOpenSettings = useAppStore((s) => s.setOnOpenSettings);
+  const setOnOpenScan = useAppStore((s) => s.setOnOpenScan);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [importOpen, setImportOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deleteRejectedOpen, setDeleteRejectedOpen] = useState(false);
+  const [scanOpen, setScanOpen] = useState(false);
   const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
   const [selectedCollections, setSelectedCollections] = useState<
     CollectionRow[]
@@ -97,7 +103,16 @@ export default function LibraryView() {
   const hdr = useHdrMerge();
   const panoDetect = usePanoDetect();
   const setPanoSuggestOpen = useAppStore((s) => s.setPanoSuggestOpen);
-  const [stoppingAnalysis, setStoppingAnalysis] = useState(false);
+  const scan = useScan();
+  // Scope + per-stage pending counts for the scan modal. Re-priced when a scan finishes, since
+  // completing work shrinks the pending numbers.
+  const scanScope = useScanScope(
+    lib.params,
+    lib.collections,
+    lib.keywords,
+    scan.doneVersion,
+  );
+  const [stoppingScan, setStoppingScan] = useState(false);
   const [stoppingHdr, setStoppingHdr] = useState(false);
 
   // While analysis runs (doneVersion bumps as batches commit), keep the filtered grid in sync so
@@ -107,12 +122,12 @@ export default function LibraryView() {
       void lib.refresh();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [analysis.doneVersion]);
+  }, [analysis.doneVersion, scan.doneVersion]);
 
-  // Clear the "Stopping…" affordance once the pass actually ends.
+  // Clear the "Stopping…" affordance once the scan actually ends.
   useEffect(() => {
-    if (!analysis.progress) setStoppingAnalysis(false);
-  }, [analysis.progress]);
+    if (!scan.running) setStoppingScan(false);
+  }, [scan.running]);
 
   // Same, for the HDR-merge Stop affordance.
   useEffect(() => {
@@ -123,13 +138,15 @@ export default function LibraryView() {
   useEffect(() => {
     setOnImport(() => setImportOpen(true));
     setOnOpenSettings(() => setSettingsOpen(true));
+    setOnOpenScan(() => setScanOpen(true));
     setOnSearch((q: string) => lib.setSearch(q.trim() ? q.trim() : null));
     return () => {
       setOnImport(null);
       setOnOpenSettings(null);
+      setOnOpenScan(null);
       setOnSearch(null);
     };
-  }, [lib.setSearch, setOnImport, setOnOpenSettings, setOnSearch]);
+  }, [lib.setSearch, setOnImport, setOnOpenSettings, setOnOpenScan, setOnSearch]);
 
   // Keep a valid primary selection: if it's unset or no longer in the current (filtered) set,
   // fall back to the first visible image.
@@ -560,6 +577,7 @@ export default function LibraryView() {
           analysis={analysis}
           panoSuggested={panoDetect.suggested}
           onOpenPanoSuggestions={() => setPanoSuggestOpen(true)}
+          onOpenScan={() => setScanOpen(true)}
         />
       </div>
 
@@ -629,8 +647,12 @@ export default function LibraryView() {
                 : "Indexing…"}
             </div>
           )}
-          {analysis.progress && (
+          {/* One pill for the whole scan, whichever phase it is in (models → detect → captions →
+              finalising faces → panoramas). Stop stays available in every phase, including the
+              model download — which the old per-job cancel could not reach. */}
+          {scan.running && (
             <div
+              data-testid="scan-pill"
               style={{
                 position: "absolute",
                 top: lib.indexing ? 46 : 10,
@@ -650,32 +672,30 @@ export default function LibraryView() {
               }}
             >
               <span>
-                {analysis.progress.kind === "models"
-                  ? `Downloading models ${analysis.progress.done} / ${analysis.progress.total}…`
-                  : `Analyzing ${analysis.progress.done} / ${analysis.progress.total}…`}
+                {scan.progress
+                  ? scanProgressLabel(scan.progress, scanScopeLabel)
+                  : "Starting scan…"}
               </span>
-              {analysis.progress.kind === "analyzing" && (
-                <button
-                  disabled={stoppingAnalysis}
-                  onClick={() => {
-                    setStoppingAnalysis(true);
-                    void analysis.cancelAnalysis();
-                  }}
-                  title="Stop analysis (keeps results processed so far)"
-                  style={{
-                    border: "1px solid var(--color-line)",
-                    borderRadius: "var(--radius-sm)",
-                    background: "var(--color-hover)",
-                    color: "var(--color-t1)",
-                    fontSize: 11,
-                    padding: "2px 8px",
-                    cursor: stoppingAnalysis ? "default" : "pointer",
-                    opacity: stoppingAnalysis ? 0.6 : 1,
-                  }}
-                >
-                  {stoppingAnalysis ? "Stopping…" : "Stop"}
-                </button>
-              )}
+              <button
+                disabled={stoppingScan}
+                onClick={() => {
+                  setStoppingScan(true);
+                  void scan.cancel();
+                }}
+                title="Stop the scan (everything already processed is kept)"
+                style={{
+                  border: "1px solid var(--color-line)",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--color-hover)",
+                  color: "var(--color-t1)",
+                  fontSize: 11,
+                  padding: "2px 8px",
+                  cursor: stoppingScan ? "default" : "pointer",
+                  opacity: stoppingScan ? 0.6 : 1,
+                }}
+              >
+                {stoppingScan ? "Stopping…" : "Stop"}
+              </button>
             </div>
           )}
 
@@ -683,7 +703,7 @@ export default function LibraryView() {
             <div
               style={{
                 position: "absolute",
-                top: 10 + (lib.indexing ? 36 : 0) + (analysis.progress ? 36 : 0),
+                top: 10 + (lib.indexing ? 36 : 0) + (scan.running ? 36 : 0),
                 left: "50%",
                 transform: "translateX(-50%)",
                 zIndex: 10,
@@ -859,6 +879,13 @@ export default function LibraryView() {
           setSelection([], null);
           void lib.refresh();
         }}
+      />
+
+      <ScanModal
+        open={scanOpen}
+        onClose={() => setScanOpen(false)}
+        scanScope={scanScope}
+        onRefreshCounts={() => void lib.refresh()}
       />
     </div>
   );
