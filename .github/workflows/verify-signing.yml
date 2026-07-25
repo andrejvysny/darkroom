@@ -62,17 +62,21 @@ jobs:
           if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_BASE64:-}" ]; then
             key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
             trap 'rm -f "$key"' EXIT
-            # Accept both shapes people actually paste: base64 of the .p8, or the .p8 itself.
-            if printf '%s' "$APPLE_API_KEY_BASE64" | grep -q 'BEGIN PRIVATE KEY'; then
+            # Accept both shapes people actually paste: base64 of the .p8, or the .p8 itself
+            # (PKCS#8 "BEGIN PRIVATE KEY" or the EC "BEGIN EC PRIVATE KEY" variant).
+            if printf '%s' "$APPLE_API_KEY_BASE64" | grep -q -- '-----BEGIN'; then
               echo "APPLE_API_KEY_BASE64 holds a raw .p8 (not base64) — using it as-is"
               printf '%s\n' "$APPLE_API_KEY_BASE64" > "$key"
             else
-              printf '%s' "$APPLE_API_KEY_BASE64" | tr -d '\r\n ' | base64 --decode > "$key" \
-                || { echo "::error::APPLE_API_KEY_BASE64 is neither valid base64 nor a .p8 — re-run: openssl base64 -A -in AuthKey_<KEYID>.p8"; exit 1; }
+              stripped=$(printf '%s' "$APPLE_API_KEY_BASE64" | tr -d '\r\n \t')
+              # Shape report only — no secret material is printed.
+              echo "diagnostic: length=${#stripped}, base64 charset=$(printf '%s' "$stripped" | grep -qE '^[A-Za-z0-9+/=]+$' && echo yes || echo no)"
+              printf '%s' "$stripped" | base64 --decode > "$key" 2>/dev/null \
+                || { echo "::error::APPLE_API_KEY_BASE64 is neither a PEM nor valid base64. Set it with: openssl base64 -A -in AuthKey_<KEYID>.p8"; exit 1; }
             fi
             chmod 600 "$key"
-            grep -q 'BEGIN PRIVATE KEY' "$key" \
-              || { echo "::error::APPLE_API_KEY_BASE64 does not resolve to an AuthKey .p8"; exit 1; }
+            grep -q -- '-----BEGIN' "$key" \
+              || { echo "::error::APPLE_API_KEY_BASE64 decodes to something that is not an AuthKey .p8"; exit 1; }
             auth=(--key "$key" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
             echo "auth: App Store Connect API key $APPLE_API_KEY"
           elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
