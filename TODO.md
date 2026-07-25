@@ -89,6 +89,13 @@ found that made large parts of the library unusable — both fixed, both now cov
       launches HEIF decode on a machine WITHOUT Homebrew libheif (that's the whole point of the
       bundling), e.g. `otool -L Darkroom.app/Contents/MacOS/darkroom | grep heif` shows
       `@executable_path/../Frameworks/...`, and Contents/Frameworks holds the 6 dylibs.
+- [ ] **First Developer ID signed release** (`docs/macos-signing.md`): release.yml now signs +
+      notarizes + staples on macOS whenever the secret set is complete, and hard-fails on a partial
+      one. Add `APPLE_SIGNING_IDENTITY` plus ONE notarization set (API key `APPLE_API_KEY` /
+      `APPLE_API_ISSUER` / `APPLE_API_KEY_BASE64`, or Apple ID `APPLE_ID` / `APPLE_PASSWORD` /
+      `APPLE_TEAM_ID`), then cut a `beta-*` tag first and open the downloaded DMG on a Mac that has
+      never built the app. Untested end-to-end: nothing in this repo has ever run a real
+      notarization. Once it lands, drop the "isn't notarized" paragraph from README.md.
 - [ ] **HIF in-app QA** (unchanged from the earlier list): HIF opens in Develop at ≈ the CR3
       sibling's brightness, all modules respond, thumbs/preview latency acceptable on 33 MP.
 - [ ] Detection in-app: Detect from the new LeftNav button, dismiss/undo persistence across

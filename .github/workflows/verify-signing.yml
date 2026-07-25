@@ -1,0 +1,78 @@
+# Proves the macOS signing/notarization secrets are usable WITHOUT running a ~30 min release build.
+# Nothing here is secret: it prints the certificate's common name and the notary history table, and
+# never echoes a secret value. Run it from the Actions tab (workflow_dispatch) after changing any
+# APPLE_* secret. Setup runbook: docs/macos-signing.md.
+name: verify-signing
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: macos-15
+    steps:
+      - name: Check certificate + identity
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            [ -n "${!v:-}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+
+          kc="$RUNNER_TEMP/verify.keychain-db"
+          p12="$RUNNER_TEMP/cert.p12"
+          kcpw="$(uuidgen)"
+          cleanup() { security delete-keychain "$kc" 2>/dev/null || true; rm -f "$p12"; }
+          trap cleanup EXIT
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12" \
+            || { echo "::error::APPLE_CERTIFICATE is not valid base64"; exit 1; }
+          security create-keychain -p "$kcpw" "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          security import "$p12" -k "$kc" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign \
+            || { echo "::error::import failed — wrong APPLE_CERTIFICATE_PASSWORD, or the .p12 carries no private key"; exit 1; }
+
+          identities=$(security find-identity -v -p codesigning "$kc")
+          echo "$identities"
+
+          echo "$identities" | grep -q 'Developer ID Application' \
+            || { echo "::error::the .p12 holds no Developer ID Application identity — an Apple Development / Apple Distribution certificate cannot be notarized"; exit 1; }
+          # Same containment check the Tauri CLI performs before it will sign.
+          echo "$identities" | grep -qF "$APPLE_SIGNING_IDENTITY" \
+            || { echo "::error::APPLE_SIGNING_IDENTITY does not match any identity in the .p12"; exit 1; }
+          echo "certificate + identity OK"
+
+      - name: Check notarization credentials
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_BASE64:-}" ]; then
+            key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            trap 'rm -f "$key"' EXIT
+            printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key"
+            chmod 600 "$key"
+            head -1 "$key" | grep -q 'BEGIN PRIVATE KEY' \
+              || { echo "::error::APPLE_API_KEY_BASE64 does not decode to an AuthKey .p8"; exit 1; }
+            auth=(--key "$key" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+            echo "auth: App Store Connect API key $APPLE_API_KEY"
+          elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            auth=(--apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID")
+            echo "auth: Apple ID $APPLE_ID"
+          else
+            echo "::error::no complete notarization credential set (API key or Apple ID)"; exit 1
+          fi
+          # Cheapest call that actually authenticates against the notary service.
+          xcrun notarytool history "${auth[@]}" --output-format json > "$RUNNER_TEMP/history.json" \
+            || { echo "::error::notarytool rejected these credentials"; exit 1; }
+          node -e "const h=require('$RUNNER_TEMP/history.json').history||[];console.log('notary auth OK —',h.length,'previous submissions')"

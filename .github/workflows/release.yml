@@ -134,43 +134,101 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      # Code-signing is ENV-GATED: it only activates when the corresponding GitHub Actions secrets are
-      # set. With no secrets (the default today) the macOS DMG stays ad-hoc signed and Windows stays
-      # unsigned — the build still succeeds. To ship signed installers later, add these repo secrets:
-      #   macOS Developer ID + notarization: APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
-      #     APPLE_SIGNING_IDENTITY ("Developer ID Application: Name (TEAMID)"), APPLE_ID,
-      #     APPLE_PASSWORD (app-specific), APPLE_TEAM_ID, KEYCHAIN_PASSWORD (any random string).
-      #   Windows Authenticode: WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD.
-      # When APPLE_SIGNING_IDENTITY is present this step flips tauri.conf.json off ad-hoc ("-") to the
-      # real identity + hardened runtime + entitlements so tauri-action notarizes; otherwise it is a no-op.
-      - name: Enable macOS signing (only when secrets present)
-        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+      # macOS Developer ID signing + notarization. Setup runbook: docs/macos-signing.md.
+      #
+      # The Tauri CLI does the whole keychain dance itself when APPLE_CERTIFICATE +
+      # APPLE_CERTIFICATE_PASSWORD are set (creates a throwaway keychain, imports the .p12, runs
+      # set-key-partition-list, deletes it on exit), signs Contents/Frameworks inside-out, signs the
+      # .app with the hardened runtime, then notarizes and staples the .app. So this step only
+      # decides WHICH variables exist: the CLI probes them with var_os(), so an empty-but-present
+      # APPLE_CERTIFICATE is treated as "signing requested" and fails the keychain import. Exporting
+      # through $GITHUB_ENV lets us export nothing at all when a secret set is absent.
+      #
+      # Repo secrets (Settings → Secrets and variables → Actions):
+      #   signing — all three together, or none (none = ad-hoc "-" from tauri.conf.json, as today):
+      #     APPLE_CERTIFICATE           base64 of the exported Developer ID Application .p12
+      #     APPLE_CERTIFICATE_PASSWORD  that .p12's export password
+      #     APPLE_SIGNING_IDENTITY      "Developer ID Application: Name (TEAMID)" — REQUIRED, it is
+      #                                 what overrides the ad-hoc "-" in tauri.conf.json
+      #   notarization — either set; the App Store Connect API key wins when both are present:
+      #     APPLE_API_KEY (key id) + APPLE_API_ISSUER + APPLE_API_KEY_BASE64 (base64 of AuthKey_*.p8)
+      #     APPLE_ID + APPLE_PASSWORD (app-specific password) + APPLE_TEAM_ID
+      #   Windows Authenticode (still unwired): WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD.
+      - name: Configure macOS signing
+        id: macsign
+        if: runner.os == 'macOS'
         env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
         run: |
           set -euo pipefail
-          node <<'NODE'
-          const fs = require("fs");
-          const p = "src-tauri/tauri.conf.json";
-          const c = JSON.parse(fs.readFileSync(p, "utf8"));
-          c.bundle = c.bundle || {};
-          c.bundle.macOS = c.bundle.macOS || {};
-          c.bundle.macOS.signingIdentity = process.env.APPLE_SIGNING_IDENTITY;
-          c.bundle.macOS.hardenedRuntime = true;
-          c.bundle.macOS.entitlements = "Darkroom.entitlements";
-          fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
-          console.log("Enabled Developer ID signing + hardened runtime for", process.env.APPLE_SIGNING_IDENTITY);
-          NODE
+          signing=0
+          notary=none
+
+          if [ -n "${APPLE_CERTIFICATE:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            signing=1
+            {
+              echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            } >> "$GITHUB_ENV"
+            echo "Developer ID signing enabled for: $APPLE_SIGNING_IDENTITY"
+          elif [ -n "${APPLE_CERTIFICATE:-}${APPLE_CERTIFICATE_PASSWORD:-}${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "::error::Partial macOS signing secrets. Set APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD and APPLE_SIGNING_IDENTITY together, or none of them."
+            exit 1
+          else
+            echo "::warning::No macOS signing secrets — building an ad-hoc signed, unnotarized .dmg (Gatekeeper will block it on download)."
+          fi
+
+          if [ "$signing" = "1" ]; then
+            if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_BASE64:-}" ]; then
+              # notarytool wants the key on disk; the CLI reads its path from APPLE_API_KEY_PATH.
+              key_dir="$RUNNER_TEMP/private_keys"
+              key_path="$key_dir/AuthKey_${APPLE_API_KEY}.p8"
+              mkdir -p "$key_dir"
+              printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_path"
+              chmod 600 "$key_path"
+              notary=api
+              {
+                echo "APPLE_API_KEY=$APPLE_API_KEY"
+                echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+                echo "APPLE_API_KEY_PATH=$key_path"
+              } >> "$GITHUB_ENV"
+              echo "Notarization: App Store Connect API key ${APPLE_API_KEY}"
+            elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+              notary=appleid
+              {
+                echo "APPLE_ID=$APPLE_ID"
+                echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+                echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+              } >> "$GITHUB_ENV"
+              echo "Notarization: Apple ID ${APPLE_ID}"
+            else
+              echo "::warning::Signing without notarization credentials — the .app is Developer ID signed but NOT notarized, which Gatekeeper still blocks. Add the API-key or Apple-ID secret set."
+            fi
+          fi
+
+          echo "signing=$signing" >> "$GITHUB_OUTPUT"
+          echo "notary=$notary" >> "$GITHUB_OUTPUT"
 
       # tauri-action runs beforeBuildCommand (npm run build), bundles, and uploads to the release.
       # Pinned from tauri-apps/tauri-action v0.6.2.
-      # NOTE: Don't pass Apple/Windows CODE-signing secrets here (causes import failures when certs
-      # are empty). Those are handled by the env-gated step above. The TAURI_SIGNING_* vars below are
-      # the minisign UPDATER keys (separate concern) — they sign the update artifacts + latest.json so
-      # the in-app updater accepts them. With createUpdaterArtifacts=true, tauri-action also generates
-      # and uploads latest.json to the release.
+      # NOTE: the APPLE_* code-signing vars are NOT listed here on purpose — the step above exports
+      # them through $GITHUB_ENV only when the full secret set exists, because listing them here
+      # would define them as empty strings and break the keychain import on unsigned builds. The
+      # TAURI_SIGNING_* vars below are the minisign UPDATER keys (separate concern) — they sign the
+      # update artifacts + latest.json so the in-app updater accepts them. With
+      # createUpdaterArtifacts=true, tauri-action also generates and uploads latest.json.
       - name: Build app + create release
+        id: build
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -183,7 +241,7 @@ jobs:
           releaseName: "Darkroom ${{ env.RELEASE_TAG }}"
           releaseBody: |
             Release artifacts:
-            - macOS Apple Silicon and Intel DMGs are ad-hoc signed and not notarized unless Developer ID signing secrets are configured.
+            - macOS Apple Silicon and Intel DMGs are Developer ID signed, notarized and stapled when the release signing secrets are configured; otherwise they fall back to ad-hoc signing and Gatekeeper blocks them.
             - Intel macOS build ships with AI analysis disabled because ONNX Runtime has no x86_64 macOS prebuilt for the pinned ort runtime.
             - Windows x64 NSIS installer is unsigned unless an Authenticode certificate is configured.
             - In-app auto-update is available from this version onward. Older installs (≤ 0.3.0) have no updater and must install this build once manually; subsequent releases update in-app.
@@ -192,3 +250,73 @@ jobs:
           # resolve. beta-* tags stay pre-releases (not an auto-update channel).
           releaseDraft: false
           prerelease: ${{ startsWith(env.RELEASE_TAG, 'beta-') }}
+
+      # Fail the release rather than ship a .app whose signature does not verify — the dylib
+      # bundling hook rewrites install names right before the bundler signs, so a broken rewrite
+      # would show up here (and nowhere else until a user's Gatekeeper rejects the app).
+      - name: Verify macOS signature
+        if: runner.os == 'macOS' && steps.macsign.outputs.signing == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(find "target/${{ matrix.rustTargets }}/release/bundle/macos" -maxdepth 1 -name '*.app' -print -quit)
+          [ -n "$app" ] || { echo "::error::no .app in target/${{ matrix.rustTargets }}/release/bundle/macos"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=4 "$app" > "$RUNNER_TEMP/codesign.txt" 2>&1
+          grep -E 'Authority|TeamIdentifier|flags=' "$RUNNER_TEMP/codesign.txt" || true
+          grep -q 'Authority=Developer ID Application' "$RUNNER_TEMP/codesign.txt" \
+            || { echo "::error::not signed by a Developer ID Application certificate"; exit 1; }
+          grep -q 'flags=.*runtime' "$RUNNER_TEMP/codesign.txt" \
+            || { echo "::error::hardened runtime is not enabled — notarization would reject this app"; exit 1; }
+          for lib in "$app"/Contents/Frameworks/*.dylib; do
+            codesign --verify --strict "$lib"
+            echo "ok: $(basename "$lib")"
+          done
+
+      # The bundler notarizes and staples the .app, then signs — but never notarizes — the .dmg it
+      # wraps it in (crates/tauri-bundler/src/bundle/macos/dmg.rs). A downloaded disk image is
+      # itself Gatekeeper-assessed, so notarize + staple it here and replace the asset tauri-action
+      # already uploaded. Apple's recommended order is exactly this: staple the app, wrap, then
+      # notarize and staple the image.
+      - name: Notarize + staple DMG
+        if: runner.os == 'macOS' && steps.macsign.outputs.notary != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.macsign.outputs.notary }}" = "api" ]; then
+            auth=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          else
+            auth=(--apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID")
+          fi
+
+          found=0
+          for dmg in target/${{ matrix.rustTargets }}/release/bundle/dmg/*.dmg; do
+            [ -f "$dmg" ] || continue
+            found=1
+            echo "Notarizing $dmg"
+            out="$RUNNER_TEMP/notary.json"
+            set +e
+            xcrun notarytool submit "$dmg" "${auth[@]}" --wait --timeout 30m --output-format json > "$out"
+            rc=$?
+            set -e
+            id=$(node -p "try{JSON.parse(require('fs').readFileSync('$out','utf8')).id||''}catch(e){''}")
+            status=$(node -p "try{JSON.parse(require('fs').readFileSync('$out','utf8')).status||''}catch(e){''}")
+            if [ "$rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+              echo "::error::notarization failed (rc=$rc status=${status:-unknown})"
+              [ -n "$id" ] && xcrun notarytool log "$id" "${auth[@]}" || true
+              exit 1
+            fi
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            # What Gatekeeper actually runs when the user opens the download.
+            spctl --assess --type open --context context:primary-signature -vv "$dmg"
+            gh release upload "$RELEASE_TAG" "$dmg" --clobber --repo "$GITHUB_REPOSITORY"
+          done
+          [ "$found" = "1" ] || { echo "::error::no .dmg in target/${{ matrix.rustTargets }}/release/bundle/dmg"; exit 1; }
+
+      - name: Remove notarization key
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/private_keys"

@@ -6,6 +6,7 @@
   },
   "bundle": {
     "macOS": {
+      "hardenedRuntime": true,
       "frameworks": [
         "frameworks/libheif.dylib",
         "frameworks/libde265.dylib",
