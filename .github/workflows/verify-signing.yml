@@ -72,7 +72,7 @@ jobs:
               # Shape report only — no secret material is printed.
               echo "diagnostic: length=${#stripped}, base64 charset=$(printf '%s' "$stripped" | grep -qE '^[A-Za-z0-9+/=]+$' && echo yes || echo no)"
               printf '%s' "$stripped" | base64 --decode > "$key" 2>/dev/null \
-                || { echo "::error::APPLE_API_KEY_BASE64 is neither a PEM nor valid base64. Set it with: openssl base64 -A -in AuthKey_<KEYID>.p8"; exit 1; }
+                || { echo "::error::APPLE_API_KEY_BASE64 is neither a PEM nor valid base64. A length one over a multiple of 4 usually means a trailing '%' copied out of a zsh terminal — pipe the value instead of copying it: openssl base64 -A -in AuthKey_<KEYID>.p8 | gh secret set APPLE_API_KEY_BASE64"; exit 1; }
             fi
             chmod 600 "$key"
             grep -q -- '-----BEGIN' "$key" \

@@ -95,6 +95,25 @@ generate one → `APPLE_PASSWORD`. Team id from developer.apple.com → Membersh
 The minisign `TAURI_SIGNING_*` secrets are a separate mechanism (updater artifact signatures) and
 have nothing to do with Apple signing.
 
+## Setting the secrets without a clipboard
+
+Copying base64 out of a terminal is how these secrets get corrupted: zsh appends a reverse-video
+`%` when output has no trailing newline, and that `%` lands in the secret. Pipe instead:
+
+```bash
+openssl base64 -A -in DeveloperID.p12   | gh secret set APPLE_CERTIFICATE      --repo <owner>/<repo>
+openssl base64 -A -in AuthKey_<KEYID>.p8 | gh secret set APPLE_API_KEY_BASE64  --repo <owner>/<repo>
+gh secret set APPLE_SIGNING_IDENTITY --repo <owner>/<repo> --body 'Developer ID Application: Name (TEAMID)'
+```
+
+`APPLE_API_KEY_BASE64` also accepts the raw `.p8` (`gh secret set APPLE_API_KEY_BASE64 < AuthKey_*.p8`);
+both workflows detect the PEM banner and skip the decode.
+
+Then run the **verify-signing** workflow (Actions → verify-signing → Run workflow). It imports the
+certificate into a throwaway keychain, asserts the identity is a Developer ID Application one that
+matches `APPLE_SIGNING_IDENTITY`, and authenticates against the notary service with
+`notarytool history` — about a minute, versus ~30 for a release build.
+
 ## Verifying a release locally
 
 ```bash
