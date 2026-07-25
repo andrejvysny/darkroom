@@ -61,6 +61,14 @@ fn hexs(bytes: &[u8]) -> String {
     s
 }
 
+/// Present images that are NOT a camera companion paired to a RAW. A RAW and the JPEG/HEIF the
+/// body wrote beside it share a capture fingerprint (same model/serial/timestamp/dimensions) and
+/// look identical to the perceptual scan — but they are one deliberate capture, not a duplicate to
+/// clean up. Pairing them at import is the user saying exactly that, so linked companions are
+/// excluded from every detector. Unpaired RAW+JPEG copies still group as before.
+const NOT_PAIRED: &str =
+    "NOT EXISTS (SELECT 1 FROM image_pairs ip WHERE ip.secondary_image_id = i.id)";
+
 /// Query images whose `col` value is shared by >1 present image, grouped. `col` is an unqualified
 /// column on `images` (`content_hash` or `capture_fingerprint`).
 fn grouped_by(conn: &Connection, col: &str, category: &str) -> Result<Vec<DupGroup>, DedupError> {
@@ -69,9 +77,10 @@ fn grouped_by(conn: &Connection, col: &str, category: &str) -> Result<Vec<DupGro
                 COALESCE(rf.stars, 0), i.iso, i.shutter, i.aperture
          FROM images i
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
-         WHERE i.status='present' AND i.{col} IS NOT NULL AND i.{col} IN (
-             SELECT {col} FROM images WHERE status='present' AND {col} IS NOT NULL
-             GROUP BY {col} HAVING COUNT(*) > 1
+         WHERE i.status='present' AND {NOT_PAIRED} AND i.{col} IS NOT NULL AND i.{col} IN (
+             SELECT i.{col} FROM images i WHERE i.status='present' AND {NOT_PAIRED}
+               AND i.{col} IS NOT NULL
+             GROUP BY i.{col} HAVING COUNT(*) > 1
          )
          ORDER BY i.{col}, i.id"
     );
@@ -322,7 +331,7 @@ struct PairEval {
 /// Same-scene / near-duplicate groups. Similarity is intentionally capture-time gated: visually
 /// related photos from different sessions are not cleanup candidates.
 pub fn find_perceptual(conn: &Connection, threshold: u32) -> Result<Vec<DupGroup>, DedupError> {
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT i.id, i.content_hash, i.path, i.original_filename, i.file_size, i.capture_date,
                 sf.dhash64, sf.phash64, sf.tiny_luma32, sf.color_grid4x4,
                 COALESCE(rf.stars, 0), i.iso, i.shutter, i.aperture,
@@ -330,9 +339,11 @@ pub fn find_perceptual(conn: &Connection, threshold: u32) -> Result<Vec<DupGroup
          FROM images i
          JOIN image_similarity_features sf ON sf.image_id = i.id
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
-         WHERE i.status='present' AND i.capture_date IS NOT NULL AND sf.feature_version=?1
-         ORDER BY i.capture_date, i.id",
-    )?;
+         WHERE i.status='present' AND {NOT_PAIRED} AND i.capture_date IS NOT NULL
+           AND sf.feature_version=?1
+         ORDER BY i.capture_date, i.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<CandidateRow> = stmt
         .query_map(params![SIMILARITY_FEATURE_VERSION], |r| {
             let hash: Vec<u8> = r.get(1)?;

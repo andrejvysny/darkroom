@@ -10,6 +10,8 @@ import {
   imageHistogram,
   imageFaces,
   imageSources,
+  imagePair,
+  imagePairUnlink,
   hdrExportDng,
   DETECTION_CATEGORIES,
   type HistData,
@@ -22,6 +24,7 @@ import {
   type UserLabels,
   type ImageFace,
   type MergeSources,
+  type PairInfo,
 } from "../../lib/ipc";
 import { useAppStore } from "../../store/app";
 
@@ -143,6 +146,7 @@ export default function RightInfo({
   });
   const [hist, setHist] = useState<HistData | null>(null);
   const [sources, setSources] = useState<MergeSources | null>(null);
+  const [pair, setPair] = useState<PairInfo | null>(null);
   const [exportingDng, setExportingDng] = useState(false);
 
   useEffect(() => {
@@ -154,16 +158,21 @@ export default function RightInfo({
       setLabels({ containsPerson: null, containsAnimal: null });
       setHist(null);
       setSources(null);
+      setPair(null);
       return;
     }
     let cancelled = false;
     setHist(null);
     setSources(null);
+    setPair(null);
     void imageHistogram(meta.id).then((h) => {
       if (!cancelled) setHist(h);
     });
     void imageSources(meta.id).then((s) => {
       if (!cancelled) setSources(s);
+    });
+    void imagePair(meta.id).then((p) => {
+      if (!cancelled) setPair(p);
     });
     void Promise.all([
       imageCaption(meta.id),
@@ -641,6 +650,87 @@ export default function RightInfo({
                 )}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* RAW + JPEG pair — the companion files the camera wrote beside this RAW (linked at import).
+          Rows are informational; "Unpair" drops the link only, never a file, and the freed companion
+          reappears in the grid (the backend emits `library:changed`). */}
+      {pair !== null && meta !== null && (
+        <div
+          style={{
+            padding: "14px 16px",
+            borderTop: "1px solid var(--color-line)",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 10.5,
+              letterSpacing: ".06em",
+              textTransform: "uppercase",
+              color: "var(--color-t3)",
+              fontWeight: 600,
+              marginBottom: 10,
+            }}
+          >
+            Paired files
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            {pair.secondaries.map((s) => (
+              <div
+                key={s.id}
+                title={s.path}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  fontSize: 11.5,
+                  padding: "5px 8px",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--color-elev)",
+                  border: "1px solid var(--color-line)",
+                }}
+              >
+                <span
+                  style={{
+                    color: "var(--color-t2)",
+                    flex: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {s.filename}
+                </span>
+                <button
+                  onClick={() => {
+                    void imagePairUnlink(s.id).then(async () => {
+                      setPair(await imagePair(meta.id));
+                      setToast(`Unpaired ${s.filename}`);
+                    });
+                  }}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "var(--color-t3)",
+                    fontSize: 11,
+                    cursor: "pointer",
+                    padding: 0,
+                    flexShrink: 0,
+                  }}
+                >
+                  Unpair
+                </button>
+              </div>
+            ))}
+          </div>
+          <div
+            style={{ fontSize: 10.5, color: "var(--color-t3)", marginTop: 8 }}
+          >
+            {pair.role === "primary"
+              ? "Hidden from the grid; edits and metadata stay per file."
+              : "This file is a companion of its RAW."}
           </div>
         </div>
       )}

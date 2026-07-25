@@ -8,8 +8,10 @@
 //! runs UNLOCKED so concurrent IPC (library queries, etc.) stays responsive during a long import.
 
 pub mod error;
+pub mod pair;
 
 pub use error::ImportError;
+pub use pair::{detect_pairs, pair_roles, PairGroup, Pairing};
 
 use chrono::DateTime;
 use core_db::rusqlite::{params, Connection};
@@ -20,7 +22,7 @@ use core_library::{
 };
 use core_raw::{hash_file, read_metadata, source_from_path};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -53,6 +55,8 @@ pub struct ImportStats {
     /// Move-mode files that were catalogued but whose original could NOT be sent to Trash
     /// (the library copy is intact; the source was left in place). Distinct from `failed`.
     pub source_retained: usize,
+    /// Camera companions (JPEG/HEIF) linked to their RAW — only non-zero under [`Pairing::Pair`].
+    pub paired: usize,
 }
 
 /// Content-hash dedup classification of a source file. `Pending` is the listing default; the real
@@ -86,6 +90,11 @@ pub struct SourceFile {
     pub status: SourceStatus,
     /// Source format bucket ("raw" | "jpeg" | "png") — drives the Import dialog's by-type filter.
     pub kind: String,
+    /// Identity of the RAW+JPEG/HEIF group this file belongs to (`None` when unpaired). Members of
+    /// one group share the key, so the dialog can select/deselect a pair as a unit.
+    pub pair_key: Option<String>,
+    /// `"primary"` (the RAW) or `"secondary"` (its camera companion); `None` when unpaired.
+    pub pair_role: Option<String>,
 }
 
 /// A resolved dedup verdict for one path (the output of [`dedup_scan`]).
@@ -197,8 +206,9 @@ fn preload_present_hashes(conn: &Connection) -> Result<HashSet<[u8; 32]>, Import
 
 /// Outcome of the unlocked per-file processing phase, consumed by the (briefly-locked) catalog step.
 enum Outcome {
-    /// Content already `present` in the catalog (pre-copy hash match) — nothing was copied.
-    Skip,
+    /// Content already `present` in the catalog (pre-copy hash match) — nothing was copied. Carries
+    /// the hash so pairing can still resolve this path to its existing catalog row.
+    Skip([u8; 32]),
     /// A byte-identical file already sits at the destination — skip, but remember the hash so a
     /// later duplicate on the same card short-circuits before copying.
     SkipSeen([u8; 32]),
@@ -228,13 +238,23 @@ pub fn import<F>(
     mode: ImportMode,
     library_root: &Path,
     recursive: bool,
+    pairing: Pairing,
     progress: F,
 ) -> Result<ImportStats, ImportError>
 where
     F: Fn(usize, usize, Option<&ImageRow>),
 {
     let files = core_library::enumerate_raws(source, recursive);
-    import_files(db, thumbs, source, &files, mode, library_root, progress)
+    import_files(
+        db,
+        thumbs,
+        source,
+        &files,
+        mode,
+        library_root,
+        pairing,
+        progress,
+    )
 }
 
 /// Import an explicit list of source files — the staged-preview commit path. Shares every per-file
@@ -248,6 +268,7 @@ pub fn import_files<F>(
     files: &[PathBuf],
     mode: ImportMode,
     library_root: &Path,
+    pairing: Pairing,
     progress: F,
 ) -> Result<ImportStats, ImportError>
 where
@@ -276,6 +297,12 @@ where
         ..Default::default()
     };
     let imported_at = now_epoch();
+    // Source path → catalog row, for the pairing pass below. Rows added this run are known
+    // directly; files that were skipped (already catalogued) are resolved afterwards by hash, so a
+    // JPEG can still be paired to a RAW that arrived in an earlier import.
+    let pairing_on = pairing == Pairing::Pair;
+    let mut new_ids: HashMap<PathBuf, i64> = HashMap::new();
+    let mut src_hashes: HashMap<PathBuf, [u8; 32]> = HashMap::new();
 
     for (i, src_path) in files.iter().enumerate() {
         // Unlocked: hash, dedup-check, copy, verify, thumbnail/metadata. A per-file error here is
@@ -290,12 +317,18 @@ where
         };
 
         let row = match outcome {
-            Outcome::Skip => {
+            Outcome::Skip(h) => {
+                if pairing_on {
+                    src_hashes.insert(src_path.clone(), h);
+                }
                 stats.skipped += 1;
                 None
             }
             Outcome::SkipSeen(h) => {
                 seen.insert(h);
+                if pairing_on {
+                    src_hashes.insert(src_path.clone(), h);
+                }
                 stats.skipped += 1;
                 None
             }
@@ -333,9 +366,12 @@ where
                 );
 
                 match inserted {
-                    Ok(Some((_id, row))) => {
+                    Ok(Some((id, row))) => {
                         stats.added += 1;
                         seen.insert(src_hash);
+                        if pairing_on {
+                            new_ids.insert(src_path.clone(), id);
+                        }
                         // Move: send the original to Trash ONLY now that its copy is durably
                         // catalogued. A trash failure leaves the source in place (counted, not lost).
                         if let Some(src) = src_to_trash {
@@ -359,6 +395,10 @@ where
         progress(i + 1, total, row.as_ref());
     }
 
+    if pairing_on {
+        stats.paired = link_detected_pairs(db, files, &new_ids, &src_hashes);
+    }
+
     {
         let guard = db.lock().expect("import: db mutex poisoned");
         finish_session(&guard.conn, &stats)?;
@@ -366,26 +406,80 @@ where
     Ok(stats)
 }
 
+/// Link each detected RAW+JPEG/HEIF group in `files` (one brief lock for the whole batch). Members
+/// are resolved to catalog rows via this run's inserts first, then by content hash — so a companion
+/// pairs with a RAW that was skipped as already-present, or imported earlier. A group whose primary
+/// cannot be resolved (import failed, or the RAW was not selected) is silently left unpaired: a
+/// failed link must never fail the import. Returns the number of links made.
+fn link_detected_pairs(
+    db: &Mutex<Db>,
+    files: &[PathBuf],
+    new_ids: &HashMap<PathBuf, i64>,
+    src_hashes: &HashMap<PathBuf, [u8; 32]>,
+) -> usize {
+    let groups = pair::detect_pairs(files);
+    if groups.is_empty() {
+        return 0;
+    }
+    let guard = db.lock().expect("import: db mutex poisoned");
+    let conn = &guard.conn;
+    let resolve = |path: &PathBuf| -> Option<i64> {
+        if let Some(id) = new_ids.get(path) {
+            return Some(*id);
+        }
+        let hash = src_hashes.get(path)?;
+        conn.query_row(
+            "SELECT id FROM images WHERE content_hash = ?1 AND status = 'present'",
+            params![&hash[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+    };
+
+    let mut linked = 0;
+    for group in groups {
+        let Some(primary_id) = resolve(&group.primary) else {
+            continue;
+        };
+        for secondary in &group.secondaries {
+            if let Some(secondary_id) = resolve(secondary) {
+                if core_library::link_pair(conn, primary_id, secondary_id).unwrap_or(false) {
+                    linked += 1;
+                }
+            }
+        }
+    }
+    linked
+}
+
 /// List the importable RAW files under `source` from filesystem metadata ONLY — no file reads, no
 /// hashing, no decode — so listing a whole card returns in milliseconds. Every file starts `Pending`;
 /// [`dedup_scan`] resolves the real dedup status in the background. Thumbnails load lazily per file
 /// via `import_thumb`.
 pub fn list_source(source: &Path, recursive: bool) -> Vec<SourceFile> {
-    core_library::enumerate_raws(source, recursive)
+    let paths = core_library::enumerate_raws(source, recursive);
+    // Path-only RAW+JPEG/HEIF grouping, so the dialog can offer the pairing choice up front.
+    let roles = pair::pair_roles(&pair::detect_pairs(&paths));
+    paths
         .into_iter()
-        .map(|path| SourceFile {
-            filename: path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file.raw")
-                .to_string(),
-            size_bytes: std::fs::metadata(&path)
-                .map(|m| m.len() as i64)
-                .unwrap_or(0),
-            mtime: file_mtime_epoch(&path),
-            status: SourceStatus::Pending,
-            kind: core_library::image_kind(&path).to_string(),
-            path: path.display().to_string(),
+        .map(|path| {
+            let pair = roles.get(&path);
+            SourceFile {
+                filename: path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file.raw")
+                    .to_string(),
+                size_bytes: std::fs::metadata(&path)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0),
+                mtime: file_mtime_epoch(&path),
+                status: SourceStatus::Pending,
+                kind: core_library::image_kind(&path).to_string(),
+                pair_key: pair.map(|(k, _)| k.clone()),
+                pair_role: pair.map(|(_, r)| (*r).to_string()),
+                path: path.display().to_string(),
+            }
         })
         .collect()
 }
@@ -469,7 +563,7 @@ fn process_one_unlocked(
 ) -> Result<Outcome, ImportError> {
     let (src_hash, _size) = hash_file(src_path)?;
     if seen.contains(&src_hash) {
-        return Ok(Outcome::Skip); // already in library (or imported this run)
+        return Ok(Outcome::Skip(src_hash)); // already in library (or imported this run)
     }
 
     let (dest_path, src_to_trash) = match mode {

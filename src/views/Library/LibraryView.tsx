@@ -63,6 +63,7 @@ function toGridImage(r: ImageRow, token?: number): GridImage {
     width: r.width,
     height: r.height,
     format: r.format,
+    pairedCount: r.pairedCount,
   };
 }
 

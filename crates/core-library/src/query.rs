@@ -31,6 +31,9 @@ pub struct QueryParams {
     pub person_id: Option<i64>,
     /// Restrict to a source format bucket ("raw" | "jpeg" | "png").
     pub format: Option<String>,
+    /// Include camera companions (the JPEG/HEIF paired to a RAW at import). Default/`None` hides
+    /// them so a paired shot occupies ONE grid cell; `Some(true)` shows every file individually.
+    pub include_paired: Option<bool>,
     pub search: Option<String>,
     /// "capture_desc" (default) | "capture_asc" | "filename" | "filename_desc"
     /// | "rating_desc" | "rating_asc" | "imported_desc" | "imported_asc".
@@ -75,13 +78,21 @@ pub struct ImageRow {
     pub imported_at: i64,
     /// Source format bucket ("raw" | "jpeg" | "png"); null for legacy rows predating the column.
     pub format: Option<String>,
+    /// How many camera companions (paired JPEG/HEIF) hang off this row — 0 for an unpaired image.
+    /// Non-zero ⇒ this row is a pair primary and the grid should badge it.
+    pub paired_count: i64,
+    /// The primary this row is a companion of, when it is one (only ever visible with
+    /// `include_paired`); `None` for primaries and unpaired images.
+    pub paired_to: Option<i64>,
 }
 
 const COLUMNS: &str = "i.id, i.content_hash, i.path, i.original_filename, i.capture_date,
     i.camera_make, i.camera_model, i.lens, i.iso, i.shutter, i.aperture, i.focal_length,
     i.width, i.height, i.orientation,
     COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label, e.updated_at, i.imported_at,
-    i.format";
+    i.format,
+    (SELECT COUNT(*) FROM image_pairs ip WHERE ip.primary_image_id = i.id),
+    (SELECT ip.primary_image_id FROM image_pairs ip WHERE ip.secondary_image_id = i.id)";
 
 // Joined into every row-returning query so `edited_at` is populated.
 const EDIT_JOIN: &str = "LEFT JOIN edits e ON e.image_id = i.id";
@@ -123,6 +134,8 @@ const WHERE: &str = "i.status = 'present'
          (SELECT 1 FROM face fa WHERE fa.asset_id = i.id AND fa.person_id = :person_id
             AND fa.status IN ('confirmed','unconfirmed')))
     AND (:format IS NULL OR i.format = :format)
+    AND (COALESCE(:include_paired, 0) = 1
+         OR NOT EXISTS (SELECT 1 FROM image_pairs ip WHERE ip.secondary_image_id = i.id))
     AND (:search IS NULL OR i.original_filename LIKE :search
                          OR i.camera_model LIKE :search
                          OR i.lens LIKE :search
@@ -174,6 +187,8 @@ fn map_row(r: &Row<'_>) -> core_db::rusqlite::Result<ImageRow> {
         edited_at: r.get(18)?,
         imported_at: r.get(19)?,
         format: r.get(20)?,
+        paired_count: r.get(21)?,
+        paired_to: r.get(22)?,
     })
 }
 
@@ -209,6 +224,7 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
             ":format": p.format,
+            ":include_paired": p.include_paired,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,
@@ -280,6 +296,7 @@ fn run_seek_phase(
         (":detected_category", &p.detected_category),
         (":person_id", &p.person_id),
         (":format", &p.format),
+        (":include_paired", &p.include_paired),
         (":tau_person", &crate::analysis::PRESENCE_TAU_PERSON),
         (":tau_animal", &crate::analysis::PRESENCE_TAU_ANIMAL),
         (":search", search),
@@ -438,12 +455,14 @@ pub struct FolderRow {
     pub count: i64,
 }
 
-/// Watched folders with present-image counts (for the left nav).
+/// Watched folders with present-image counts (for the left nav). Paired camera companions are
+/// excluded so the count matches the (companion-hiding) default grid.
 pub fn list_folders(conn: &Connection) -> Result<Vec<FolderRow>, LibError> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.path, COUNT(i.id)
          FROM folders f
          LEFT JOIN images i ON i.folder_id = f.id AND i.status = 'present'
+              AND NOT EXISTS (SELECT 1 FROM image_pairs ip WHERE ip.secondary_image_id = i.id)
          GROUP BY f.id, f.path
          ORDER BY f.path",
     )?;
@@ -483,7 +502,8 @@ pub fn date_tree(conn: &Connection) -> Result<Vec<DateTreeYear>, LibError> {
         "SELECT COALESCE(strftime('%Y', capture_date, 'unixepoch'), 'Unknown')      AS y,
                 COALESCE(strftime('%Y-%m-%d', capture_date, 'unixepoch'), 'Unknown') AS d,
                 COUNT(*)
-         FROM images WHERE status = 'present'
+         FROM images i WHERE status = 'present'
+           AND NOT EXISTS (SELECT 1 FROM image_pairs ip WHERE ip.secondary_image_id = i.id)
          GROUP BY y, d
          ORDER BY y = 'Unknown', y DESC, d = 'Unknown', d DESC",
     )?;
@@ -631,6 +651,7 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
             ":format": p.format,
+            ":include_paired": p.include_paired,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
             ":search": search,

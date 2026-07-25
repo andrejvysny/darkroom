@@ -88,6 +88,9 @@ export type QueryParams = {
   personId?: number | null;
   /** Source format bucket filter: "raw" | "jpeg" | "png" | "heif" | "hdr". */
   format?: string | null;
+  /** Show camera companions (the JPEG/HEIF paired to a RAW at import) as their own grid cells.
+   *  Default/omitted hides them, so a paired shot occupies one cell. */
+  includePaired?: boolean;
   search?: string | null;
   sort?: SortKey;
   limit?: number;
@@ -167,6 +170,20 @@ export type ImageRow = {
   /** Source format bucket ("raw" | "jpeg" | "png" | "heif" | "hdr"); null for legacy rows
    *  predating the column. */
   format: string | null;
+  /** Camera companions (paired JPEG/HEIF) hanging off this row; > 0 ⇒ badge it as a pair. */
+  pairedCount: number;
+  /** The primary this row is a companion of (only visible with `includePaired`); null otherwise. */
+  pairedTo: number | null;
+};
+
+/** One image's place in a RAW+JPEG/HEIF pair (mirrors Rust `PairInfo`). */
+export type PairInfo = {
+  /** "primary" (the RAW) or "secondary" (a camera companion). */
+  role: "primary" | "secondary";
+  /** Id of the RAW anchoring the pair. */
+  primaryId: number;
+  /** Every companion in the pair, ordered by filename. */
+  secondaries: ImageRow[];
 };
 
 export type FolderRow = {
@@ -265,6 +282,8 @@ export type ImportStats = {
   failed: number;
   /** Move-mode files catalogued but whose original could not be sent to Trash (source kept). */
   sourceRetained: number;
+  /** Camera companions (JPEG/HEIF) linked to their RAW — only non-zero when pairing was chosen. */
+  paired: number;
 };
 
 /** Content-hash dedup status of a source file (matches Rust `SourceStatus`). "pending" = not yet
@@ -284,7 +303,15 @@ export type SourceFile = {
   status: SourceStatus;
   /** Source format bucket ("raw" | "jpeg" | "png") — drives the by-type filter chips. */
   kind: string;
+  /** Identity of the RAW+JPEG/HEIF group this file belongs to; null when unpaired. Members of one
+   *  group share the key, so the dialog selects/deselects a pair as a unit. */
+  pairKey: string | null;
+  /** "primary" (the RAW) or "secondary" (its camera companion); null when unpaired. */
+  pairRole: "primary" | "secondary" | null;
 };
+
+/** How an import treats a JPEG/HEIF the camera wrote beside a RAW (matches Rust `Pairing`). */
+export type Pairing = "pair" | "standalone";
 
 /** A resolved hash-dedup verdict for one path (matches Rust `DedupResult`). */
 export type DedupResult = { path: string; status: SourceStatus };
@@ -361,6 +388,7 @@ export function importCommit(
   dest: string,
   selected: string[],
   options: ImportOptions,
+  pairing: Pairing = "standalone",
 ): Promise<ImportStats> {
   return invoke<ImportStats>("import_commit", {
     source,
@@ -368,7 +396,18 @@ export function importCommit(
     dest,
     selected,
     options,
+    pairing,
   });
+}
+
+/** The RAW+JPEG/HEIF pair `imageId` belongs to (from either member); null when unpaired. */
+export function imagePair(imageId: number): Promise<PairInfo | null> {
+  return invoke<PairInfo | null>("image_pair", { imageId });
+}
+
+/** Break a pair — the companion returns to the grid as a standalone image. Files are untouched. */
+export function imagePairUnlink(secondaryId: number): Promise<void> {
+  return invoke<void>("image_pair_unlink", { secondaryId });
 }
 
 /** Merge 2–9 bracketed RAW frames (tripod) into a scene-referred HDR EXR in the library.

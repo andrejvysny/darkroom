@@ -13,6 +13,8 @@ export interface GridImage {
   height?: number | null;
   /** Catalog format bucket ("raw" | "jpeg" | "png" | "heif" | "hdr") — drives the HDR chip. */
   format?: string | null;
+  /** Camera companions paired to this RAW — drives the "+JPG" chip (they have no cell of their own). */
+  pairedCount?: number;
 }
 
 export interface SelectMods {
@@ -156,8 +158,9 @@ export default function ThumbGrid({
                 const sel = selectedSet.has(img.id);
                 const primary = img.id === selectedId;
                 const isHdr = img.format === "hdr";
+                const paired = (img.pairedCount ?? 0) > 0;
                 const hasOverlay =
-                  !!img.label || !!img.flag || img.stars > 0 || isHdr;
+                  !!img.label || !!img.flag || img.stars > 0 || isHdr || paired;
                 return (
                   <div
                     key={img.id}
@@ -246,6 +249,24 @@ export default function ThumbGrid({
                             }}
                           >
                             HDR
+                          </span>
+                        )}
+                        {paired && (
+                          <span
+                            title={`${img.pairedCount} paired file${img.pairedCount === 1 ? "" : "s"}`}
+                            style={{
+                              marginLeft: img.label || isHdr ? 6 : 0,
+                              fontSize: 9,
+                              fontWeight: 700,
+                              letterSpacing: ".06em",
+                              color: "var(--color-t2)",
+                              border: "1px solid var(--color-line-2)",
+                              borderRadius: 3,
+                              padding: "1px 4px",
+                              background: "rgba(0,0,0,.35)",
+                            }}
+                          >
+                            +JPG
                           </span>
                         )}
                         {img.flag === "pick" && (

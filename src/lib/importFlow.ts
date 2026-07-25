@@ -7,6 +7,7 @@ import {
   type ImportMode,
   type ImportOptions,
   type ImportStats,
+  type Pairing,
 } from "./ipc";
 
 /** Open the native folder picker; returns the chosen path (or null if cancelled). */
@@ -30,6 +31,7 @@ export async function commitImport(
   dest: string,
   selected: string[],
   options: ImportOptions,
+  pairing: Pairing = "standalone",
   onComplete?: () => void,
 ): Promise<void> {
   const { setToast } = useAppStore.getState();
@@ -42,17 +44,18 @@ export async function commitImport(
   const unDone = await listen<ImportStats>("import:done", (ev) => {
     unProgress();
     unDone();
-    const { added, skipped, sourceRetained } = ev.payload;
+    const { added, skipped, sourceRetained, paired } = ev.payload;
     const retained =
       sourceRetained > 0
         ? `, ${sourceRetained} original(s) kept (trash failed)`
         : "";
-    setToast(`Imported: added ${added}, skipped ${skipped}${retained}`);
+    const pairs = paired > 0 ? `, ${paired} paired` : "";
+    setToast(`Imported: added ${added}, skipped ${skipped}${pairs}${retained}`);
     onComplete?.();
   });
 
   try {
-    await importCommit(source, mode, dest, selected, options);
+    await importCommit(source, mode, dest, selected, options, pairing);
   } catch (err) {
     unProgress();
     unDone();

@@ -9,6 +9,7 @@ import {
   type DedupResult,
   type ImportMode,
   type ImportOptions,
+  type Pairing,
   type SourceFile,
 } from "../../lib/ipc";
 import { commitImport, pickFolder, resolveDest } from "../../lib/importFlow";
@@ -35,6 +36,20 @@ const MODES: { mode: ImportMode; label: string; desc: string }[] = [
     mode: "reference",
     label: "Reference",
     desc: "Catalog in place; source folder is watched.",
+  },
+];
+
+/** The RAW+JPEG choice, shown only when the source actually holds such pairs. */
+const PAIRINGS: { value: Pairing; label: string; desc: string }[] = [
+  {
+    value: "pair",
+    label: "Pair them",
+    desc: "The JPEG/HEIF is linked to its RAW: one photo in the grid, both files kept.",
+  },
+  {
+    value: "standalone",
+    label: "Import as separate photos",
+    desc: "Every file becomes its own photo, as if it had been shot alone.",
   },
 ];
 
@@ -116,6 +131,10 @@ export default function ImportDialog({
   // silently doubles storage (a card import can be tens of GB) and Move Trashes the originals, so
   // both should be a deliberate choice rather than something a stray click can trigger.
   const [mode, setMode] = useState<ImportMode>("reference");
+  // Pairing defaults to on: it is reversible (a pair can be unlinked at any time), keeps both
+  // files, and is what "the camera shot RAW+JPEG" actually means. The choice is only ever shown
+  // when the source really holds such pairs.
+  const [pairing, setPairing] = useState<Pairing>("pair");
   const [rating, setRating] = useState(0);
   const [flag, setFlag] = useState<"none" | "pick" | "reject">("none");
   const [keywordsText, setKeywordsText] = useState("");
@@ -136,6 +155,7 @@ export default function ImportDialog({
     setListing(false);
     setRecursive(true);
     setKindFilter("all");
+    setPairing("pair");
     setDedupProgress(null);
     setPreviewPath(null);
     setPreviewUrl(null);
@@ -273,11 +293,58 @@ export default function ImportDialog({
     selectable(f, skipDuplicates),
   ).length;
 
+  // RAW+JPEG/HEIF groups detected in this listing: every member path maps to its whole group, so a
+  // pair can be selected/deselected as a unit. `pairCount` gates the whole pairing prompt.
+  const pairsByPath = useMemo(() => {
+    const byKey = new Map<string, SourceFile[]>();
+    for (const f of files) {
+      if (!f.pairKey) continue;
+      const members = byKey.get(f.pairKey);
+      if (members) members.push(f);
+      else byKey.set(f.pairKey, [f]);
+    }
+    const byPath = new Map<string, SourceFile[]>();
+    for (const members of byKey.values())
+      for (const m of members) byPath.set(m.path, members);
+    return byPath;
+  }, [files]);
+  const pairCount = useMemo(
+    () => files.filter((f) => f.pairRole === "primary").length,
+    [files],
+  );
+  const pairingOn = pairing === "pair" && pairCount > 0;
+
+  /** Every selectable file that must travel with `path` — itself, plus its pair members when
+   *  pairing is on (a companion is meaningless without its RAW, and vice versa). */
+  const withPair = (path: string): string[] => {
+    if (!pairingOn) return [path];
+    const members = pairsByPath.get(path);
+    if (!members) return [path];
+    return members
+      .filter((m) => selectable(m, skipDuplicates))
+      .map((m) => m.path);
+  };
+
+  // Turning pairing on pulls each selected file's partners in, so what the footer counts is what
+  // actually gets imported.
+  useEffect(() => {
+    if (!pairingOn) return;
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const path of prev) for (const p of withPair(path)) next.add(p);
+      return next.size === prev.size ? prev : next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairingOn, pairsByPath, skipDuplicates]);
+
   function toggle(path: string) {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
+      const on = !next.has(path);
+      for (const p of withPair(path)) {
+        if (on) next.add(p);
+        else next.delete(p);
+      }
       return next;
     });
   }
@@ -293,14 +360,16 @@ export default function ImportDialog({
   }
 
   // Bulk-select over the *visible* (type-filtered) files, merging into the current selection so a
-  // filtered "Select all" never deselects files hidden by the active chip.
+  // filtered "Select all" never deselects files hidden by the active chip. Deselection runs first
+  // so that, when pairing is on, a partner dropped by the non-matching pass is put back by the
+  // matching one (e.g. "Only new" over a new RAW whose JPEG is a known duplicate).
   const setAll = (pred: (f: SourceFile) => boolean) =>
     setSelected((prev) => {
       const next = new Set(prev);
-      const visible = new Set(visibleFiles.map((f) => f.path));
-      for (const f of visibleFiles) if (pred(f)) next.add(f.path);
       for (const f of visibleFiles)
-        if (!pred(f) && visible.has(f.path)) next.delete(f.path);
+        if (!pred(f)) for (const p of withPair(f.path)) next.delete(p);
+      for (const f of visibleFiles)
+        if (pred(f)) for (const p of withPair(f.path)) next.add(p);
       return next;
     });
 
@@ -326,6 +395,7 @@ export default function ImportDialog({
       dest ?? "",
       [...selected],
       options,
+      pairingOn ? "pair" : "standalone",
       onComplete,
     );
   }
@@ -439,8 +509,9 @@ export default function ImportDialog({
                       onToggleGroup={(paths, on) =>
                         setSelected((prev) => {
                           const next = new Set(prev);
-                          for (const p of paths)
-                            on ? next.add(p) : next.delete(p);
+                          for (const path of paths)
+                            for (const p of withPair(path))
+                              on ? next.add(p) : next.delete(p);
                           return next;
                         })
                       }
@@ -508,6 +579,47 @@ export default function ImportDialog({
                   ))}
                 </div>
               </Field>
+
+              {pairCount > 0 && (
+                <Field label={`RAW + JPEG (${pairCount} shot${pairCount === 1 ? "" : "s"})`}>
+                  <div
+                    style={{ display: "flex", flexDirection: "column", gap: 6 }}
+                  >
+                    {PAIRINGS.map((p) => (
+                      <button
+                        key={p.value}
+                        onClick={() => setPairing(p.value)}
+                        style={modeBtn(pairing === p.value)}
+                      >
+                        <span style={{ fontWeight: 600, fontSize: 12.5 }}>
+                          {p.label}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            color: "var(--color-t3)",
+                            lineHeight: 1.4,
+                          }}
+                        >
+                          {p.desc}
+                        </span>
+                      </button>
+                    ))}
+                    {pairingOn && (
+                      <span
+                        style={{
+                          fontSize: 10.5,
+                          color: "var(--color-t3)",
+                          lineHeight: 1.4,
+                        }}
+                      >
+                        Selecting one file of a pair selects the other; both are
+                        always imported together.
+                      </span>
+                    )}
+                  </div>
+                </Field>
+              )}
 
               {mode !== "reference" && (
                 <Field label="Destination">
@@ -775,6 +887,11 @@ function DayGroup({
             >
               {f.filename}
             </span>
+            {f.pairRole && (
+              <span style={{ fontSize: 9.5, color: "var(--color-accent)" }}>
+                {f.pairRole === "primary" ? "RAW+" : "companion"}
+              </span>
+            )}
             {badge && (
               <span style={{ fontSize: 9.5, color: "#b08968" }}>{badge}</span>
             )}

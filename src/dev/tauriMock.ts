@@ -62,6 +62,9 @@ function makeRows(n: number): ImageRow[] {
       editedAt: null,
       importedAt: base - i * 3600,
       format: "raw",
+      // Every 7th fixture stands in for a RAW+JPEG shot, so the pair badge is exercisable.
+      pairedCount: i % 7 === 0 ? 1 : 0,
+      pairedTo: null,
     };
   });
 }
@@ -429,21 +432,34 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   import_list: () => {
     const day = (y: number, m: number, d: number) =>
       Math.floor(Date.UTC(y, m - 1, d, 12) / 1000);
-    const mk = (i: number, mtime: number) => ({
-      path: `/Volumes/SD_CARD/DCIM/IMG_${String(9000 + i).padStart(4, "0")}.CR3`,
-      filename: `IMG_${String(9000 + i).padStart(4, "0")}.CR3`,
-      sizeBytes: 28_000_000 + i * 1000,
-      mtime,
-      // Fast list is metadata-only → always pending; import_dedup resolves the real status.
-      status: "pending",
-      kind: "raw",
-    });
+    const mk = (
+      i: number,
+      mtime: number,
+      ext: "CR3" | "JPG" = "CR3",
+      pairRole: "primary" | "secondary" | null = null,
+    ) => {
+      const stem = `IMG_${String(9000 + i).padStart(4, "0")}`;
+      return {
+        path: `/Volumes/SD_CARD/DCIM/${stem}.${ext}`,
+        filename: `${stem}.${ext}`,
+        sizeBytes: (ext === "CR3" ? 28_000_000 : 6_000_000) + i * 1000,
+        mtime,
+        // Fast list is metadata-only → always pending; import_dedup resolves the real status.
+        status: "pending",
+        kind: ext === "CR3" ? "raw" : "jpeg",
+        pairKey: pairRole ? `/Volumes/SD_CARD/DCIM/${stem.toLowerCase()}` : null,
+        pairRole,
+      };
+    };
     return [
       mk(1, day(2026, 6, 22)),
       mk(2, day(2026, 6, 22)),
       mk(3, day(2026, 6, 22)),
       mk(4, day(2026, 6, 21)),
       mk(5, day(2026, 6, 21)),
+      // A camera RAW+JPEG shot, so the pairing prompt is exercisable in the mock frontend.
+      mk(6, day(2026, 6, 21), "CR3", "primary"),
+      mk(6, day(2026, 6, 21), "JPG", "secondary"),
     ];
   },
   // Hash-dedup verdicts: flag #3 as already in library, #5 as a batch duplicate.
@@ -466,7 +482,27 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     skipped: 0,
     failed: 0,
     sourceRetained: 0,
+    paired: String(p.pairing) === "pair" ? 1 : 0,
   }),
+  image_pair: (p) =>
+    Number(p.imageId) % 7 === 1
+      ? {
+          role: "primary",
+          primaryId: Number(p.imageId),
+          secondaries: [
+            {
+              ...rows[0],
+              id: 10_000 + Number(p.imageId),
+              filename: rows[0].filename.replace(".CR3", ".JPG"),
+              path: rows[0].path.replace(".CR3", ".JPG"),
+              format: "jpeg",
+              pairedCount: 0,
+              pairedTo: Number(p.imageId),
+            },
+          ],
+        }
+      : null,
+  image_pair_unlink: () => undefined,
   dedup_scan: (p) =>
     String(p.category) === "byte" ? [DUP_GROUPS[0]] : DUP_GROUPS.slice(1, 3),
   dedup_scan_perceptual: () => [DUP_GROUPS[3]],

@@ -37,6 +37,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/018_panorama.sql"),
     include_str!("../migrations/019_pano_detect.sql"),
     include_str!("../migrations/020_hdr_sources.sql"),
+    include_str!("../migrations/021_image_pairs.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -135,7 +136,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 20, "expected 20 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 21, "expected 21 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -390,6 +391,83 @@ mod tests {
     }
 
     #[test]
+    fn migration_021_image_pairs_constraints() {
+        let db = Db::open_in_memory().unwrap();
+        let raw = insert_folder_and_image(&db.conn, 1);
+        let jpeg = insert_folder_and_image(&db.conn, 2);
+        let heif = insert_folder_and_image(&db.conn, 3);
+
+        // One RAW may carry several companions (CR3 + JPG + HIF).
+        for sec in [jpeg, heif] {
+            db.conn
+                .execute(
+                    "INSERT INTO image_pairs(secondary_image_id, primary_image_id, created_at)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![sec, raw],
+                )
+                .unwrap();
+        }
+
+        // (a) A companion belongs to exactly ONE primary — re-linking it must violate the PK.
+        let other_raw = insert_folder_and_image(&db.conn, 4);
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO image_pairs(secondary_image_id, primary_image_id, created_at)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![jpeg, other_raw],
+                )
+                .is_err(),
+            "a second primary for the same companion must violate the PRIMARY KEY"
+        );
+
+        // (b) Self-links are rejected by the CHECK.
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO image_pairs(secondary_image_id, primary_image_id, created_at)
+                     VALUES (?1, ?1, 1)",
+                    rusqlite::params![other_raw],
+                )
+                .is_err(),
+            "an image paired to itself must violate the CHECK constraint"
+        );
+
+        // (c) Deleting a companion drops only its link row; the RAW and its other companion survive.
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![jpeg])
+            .unwrap();
+        let left: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM image_pairs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            left, 1,
+            "deleting a companion must cascade only its own link"
+        );
+
+        // (d) Deleting the RAW cascades away every remaining link, leaving the companions intact.
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![raw])
+            .unwrap();
+        let left: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM image_pairs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "deleting the primary must cascade its link rows");
+        let heif_present: bool = db
+            .conn
+            .prepare("SELECT 1 FROM images WHERE id = ?1")
+            .unwrap()
+            .exists(rusqlite::params![heif])
+            .unwrap();
+        assert!(
+            heif_present,
+            "the companion image itself must survive its primary's deletion"
+        );
+    }
+
+    #[test]
     fn opens_and_creates_all_tables() {
         let db = Db::open_in_memory().unwrap();
         let mut names: Vec<String> = db
@@ -422,6 +500,7 @@ mod tests {
             "image_detections",
             "image_features",
             "image_keywords",
+            "image_pairs",
             "image_presence",
             "image_similarity_features",
             "image_user_labels",

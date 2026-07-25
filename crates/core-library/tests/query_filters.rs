@@ -267,6 +267,57 @@ fn empty_params_returns_all() {
     assert_eq!(count_images(&db.conn, &QueryParams::default()).unwrap(), 4);
 }
 
+#[test]
+fn paired_companions_are_hidden_unless_requested() {
+    let db = seed();
+    let c = &db.conn;
+    // Pair BBB.CR3 (id 2) as the camera companion of AAA.CR3 (id 1).
+    core_library::link_pair(c, 1, 2).unwrap();
+
+    let hidden = QueryParams::default();
+    assert_eq!(
+        ids(c, &hidden),
+        vec![4, 1, 3],
+        "companion hidden by default"
+    );
+    assert_eq!(count_images(c, &hidden).unwrap(), 3);
+
+    let shown = QueryParams {
+        include_paired: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        ids(c, &shown),
+        vec![4, 1, 2, 3],
+        "companion shown on request"
+    );
+    assert_eq!(count_images(c, &shown).unwrap(), 4);
+
+    // Seek pagination applies the same rule (it builds its own SQL).
+    let seeked = QueryParams {
+        seek: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        ids(c, &seeked),
+        vec![4, 1, 3],
+        "seek path hides companions too"
+    );
+
+    // The primary is badgeable; the companion knows its primary when visible.
+    let rows = query_images(c, &shown).unwrap();
+    let primary = rows.iter().find(|r| r.id == 1).unwrap();
+    let companion = rows.iter().find(|r| r.id == 2).unwrap();
+    assert_eq!(primary.paired_count, 1);
+    assert_eq!(primary.paired_to, None);
+    assert_eq!(companion.paired_count, 0);
+    assert_eq!(companion.paired_to, Some(1));
+
+    // Unlinking returns it to the default grid.
+    core_library::unlink_pair(c, 2).unwrap();
+    assert_eq!(ids(c, &hidden), vec![4, 1, 2, 3]);
+}
+
 /// Insert a row with an explicit (possibly NULL) capture_date; returns its id.
 fn insert_cap(conn: &Connection, tag: u8, capture_date: Option<i64>) -> i64 {
     conn.execute(

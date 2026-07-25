@@ -12,6 +12,7 @@ pub mod features;
 pub mod index;
 pub mod keywords;
 pub mod maintenance;
+pub mod pairs;
 pub mod pano_detect;
 pub mod presets;
 pub mod query;
@@ -55,6 +56,7 @@ pub use keywords::{
     keywords_for_image, list_keywords, remove_keyword_from_image, KeywordRow,
 };
 pub use maintenance::reap_dangling_import_sessions;
+pub use pairs::{link_pair, pair_info, primary_of, secondaries_of, unlink_pair, PairInfo};
 pub use presets::{
     delete_preset, get_preset, insert_preset, is_builtin, list_presets, seed_builtin_preset,
     unique_name, update_preset, PresetFull, PresetSummary,

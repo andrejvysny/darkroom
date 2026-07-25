@@ -189,6 +189,8 @@ pub fn run() {
             commands::hdr_cancel,
             commands::hdr_export_dng,
             commands::image_sources,
+            commands::image_pair,
+            commands::image_pair_unlink,
             commands::thumb_cache_cap,
             commands::thumb_cache_size,
             commands::set_thumb_cache_cap,

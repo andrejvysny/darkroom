@@ -67,6 +67,34 @@ fn groups_byte_and_capture_then_resolve() {
 }
 
 #[test]
+fn paired_companions_are_not_duplicates() {
+    let db = Db::open_in_memory().unwrap();
+    let (h_raw, h_jpg) = ([1u8; 32], [2u8; 32]);
+    let fp = [9u8; 32]; // a camera RAW+JPEG pair shares its capture fingerprint
+
+    insert(&db, &h_raw, Some(&fp), "855A0001.CR3");
+    insert(&db, &h_jpg, Some(&fp), "855A0001.JPG");
+    assert_eq!(
+        core_dedup::find_same_capture(&db.conn).unwrap().len(),
+        1,
+        "unpaired, they look like a same-capture duplicate"
+    );
+
+    // Pairing them at import is the user declaring "one shot, two files".
+    db.conn
+        .execute(
+            "INSERT INTO image_pairs(secondary_image_id, primary_image_id, created_at)
+             VALUES(2, 1, 0)",
+            [],
+        )
+        .unwrap();
+    assert!(
+        core_dedup::find_same_capture(&db.conn).unwrap().is_empty(),
+        "a linked companion must never be offered for cleanup"
+    );
+}
+
+#[test]
 fn resolve_rejects_invalid_keeper_and_trashes_nothing() {
     let db = Db::open_in_memory().unwrap();
     let h1 = [1u8; 32];

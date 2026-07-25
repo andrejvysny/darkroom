@@ -27,6 +27,18 @@
 > (portrait HIF) is resolved — libheif applies `irot`, so `.oriented()` must NOT be added.
 > Details + open items: `TODO.md` "Real-corpus validation round".
 >
+> **2026-07-25 — RAW+JPEG pairing (UNCOMMITTED on `main`).** The Import dialog now asks, whenever
+> the source holds RAW+JPEG/HEIF shots, whether to **pair** them (companion linked to its RAW: one
+> grid cell, both files catalogued and developable) or import them **standalone** (previous
+> behaviour). Detection is path-only (same folder + case-insensitive stem, ≥1 RAW + ≥1 `.jpg`/
+> `.jpeg`/`.hif`; PNG/EXR excluded as app products), so listing a card stays instant. Schema **21**
+> (`021_image_pairs.sql`). Companions are hidden from the default grid + nav counts, excluded from
+> every dedup detector (a RAW and its JPEG share a capture fingerprint and would otherwise read as
+> duplicates), badged `+JPG` on the primary tile, listed with an Unpair action in the metadata panel,
+> and revealed by LeftNav → "Show paired JPEGs". Pairing is **import-time only** — the FS watcher and
+> `library_index_root` still catalogue companions standalone. Gates: `cargo test --workspace` green,
+> clippy no new warnings, `npm run build` clean. **Live GUI QA pending.**
+>
 > **Schema is now 20** (`020_hdr_sources.sql`). **New IPC**: `hdr_cancel`, `image_sources`,
 > `hdr_export_dng`. **New harnesses**: `core-raw --example export_hdr_dng`,
 > `core-library --example {detect_catalog,index_root}`.
@@ -470,7 +482,14 @@ replace_all) → DevelopParams` (merged, NOT persisted — FE commits), `presets
   `PanoGroupRow[]`, `pano_detect_dismiss(group_id, dismissed)`,
   `pano_detect_mark_merged(group_id, merged_image_id)`. Events:
   `pano_detect:{progress {phase,done,total}, done {found}, error {message}}`
-- Import: `import_start`
+- Import: `import_start`; staged flow — `import_list` → `import_dedup` → `import_thumb` →
+  `import_commit(source, mode, dest, selected, options, pairing)`
+- RAW+JPEG pairing (**NEW**, schema 21): `import_commit`'s `pairing` ∈ {`"pair"`,`"standalone"`}
+  (default standalone) links each camera companion (a `.jpg`/`.jpeg`/`.hif` sharing a RAW's folder +
+  stem) to that RAW in `image_pairs`; `image_pair(image_id) → PairInfo|null`,
+  `image_pair_unlink(secondary_id)` (emits `library:changed`). Linked companions are hidden from
+  `library_query`/`library_count`/`list_folders`/`date_tree` unless `QueryParams.include_paired`, are
+  excluded from every dedup detector, and `ImageRow` carries `paired_count` / `paired_to`.
 - AI scan / People (**unified manual pass** — `feat/unified-ai-pipeline`): `analysis_status`,
   `analysis_run(force)`, `analysis_cancel`, `analysis_models_ensure`, `analysis_facets`,
   `analysis_detector_size`/`set_analysis_detector_size`, `face_stage_enabled`/`set_face_stage_enabled`,
@@ -482,7 +501,8 @@ replace_all) → DevelopParams` (merged, NOT persisted — FE commits), `presets
   `library_index_root`'s `analyze` flag is now a **no-op** (scan is fully manual).
 
 `QueryParams` filter dimensions: `folder_id`, `min_stars`, `flag`, `color_label`
-(`"__none__"` = unlabeled), `keyword_id`, `collection_id`, `import_session_id`, `search`
+(`"__none__"` = unlabeled), `keyword_id`, `collection_id`, `import_session_id`, `include_paired`
+(view option, not cleared by "All photos"), `search`
 (filename/camera/lens/keyword), `sort` ∈ {capture_desc|asc, filename|\_desc, rating_desc|asc,
 imported_desc|asc}.
 

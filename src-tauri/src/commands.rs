@@ -1999,6 +1999,9 @@ pub async fn import_thumb(
 
 /// Commit a staged import: copy/move/reference only the `selected` source files, then apply
 /// `options` to the freshly-added rows. Emits `import:progress` (live rows) + `import:done`.
+///
+/// `pairing` decides what happens to a JPEG/HEIF the camera wrote beside a RAW: `"pair"` links it
+/// to that RAW (one grid cell), anything else (the default) catalogs every file standalone.
 #[tauri::command]
 pub async fn import_commit(
     app: AppHandle,
@@ -2007,6 +2010,7 @@ pub async fn import_commit(
     dest: String,
     selected: Vec<String>,
     options: ImportOptions,
+    pairing: Option<String>,
 ) -> Result<core_import::ImportStats, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -2015,6 +2019,10 @@ pub async fn import_commit(
             "move" => core_import::ImportMode::Move,
             "reference" => core_import::ImportMode::Reference,
             _ => core_import::ImportMode::Copy,
+        };
+        let pairing = match pairing.as_deref() {
+            Some("pair") => core_import::Pairing::Pair,
+            _ => core_import::Pairing::Standalone,
         };
         let files: Vec<PathBuf> = selected.iter().map(PathBuf::from).collect();
         // Gate the FS watcher for the duration of the import so it can't race the now-unlocked
@@ -2033,6 +2041,7 @@ pub async fn import_commit(
             &files,
             import_mode,
             Path::new(&dest),
+            pairing,
             |done, total, added| {
                 if let Some(row) = added {
                     added_ids.borrow_mut().push(row.id);
@@ -2832,6 +2841,40 @@ pub async fn image_sources(app: AppHandle, image_id: i64) -> Result<Option<Merge
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::merge_sources(&db.conn, image_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The RAW+JPEG/HEIF pair `image_id` belongs to, from either member, for the metadata panel.
+/// `None` when the image is not paired.
+#[tauri::command]
+pub async fn image_pair(
+    app: AppHandle,
+    image_id: i64,
+) -> Result<Option<core_library::PairInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::pair_info(&db.conn, image_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Break a pair: `secondary_id` (the camera companion) returns to the grid as a standalone image.
+/// Files on disk are untouched — this only drops the catalog link.
+#[tauri::command]
+pub async fn image_pair_unlink(app: AppHandle, secondary_id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::unlink_pair(&db.conn, secondary_id).map_err(|e| e.to_string())?;
+        }
+        // The companion re-enters the default grid query — refresh whoever is showing it.
+        let _ = app.emit("library:changed", ());
+        Ok::<_, String>(())
     })
     .await
     .map_err(|e| e.to_string())?

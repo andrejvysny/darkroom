@@ -353,6 +353,18 @@ export default function LeftNav({
             />
           );
         })}
+        {/* Camera companions (a JPEG/HEIF paired to a RAW at import) get no grid cell of their own
+            by default — this reveals them as individual photos. Not a filter dimension: "All photos"
+            must not silently turn it back off. */}
+        <NavRow
+          icon="photos"
+          label="Show paired JPEGs"
+          count=""
+          active={params.includePaired === true}
+          onClick={() =>
+            patchParams({ includePaired: !params.includePaired })
+          }
+        />
       </div>
     </aside>
   );

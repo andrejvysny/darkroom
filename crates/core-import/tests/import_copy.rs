@@ -2,7 +2,7 @@
 //! catalog insertion, and idempotent re-import (no duplicates). Skips if `library/2026` is absent.
 
 use core_db::Db;
-use core_import::{dedup_scan, import, list_source, ImportMode, SourceStatus};
+use core_import::{dedup_scan, import, list_source, ImportMode, Pairing, SourceStatus};
 use core_library::ThumbCache;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -58,6 +58,7 @@ fn copy_import_routes_and_dedupes() {
         ImportMode::Copy,
         libdir.path(),
         true,
+        Pairing::Standalone,
         |_, _, _| {},
     )
     .unwrap();
@@ -88,6 +89,7 @@ fn copy_import_routes_and_dedupes() {
         ImportMode::Copy,
         libdir.path(),
         true,
+        Pairing::Standalone,
         |_, _, _| {},
     )
     .unwrap();
@@ -101,6 +103,96 @@ fn copy_import_routes_and_dedupes() {
         .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, n as i64, "no duplicate rows");
+}
+
+/// Stage a card holding one RAW + JPEG pair (`PAIR01.CR3` + `PAIR01.JPG`), from the committed
+/// fixtures. `None` when the CR3 fixture is absent.
+fn pair_card() -> Option<tempfile::TempDir> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let raw = root
+        .join("library/2026/2026-06-06/_55A3947.CR3")
+        .canonicalize()
+        .ok()?;
+    let jpeg = root.join("docs/sample-poppies.jpg").canonicalize().ok()?;
+    let card = tempfile::tempdir().unwrap();
+    std::fs::copy(&raw, card.path().join("PAIR01.CR3")).unwrap();
+    std::fs::copy(&jpeg, card.path().join("PAIR01.JPG")).unwrap();
+    Some(card)
+}
+
+fn run_pair_import(card: &std::path::Path, pairing: Pairing) -> (Mutex<Db>, tempfile::TempDir) {
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    let stats = import(
+        &db,
+        &thumbs,
+        card,
+        ImportMode::Copy,
+        libdir.path(),
+        true,
+        pairing,
+        |_, _, _| {},
+    )
+    .unwrap();
+    assert_eq!(stats.added, 2, "both members of the pair are catalogued");
+    assert_eq!(
+        stats.paired,
+        usize::from(pairing == Pairing::Pair),
+        "companion linked only under Pairing::Pair"
+    );
+    (db, libdir)
+}
+
+#[test]
+fn pair_import_links_companion_and_hides_it_from_the_grid() {
+    let Some(card) = pair_card() else {
+        eprintln!("CR3 fixture not present — skipping");
+        return;
+    };
+
+    // Standalone: two independent rows, both visible, no link.
+    let (db, _lib) = run_pair_import(card.path(), Pairing::Standalone);
+    {
+        let g = db.lock().unwrap();
+        let links: i64 = g
+            .conn
+            .query_row("SELECT COUNT(*) FROM image_pairs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 0, "standalone import must not pair anything");
+        let visible =
+            core_library::query_images(&g.conn, &core_library::QueryParams::default()).unwrap();
+        assert_eq!(visible.len(), 2, "both files show in the grid");
+    }
+
+    // Pair: the JPEG is linked to the CR3 and drops out of the default grid.
+    let (db, _lib) = run_pair_import(card.path(), Pairing::Pair);
+    let g = db.lock().unwrap();
+    let visible =
+        core_library::query_images(&g.conn, &core_library::QueryParams::default()).unwrap();
+    assert_eq!(visible.len(), 1, "the pair occupies one grid cell");
+    let primary = &visible[0];
+    assert_eq!(primary.filename, "PAIR01.CR3", "the RAW is the primary");
+    assert_eq!(primary.paired_count, 1);
+
+    let info = core_library::pair_info(&g.conn, primary.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.role, "primary");
+    assert_eq!(info.secondaries.len(), 1);
+    assert_eq!(info.secondaries[0].filename, "PAIR01.JPG");
+
+    // The companion is still a real, queryable catalog row — just hidden by default.
+    let all = core_library::query_images(
+        &g.conn,
+        &core_library::QueryParams {
+            include_paired: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(all.len(), 2);
 }
 
 // `list_source` + `dedup_scan` only touch raw bytes (enumerate by extension, hash via BLAKE3 — no
@@ -199,6 +291,7 @@ fn move_import_trashes_sources_after_catalog() {
         ImportMode::Move,
         libdir.path(),
         true,
+        Pairing::Standalone,
         |_, _, _| {},
     )
     .unwrap();
