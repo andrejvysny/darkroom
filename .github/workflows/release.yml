@@ -194,8 +194,16 @@ jobs:
               key_dir="$RUNNER_TEMP/private_keys"
               key_path="$key_dir/AuthKey_${APPLE_API_KEY}.p8"
               mkdir -p "$key_dir"
-              printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_path"
+              # Accept both shapes people actually paste: base64 of the .p8, or the .p8 itself.
+              if printf '%s' "$APPLE_API_KEY_BASE64" | grep -q 'BEGIN PRIVATE KEY'; then
+                printf '%s\n' "$APPLE_API_KEY_BASE64" > "$key_path"
+              else
+                printf '%s' "$APPLE_API_KEY_BASE64" | tr -d '\r\n ' | base64 --decode > "$key_path" \
+                  || { echo "::error::APPLE_API_KEY_BASE64 is neither valid base64 nor a .p8"; exit 1; }
+              fi
               chmod 600 "$key_path"
+              grep -q 'BEGIN PRIVATE KEY' "$key_path" \
+                || { echo "::error::APPLE_API_KEY_BASE64 does not resolve to an AuthKey .p8"; exit 1; }
               notary=api
               {
                 echo "APPLE_API_KEY=$APPLE_API_KEY"
