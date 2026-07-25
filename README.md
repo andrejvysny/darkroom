@@ -24,14 +24,14 @@ Grab the latest `.dmg` from the **[Releases page](../../releases/latest)**:
 - **Apple Silicon** (M1–M4): `Darkroom_<version>_aarch64.dmg`
 - **Intel**: `Darkroom_<version>_x64.dmg`
 
-Open the `.dmg` and drag **Darkroom** into your Applications folder. The app isn't notarized by
-Apple yet, so the first launch needs one command:
+Open the `.dmg` and drag **Darkroom** into your Applications folder. From 0.1.1 on, macOS builds
+are signed with a Developer ID certificate and notarized by Apple, so they open with a normal
+double-click — no `xattr` incantation.
 
-```bash
-xattr -dr com.apple.quarantine /Applications/Darkroom.app
-```
+A Windows installer (`Darkroom_<version>_x64-setup.exe`) is published too, but it is **not code
+signed yet**, so SmartScreen shows "Windows protected your PC" — *More info* → *Run anyway*.
 
-Then open it normally. **From then on Darkroom keeps itself up to date** — when a new version is
+**Darkroom keeps itself up to date** — when a new version is
 released it prompts you, downloads it in the background, and restarts into the new version. No
 re-downloading.
 
