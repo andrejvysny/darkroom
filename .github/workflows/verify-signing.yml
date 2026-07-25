@@ -46,7 +46,9 @@ jobs:
             || { echo "::error::APPLE_SIGNING_IDENTITY does not match any identity in the .p12"; exit 1; }
           echo "certificate + identity OK"
 
+      # always(): the two credential sets fail independently, so one run should report on both.
       - name: Check notarization credentials
+        if: always()
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
