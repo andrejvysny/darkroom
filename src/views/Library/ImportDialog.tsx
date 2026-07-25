@@ -112,7 +112,10 @@ export default function ImportDialog({
   const [kindFilter, setKindFilter] = useState<"all" | "raw" | "jpeg" | "png">(
     "all",
   );
-  const [mode, setMode] = useState<ImportMode>("copy");
+  // Reference is the default: it is the only mode that cannot touch the source files. Copy
+  // silently doubles storage (a card import can be tens of GB) and Move Trashes the originals, so
+  // both should be a deliberate choice rather than something a stray click can trigger.
+  const [mode, setMode] = useState<ImportMode>("reference");
   const [rating, setRating] = useState(0);
   const [flag, setFlag] = useState<"none" | "pick" | "reject">("none");
   const [keywordsText, setKeywordsText] = useState("");

@@ -48,13 +48,16 @@ const fieldLabel: React.CSSProperties = {
 
 /**
  * Panorama merge modal. Opens when `panoramaSources` (a 2..=10 image-id selection staged by
- * SelectionBar) is non-null. Debounced-previews the merge as options change, then hands off to
+ * SelectionBar or `usePanoDetect().openMerge`, plus the originating detect-group id if any) is
+ * non-null. Debounced-previews the merge as options change, then hands off to
  * `usePanorama().startMerge` and closes immediately — the PanoramaPill takes over from there.
  */
 export default function PanoramaModal() {
-  const sourceIds = useAppStore((s) => s.panoramaSources);
+  const sources = useAppStore((s) => s.panoramaSources);
   const setPanoramaSources = useAppStore((s) => s.setPanoramaSources);
-  const open_ = sourceIds !== null;
+  const open_ = sources !== null;
+  const sourceIds = sources?.ids ?? null;
+  const detectGroupId = sources?.detectGroupId ?? null;
   const { startMerge } = usePanorama();
 
   const [projection, setProjection] = useState<PanoramaProjection>("auto");
@@ -140,14 +143,17 @@ export default function PanoramaModal() {
     setPanoramaSources(null);
   };
 
-  const canMerge = sourceIds.length >= 2 && sourceIds.length <= 10 && !busy;
+  // A failed preview usually means the source set itself won't stitch (e.g. no overlap) — don't
+  // let the user kick off a full-res merge that's likely to fail the same way.
+  const canMerge =
+    sourceIds.length >= 2 && sourceIds.length <= 10 && !busy && !previewError;
 
   const handleMerge = () => {
     if (!canMerge) return;
     setBusy(true);
     // Fire-and-forget from the modal's perspective: usePanorama() tracks the job in the store and the
     // PanoramaPill surfaces progress/errors from here on.
-    void startMerge({ imageIds: sourceIds, projection, boundaryWarp, autoCrop });
+    void startMerge({ imageIds: sourceIds, projection, boundaryWarp, autoCrop, detectGroupId });
     setPanoramaSources(null);
   };
 

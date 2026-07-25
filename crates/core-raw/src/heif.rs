@@ -33,9 +33,99 @@ mod imp {
         RawError::Decode(format!("HEIF: {e}"))
     }
 
+    /// ISO/IEC 14496-12 codes for the profile this module implements.
+    const NCLX_PRIMARIES_BT2020: u16 = 9;
+    const NCLX_TRANSFER_PQ: u16 = 16;
+
+    /// Every `nclx` colour description in the container, as raw `(primaries, transfer)` code points.
+    ///
+    /// Needed because libheif only reports an nclx profile that hangs off the *item* it was asked
+    /// about: a real Canon `.HIF` primary item is a **4×5 grid** (a derived item), and
+    /// `heif_image_handle_get_nclx_color_profile` on that grid handle answers `Unspecified/
+    /// Unspecified` even though `heif-info` lists an nclx and every tile carries BT.2020 PQ. The
+    /// synthetic fixtures are single-item, so they never exercised this. Rather than trust the
+    /// bindings' view, read the `colr` boxes out of the container ourselves.
+    ///
+    /// Boxes are walked structurally (size/type headers), descending only into the containers that
+    /// can hold `colr` — `meta` and `moov` are FullBoxes, so their 4 version/flags bytes are skipped.
+    fn container_nclx(bytes: &[u8]) -> Vec<(u16, u16)> {
+        fn walk(b: &[u8], out: &mut Vec<(u16, u16)>, depth: u32) {
+            // ipco nests a few levels below meta; the cap just stops a malformed file recursing.
+            if depth > 8 {
+                return;
+            }
+            let mut pos = 0usize;
+            while pos + 8 <= b.len() {
+                let size32 = u32::from_be_bytes([b[pos], b[pos + 1], b[pos + 2], b[pos + 3]]);
+                let typ = &b[pos + 4..pos + 8];
+                let (header, size) = match size32 {
+                    // size 1 → 64-bit largesize follows the type.
+                    1 => {
+                        if pos + 16 > b.len() {
+                            return;
+                        }
+                        let large =
+                            u64::from_be_bytes(b[pos + 8..pos + 16].try_into().expect("8 bytes"));
+                        (16usize, large as usize)
+                    }
+                    // size 0 → the box runs to the end of the enclosing box.
+                    0 => (8usize, b.len() - pos),
+                    n => (8usize, n as usize),
+                };
+                if size < header || pos + size > b.len() {
+                    return;
+                }
+                let body = &b[pos + header..pos + size];
+                match typ {
+                    b"colr" => {
+                        // colour_type (4 bytes) then, for 'nclx', three u16 code points.
+                        if body.len() >= 10 && &body[0..4] == b"nclx" {
+                            let primaries = u16::from_be_bytes([body[4], body[5]]);
+                            let transfer = u16::from_be_bytes([body[6], body[7]]);
+                            out.push((primaries, transfer));
+                        }
+                    }
+                    b"meta" | b"moov" => {
+                        // FullBox: skip version+flags before the children.
+                        if body.len() > 4 {
+                            walk(&body[4..], out, depth + 1);
+                        }
+                    }
+                    b"iprp" | b"ipco" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                        walk(body, out, depth + 1)
+                    }
+                    _ => {}
+                }
+                pos += size;
+            }
+        }
+        let mut out = Vec::new();
+        walk(bytes, &mut out, 0);
+        out
+    }
+
     /// Accept only the profile this module implements: BT.2020 primaries + ST-2084 (PQ) transfer.
     /// Anything else (iPhone HEIC, SDR HEIF, HLG) gets a clean error instead of wrong colors.
-    fn verify_pq_bt2020(handle: &ImageHandle) -> Result<(), RawError> {
+    ///
+    /// The container's own `colr` boxes are authoritative (see [`container_nclx`]); the handle's
+    /// nclx is only consulted when the container carries none. **Every** nclx found must agree on
+    /// BT.2020 PQ — if a file mixed profiles across its items we could not say which one describes
+    /// the buffer we actually decoded, so refusing is the honest answer.
+    fn verify_pq_bt2020(bytes: &[u8], handle: &ImageHandle) -> Result<(), RawError> {
+        let found = container_nclx(bytes);
+        if !found.is_empty() {
+            if let Some(&(primaries, transfer)) = found
+                .iter()
+                .find(|&&(p, t)| p != NCLX_PRIMARIES_BT2020 || t != NCLX_TRANSFER_PQ)
+            {
+                return Err(de(format!(
+                    "unsupported color profile (nclx primaries {primaries}, transfer {transfer}) — \
+                     only BT.2020 PQ (Canon HDR .HIF) is supported"
+                )));
+            }
+            return Ok(());
+        }
+
         let nclx = handle.color_profile_nclx().ok_or_else(|| {
             de("no nclx color profile (expected BT.2020 PQ, e.g. Canon HDR .HIF)")
         })?;
@@ -123,7 +213,7 @@ mod imp {
     pub fn decode_heif_linear(bytes: &[u8]) -> Result<LinearImage, RawError> {
         let ctx = HeifContext::read_from_bytes(bytes).map_err(de)?;
         let handle = ctx.primary_image_handle().map_err(de)?;
-        verify_pq_bt2020(&handle)?;
+        verify_pq_bt2020(bytes, &handle)?;
         let lib = LibHeif::new();
         decode_handle_linear(&lib, &handle)
     }
@@ -179,7 +269,7 @@ mod imp {
     ) -> Result<(LinearImage, u32, u32), RawError> {
         let ctx = HeifContext::read_from_bytes(bytes).map_err(de)?;
         let handle = ctx.primary_image_handle().map_err(de)?;
-        verify_pq_bt2020(&handle)?;
+        verify_pq_bt2020(bytes, &handle)?;
         let lib = LibHeif::new();
         let (pw, ph) = (handle.width(), handle.height());
 
@@ -224,6 +314,76 @@ mod imp {
             disp_width: pw,
             disp_height: ph,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `size||type||payload`, the ISOBMFF box header this parser walks.
+        fn boxed(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut v = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(typ);
+            v.extend_from_slice(payload);
+            v
+        }
+
+        fn colr_nclx(primaries: u16, transfer: u16, matrix: u16) -> Vec<u8> {
+            let mut p = b"nclx".to_vec();
+            p.extend_from_slice(&primaries.to_be_bytes());
+            p.extend_from_slice(&transfer.to_be_bytes());
+            p.extend_from_slice(&matrix.to_be_bytes());
+            p.push(0x80); // full_range_flag
+            boxed(b"colr", &p)
+        }
+
+        /// The shape a real Canon `.HIF` has: the colour description lives in `meta/iprp/ipco`, not
+        /// on the (grid) item handle libheif answers for. Nesting + the `meta` FullBox skip are the
+        /// two things that must hold for the grid case to be read at all.
+        fn canon_like(colr: &[u8]) -> Vec<u8> {
+            let ipco = boxed(b"ipco", colr);
+            let iprp = boxed(b"iprp", &ipco);
+            let mut meta_payload = vec![0, 0, 0, 0]; // FullBox version+flags
+            meta_payload.extend_from_slice(&iprp);
+            boxed(b"meta", &meta_payload)
+        }
+
+        #[test]
+        fn finds_nested_nclx_like_a_canon_grid_hif() {
+            let f = canon_like(&colr_nclx(
+                NCLX_PRIMARIES_BT2020,
+                NCLX_TRANSFER_PQ,
+                9, // BT.2020 non-constant luminance
+            ));
+            assert_eq!(
+                container_nclx(&f),
+                vec![(NCLX_PRIMARIES_BT2020, NCLX_TRANSFER_PQ)]
+            );
+        }
+
+        #[test]
+        fn ignores_icc_colr_so_a_gain_map_heic_still_falls_through() {
+            // Apple's HEIC carries `colr` of type `prof` (ICC) — no nclx codes to trust.
+            let f = canon_like(&boxed(b"colr", b"prof\x00\x01\x02\x03"));
+            assert!(container_nclx(&f).is_empty());
+        }
+
+        #[test]
+        fn non_pq_transfer_is_reported_not_silently_accepted() {
+            // sRGB primaries/transfer (1, 13) — the shape an SDR HEIF would have.
+            let f = canon_like(&colr_nclx(1, 13, 1));
+            assert_eq!(container_nclx(&f), vec![(1, 13)]);
+        }
+
+        /// A truncated/garbage box must terminate the walk rather than loop or panic.
+        #[test]
+        fn malformed_boxes_terminate_the_walk() {
+            assert!(container_nclx(&[0, 0, 0, 0]).is_empty());
+            assert!(container_nclx(&[0xff, 0xff, 0xff, 0xff, b'c', b'o', b'l', b'r']).is_empty());
+            let mut truncated = canon_like(&colr_nclx(9, 16, 9));
+            truncated.truncate(truncated.len() - 4);
+            let _ = container_nclx(&truncated); // must not panic
+        }
     }
 }
 

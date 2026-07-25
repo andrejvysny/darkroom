@@ -11,10 +11,21 @@
 //! response recovery is needed — scale each frame's radiance by its exposure ratio to the
 //! reference (`2^(EV_frame − EV_ref)`; a brighter-exposed frame scales DOWN), then average with
 //! per-pixel confidence weights that zero out near-clipped pixels and down-weight noisy shadows.
-//! v1 is tripod-only: no alignment, no deghosting — frames must be pixel-aligned and same-sized.
+//!
+//! Two merge paths share the same weighted accumulator:
+//! - **Tripod** ([`MergeAccumulator::new`] + [`MergeAccumulator::add_frame`]): frames must already be
+//!   pixel-aligned and same-sized; every pixel of every frame is trusted.
+//! - **Hand-held** ([`MergeAccumulator::with_reference`] + [`MergeAccumulator::add_frame_masked`]):
+//!   the caller aligns each frame to the reference (`core_pano::align` → [`warp_into_reference`]),
+//!   passes the warp's validity mask (out-of-frame borders are *skipped*, not floored), and the
+//!   accumulator down-weights pixels that disagree with the reference radiance (deghosting — moving
+//!   subjects, wind, water) so the merge follows the one chosen exposure instead of ghosting.
 
 use core_raw::LinearImage;
 use thiserror::Error;
+
+mod warp;
+pub use warp::warp_into_reference;
 
 #[derive(Debug, Error)]
 pub enum HdrError {
@@ -94,8 +105,32 @@ fn hat_weight(m: f32) -> f32 {
     w_high * w_low
 }
 
+/// Deghosting tuning for the hand-held path. A warped frame's per-pixel weight is scaled by its
+/// radiance *consistency* with the reference: `consist = exp(−(d/denom)²)` where `d` is the sum of
+/// absolute per-channel differences (moving frame vs reference, reference-exposure scale) and
+/// `denom = sigma + k·max(reference)`. Both knobs are in **linear radiance** at the reference
+/// exposure — not display units.
+#[derive(Debug, Clone, Copy)]
+pub struct DeghostParams {
+    /// Consistency tolerance at black (absolute radiance noise floor). Larger = more forgiving.
+    pub sigma: f32,
+    /// Fractional tolerance that grows with brightness, so bright regions get a proportional (not
+    /// absolute) allowance before they read as "moved".
+    pub k: f32,
+}
+
+impl Default for DeghostParams {
+    fn default() -> Self {
+        DeghostParams {
+            sigma: 0.05,
+            k: 0.25,
+        }
+    }
+}
+
 /// Streaming exposure-weighted merge accumulator. Holds three flat buffers (7 f32/pixel total —
-/// ≈0.9 GB at 33 MP) regardless of frame count; callers decode → `add_frame` → drop each frame.
+/// ≈0.9 GB at 33 MP) regardless of frame count — plus one resident copy of the reference (+3 f32/px)
+/// on the hand-held path; callers decode → `add_frame`/`add_frame_masked` → drop each frame.
 pub struct MergeAccumulator {
     width: u32,
     height: u32,
@@ -107,9 +142,16 @@ pub struct MergeAccumulator {
     /// frame, where the weighted sum is empty.
     fallback: Vec<f32>,
     frames: usize,
+    /// Reference radiance (reference-exposure scale, 3 f32/px), held on the hand-held path so each
+    /// subsequent frame can be deghosted against it. `None` on the tripod path (no deghosting).
+    reference: Option<Vec<f32>>,
+    /// Deghost tuning; consulted only when `reference` is `Some`.
+    deghost: DeghostParams,
 }
 
 impl MergeAccumulator {
+    /// Tripod accumulator: no reference held, no deghosting. Every pixel of every `add_frame` is
+    /// trusted (frames must already be pixel-aligned).
     pub fn new(width: u32, height: u32) -> Self {
         let n = width as usize * height as usize;
         MergeAccumulator {
@@ -119,18 +161,35 @@ impl MergeAccumulator {
             wsum: vec![0.0; n],
             fallback: vec![0.0; n * 3],
             frames: 0,
+            reference: None,
+            deghost: DeghostParams::default(),
         }
     }
 
-    /// Accumulate one frame. `scale` is [`relative_scale`] (frame → reference); `is_shortest`
-    /// marks the shortest exposure (highest EV₁₀₀ — the frame with the most surviving highlights),
-    /// which doubles as the all-clipped fallback.
-    pub fn add_frame(
-        &mut self,
-        frame: &LinearImage,
-        scale: f32,
-        is_shortest: bool,
-    ) -> Result<(), HdrError> {
+    /// Hand-held accumulator seeded with the (already-decoded) `reference` frame, which is both the
+    /// deghosting anchor and the first accumulated frame (at scale 1.0 — it *is* the reference
+    /// exposure, so `frames == 1` on return). Subsequent frames are added via [`add_frame_masked`]
+    /// (aligned + warped) and deghosted against this reference.
+    ///
+    /// [`add_frame_masked`]: Self::add_frame_masked
+    pub fn with_reference(
+        reference: &LinearImage,
+        ref_is_shortest: bool,
+        params: DeghostParams,
+    ) -> Result<Self, HdrError> {
+        let mut acc = MergeAccumulator::new(reference.width, reference.height);
+        acc.check_dims(reference)?;
+        acc.reference = Some(reference.data.clone());
+        acc.deghost = params;
+        // Accumulate the reference itself. With a stored reference the deghost factor is computed,
+        // but obs == pred here (d == 0 → consist == 1), so it is an exact no-op for this frame.
+        acc.accumulate(&reference.data, 1.0, ref_is_shortest, None);
+        acc.frames += 1;
+        Ok(acc)
+    }
+
+    /// Size + buffer-length guards shared by every accumulate entry point.
+    fn check_dims(&self, frame: &LinearImage) -> Result<(), HdrError> {
         if (frame.width, frame.height) != (self.width, self.height) {
             return Err(HdrError::SizeMismatch {
                 want_w: self.width,
@@ -142,10 +201,81 @@ impl MergeAccumulator {
         if frame.data.len() != self.wsum.len() * 3 {
             return Err(HdrError::MalformedFrame);
         }
+        Ok(())
+    }
 
-        for (i, px) in frame.data.chunks_exact(3).enumerate() {
+    /// Accumulate one frame. `scale` is [`relative_scale`] (frame → reference); `is_shortest`
+    /// marks the shortest exposure (highest EV₁₀₀ — the frame with the most surviving highlights),
+    /// which doubles as the all-clipped fallback.
+    pub fn add_frame(
+        &mut self,
+        frame: &LinearImage,
+        scale: f32,
+        is_shortest: bool,
+    ) -> Result<(), HdrError> {
+        self.check_dims(frame)?;
+        self.accumulate(&frame.data, scale, is_shortest, None);
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// Accumulate one **masked** frame (hand-held path): identical to [`add_frame`] but pixels whose
+    /// `valid` byte is `0` are skipped entirely — not floored. This is the critical difference from
+    /// feeding a warped frame straight through [`add_frame`]: an out-of-frame warp border reads as
+    /// `0.0`, and `hat_weight(0.0) == W_LOW_FLOOR (0.05)` would otherwise pull those dark borders
+    /// into the weighted sum as visible halos. `valid.len()` must equal the pixel count.
+    ///
+    /// [`add_frame`]: Self::add_frame
+    pub fn add_frame_masked(
+        &mut self,
+        frame: &LinearImage,
+        scale: f32,
+        is_shortest: bool,
+        valid: &[u8],
+    ) -> Result<(), HdrError> {
+        self.check_dims(frame)?;
+        if valid.len() != self.wsum.len() {
+            return Err(HdrError::MalformedFrame);
+        }
+        self.accumulate(&frame.data, scale, is_shortest, Some(valid));
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// Per-pixel accumulation shared by every entry point. `valid` (when `Some`) skips masked-out
+    /// pixels; a stored `reference` (hand-held path) additionally deghosts each pixel against the
+    /// reference radiance. Callers own the `frames` counter and the dimension guards.
+    fn accumulate(&mut self, data: &[f32], scale: f32, is_shortest: bool, valid: Option<&[u8]>) {
+        // Move the reference buffer out so we can read it while mutating sum/wsum/fallback (a split
+        // borrow the checker won't grant through `self`); restore it before returning.
+        let reference = self.reference.take();
+        let deghost = self.deghost;
+
+        for (i, px) in data.chunks_exact(3).enumerate() {
+            if let Some(v) = valid {
+                if v[i] == 0 {
+                    continue; // out-of-frame warp border — contributes nothing this frame
+                }
+            }
             let m = px[0].max(px[1]).max(px[2]);
-            let w = hat_weight(m);
+            let mut w = hat_weight(m);
+
+            if let Some(ref_data) = &reference {
+                // Deghost: down-weight this frame where its radiance disagrees with the reference.
+                let pred = [ref_data[i * 3], ref_data[i * 3 + 1], ref_data[i * 3 + 2]];
+                let pred_max = pred[0].max(pred[1]).max(pred[2]).max(0.0);
+                let obs = [scale * px[0], scale * px[1], scale * px[2]];
+                let ref_conf = hat_weight(pred_max);
+                let d =
+                    (obs[0] - pred[0]).abs() + (obs[1] - pred[1]).abs() + (obs[2] - pred[2]).abs();
+                let denom = deghost.sigma + deghost.k * pred_max;
+                let ratio = d / denom;
+                let consist = (-(ratio * ratio)).exp();
+                // Where the reference clips, ref_conf → 0, factor → 1 (deghost off) so darker frames
+                // can still fill blown highlights — the classic recover-highlights-lose-deghost trade.
+                w *= 1.0 - ref_conf * (1.0 - consist);
+            }
+
             let ws = w * scale;
             self.sum[i * 3] += ws * px[0];
             self.sum[i * 3 + 1] += ws * px[1];
@@ -157,8 +287,8 @@ impl MergeAccumulator {
                 self.fallback[i * 3 + 2] = scale * px[2];
             }
         }
-        self.frames += 1;
-        Ok(())
+
+        self.reference = reference;
     }
 
     /// Finish the merge: weighted average where any frame contributed, the scaled shortest
@@ -342,5 +472,164 @@ mod tests {
         assert!(ev100(&exposure(0.0, 8.0, 100.0)).is_err());
         assert!(ev100(&exposure(0.01, -1.0, 100.0)).is_err());
         assert!(ev100(&exposure(0.01, 8.0, 0.0)).is_err());
+    }
+
+    // ---------- Hand-held path: masked accumulate + deghosting ----------
+
+    /// An all-valid masked accumulate must be bit-identical to `add_frame` (the mask machinery adds
+    /// nothing when every pixel is valid and no reference is held).
+    #[test]
+    fn masked_all_valid_matches_add_frame() {
+        let a = img(6, 5, |i| [0.02 + i as f32 * 0.01, 0.3, 0.55]);
+        let b = img(6, 5, |i| [0.05 + i as f32 * 0.013, 0.28, 0.6]);
+        let valid = vec![1u8; 6 * 5];
+
+        let mut plain = MergeAccumulator::new(6, 5);
+        plain.add_frame(&a, 1.0, true).unwrap();
+        plain.add_frame(&b, 0.5, false).unwrap();
+        let out_plain = plain.finish().unwrap();
+
+        let mut masked = MergeAccumulator::new(6, 5);
+        masked.add_frame_masked(&a, 1.0, true, &valid).unwrap();
+        masked.add_frame_masked(&b, 0.5, false, &valid).unwrap();
+        let out_masked = masked.finish().unwrap();
+
+        assert_eq!(out_plain.data, out_masked.data);
+    }
+
+    /// A pixel masked out in one frame must contribute nothing there — the merged value equals the
+    /// merge of only the remaining frames, with no dark pull from the masked frame's (0.0) border.
+    #[test]
+    fn masked_border_contributes_nothing() {
+        let a = img(4, 4, |_| [0.30, 0.30, 0.30]);
+        let b = img(4, 4, |_| [0.32, 0.32, 0.32]);
+        // c is bright everywhere, but pixel 0 is a dark out-of-frame border we mask off.
+        let c = img(4, 4, |i| if i == 0 { [0.0; 3] } else { [0.85; 3] });
+        let mut valid = vec![1u8; 16];
+        valid[0] = 0;
+
+        let mut with_c = MergeAccumulator::new(4, 4);
+        with_c.add_frame(&a, 1.0, true).unwrap();
+        with_c.add_frame(&b, 1.0, false).unwrap();
+        with_c.add_frame_masked(&c, 1.0, false, &valid).unwrap();
+        let out = with_c.finish().unwrap();
+
+        // Reference: the same merge WITHOUT c at all.
+        let mut without_c = MergeAccumulator::new(4, 4);
+        without_c.add_frame(&a, 1.0, true).unwrap();
+        without_c.add_frame(&b, 1.0, false).unwrap();
+        let out_ref = without_c.finish().unwrap();
+
+        // Masked pixel 0 == the a+b-only merge (no contribution, no dark pull).
+        assert!(
+            (out.data[0] - out_ref.data[0]).abs() < 1e-6,
+            "{}",
+            out.data[0]
+        );
+        assert!(
+            out.data[0] > 0.25,
+            "masked border darkened pixel: {}",
+            out.data[0]
+        );
+        // A fully-valid pixel (1) DID take c into account (sanity that the mask is per-pixel).
+        assert!(out.data[3] > out_ref.data[3]);
+    }
+
+    /// Three frames where one has a moved bright object at a pixel: deghosting must down-weight it so
+    /// the merge follows the reference radiance there, not the naive average.
+    #[test]
+    fn deghost_downweights_moved_pixel() {
+        let reference = img(2, 2, |_| [0.30, 0.30, 0.30]);
+        let consistent = img(2, 2, |_| [0.30, 0.30, 0.30]); // agrees with the reference
+        let moved = img(2, 2, |_| [0.90, 0.90, 0.90]); // a bright object that moved into frame
+        let valid = vec![1u8; 4];
+
+        let mut acc =
+            MergeAccumulator::with_reference(&reference, false, DeghostParams::default()).unwrap();
+        acc.add_frame_masked(&consistent, 1.0, false, &valid)
+            .unwrap();
+        acc.add_frame_masked(&moved, 1.0, true, &valid).unwrap();
+        let out = acc.finish().unwrap();
+
+        // Naive average would be (0.3+0.3+0.9)/3 = 0.5; deghosting drops the moved frame → ≈ 0.30.
+        for px in out.data.chunks_exact(3) {
+            assert!(
+                (px[0] - 0.30).abs() < 0.03,
+                "expected ≈0.30 (deghosted), got {}",
+                px[0]
+            );
+        }
+    }
+
+    /// Where the reference clips, deghosting must switch OFF (ref_conf → 0) so a darker frame's
+    /// (differing, higher) radiance recovers the blown highlight instead of being rejected as a ghost.
+    #[test]
+    fn deghost_off_where_reference_clipped() {
+        let reference = img(2, 2, |_| [1.0, 1.0, 1.0]); // clipped everywhere
+                                                        // Darker (shorter) frame: unclipped 0.75, exposed 2 stops down → scale ×4 → true radiance 3.0.
+        let darker = img(2, 2, |_| [0.75, 0.75, 0.75]);
+        let valid = vec![1u8; 4];
+
+        let mut acc =
+            MergeAccumulator::with_reference(&reference, false, DeghostParams::default()).unwrap();
+        acc.add_frame_masked(&darker, 4.0, true, &valid).unwrap();
+        let out = acc.finish().unwrap();
+
+        // The clipped reference contributes zero weight (hat_weight(1.0)=0), deghost is OFF, so the
+        // darker frame alone sets the value: 4.0 × 0.75 = 3.0.
+        for px in out.data.chunks_exact(3) {
+            assert!(
+                (px[0] - 3.0).abs() < 0.02,
+                "highlight not recovered: {}",
+                px[0]
+            );
+        }
+    }
+
+    // ---------- Hand-held path: warp ----------
+
+    fn warp_scene(w: u32, h: u32) -> LinearImage {
+        // Distinct per-pixel values so a shift is detectable.
+        img(w, h, |i| {
+            [
+                0.10 + i as f32 * 0.03,
+                0.20 + i as f32 * 0.017,
+                0.05 + i as f32 * 0.021,
+            ]
+        })
+    }
+
+    #[test]
+    fn warp_identity_round_trips() {
+        let mov = warp_scene(5, 4);
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let (rgb, mask) = warp_into_reference(&mov, 5, 4, &identity);
+        // Sampling at integer coordinates is exact → the buffer round-trips byte-for-byte.
+        assert_eq!(rgb, mov.data);
+        assert!(mask.iter().all(|&m| m == 1));
+    }
+
+    #[test]
+    fn warp_translation_shifts_and_masks_border() {
+        let mov = warp_scene(4, 2);
+        // q = p + (1, 0): moving-frame content lands one pixel to the right on the reference grid.
+        let m = [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let (rgb, mask) = warp_into_reference(&mov, 4, 2, &m);
+
+        for y in 0..2usize {
+            // Column 0 was vacated (back-projects to x = -1, outside mov) → masked off.
+            assert_eq!(mask[y * 4], 0, "vacated border not masked at row {y}");
+            for x in 1..4usize {
+                let out_i = y * 4 + x;
+                let src_i = y * 4 + (x - 1);
+                assert_eq!(mask[out_i], 1);
+                for c in 0..3 {
+                    assert!(
+                        (rgb[out_i * 3 + c] - mov.data[src_i * 3 + c]).abs() < 1e-5,
+                        "content not shifted at ({x},{y}) ch{c}"
+                    );
+                }
+            }
+        }
     }
 }

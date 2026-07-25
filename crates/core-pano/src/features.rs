@@ -92,33 +92,60 @@ pub(crate) fn fixed_test_pairs() -> Vec<[f32; 4]> {
 }
 
 /// Extract keypoints + steered descriptors for one frame using the shared test-pair `pattern`.
+/// Thin wrapper over [`extract_at`] where the supplied buffer *is* the full-res image (`full ==
+/// buffer` dims), preserving the exact P1 behavior (registration-scale detect, full-res keypoints).
 pub(crate) fn extract(frame: &Frame, pattern: &[[f32; 4]]) -> FrameFeatures {
-    let full_long = frame.width.max(frame.height) as u32;
-    let reg_scale = if full_long <= REG_LONG_SIDE {
-        1.0
-    } else {
-        REG_LONG_SIDE as f64 / full_long as f64
-    };
-    let dw = ((frame.width as f64 * reg_scale).round() as u32).max(1);
-    let dh = ((frame.height as f64 * reg_scale).round() as u32).max(1);
-
-    let luma_full = luma_from_rgb(frame);
-    let luma_reg = downscale(
-        &luma_full,
+    extract_at(
+        &frame.rgb,
         frame.width,
         frame.height,
-        dw as usize,
-        dh as usize,
-    );
-    let gray = stretch_to_u8(&luma_reg, dw, dh);
+        frame.width,
+        frame.height,
+        pattern,
+    )
+}
+
+/// Extract keypoints + steered descriptors from an interleaved-RGB buffer, decoupling the *sampled*
+/// buffer resolution (`buf_w × buf_h`) from the *true full-res* geometry (`full_w × full_h`) the
+/// stored keypoints must live in. This is the shared primitive behind both [`extract`] (panorama
+/// registration, where the buffer is full-res) and HDR alignment (`align::estimate_alignment_rgb`).
+///
+/// Detection/description run at *registration scale* (`detect_long = min(REG_LONG_SIDE, buf_long)`;
+/// a no-op downscale when the buffer is already small enough). Every kept keypoint is then mapped to
+/// TRUE full-res pixels via `inv_scale = full_long / detect_long`, and the recorded
+/// `reg_scale = detect_long / full_long (≤ 1)` scales the registration-scale RANSAC threshold up to
+/// full-res. When `full == buffer` (both current callers) this reduces exactly to the historical
+/// `extract` math — verified by the P1 registration/detection tests, which must stay untouched.
+pub(crate) fn extract_at(
+    rgb: &[f32],
+    buf_w: usize,
+    buf_h: usize,
+    full_w: usize,
+    full_h: usize,
+    pattern: &[[f32; 4]],
+) -> FrameFeatures {
+    let buf_long = buf_w.max(buf_h) as u32;
+    let full_long = full_w.max(full_h) as f64;
+    let detect_long = REG_LONG_SIDE.min(buf_long);
+    // Scale from the supplied buffer down to detection resolution (== 1.0 when the buffer is already
+    // ≤ REG_LONG_SIDE, in which case `downscale` short-circuits to a copy).
+    let det_scale = detect_long as f64 / buf_long as f64;
+    let dw = ((buf_w as f64 * det_scale).round() as usize).max(1);
+    let dh = ((buf_h as f64 * det_scale).round() as usize).max(1);
+
+    let luma_buf = luma_from_rgb(rgb, buf_w, buf_h);
+    let luma_reg = downscale(&luma_buf, buf_w, buf_h, dw, dh);
+    let gray = stretch_to_u8(&luma_reg, dw as u32, dh as u32);
     // BRIEF samples the box-smoothed image (Calonder/Rublee): a 3×3 box filter suppresses pixel
     // noise so the intensity comparisons are stable. Orientation is computed on the un-smoothed
     // gray, matching the ORB centroid.
     let smoothed = box_filter(&gray, 1, 1);
 
-    let corners = detect_corners(&gray, dw, dh);
+    let corners = detect_corners(&gray, dw as u32, dh as u32);
 
-    let inv_scale = 1.0 / reg_scale;
+    // Detection px → TRUE full-res px, and the ≤1 registration scale for the RANSAC threshold math.
+    let inv_scale = full_long / detect_long as f64;
+    let reg_scale = detect_long as f64 / full_long;
     let mut points = Vec::with_capacity(corners.len());
     let mut descriptors = Vec::with_capacity(corners.len());
     for (cx, cy, _score) in corners {
@@ -135,16 +162,16 @@ pub(crate) fn extract(frame: &Frame, pattern: &[[f32; 4]]) -> FrameFeatures {
     }
 }
 
-/// Rec.601 luma on the linear camera-native RGB. WHY percentile-stretch afterwards: camera-native
-/// values are dim and keep >1.0 headroom, so a naive `*255` clips almost everything to black; FAST
-/// needs contrast in the u8 domain.
-fn luma_from_rgb(frame: &Frame) -> Vec<f32> {
-    let n = frame.width * frame.height;
+/// Rec.601 luma on the linear camera-native RGB buffer (`rgb.len() == w*h*3`). WHY percentile-stretch
+/// afterwards: camera-native values are dim and keep >1.0 headroom, so a naive `*255` clips almost
+/// everything to black; FAST needs contrast in the u8 domain.
+fn luma_from_rgb(rgb: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let n = w * h;
     let mut out = vec![0.0f32; n];
     for (i, o) in out.iter_mut().enumerate() {
-        let r = frame.rgb[i * 3];
-        let g = frame.rgb[i * 3 + 1];
-        let b = frame.rgb[i * 3 + 2];
+        let r = rgb[i * 3];
+        let g = rgb[i * 3 + 1];
+        let b = rgb[i * 3 + 2];
         *o = 0.299 * r + 0.587 * g + 0.114 * b;
     }
     out
@@ -176,6 +203,57 @@ fn downscale(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32
                 }
             }
             out[dy * dw + dx] = (acc / count) as f32;
+        }
+    }
+    out
+}
+
+/// Target dimensions for an area-downscale of a `sw × sh` buffer whose long side is capped at
+/// `max_long_side`. Returns the source dims unchanged when it already fits.
+pub(crate) fn capped_dims(sw: usize, sh: usize, max_long_side: u32) -> (usize, usize) {
+    let long = sw.max(sh) as u32;
+    if long <= max_long_side || long == 0 {
+        return (sw, sh);
+    }
+    let ratio = max_long_side as f64 / long as f64;
+    (
+        ((sw as f64 * ratio).round() as usize).max(1),
+        ((sh as f64 * ratio).round() as usize).max(1),
+    )
+}
+
+/// Three-channel sibling of [`downscale`] for interleaved RGB (`src.len() == sw*sh*3`). Same
+/// area-average rule, applied per channel, so a downscaled frame keeps the box-filtered energy the
+/// feature detector and the seam/exposure estimators expect.
+pub(crate) fn downscale_rgb(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+    if dw == sw && dh == sh {
+        return src.to_vec();
+    }
+    let mut out = vec![0.0f32; dw * dh * 3];
+    let sx = sw as f64 / dw as f64;
+    let sy = sh as f64 / dh as f64;
+    for dy in 0..dh {
+        let y0 = (dy as f64 * sy).floor() as usize;
+        let y1 = (((dy + 1) as f64 * sy).ceil() as usize).min(sh).max(y0 + 1);
+        for dx in 0..dw {
+            let x0 = (dx as f64 * sx).floor() as usize;
+            let x1 = (((dx + 1) as f64 * sx).ceil() as usize).min(sw).max(x0 + 1);
+            let mut acc = [0.0f64; 3];
+            let mut count = 0.0f64;
+            for y in y0..y1 {
+                let row = y * sw;
+                for x in x0..x1 {
+                    let i = (row + x) * 3;
+                    acc[0] += src[i] as f64;
+                    acc[1] += src[i + 1] as f64;
+                    acc[2] += src[i + 2] as f64;
+                    count += 1.0;
+                }
+            }
+            let o = (dy * dw + dx) * 3;
+            out[o] = (acc[0] / count) as f32;
+            out[o + 1] = (acc[1] / count) as f32;
+            out[o + 2] = (acc[2] / count) as f32;
         }
     }
     out

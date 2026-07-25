@@ -4,7 +4,7 @@ import { useAppStore } from "../store/app";
 import {
   panoramaMerge,
   panoramaCancel,
-  panoDetectMarkMerged,
+  panoramaStatus,
   type PanoramaOptions,
 } from "./ipc";
 import { log } from "./logger";
@@ -19,6 +19,9 @@ const PANORAMA_PHASE_LABELS: Record<string, string> = {
   crop: "Cropping",
   rectangle: "Boundary warp",
   encode: "Writing DNG",
+  // Not a backend phase: the placeholder `reconnect` (below) uses it when all we know is that a
+  // merge is running, because we joined after its last progress event.
+  running: "in progress",
 };
 
 export function panoramaPhaseLabel(phase: string): string {
@@ -48,43 +51,80 @@ export function panoramaErrorMessage(err: unknown): string {
 // site) is needed here because this hook is meant to be called from multiple places.
 let listenersBootstrapped = false;
 
+/** Bumped by every `panorama:*` event. `reconnect` compares it across its await so a merge that
+ *  finished while the status call was in flight can't resurrect the pill. */
+let eventSeq = 0;
+
 function bootstrapListeners(): void {
   if (listenersBootstrapped) return;
   listenersBootstrapped = true;
 
   void listen<{ phase: string }>("panorama:progress", (ev) => {
+    eventSeq += 1;
     useAppStore.getState().setPanoramaJob({ phase: ev.payload.phase });
   });
 
-  void listen<{ imageId: number }>("panorama:done", (ev) => {
+  void listen<{
+    imageId: number;
+    detectGroupId: number | null;
+    used: number;
+    total: number;
+  }>("panorama:done", (ev) => {
+    eventSeq += 1;
+    const { imageId, used, total } = ev.payload;
     useAppStore.getState().setPanoramaJob(null);
-    useAppStore.getState().setToast("Panorama merged");
+    useAppStore
+      .getState()
+      .setToast(
+        used < total
+          ? `Panorama merged — stitched ${used} of ${total} frames (${total - used} didn't overlap)`
+          : "Panorama merged",
+      );
     // The backend also emits `library:changed` when it commits the new image, which `useLibrary`
     // already refreshes the grid on — here we just carry the freshly-merged image into the selection.
-    useAppStore.getState().setSelection([ev.payload.imageId], ev.payload.imageId);
+    useAppStore.getState().setSelection([imageId], imageId);
 
-    // If this merge was handed off from a detected panorama suggestion (PanoSuggestions →
-    // openMerge), tell the backend the group is now merged so it drops out of the review list.
-    const activeGroupId = useAppStore.getState().activePanoDetectGroupId;
-    if (activeGroupId != null) {
-      useAppStore.getState().setActivePanoDetectGroup(null);
-      void panoDetectMarkMerged(activeGroupId, ev.payload.imageId).catch(
-        (err: unknown) => {
-          log.debug("panorama", "mark merged failed", log.errorSummary(err));
-        },
-      );
-    }
+    // A merge handed off from a detected suggestion (PanoSuggestions → openMerge → PanoramaModal →
+    // startMerge) carries its group id through the merge call, and the backend echoes it back here
+    // — no ambient store field to go stale. Recording the merge is `usePanoDetect`'s job (it owns
+    // both the IPC call and the store refresh); it listens for this same event.
   });
 
   void listen<{ message: string }>("panorama:error", (ev) => {
+    eventSeq += 1;
     useAppStore.getState().setPanoramaJob(null);
     useAppStore
       .getState()
       .setToast(`Panorama merge failed: ${ev.payload.message}`);
-    // Don't mark a detected group merged on a failed stitch — clear the handoff so a retry (or a
-    // fresh manual merge) doesn't spuriously call panoDetectMarkMerged later.
-    useAppStore.getState().setActivePanoDetectGroup(null);
   });
+}
+
+// One-shot per renderer, for the same reason `listenersBootstrapped` is: this hook has several call
+// sites, and the probe below must fire exactly once no matter how many mount.
+let statusProbed = false;
+
+/**
+ * Re-attach to a merge that is already running in the backend.
+ *
+ * A merge outlives the webview: reload the renderer (or open a fresh window) mid-merge and the store
+ * comes back empty, so the PanoramaPill vanishes even though the job is still churning — and the
+ * next event the UI would see is `panorama:done`. Asking `panorama_status` once at mount closes that
+ * hole; the phase is a placeholder until the next `panorama:progress` event refines it.
+ */
+function reconnect(): void {
+  if (statusProbed) return;
+  statusProbed = true;
+  const seenBefore = eventSeq;
+  void panoramaStatus()
+    .then((status) => {
+      // A real event landed while we were asking — it knows better than this snapshot does.
+      if (!status.running || eventSeq !== seenBefore) return;
+      if (useAppStore.getState().panoramaJob) return;
+      useAppStore.getState().setPanoramaJob({ phase: "running" });
+    })
+    .catch((err: unknown) => {
+      log.debug("panorama", "status probe failed", log.errorSummary(err));
+    });
 }
 
 export interface PanoramaActions {
@@ -107,6 +147,8 @@ export function usePanorama(): { job: { phase: string } | null } & PanoramaActio
 
   useEffect(() => {
     bootstrapListeners();
+    // After the listeners, so a merge that finishes during the probe is seen as an event first.
+    reconnect();
   }, []);
 
   const startMerge = useCallback(async (opts: PanoramaOptions) => {

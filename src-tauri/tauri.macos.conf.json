@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "npm run build && bash scripts/macos-bundle-dylibs.sh stage",
+    "beforeBundleCommand": "bash scripts/macos-bundle-dylibs.sh bundle"
+  },
+  "bundle": {
+    "macOS": {
+      "frameworks": [
+        "frameworks/libheif.dylib",
+        "frameworks/libde265.dylib",
+        "frameworks/libx265.dylib",
+        "frameworks/libaom.dylib",
+        "frameworks/libsharpyuv.dylib",
+        "frameworks/libvmaf.dylib"
+      ]
+    }
+  }
+}

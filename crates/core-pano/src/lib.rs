@@ -19,7 +19,16 @@
 //! - Homography direction: [`PairMatch::h`] maps image-`i` points to image-`j` points (`q ≈ H·p`).
 //! - Luma for features is `Y = 0.299R + 0.587G + 0.114B` on the linear data, then percentile-stretched
 //!   (2%..98%) to u8 because camera-native values are dim; see [`features`].
+//! - Memory: [`stitch`] / [`register`] / [`compose`] sample resident [`Frame`]s. [`stitch_streaming`]
+//!   and [`register_streaming`] take a [`FrameSource`] instead and hold at most ONE full-res frame at
+//!   a time — every frame is materialized once downscaled (registration, exposure gains, seams) and
+//!   then once at full resolution as it is blended. Because the poses are always expressed in full-res
+//!   units, the two paths are interchangeable.
+//! - Cancellation: only the streaming entry points take a `cancel` probe; it is polled between source
+//!   loads, inside the parallel feature/pair sweeps, and between warped frames, returning
+//!   [`PanoError::Cancelled`]. The non-streaming entry points are their `cancel`-free wrappers.
 
+pub mod align;
 mod blend;
 mod bundle;
 mod camera;
@@ -36,6 +45,7 @@ mod rng;
 mod seam;
 mod wave;
 
+pub use align::{estimate_alignment_rgb, AlignModel};
 pub use detect::{
     detect_groups, DetectOptions, DetectReport, DetectedGroup, EdgeClass, VerifiedEdge,
 };
@@ -52,6 +62,73 @@ pub struct Frame {
     pub height: usize,
     pub rgb: Vec<f32>,
     pub focal_seed_px: Option<f32>,
+}
+
+/// One frame materialized by a [`FrameSource`], possibly at a reduced resolution.
+///
+/// `width`/`height` describe the buffer actually handed over; `full_width`/`full_height` describe the
+/// frame's TRUE full-res geometry. Everything the registration solves (keypoints, homographies,
+/// focals, principal points) lives in full-res units regardless of how big the delivered buffer is,
+/// so poses from a downscaled pass are directly usable to warp the full-res original.
+pub struct LoadedFrame {
+    pub rgb: Vec<f32>,
+    pub width: usize,
+    pub height: usize,
+    pub full_width: usize,
+    pub full_height: usize,
+    pub focal_seed_px: Option<f32>,
+}
+
+/// A lazily-materialized set of input frames.
+///
+/// This is the seam that lets [`stitch_streaming`] hold at most ONE full-res source in memory at a
+/// time: the stitcher asks for every frame once at a small `max_long_side` (registration, exposure
+/// gains and seam finding all run there), then asks for each used frame once more at full resolution
+/// during the blend, dropping it before requesting the next. A 10-frame 32 MP merge therefore costs
+/// one ~0.4 GB decode plus the small buffers, not ten.
+///
+/// Implementations must be cheap to call concurrently only in the sense of `Sync` — the stitcher
+/// loads sequentially.
+pub trait FrameSource: Sync {
+    /// Number of input frames.
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Materialize frame `i`. When `max_long_side` is `Some(m)` the returned buffer SHOULD have its
+    /// long side reduced to ≤ `m` (area-downscaled), but a source may return it larger — the caller
+    /// reads the real dimensions off the [`LoadedFrame`]. `full_width`/`full_height` must always
+    /// report the untouched geometry.
+    fn load(&self, i: usize, max_long_side: Option<u32>) -> Result<LoadedFrame, PanoError>;
+}
+
+/// Resident frames as a [`FrameSource`]: `load` copies (and, if asked, area-downscales) the buffer
+/// that is already in memory. Used by the tests/examples and by anything that already holds the
+/// pixels; the streaming win only materializes for a source that decodes on demand.
+impl FrameSource for &[Frame] {
+    fn len(&self) -> usize {
+        <[Frame]>::len(self)
+    }
+
+    fn load(&self, i: usize, max_long_side: Option<u32>) -> Result<LoadedFrame, PanoError> {
+        let f = self
+            .get(i)
+            .ok_or_else(|| PanoError::Load(format!("frame index {i} out of range")))?;
+        let (dw, dh) = match max_long_side {
+            Some(m) => features::capped_dims(f.width, f.height, m),
+            None => (f.width, f.height),
+        };
+        Ok(LoadedFrame {
+            rgb: features::downscale_rgb(&f.rgb, f.width, f.height, dw, dh),
+            width: dw,
+            height: dh,
+            full_width: f.width,
+            full_height: f.height,
+            focal_seed_px: f.focal_seed_px,
+        })
+    }
 }
 
 /// Output projection surface. P1 records the request; P2 acts on it (`Auto` picks per field of view).
@@ -143,6 +220,14 @@ pub enum PanoError {
     TooFewMatched(usize),
     #[error("cancelled")]
     Cancelled,
+    /// A [`FrameSource`] could not materialize a frame (decode failure, missing file, …).
+    #[error("{0}")]
+    Load(String),
+}
+
+/// The cancel probe the non-cancellable public entry points pass through (`&never_cancel`).
+fn never_cancel() -> bool {
+    false
 }
 
 /// Inlier subsample cap per pair for bundle adjustment (keeps BA fast; more is redundant).
@@ -156,6 +241,67 @@ pub fn register(
     frames: &[Frame],
     progress: &(dyn Fn(Phase) + Sync),
 ) -> Result<Registration, PanoError> {
+    let inputs: Vec<RegInput<'_>> = frames.iter().map(RegInput::resident).collect();
+    register_inner(&inputs, progress, &never_cancel)
+}
+
+/// Register the frames of a [`FrameSource`] without ever holding a full-res buffer: every frame is
+/// materialized once at the ~1400 px seam resolution and the keypoints are lifted to full-res units,
+/// so the returned poses are in the same units [`register`] would produce.
+pub fn register_streaming(
+    src: &dyn FrameSource,
+    progress: &(dyn Fn(Phase) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Registration, PanoError> {
+    progress(Phase::Register);
+    let lows = load_low_pass(src, cancel)?;
+    let inputs: Vec<RegInput<'_>> = lows.iter().map(RegInput::loaded).collect();
+    register_inner(&inputs, progress, cancel)
+}
+
+/// One frame as the registration sees it: a buffer to detect in, plus the TRUE full-res geometry the
+/// stored keypoints / principal point / focal seed belong to.
+struct RegInput<'a> {
+    rgb: &'a [f32],
+    width: usize,
+    height: usize,
+    full_width: usize,
+    full_height: usize,
+    focal_seed_px: Option<f32>,
+}
+
+impl<'a> RegInput<'a> {
+    /// A resident frame — the buffer IS the full-res image (the historical `register` path).
+    fn resident(f: &'a Frame) -> RegInput<'a> {
+        RegInput {
+            rgb: &f.rgb,
+            width: f.width,
+            height: f.height,
+            full_width: f.width,
+            full_height: f.height,
+            focal_seed_px: f.focal_seed_px,
+        }
+    }
+
+    fn loaded(f: &'a LoadedFrame) -> RegInput<'a> {
+        RegInput {
+            rgb: &f.rgb,
+            width: f.width,
+            height: f.height,
+            full_width: f.full_width,
+            full_height: f.full_height,
+            focal_seed_px: f.focal_seed_px,
+        }
+    }
+}
+
+/// Shared body of [`register`] / [`register_streaming`]. With `full == buffer` dims and a
+/// never-firing `cancel` this is bit-for-bit the pre-streaming pipeline.
+fn register_inner(
+    frames: &[RegInput<'_>],
+    progress: &(dyn Fn(Phase) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Registration, PanoError> {
     progress(Phase::Register);
 
     let n = frames.len();
@@ -164,11 +310,28 @@ pub fn register(
     }
 
     // --- Features (parallel over frames) ---
+    // `None` marks a frame skipped because cancellation fired mid-sweep; any `None` aborts below.
     let pattern = features::fixed_test_pairs();
-    let feats: Vec<features::FrameFeatures> = frames
+    let feats: Vec<Option<features::FrameFeatures>> = frames
         .par_iter()
-        .map(|f| features::extract(f, &pattern))
+        .map(|f| {
+            if cancel() {
+                return None;
+            }
+            Some(features::extract_at(
+                f.rgb,
+                f.width,
+                f.height,
+                f.full_width,
+                f.full_height,
+                &pattern,
+            ))
+        })
         .collect();
+    if feats.iter().any(|f| f.is_none()) {
+        return Err(PanoError::Cancelled);
+    }
+    let feats: Vec<features::FrameFeatures> = feats.into_iter().flatten().collect();
 
     // --- Matching + RANSAC + verification (parallel over unordered pairs) ---
     let pair_list: Vec<(usize, usize)> = (0..n)
@@ -178,6 +341,9 @@ pub fn register(
     let pairwise: Vec<PairMatch> = pair_list
         .par_iter()
         .filter_map(|&(i, j)| {
+            if cancel() {
+                return None;
+            }
             let matches = matching::match_descriptors(&feats[i].descriptors, &feats[j].descriptors);
             if matches.len() < 4 {
                 return None;
@@ -201,6 +367,10 @@ pub fn register(
             })
         })
         .collect();
+    // A cancelled sweep silently drops pairs, so never let a partial `pairwise` reach the graph.
+    if cancel() {
+        return Err(PanoError::Cancelled);
+    }
 
     // --- Match graph: largest component + max-inlier spanning tree ---
     let edges: Vec<graph::Edge> = pairwise
@@ -218,16 +388,18 @@ pub fn register(
     progress(Phase::BundleAdjust);
 
     // --- Camera model: shared focal + spanning-tree rotation seeds ---
+    // Principal points (like every keypoint) are in FULL-RES pixels, even when the buffers we just
+    // detected in were downscaled.
     let principal_points: Vec<(f64, f64)> = frames
         .iter()
-        .map(|f| (f.width as f64 * 0.5, f.height as f64 * 0.5))
+        .map(|f| (f.full_width as f64 * 0.5, f.full_height as f64 * 0.5))
         .collect();
 
     // Focal from every verified homography; fall back to the reference frame's seed / a wide guess.
     let homs: Vec<Matrix3<f64>> = pairwise.iter().map(|pm| pm.h).collect();
     let focal = camera::estimate_focal(
         &homs,
-        frames[tree.reference].width as f64,
+        frames[tree.reference].full_width as f64,
         frames[tree.reference].focal_seed_px,
     );
 
@@ -291,7 +463,140 @@ pub fn stitch(
     progress: &(dyn Fn(Phase) + Sync),
 ) -> Result<StitchResult, PanoError> {
     let reg = register(frames, progress)?;
-    compose(frames, &reg, opt, progress)
+    compose_inner(Source::Resident(frames), &reg, opt, progress, &never_cancel)
+}
+
+/// [`stitch`] over a lazily-materialized [`FrameSource`], holding at most one full-res frame at a
+/// time and honoring `cancel` between every phase and every frame.
+///
+/// Two passes over the source: a low-resolution pass (every frame at the ~1400 px seam resolution)
+/// that drives registration, exposure gains and seam masks, then a full-resolution pass over the
+/// *used* frames only — each loaded, warped into the blender, and dropped before the next is asked
+/// for.
+pub fn stitch_streaming(
+    src: &dyn FrameSource,
+    opt: &StitchOptions,
+    progress: &(dyn Fn(Phase) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<StitchResult, PanoError> {
+    progress(Phase::Register);
+    let lows = load_low_pass(src, cancel)?;
+    let reg = {
+        let inputs: Vec<RegInput<'_>> = lows.iter().map(RegInput::loaded).collect();
+        register_inner(&inputs, progress, cancel)?
+    };
+    compose_inner(Source::Streaming { src, lows }, &reg, opt, progress, cancel)
+}
+
+/// Materialize every frame at the ~1400 px seam resolution, sequentially — at most one full-res
+/// decode is live inside `load` at a time, and only the small buffer survives the call.
+fn load_low_pass(
+    src: &dyn FrameSource,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Vec<LoadedFrame>, PanoError> {
+    let n = src.len();
+    let mut lows = Vec::with_capacity(n);
+    for i in 0..n {
+        if cancel() {
+            return Err(PanoError::Cancelled);
+        }
+        lows.push(src.load(i, Some(project::SEAM_LONG_SIDE as u32))?);
+    }
+    Ok(lows)
+}
+
+/// Where the compositor gets pixels from.
+enum Source<'a> {
+    /// Frames already in memory — sampled in place, at full resolution, for both passes.
+    Resident(&'a [Frame]),
+    /// Frames materialized on demand; `lows` is the resident low-resolution pass.
+    Streaming {
+        src: &'a dyn FrameSource,
+        lows: Vec<LoadedFrame>,
+    },
+}
+
+/// A full-resolution frame held for exactly one blend step: borrowed for a resident source, owned
+/// (and dropped at the end of the step) for a streaming one.
+enum Held<'a> {
+    Borrowed(&'a Frame),
+    Owned(LoadedFrame),
+}
+
+impl Held<'_> {
+    fn view(&self) -> project::FrameView<'_> {
+        match self {
+            Held::Borrowed(f) => project::FrameView {
+                rgb: &f.rgb,
+                width: f.width,
+                height: f.height,
+            },
+            Held::Owned(f) => project::FrameView {
+                rgb: &f.rgb,
+                width: f.width,
+                height: f.height,
+            },
+        }
+    }
+}
+
+impl Source<'_> {
+    /// FULL-RES `(width, height)` of every input frame — geometry only, no pixels touched.
+    fn dims(&self) -> Vec<(usize, usize)> {
+        match self {
+            Source::Resident(frames) => frames.iter().map(|f| (f.width, f.height)).collect(),
+            Source::Streaming { lows, .. } => {
+                lows.iter().map(|f| (f.full_width, f.full_height)).collect()
+            }
+        }
+    }
+
+    /// The buffer the exposure/seam pass samples for frame `i`, and its scale relative to full-res
+    /// (1.0 for a resident source — hence byte-identical results there).
+    fn low_view(&self, i: usize) -> (project::FrameView<'_>, f64) {
+        match self {
+            Source::Resident(frames) => {
+                let f = &frames[i];
+                (
+                    project::FrameView {
+                        rgb: &f.rgb,
+                        width: f.width,
+                        height: f.height,
+                    },
+                    1.0,
+                )
+            }
+            Source::Streaming { lows, .. } => {
+                let f = &lows[i];
+                let ratio = f.width.max(f.height) as f64 / f.full_width.max(f.full_height) as f64;
+                (
+                    project::FrameView {
+                        rgb: &f.rgb,
+                        width: f.width,
+                        height: f.height,
+                    },
+                    ratio,
+                )
+            }
+        }
+    }
+
+    /// Drop the low-resolution pass once seams and gains are solved (no-op when resident, whose
+    /// buffers are the caller's).
+    fn release_low(&mut self) {
+        if let Source::Streaming { lows, .. } = self {
+            lows.clear();
+            lows.shrink_to_fit();
+        }
+    }
+
+    /// Frame `i` at FULL resolution for the blend step.
+    fn full(&self, i: usize) -> Result<Held<'_>, PanoError> {
+        match self {
+            Source::Resident(frames) => Ok(Held::Borrowed(&frames[i])),
+            Source::Streaming { src, .. } => Ok(Held::Owned(src.load(i, None)?)),
+        }
+    }
 }
 
 /// Composite an already-computed [`Registration`] into a panorama (lets a caller reuse a registration).
@@ -308,9 +613,24 @@ pub fn compose(
     opt: &StitchOptions,
     progress: &(dyn Fn(Phase) + Sync),
 ) -> Result<StitchResult, PanoError> {
+    compose_inner(Source::Resident(frames), reg, opt, progress, &never_cancel)
+}
+
+/// Shared body of [`compose`] / [`stitch_streaming`]'s compositing half.
+///
+/// For [`Source::Resident`] every `low_view` is the full-res buffer at ratio 1, which makes the
+/// camera rescale below an identity and keeps this path bit-for-bit the pre-streaming compositor.
+fn compose_inner(
+    mut source: Source<'_>,
+    reg: &Registration,
+    opt: &StitchOptions,
+    progress: &(dyn Fn(Phase) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<StitchResult, PanoError> {
     progress(Phase::Warp);
 
-    let cams = project::build_used_cams(frames, reg);
+    let dims = source.dims();
+    let cams = project::build_used_cams(&dims, reg);
     let ref_slot = reg
         .used_indices
         .iter()
@@ -322,7 +642,23 @@ pub fn compose(
     let (map, capped) = project::build_map(&cams, ref_slot, projection, opt.max_long_side);
 
     // Low-resolution warps drive exposure compensation and seam finding; hold them all (small).
-    let (low_map, low_warps) = project::warp_lowres(&cams, &reg.used_indices, frames, &map);
+    // The CANVAS scale (`seam_ratio`) and the SOURCE scale (`low_view`'s ratio) are independent: the
+    // canvas always drops to ~SEAM_LONG_SIDE, while the source is whatever the frame source handed
+    // over — full-res when resident, ~SEAM_LONG_SIDE when streaming.
+    let low_map = map.scaled(project::seam_ratio(&map));
+    let mut low_warps: Vec<Option<project::Warped>> = Vec::with_capacity(cams.len());
+    for (cam, &fidx) in cams.iter().zip(reg.used_indices.iter()) {
+        if cancel() {
+            return Err(PanoError::Cancelled);
+        }
+        let (view, ratio) = source.low_view(fidx);
+        let low_cam = cam.scaled(ratio, view.width, view.height);
+        low_warps.push(project::warp(&low_cam, view, &low_map));
+    }
+    if cancel() {
+        return Err(PanoError::Cancelled);
+    }
+
     let gains = exposure::solve_gains(&low_warps);
     let seams = seam::build_id_map(
         &low_warps,
@@ -333,14 +669,26 @@ pub fn compose(
         low_map.height,
     );
     drop(low_warps);
+    // Nothing reads the low-resolution buffers past this point; free them before the blend loop
+    // starts pulling full-res frames, so the two never coexist.
+    source.release_low();
 
     progress(Phase::Blend);
 
     let mut blender = blend::Blender::new(map.width, map.height);
     for (slot, (&fidx, cam)) in reg.used_indices.iter().zip(cams.iter()).enumerate() {
-        if let Some(w) = project::warp(cam, &frames[fidx], &map) {
+        if cancel() {
+            return Err(PanoError::Cancelled);
+        }
+        // `held` owns the full-res buffer on the streaming path and is dropped at the end of this
+        // iteration — at most one full-res source is ever resident.
+        let held = source.full(fidx)?;
+        if let Some(w) = project::warp(cam, held.view(), &map) {
             blender.add(&w, slot, &seams, gains[slot]);
         }
+    }
+    if cancel() {
+        return Err(PanoError::Cancelled);
     }
     let (mut rgb, mut valid) = blender.finish();
     let mut width = map.width;

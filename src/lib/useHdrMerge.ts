@@ -1,7 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { hdrMerge, type ImageRow } from "./ipc";
+import { useAppStore } from "../store/app";
 import { log } from "./logger";
+
+/** `hdr:done` payload: the new catalog row plus any per-frame merge warnings (e.g. a frame that
+ *  couldn't be aligned and was merged unaligned). */
+interface HdrDone {
+  warnings?: string[];
+}
 
 export interface HdrProgress {
   done: number;
@@ -62,7 +69,17 @@ export function useHdrMerge(): HdrMergeState & HdrMergeActions {
           setProgress(ev.payload),
         ),
       );
-      unlisteners.push(await listen("hdr:done", () => setProgress(null)));
+      unlisteners.push(
+        await listen<HdrDone>("hdr:done", (ev) => {
+          setProgress(null);
+          const warnings = ev.payload?.warnings ?? [];
+          if (warnings.length > 0) {
+            const extra =
+              warnings.length > 1 ? ` (+${warnings.length - 1} more)` : "";
+            useAppStore.getState().setToast(`${warnings[0]}${extra}`);
+          }
+        }),
+      );
     }
     void setup();
 

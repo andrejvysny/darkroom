@@ -51,6 +51,32 @@ pub(crate) fn verify_pair(
     }
 }
 
+/// Run affine RANSAC then the Brown&Lowe gate on candidate correspondences `(p, q)`. Same contract
+/// as [`verify_pair`] but fits a 6-DOF **affine** model (`q ≈ A·p`, embedded in a 3×3 with last row
+/// `[0,0,1]`) instead of the 8-DOF projective homography. Returns the transform (mov→ref) or `None`
+/// if the pair is not a confident overlap.
+///
+/// WHY affine for HDR brackets: the frames differ by tiny hand-held jitter, so the projective terms
+/// would be estimated from a nearly-degenerate configuration and can extrapolate wildly across
+/// textureless sky where inliers cluster. Affine's 6 DOF capture translation/rotation/shear/scale —
+/// everything a small pose change induces — while staying well conditioned; residual parallax is
+/// deghosting's job, not the global fit's.
+pub(crate) fn verify_pair_affine(
+    corr: &[(Point2<f64>, Point2<f64>)],
+    reg_scale: f64,
+    pair_index: u64,
+) -> Option<Matrix3<f64>> {
+    let res = ransac_affine(corr, reg_scale, pair_index)?;
+    let n_inliers = res.inliers.len();
+    let n_matches = corr.len();
+    // Same Brown & Lowe overlap gate as `verify_pair`: `n_i ≥ 15` and `n_i > 8 + 0.3·n_f`.
+    if n_inliers >= 15 && (n_inliers as f64) > 8.0 + 0.3 * n_matches as f64 {
+        Some(res.m)
+    } else {
+        None
+    }
+}
+
 struct RansacResult {
     h: Matrix3<f64>,
     inliers: Vec<(Point2<f64>, Point2<f64>)>,
@@ -121,6 +147,120 @@ fn ransac_homography(
         .collect();
 
     Some(RansacResult { h, inliers })
+}
+
+struct RansacAffineResult {
+    m: Matrix3<f64>,
+    inliers: Vec<(Point2<f64>, Point2<f64>)>,
+}
+
+/// Adaptive RANSAC for a 6-DOF affine model — the 3-point analogue of [`ransac_homography`]. Same
+/// SplitMix64 seeding discipline, reg-scale threshold, and adaptive-iteration early-exit; only the
+/// minimal-sample size (3 not 4, so the consensus probability is `w³` not `w⁴`), the solver, and the
+/// residual (one-directional 2-D distance — affine is exactly invertible, so the symmetric form is
+/// redundant) differ.
+fn ransac_affine(
+    corr: &[(Point2<f64>, Point2<f64>)],
+    reg_scale: f64,
+    pair_index: u64,
+) -> Option<RansacAffineResult> {
+    let n = corr.len();
+    if n < 3 {
+        return None;
+    }
+    let thresh = INLIER_THRESH_REG_PX / reg_scale;
+    let thresh_sq = thresh * thresh;
+
+    let mut rng = SplitMix64::new(0xC0FFEE_u64.wrapping_add(pair_index));
+    let mut best_inliers: Vec<usize> = Vec::new();
+    let mut dynamic_iters = MAX_ITERS;
+
+    let mut iter = 0usize;
+    while iter < MAX_ITERS && iter < dynamic_iters {
+        iter += 1;
+        let sample = pick3(&mut rng, n);
+        let subset = [corr[sample[0]], corr[sample[1]], corr[sample[2]]];
+        let Some(m) = affine_fit(&subset) else {
+            continue;
+        };
+
+        let inliers: Vec<usize> = (0..n)
+            .filter(|&k| affine_err_sq(&m, &corr[k].0, &corr[k].1) < thresh_sq)
+            .collect();
+
+        if inliers.len() > best_inliers.len() {
+            best_inliers = inliers;
+            // Adaptive early exit for a 3-point sample: shrink the required iterations as `w³` grows.
+            let w = best_inliers.len() as f64 / n as f64;
+            let w3 = w * w * w;
+            if w3 > 0.0 && w3 < 1.0 {
+                let need = (1.0 - CONFIDENCE).ln() / (1.0 - w3).ln();
+                dynamic_iters = (need.ceil() as usize).clamp(1, MAX_ITERS);
+            } else if w3 >= 1.0 {
+                dynamic_iters = iter; // perfect consensus, stop
+            }
+        }
+    }
+
+    if best_inliers.len() < 3 {
+        return None;
+    }
+
+    // Refit over ALL inliers (least-squares; the 3-point model was only for consensus).
+    let inlier_pts: Vec<(Point2<f64>, Point2<f64>)> =
+        best_inliers.iter().map(|&k| corr[k]).collect();
+    let m = affine_fit(&inlier_pts)?;
+    let inliers: Vec<(Point2<f64>, Point2<f64>)> = corr
+        .iter()
+        .copied()
+        .filter(|(p, q)| affine_err_sq(&m, p, q) < thresh_sq)
+        .collect();
+
+    Some(RansacAffineResult { m, inliers })
+}
+
+/// Least-squares affine fit `q ≈ A·p` (2×3, embedded as a 3×3 with last row `[0,0,1]`) via the normal
+/// equations `S·θ = r`. Handles both the minimal 3-point case (exact solve) and the over-determined
+/// inlier refit; `S` is singular only when the source points are collinear (`None`), which the
+/// minimal sampler avoids and the inlier set never hits in practice.
+fn affine_fit(corr: &[(Point2<f64>, Point2<f64>)]) -> Option<Matrix3<f64>> {
+    let mut s = SMatrix::<f64, 3, 3>::zeros();
+    let mut rx = Vector3::zeros();
+    let mut ry = Vector3::zeros();
+    for (p, q) in corr {
+        let row = Vector3::new(p.x, p.y, 1.0);
+        s += row * row.transpose();
+        rx += row * q.x;
+        ry += row * q.y;
+    }
+    let s_inv = s.try_inverse()?;
+    let abc = s_inv * rx; // [a, b, c] — the top row of A
+    let def = s_inv * ry; // [d, e, f] — the middle row of A
+    Some(Matrix3::new(
+        abc[0], abc[1], abc[2], def[0], def[1], def[2], 0.0, 0.0, 1.0,
+    ))
+}
+
+/// Squared 2-D residual `‖q − A·p‖²` for an affine `m` (last row `[0,0,1]`, so no homogeneous divide).
+fn affine_err_sq(m: &Matrix3<f64>, p: &Point2<f64>, q: &Point2<f64>) -> f64 {
+    let x = m[(0, 0)] * p.x + m[(0, 1)] * p.y + m[(0, 2)];
+    let y = m[(1, 0)] * p.x + m[(1, 1)] * p.y + m[(1, 2)];
+    let (dx, dy) = (x - q.x, y - q.y);
+    dx * dx + dy * dy
+}
+
+/// Pick 3 distinct indices in `[0, n)` deterministically (the affine analogue of [`pick4`]).
+fn pick3(rng: &mut SplitMix64, n: usize) -> [usize; 3] {
+    let mut out = [0usize; 3];
+    let mut count = 0;
+    while count < 3 {
+        let cand = rng.gen_range(n);
+        if !out[..count].contains(&cand) {
+            out[count] = cand;
+            count += 1;
+        }
+    }
+    out
 }
 
 /// Squared symmetric transfer error: `‖q − H·p‖² + ‖p − H⁻¹·q‖²` (both directions, in target pixels).

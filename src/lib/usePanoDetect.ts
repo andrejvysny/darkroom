@@ -1,38 +1,27 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   panoDetectStatus,
   panoDetectGroups,
   panoDetectRun,
   panoDetectCancel,
   panoDetectDismiss,
-  type PanoDetectStatus,
+  panoDetectMarkMerged,
   type PanoGroupRow,
 } from "./ipc";
-import { useAppStore } from "../store/app";
+import { useAppStore, type PanoDetectProgress, type PanoDetectStoreState } from "../store/app";
 import { log } from "./logger";
 
-export type PanoDetectProgress = {
-  phase: string;
-  done: number;
-  total: number;
-} | null;
-
-export interface PanoDetectState {
-  status: PanoDetectStatus | null;
-  groups: PanoGroupRow[];
-  progress: PanoDetectProgress;
-  error: string | null;
-}
+export type { PanoDetectProgress };
 
 export interface PanoDetectActions {
   detect: (force?: boolean) => Promise<void>;
   cancel: () => Promise<void>;
   reload: () => Promise<void>;
   dismiss: (groupId: number, dismissed: boolean) => Promise<void>;
-  /** Stage a detected group into the existing Panorama merge modal: sets the active-group id (so
-   *  `usePanorama`'s `panorama:done` handler can call `panoDetectMarkMerged`) and the merge
-   *  source ids, which opens `PanoramaModal`. */
+  /** Stage a detected group into the existing Panorama merge modal: sets the merge source ids
+   *  plus the originating group id (threaded through the merge IPC call and echoed back on
+   *  `panorama:done`, where this module marks the group merged), which opens `PanoramaModal`. */
   openMerge: (group: PanoGroupRow) => void;
 }
 
@@ -45,165 +34,173 @@ function progressLabel(p: NonNullable<PanoDetectProgress>): string {
   return `${p.phase}…`;
 }
 
-/**
- * Owns panorama-detection state: scan status, the detected-group list, and live
- * progress/error — plus the actions to drive a scan and review its results. Modeled on
- * `useAnalysis`: each call site gets its own local state, bootstrapped once (StrictMode-safe via a
- * per-instance ref guard) and kept live by its own `pano_detect:*` event subscriptions, so both
- * `LibraryView` (LeftNav's suggestion count) and `PanoSuggestions` (the full review overlay) — the
- * two call sites — see consistent, independently-live state regardless of mount order.
- */
-export function usePanoDetect(): PanoDetectState & PanoDetectActions {
-  const [status, setStatus] = useState<PanoDetectStatus | null>(null);
-  const [groups, setGroups] = useState<PanoGroupRow[]>([]);
-  const [progress, setProgress] = useState<PanoDetectProgress>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // Guard against double-run in React 19 StrictMode
-  const bootstrappedRef = useRef(false);
-
-  const reloadStatus = useCallback(async () => {
-    try {
-      setStatus(await panoDetectStatus());
-    } catch (err) {
-      log.debug("panoDetect", "reload status failed", log.errorSummary(err));
-    }
-  }, []);
-
-  const reloadGroups = useCallback(async () => {
-    try {
-      // Always fetch dismissed groups too — PanoSuggestions filters the "Show dismissed" toggle
-      // client-side so toggling it doesn't need a round-trip.
-      setGroups(await panoDetectGroups(true));
-    } catch (err) {
-      log.debug("panoDetect", "reload groups failed", log.errorSummary(err));
-    }
-  }, []);
-
-  const reload = useCallback(async () => {
-    await Promise.all([reloadStatus(), reloadGroups()]);
-  }, [reloadStatus, reloadGroups]);
-
-  const detect = useCallback(async (force = false) => {
-    setError(null);
-    // Optimistic progress, mirrors usePanorama's optimistic job set — pano_detect:progress
-    // overwrites this as soon as the backend reports the real phase/counts.
-    setProgress({ phase: "cluster", done: 0, total: 0 });
-    try {
-      await panoDetectRun(force);
-      // Happy path: pano_detect:done (below) clears progress, reloads, and toasts.
-    } catch (err) {
-      setProgress(null);
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-      useAppStore.getState().setToast(`Panorama detection failed: ${msg}`);
-      log.warn("panoDetect", "run failed", { force, ...log.errorSummary(err) });
-    }
-  }, []);
-
-  const cancel = useCallback(async () => {
-    try {
-      await panoDetectCancel();
-    } catch (err) {
-      log.debug("panoDetect", "cancel failed", log.errorSummary(err));
-    } finally {
-      setProgress(null);
-    }
-  }, []);
-
-  const dismiss = useCallback(
-    async (groupId: number, dismissed: boolean) => {
-      // Optimistic local update so the row flips immediately.
-      setGroups((prev) =>
-        prev.map((g) =>
-          g.id === groupId
-            ? { ...g, status: dismissed ? "dismissed" : "suggested" }
-            : g,
-        ),
-      );
-      try {
-        await panoDetectDismiss(groupId, dismissed);
-        void reloadStatus();
-      } catch (err) {
-        log.warn("panoDetect", "dismiss failed", log.errorSummary(err));
-        await reload(); // revert to server truth on failure
-      }
-    },
-    [reload, reloadStatus],
-  );
-
-  const openMerge = useCallback((group: PanoGroupRow) => {
-    useAppStore.getState().setActivePanoDetectGroup(group.id);
+async function reloadStatus(): Promise<void> {
+  try {
+    const status = await panoDetectStatus();
     useAppStore
       .getState()
-      .setPanoramaSources(group.members.map((m) => m.imageId));
-  }, []);
+      .setPanoDetect({ running: status.running, suggested: status.suggested });
+  } catch (err) {
+    log.debug("panoDetect", "reload status failed", log.errorSummary(err));
+  }
+}
 
-  // Mount: fetch initial status + groups, register event listeners
-  useEffect(() => {
-    if (bootstrappedRef.current) return;
-    bootstrappedRef.current = true;
+async function reloadGroups(): Promise<void> {
+  try {
+    // Always fetch dismissed groups too — PanoSuggestions filters the "Show dismissed" toggle
+    // client-side so toggling it doesn't need a round-trip.
+    const groups = await panoDetectGroups(true);
+    useAppStore.getState().setPanoDetect({ groups });
+  } catch (err) {
+    log.debug("panoDetect", "reload groups failed", log.errorSummary(err));
+  }
+}
 
-    void reload();
+async function reload(): Promise<void> {
+  useAppStore.getState().setPanoDetect({ loading: true });
+  await Promise.all([reloadStatus(), reloadGroups()]);
+  useAppStore.getState().setPanoDetect({ loading: false });
+}
 
-    const unlisteners: UnlistenFn[] = [];
+/** Refresh the shared store (groups + suggested count) from the backend, for callers outside this
+ *  module that change suggestion state through some other path. */
+export function refreshPanoDetect(): void {
+  void reload();
+}
 
-    async function setup() {
-      const unProgress = await listen<{
-        phase: string;
-        done: number;
-        total: number;
-      }>("pano_detect:progress", (ev) => {
-        setProgress({
+async function detect(force = false): Promise<void> {
+  const { setPanoDetect, setToast } = useAppStore.getState();
+  // Optimistic: flip busy immediately (mirrors the old per-instance optimistic progress) so every
+  // consumer's Detect button dims right away instead of waiting for the first progress event.
+  setPanoDetect({ running: true, progress: { phase: "cluster", done: 0, total: 0 } });
+  try {
+    await panoDetectRun(force);
+    // Happy path: pano_detect:done (listener below) clears running/progress, reloads, and toasts.
+  } catch (err) {
+    setPanoDetect({ running: false, progress: null });
+    const msg = err instanceof Error ? err.message : String(err);
+    setToast(`Panorama detection failed: ${msg}`);
+    log.warn("panoDetect", "run failed", { force, ...log.errorSummary(err) });
+  }
+}
+
+async function cancel(): Promise<void> {
+  try {
+    await panoDetectCancel();
+  } catch (err) {
+    log.debug("panoDetect", "cancel failed", log.errorSummary(err));
+  } finally {
+    useAppStore.getState().setPanoDetect({ running: false, progress: null });
+  }
+}
+
+async function dismiss(groupId: number, dismissed: boolean): Promise<void> {
+  const { panoDetect, setPanoDetect } = useAppStore.getState();
+  // Optimistic local update so the row flips immediately.
+  setPanoDetect({
+    groups: panoDetect.groups.map((g) =>
+      g.id === groupId ? { ...g, status: dismissed ? "dismissed" : "suggested" } : g,
+    ),
+  });
+  try {
+    await panoDetectDismiss(groupId, dismissed);
+    void reloadStatus();
+  } catch (err) {
+    log.warn("panoDetect", "dismiss failed", log.errorSummary(err));
+    await reload(); // revert to server truth on failure
+  }
+}
+
+function openMerge(group: PanoGroupRow): void {
+  useAppStore.getState().setPanoramaSources({
+    ids: group.members.map((m) => m.imageId),
+    detectGroupId: group.id,
+  });
+}
+
+// The `pano_detect:*` event listeners (+ the initial fetch) are process-wide singletons: set up
+// exactly once no matter how many components call `usePanoDetect()` (LeftNav, PanoSuggestions, …).
+// Mirrors `usePanorama.ts`'s `listenersBootstrapped` module guard — needed here for the same reason:
+// this hook is called from more than one always-live place, and per-instance listeners meant
+// duplicate `pano_detect:done`/`error` toasts, doubled status/groups round-trips on mount, and a
+// LeftNav badge that could go stale after a dismiss/merge handled by a different instance.
+let listenersBootstrapped = false;
+
+function bootstrapListeners(): void {
+  if (listenersBootstrapped) return;
+  listenersBootstrapped = true;
+
+  void reload();
+
+  void listen<{ phase: string; done: number; total: number }>(
+    "pano_detect:progress",
+    (ev) => {
+      useAppStore.getState().setPanoDetect({
+        running: true,
+        progress: {
           phase: ev.payload.phase,
           done: ev.payload.done,
           total: ev.payload.total,
-        });
+        },
       });
-      unlisteners.push(unProgress);
+    },
+  );
 
-      const unDone = await listen<{ found: number }>(
-        "pano_detect:done",
-        (ev) => {
-          setProgress(null);
-          setError(null);
-          void reload();
-          useAppStore
-            .getState()
-            .setToast(
-              ev.payload.found > 0
-                ? `Found ${ev.payload.found} panorama suggestion${ev.payload.found === 1 ? "" : "s"}`
-                : "No new panorama suggestions found",
-            );
-        },
+  void listen<{ found: number }>("pano_detect:done", (ev) => {
+    useAppStore.getState().setPanoDetect({ running: false, progress: null });
+    void reload();
+    useAppStore
+      .getState()
+      .setToast(
+        ev.payload.found > 0
+          ? `Found ${ev.payload.found} panorama suggestion${ev.payload.found === 1 ? "" : "s"}`
+          : "No new panorama suggestions found",
       );
-      unlisteners.push(unDone);
+  });
 
-      const unError = await listen<{ message: string }>(
-        "pano_detect:error",
-        (ev) => {
-          setProgress(null);
-          setError(ev.payload.message);
-          useAppStore
-            .getState()
-            .setToast(`Panorama detection failed: ${ev.payload.message}`);
-        },
-      );
-      unlisteners.push(unError);
-    }
+  void listen<{ message: string }>("pano_detect:error", (ev) => {
+    useAppStore.getState().setPanoDetect({ running: false, progress: null });
+    useAppStore
+      .getState()
+      .setToast(`Panorama detection failed: ${ev.payload.message}`);
+  });
 
-    void setup();
+  // A merge that began as a suggestion (PanoSuggestions → openMerge) carries its group id through
+  // the merge IPC call; the backend echoes it back on `panorama:done`. Recording that merge is this
+  // module's business, so it listens for the event directly rather than having `usePanorama` (or
+  // the transport layer in `ipc.ts`) reach into the detect store: mark, then refresh so the group
+  // leaves the review list immediately.
+  void listen<{ imageId: number; detectGroupId: number | null }>(
+    "panorama:done",
+    (ev) => {
+      const { imageId, detectGroupId } = ev.payload;
+      if (detectGroupId == null) return;
+      void panoDetectMarkMerged(detectGroupId, imageId)
+        .then(reload)
+        .catch((err: unknown) => {
+          log.debug("panoDetect", "mark merged failed", log.errorSummary(err));
+        });
+    },
+  );
+}
 
-    return () => {
-      unlisteners.forEach((fn) => fn());
-    };
-  }, [reload]);
+/**
+ * Panorama-detection state + actions, backed by the shared `panoDetect` store slice (see
+ * `store/app.ts`). Event listeners and the initial status/groups fetch are module-level singletons
+ * (bootstrapped once on first mount, however many call sites there are); the hook itself just reads
+ * the store and hands back stable actions, so `LibraryView` (LeftNav's suggestion count),
+ * `LeftNav` (the Detect/Re-detect header button), and `PanoSuggestions` (the full review overlay)
+ * always see the exact same state.
+ */
+export function usePanoDetect(): PanoDetectStoreState & PanoDetectActions {
+  const panoDetect = useAppStore((s) => s.panoDetect);
+
+  useEffect(() => {
+    bootstrapListeners();
+  }, []);
 
   return {
-    status,
-    groups,
-    progress,
-    error,
+    ...panoDetect,
     detect,
     cancel,
     reload,

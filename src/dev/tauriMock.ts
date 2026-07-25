@@ -123,6 +123,7 @@ function panoMember(
   row: ImageRow,
   position: number,
   format: string | null = row.format,
+  present = true,
 ): PanoMemberRow {
   return {
     imageId: row.id,
@@ -131,6 +132,7 @@ function panoMember(
     captureDate: row.captureDate,
     format,
     position,
+    present,
   };
 }
 

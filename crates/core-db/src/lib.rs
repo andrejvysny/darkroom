@@ -36,6 +36,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/017_image_format.sql"),
     include_str!("../migrations/018_panorama.sql"),
     include_str!("../migrations/019_pano_detect.sql"),
+    include_str!("../migrations/020_hdr_sources.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -134,7 +135,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 19, "expected 19 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 20, "expected 20 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -253,13 +254,14 @@ mod tests {
 
         // (a) Deleting a member image cascades both its membership row and its scan marker.
         db.conn
-            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![image_a])
+            .execute(
+                "DELETE FROM images WHERE id = ?1",
+                rusqlite::params![image_a],
+            )
             .unwrap();
         let members: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM pano_detect_members", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM pano_detect_members", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
             members, 0,
@@ -276,7 +278,10 @@ mod tests {
 
         // (b) Deleting the merged image sets merged_image_id NULL but leaves the group row intact.
         db.conn
-            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![image_b])
+            .execute(
+                "DELETE FROM images WHERE id = ?1",
+                rusqlite::params![image_b],
+            )
             .unwrap();
         let merged_image_id: Option<i64> = db
             .conn
@@ -299,6 +304,88 @@ mod tests {
         assert!(
             dup.is_err(),
             "inserting a second group with a duplicate member_key must violate the UNIQUE constraint"
+        );
+    }
+
+    #[test]
+    fn migration_020_hdr_sources_cascades() {
+        let db = Db::open_in_memory().unwrap();
+
+        // (a) Deleting the merged (parent) image cascades to the link row.
+        let hdr1 = insert_folder_and_image(&db.conn, 1);
+        let src1 = insert_folder_and_image(&db.conn, 2);
+        db.conn
+            .execute(
+                "INSERT INTO hdr_sources(hdr_image_id, source_image_id, position, relative_ev)
+                 VALUES (?1, ?2, 0, -1.0)",
+                rusqlite::params![hdr1, src1],
+            )
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![hdr1])
+            .unwrap();
+        let links: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM hdr_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            links, 0,
+            "deleting the merged image must cascade-delete its hdr_sources link row"
+        );
+
+        // (b) Deleting a source image cascades to the link row but leaves the merged image intact.
+        let hdr2 = insert_folder_and_image(&db.conn, 3);
+        let src2 = insert_folder_and_image(&db.conn, 4);
+        db.conn
+            .execute(
+                "INSERT INTO hdr_sources(hdr_image_id, source_image_id, position, relative_ev)
+                 VALUES (?1, ?2, 0, 0.0)",
+                rusqlite::params![hdr2, src2],
+            )
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![src2])
+            .unwrap();
+        let links2: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM hdr_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            links2, 0,
+            "deleting a source image must cascade-delete its hdr_sources link row"
+        );
+        let hdr_still_present: bool = db
+            .conn
+            .prepare("SELECT 1 FROM images WHERE id = ?1")
+            .unwrap()
+            .exists(rusqlite::params![hdr2])
+            .unwrap();
+        assert!(
+            hdr_still_present,
+            "the merged image itself must survive its source frame's deletion"
+        );
+
+        // (c) position is unique per hdr_image_id, not globally: a different merge can reuse
+        // position 0 (PRIMARY KEY is (hdr_image_id, position))...
+        let hdr3 = insert_folder_and_image(&db.conn, 5);
+        let src3 = insert_folder_and_image(&db.conn, 6);
+        db.conn
+            .execute(
+                "INSERT INTO hdr_sources(hdr_image_id, source_image_id, position, relative_ev)
+                 VALUES (?1, ?2, 0, 1.0)",
+                rusqlite::params![hdr3, src3],
+            )
+            .unwrap();
+        // ...but a second row at the SAME (hdr_image_id, position) must violate the PK.
+        let src3b = insert_folder_and_image(&db.conn, 7);
+        let dup_position = db.conn.execute(
+            "INSERT INTO hdr_sources(hdr_image_id, source_image_id, position, relative_ev)
+             VALUES (?1, ?2, 0, 2.0)",
+            rusqlite::params![hdr3, src3b],
+        );
+        assert!(
+            dup_position.is_err(),
+            "a second source at the same (hdr_image_id, position) must violate the PRIMARY KEY"
         );
     }
 
@@ -330,6 +417,7 @@ mod tests {
             "face_embedding",
             "face_rejection",
             "folders",
+            "hdr_sources",
             "image_captions",
             "image_detections",
             "image_features",

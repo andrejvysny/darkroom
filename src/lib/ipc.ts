@@ -378,6 +378,18 @@ export function hdrMerge(imageIds: number[]): Promise<ImageRow> {
   return invoke<ImageRow>("hdr_merge", { imageIds });
 }
 
+/** Request the running HDR merge to stop (honored between frames). */
+export function hdrCancel(): Promise<void> {
+  return invoke<void>("hdr_cancel", {});
+}
+
+/** Export a merged-HDR image (`format === "hdr"`) as an uncompressed FLOAT LinearRaw DNG for
+ *  Lightroom/ACR interop — the full >1.0 headroom Merge-to-HDR produced survives untouched. Export
+ *  only: never re-imported into the catalog. */
+export function hdrExportDng(imageId: number, dest: string): Promise<void> {
+  return invoke<void>("hdr_export_dng", { imageId, dest });
+}
+
 export function dedupScan(category: "byte" | "capture"): Promise<DupGroup[]> {
   return invoke<DupGroup[]>("dedup_scan", { category });
 }
@@ -1186,6 +1198,33 @@ export function imageHistogram(imageId: number): Promise<HistData | null> {
   return invoke<HistData | null>("image_histogram", { imageId });
 }
 
+/** One source frame that fed a merged image (HDR bracket or panorama stitch), for the metadata
+ *  panel's "Source frames" section. Mirrors Rust `SourceRow`. */
+export type SourceRow = {
+  imageId: number;
+  filename: string;
+  /** Capture/bracket order (0-based), as recorded at merge time. */
+  position: number;
+  /** EV offset from the reference (metered) frame — HDR only; `null` for panorama sources. */
+  relativeEv: number | null;
+  /** `false` when the source's file is missing/relinked-away (the catalog link survives). */
+  present: boolean;
+};
+
+/** The source frames behind one merged image, and which merge kind produced it. Mirrors Rust
+ *  `MergeSources`. */
+export type MergeSources = {
+  kind: "hdr" | "panorama";
+  /** Ordered by `position`. */
+  sources: SourceRow[];
+};
+
+/** Source frames behind `imageId` (an HDR bracket or a panorama stitch), for the metadata panel's
+ *  "Source frames" section. `null` when `imageId` is an ordinary, un-merged image. */
+export function imageSources(imageId: number): Promise<MergeSources | null> {
+  return invoke<MergeSources | null>("image_sources", { imageId });
+}
+
 export function exportImage(
   imageId: number,
   params: DevelopParams,
@@ -1810,7 +1849,7 @@ export type PanoramaProjection =
   | "perspective";
 
 /** Shared option set for `panoramaPreview`/`panoramaMerge` (mirrors the fixed Rust IPC contract —
- *  `panorama_preview`/`panorama_merge` take these four fields; Tauri auto-converts the camelCase JS
+ *  `panorama_preview`/`panorama_merge` take these fields; Tauri auto-converts the camelCase JS
  *  keys below to the Rust commands' snake_case params). */
 export type PanoramaOptions = {
   imageIds: number[];
@@ -1818,6 +1857,10 @@ export type PanoramaOptions = {
   /** 0..100; the backend clamps. Blends the seam boundary to hide parallax/exposure mismatches. */
   boundaryWarp: number;
   autoCrop: boolean;
+  /** Originating panorama-detection group id, when this merge was handed off from
+   *  `usePanoDetect().openMerge` — echoed back verbatim on the `panorama:done` event so the caller
+   *  can mark the group merged without an ambient store field. `panoramaPreview` ignores it. */
+  detectGroupId?: number | null;
 };
 
 /** Fast low-res preview of a panorama merge for the given options. Returns an object URL backed by
@@ -1843,12 +1886,22 @@ export function panoramaMerge(opts: PanoramaOptions): Promise<number> {
     projection: opts.projection,
     boundaryWarp: opts.boundaryWarp,
     autoCrop: opts.autoCrop,
+    detectGroupId: opts.detectGroupId ?? null,
   });
 }
 
 /** Request the running panorama merge to stop. */
 export function panoramaCancel(): Promise<void> {
   return invoke<void>("panorama_cancel", {});
+}
+
+/** Whether a panorama merge job is running in the backend right now (mirrors Rust `PanoStatus`).
+ *  A merge outlives the renderer, so this is how the UI re-attaches its progress pill after a
+ *  reload — the `panorama:*` events only tell you about transitions you were listening for. */
+export type PanoramaStatus = { running: boolean };
+
+export function panoramaStatus(): Promise<PanoramaStatus> {
+  return invoke<PanoramaStatus>("panorama_status", {});
 }
 
 /** Drop the merge dialog's cached preview frames (called when the modal closes). */
@@ -1866,6 +1919,9 @@ export type PanoMemberRow = {
   captureDate: number | null;
   format: string | null;
   position: number;
+  /** False when the source image's file is missing (soft-deleted via reconcile — the group's link
+   *  survives). `PanoSuggestions` dims this member and disables the merge handoff until it returns. */
+  present: boolean;
 };
 
 /** A detected group of images the backend believes can be stitched into one panorama. */
@@ -1920,8 +1976,9 @@ export function panoDetectDismiss(
   return invoke<void>("pano_detect_dismiss", { groupId, dismissed });
 }
 
-/** Mark a group merged once its handoff into the panorama merge flow lands a new image
- *  (`usePanorama`'s `panorama:done` handler calls this automatically). */
+/** Mark a group merged once its handoff into the panorama merge flow lands a new image.
+ *  `usePanoDetect`'s own `panorama:done` listener calls this and then refreshes the shared store —
+ *  the refresh lives there, not here, so this module stays pure transport. */
 export function panoDetectMarkMerged(
   groupId: number,
   mergedImageId: number,

@@ -1,6 +1,11 @@
-//! Merge a real tripod exposure bracket end-to-end (the no-GUI validation harness for
-//! Merge-to-HDR). Run with a directory of 2–9 bracketed CR3s of a static scene:
-//!   cargo run -p core-hdr --example merge_one [BRACKET_DIR]
+//! Merge a real exposure bracket end-to-end (the no-GUI validation harness for Merge-to-HDR). Run
+//! with a directory of 2–9 bracketed CR3s of a static scene:
+//!   cargo run -p core-hdr --example merge_one [BRACKET_DIR] [--no-align]
+//!
+//! By default each non-reference frame is *aligned* to the reference (hand-held path:
+//! `core_pano::align` + `warp_into_reference` + masked/deghosting accumulate); `--no-align` uses the
+//! legacy tripod accumulator (`new` + `add_frame`). A true tripod fixture should align to an
+//! identity-like transform, so both paths land in the same place there.
 //!
 //! Prints per-frame EV/scale/timings, writes `/tmp/darkroom-hdr.exr` (the shipping fp16
 //! linear-ProPhoto format) and `/tmp/darkroom-hdr-preview.jpg` (clamped-SDR eyeball). For a real
@@ -11,8 +16,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
-    let dir = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let no_align = args.iter().any(|a| a == "--no-align");
+    let dir = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .unwrap_or_else(|| "library/fixtures-hdr".to_string());
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -81,9 +90,18 @@ fn main() -> anyhow::Result<()> {
         t0.elapsed(),
         ref_wb
     );
-    let mut acc = core_hdr::MergeAccumulator::new(ref_img.width, ref_img.height);
-    acc.add_frame(&ref_img, 1.0, ref_idx == shortest_idx)?;
-    drop(ref_img);
+    let (ref_w, ref_h) = (ref_img.width, ref_img.height);
+    let mut acc = if no_align {
+        let mut a = core_hdr::MergeAccumulator::new(ref_w, ref_h);
+        a.add_frame(&ref_img, 1.0, ref_idx == shortest_idx)?;
+        a
+    } else {
+        core_hdr::MergeAccumulator::with_reference(
+            &ref_img,
+            ref_idx == shortest_idx,
+            core_hdr::DeghostParams::default(),
+        )?
+    };
 
     for (i, f) in files.iter().enumerate() {
         if i == ref_idx {
@@ -93,16 +111,51 @@ fn main() -> anyhow::Result<()> {
         let src = core_raw::source_from_path(f)?;
         let (img, _) = core_raw::develop_linear_wb(&src, Some(ref_wb))?;
         let scale = core_hdr::relative_scale(&exposures[i], &ref_exp)? as f32;
-        acc.add_frame(&img, scale, i == shortest_idx)?;
-        println!(
-            "  [{}] {:?}: EV100 {:.2}, scale ×{:.3}, decoded+merged in {:.2?}",
-            i,
-            f.file_name().unwrap(),
-            core_hdr::ev100(&exposures[i])?,
-            scale,
-            t.elapsed()
-        );
+        let ev = core_hdr::ev100(&exposures[i])?;
+        let name = f.file_name().unwrap().to_owned();
+
+        if no_align {
+            acc.add_frame(&img, scale, i == shortest_idx)?;
+            println!(
+                "  [{i}] {name:?}: EV100 {ev:.2}, scale ×{scale:.3}, decoded+merged in {:.2?}",
+                t.elapsed()
+            );
+        } else {
+            match core_pano::align::estimate_alignment_rgb(
+                &ref_img.data,
+                ref_w as usize,
+                ref_h as usize,
+                &img.data,
+                img.width as usize,
+                img.height as usize,
+                core_pano::align::AlignModel::Affine,
+            ) {
+                Some(m) => {
+                    let (warped, mask) = core_hdr::warp_into_reference(&img, ref_w, ref_h, &m);
+                    let valid = mask.iter().filter(|&&v| v != 0).count();
+                    let pct = 100.0 * valid as f64 / mask.len() as f64;
+                    let warped_img = core_raw::LinearImage {
+                        width: ref_w,
+                        height: ref_h,
+                        data: warped,
+                    };
+                    acc.add_frame_masked(&warped_img, scale, i == shortest_idx, &mask)?;
+                    println!(
+                        "  [{i}] {name:?}: EV100 {ev:.2}, scale ×{scale:.3}, aligned ({pct:.1}% valid), merged in {:.2?}",
+                        t.elapsed()
+                    );
+                }
+                None => {
+                    acc.add_frame(&img, scale, i == shortest_idx)?;
+                    println!(
+                        "  [{i}] {name:?}: EV100 {ev:.2}, scale ×{scale:.3}, UNALIGNED (fell back), merged in {:.2?}",
+                        t.elapsed()
+                    );
+                }
+            }
+        }
     }
+    drop(ref_img);
 
     let t = Instant::now();
     let merged = acc.finish()?;

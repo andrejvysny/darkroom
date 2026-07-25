@@ -3,6 +3,39 @@
 > Snapshot for resuming in a new session. Pairs with `TODO.md` (what's next + leftovers), `README.md`
 > (overview), `SPEC_V1.md` (full spec).
 
+> **2026-07-20 — HDR/Pano review pass (UNCOMMITTED on `main` `4a0bc57`).** Senior review of the
+> three landed subsystems (HDR · panorama merge · panorama detection) + remaining-work execution.
+> Plan: `~/.claude/plans/act-as-senior-software-elegant-flurry.md`; live status in `TODO.md` top
+> section. Landed so far: **Track A** (8 verified correctness bugs — detect-merge misattribution,
+> dishonest `panorama_sources` links, `hdr_merge` mixed-camera/duplicate-id holes, orphan/truncated
+> output files on failure, merge-gated-on-stale-preview), **Track B** (hand-held HDR: affine
+> alignment + reference-based deghosting + cancel; `hdr_sources` + Source-frames UI; float-DNG
+> export; macOS libheif dylib bundling + CI installs), **Track C** (panorama `FrameSource`
+> streaming — peak frame RAM ~3.8 GB → ~0.55 GB at 10×32 MP — plus real cancel threading and
+> `panorama_status` reconnect), **Track D** (detection state lifted to the store with singleton
+> listeners, zombie-suggestion pruning, LeftNav Detect button). **All four tracks landed.**
+> `cargo test --workspace` = 52 suites, 0 failures; clippy `--examples`, tsc, and build clean.
+> Remaining work is the QA that needs the dev Mac + real captures (see `TODO.md`).
+>
+> **2026-07-20 (later) — validated against a real 2137-file / 38 GB R7 card dump.** Two hard bugs
+> found and fixed: **every real `.HIF` was rejected** (Canon's primary item is a 4×5 grid, so
+> libheif's handle-level nclx reads `Unspecified` — we now parse the container's `colr` boxes
+> ourselves, `heif.rs::container_nclx`), and **557 HDR-PQ CR3s failed to index** (rawler can't
+> extract their HEVC embedded preview; `thumb.rs` now falls back to developing the mosaic). Full
+> index is 2134/2134, 0 failed. Also fixed a recall regression in the new pano streaming path
+> (Triangle→Lanczos3 for the low-res pass: 8→12 frames registered on a real sweep). Risk R4
+> (portrait HIF) is resolved — libheif applies `irot`, so `.oriented()` must NOT be added.
+> Details + open items: `TODO.md` "Real-corpus validation round".
+>
+> **Schema is now 20** (`020_hdr_sources.sql`). **New IPC**: `hdr_cancel`, `image_sources`,
+> `hdr_export_dng`. **New harnesses**: `core-raw --example export_hdr_dng`,
+> `core-library --example {detect_catalog,index_root}`.
+> **macOS builds now require `brew install libheif`** — `bundle.macOS.frameworks` +
+> `beforeBundleCommand` live in `src-tauri/tauri.macos.conf.json` (a macOS-only config overlay, so
+> Windows/Linux `cargo check` isn't gated on staged dylibs), and `tauri-build` validates those
+> paths at compile time → run `bash scripts/macos-bundle-dylibs.sh stage` once before building
+> `src-tauri` on a fresh clone (CI does this automatically).
+
 > **2026-07-18 — HDR pass (branch `claude/hdr-heif-support-5r5ztx`): Canon HDR PQ HEIF (`.hif`)
 > full develop support + Merge-to-HDR (tripod v1, fp16 linear-ProPhoto EXR). See "Latest pass — HDR"
 > below. Binding-map correction: bindings 0–15 are ALL used (15 = `ChanMix`); next free = 16 — any
@@ -45,7 +78,8 @@ photo manager ships this, so there was no reference implementation.
   Merge…" gated on `allRaw` — merge is RAW-only — hands member ids to `PanoramaModal` via
   `panoramaSources`), LeftNav "Panoramas" section + suggested count, CommandPalette entry;
   `panorama:done` records suggestion-originated merges via `pano_detect_mark_merged`
-  (`activePanoDetectGroupId` store field, cleared on merge error).
+  (`detectGroupId` rides the `panorama_merge` IPC call and is echoed back on `panorama:done` —
+  no ambient store field).
 - **Validated on real photos** (this container): 19-image corpus (opencv_extra boat×6 /
   newspaper×4 / s×2 / a×3 + synthetic burst trio + unrelated control) → exactly the 4 ground-truth
   groups, bursts classified Burst and excluded, unrelated matched nothing, **0 false pairs of 171**
@@ -97,10 +131,13 @@ schema = 18) and editable in Develop **with full raw WB latitude** (no tone curv
   only 1 CR3) — on the dev machine run
   `cargo run --release -p core-raw --example stitch_cr3 -- <dir-of-pano-CR3s> /tmp/o.dng` and open
   the DNG in Develop (WB slider must behave like a raw; optionally Adobe `dng_validate`).
-- **v1 limits (see TODO)**: Boundary Warp inert (P5: He/Chang/Sun rectangling), DP seams (graph-cut
-  P5), no deghosting; `merge` holds all full-res sources in RAM (~0.4 GB/frame → ~4 GB at 10
+- **v1 limits (see TODO)**: `merge` holds all full-res sources in RAM (~0.4 GB/frame → ~4 GB at 10
   frames); ~~preview cache freed on merge but not on plain modal close~~ (fixed 2026-07-19:
-  `panorama_preview_release`).
+  `panorama_preview_release`). Boundary Warp, deghosting, and graph-cut seams are NOT limits
+  anymore: Boundary Warp is wired end-to-end (`core-pano/src/rectangle.rs`, `b7fdfc3`), deghosting
+  is gain-corrected diff + median ghost mask as a hard seam penalty, and graph-cut seams are
+  implemented but DP stays the default (benchmark: ~35 ms DP vs ~42 s graph-cut at identical seam
+  quality — see TODO).
 
 ## Repo state sync (2026-06-26)
 

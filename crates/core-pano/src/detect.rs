@@ -146,8 +146,10 @@ pub fn detect_groups(
 
     // --- Features (parallel over frames), exactly as register() ---
     let pattern = features::fixed_test_pairs();
-    let feats: Vec<features::FrameFeatures> =
-        frames.par_iter().map(|f| features::extract(f, &pattern)).collect();
+    let feats: Vec<features::FrameFeatures> = frames
+        .par_iter()
+        .map(|f| features::extract(f, &pattern))
+        .collect();
 
     // --- Candidate pair list ---
     let pair_list: Vec<(usize, usize)> = match pairs_hint {
@@ -171,8 +173,7 @@ pub fn detect_groups(
             if cancel() {
                 return None;
             }
-            let matches =
-                matching::match_descriptors(&feats[i].descriptors, &feats[j].descriptors);
+            let matches = matching::match_descriptors(&feats[i].descriptors, &feats[j].descriptors);
             if matches.len() < MIN_MATCHES {
                 return None;
             }
@@ -491,7 +492,12 @@ mod tests {
 
     #[test]
     fn clip_no_overlap_is_empty() {
-        let quad = [pt(20.0, 20.0), pt(30.0, 20.0), pt(30.0, 30.0), pt(20.0, 30.0)];
+        let quad = [
+            pt(20.0, 20.0),
+            pt(30.0, 20.0),
+            pt(30.0, 30.0),
+            pt(20.0, 30.0),
+        ];
         let clipped = clip_poly_rect(&quad, 10.0, 10.0);
         assert!(clipped.is_empty());
         assert!(poly_area(&clipped) < 1e-12);

@@ -91,6 +91,9 @@ pub struct AppState {
     pub display_referred_memo: Mutex<Option<(i64, bool)>>,
     /// Single-flight guard for `hdr_merge` (a merge decodes N full-res RAWs — one at a time).
     pub hdr_running: AtomicBool,
+    /// Set by `hdr_cancel` to abort the running merge (checked between frames). Reset on the merge's
+    /// `Running` drop-guard so an early return / error can never leave it latched.
+    pub hdr_cancel: AtomicBool,
     /// Histogram of the most recent successful render, for a reliable pull (the event can be missed).
     pub last_histogram: Mutex<Option<Histogram>>,
     /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
@@ -226,6 +229,7 @@ impl AppState {
             prefetch_gen: AtomicU64::new(0),
             display_referred_memo: Mutex::new(None),
             hdr_running: AtomicBool::new(false),
+            hdr_cancel: AtomicBool::new(false),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
             import_active: AtomicUsize::new(0),

@@ -22,6 +22,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # HEIF decode (core-raw/src/heif.rs) dynamic-links system libheif — the runner image
+      # usually ships it, but pin the install so the build never depends on image luck.
+      - name: Install libheif (HEIF decode system dep)
+        run: brew install libheif
+
+      # tauri-build validates the bundle.macOS.frameworks paths (tauri.macos.conf.json) at
+      # compile time, so the dylib closure must be staged before any cargo build of src-tauri.
+      - name: Stage macOS dylib closure
+        run: bash scripts/macos-bundle-dylibs.sh stage
+
       - name: Install Rust 1.91 (+ clippy)
         uses: dtolnay/rust-toolchain@1.91.0
         with:

@@ -525,6 +525,81 @@ pub fn image_by_id(conn: &Connection, id: i64) -> Result<Option<ImageRow>, LibEr
     Ok(conn.query_row(&sql, [id], map_row).optional()?)
 }
 
+/// One source frame that fed a merged image (HDR bracket or panorama stitch), for the "Source
+/// frames" panel in the metadata sidebar.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRow {
+    pub image_id: i64,
+    pub filename: String,
+    /// Capture/bracket order (0-based), as recorded at merge time.
+    pub position: i64,
+    /// EV offset from the reference (metered) frame — `hdr_sources` only; always `None` for panorama.
+    pub relative_ev: Option<f32>,
+    /// `false` when the source row's file is missing/relinked-away (`images.status != 'present'`) —
+    /// the link survives (only a hard delete of the row cascades it away), so this can legitimately
+    /// happen and the panel should show it rather than silently drop the row.
+    pub present: bool,
+}
+
+/// The source frames behind one merged image, and which merge kind produced it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeSources {
+    /// "hdr" | "panorama".
+    pub kind: String,
+    /// Ordered by `position`.
+    pub sources: Vec<SourceRow>,
+}
+
+/// Source frames for `image_id`'s "Source frames" panel: checks `hdr_sources` first, then
+/// `panorama_sources` (an image can only be the result of one merge kind — the write paths
+/// (`hdr_merge`/`panorama_merge`) never populate both for the same id). `None` when `image_id` is
+/// neither (an ordinary, un-merged image).
+pub fn merge_sources(conn: &Connection, image_id: i64) -> Result<Option<MergeSources>, LibError> {
+    let map_source = |r: &Row, relative_ev: Option<f32>| -> core_db::rusqlite::Result<SourceRow> {
+        Ok(SourceRow {
+            image_id: r.get(0)?,
+            position: r.get(1)?,
+            filename: r.get(2)?,
+            present: r.get::<_, String>(3)? == "present",
+            relative_ev,
+        })
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT hs.source_image_id, hs.position, i.original_filename, i.status, hs.relative_ev
+         FROM hdr_sources hs JOIN images i ON i.id = hs.source_image_id
+         WHERE hs.hdr_image_id = ?1 ORDER BY hs.position",
+    )?;
+    let hdr_rows = stmt
+        .query_map([image_id], |r| map_source(r, r.get(4)?))?
+        .collect::<core_db::rusqlite::Result<Vec<_>>>()?;
+    if !hdr_rows.is_empty() {
+        return Ok(Some(MergeSources {
+            kind: "hdr".into(),
+            sources: hdr_rows,
+        }));
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT ps.source_image_id, ps.position, i.original_filename, i.status
+         FROM panorama_sources ps JOIN images i ON i.id = ps.source_image_id
+         WHERE ps.pano_image_id = ?1 ORDER BY ps.position",
+    )?;
+    let pano_rows = stmt
+        .query_map([image_id], |r| map_source(r, None))?
+        .collect::<core_db::rusqlite::Result<Vec<_>>>()?;
+    if !pano_rows.is_empty() {
+        return Ok(Some(MergeSources {
+            kind: "panorama".into(),
+            sources: pano_rows,
+        }));
+    }
+
+    Ok(None)
+}
+
 /// Ids of all present images, newest capture first — the work-list for canonical thumbnail backfill.
 pub fn present_image_ids(conn: &Connection) -> Result<Vec<i64>, LibError> {
     let mut stmt = conn.prepare(

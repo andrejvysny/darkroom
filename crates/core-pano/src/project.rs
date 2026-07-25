@@ -13,7 +13,7 @@
 use nalgebra::{Matrix3, Vector3};
 use rayon::prelude::*;
 
-use crate::{Frame, Projection, Registration};
+use crate::{Projection, Registration};
 
 /// Border samples taken per frame edge when measuring the canvas extent / a frame's canvas rect.
 const BORDER_SAMPLES_PER_EDGE: usize = 64;
@@ -29,6 +29,50 @@ pub(crate) struct UsedCam {
     pub focal: f64,
     pub w: usize,
     pub h: usize,
+}
+
+impl UsedCam {
+    /// Re-express this camera for a source buffer that is `ratio` (≤ 1) the size of the full-res
+    /// frame the pose was solved in — the [`PanoMap::scaled`] trick applied to the *source* side, so
+    /// a warp can sample a downscaled copy of the frame while the canvas keeps its own scale.
+    ///
+    /// The buffer's true dimensions are passed explicitly rather than derived as `round(w · ratio)`:
+    /// the caller's downscaler owns that rounding, and a one-pixel disagreement here would let the
+    /// warp's `sx ≤ cam.w - 1` bound admit a sample past the end of the buffer.
+    pub(crate) fn scaled(&self, ratio: f64, w: usize, h: usize) -> UsedCam {
+        if ratio == 1.0 {
+            return UsedCam {
+                k: self.k,
+                k_inv: self.k_inv,
+                r: self.r,
+                rt: self.rt,
+                focal: self.focal,
+                w,
+                h,
+            };
+        }
+        let k = scale_k(&self.k, ratio);
+        UsedCam {
+            k,
+            k_inv: k.try_inverse().unwrap_or_else(Matrix3::identity),
+            r: self.r,
+            rt: self.rt,
+            focal: self.focal * ratio,
+            w,
+            h,
+        }
+    }
+}
+
+/// A borrowed interleaved-RGB buffer (`rgb.len() == width*height*3`) — what [`warp`] samples.
+///
+/// Decoupling the sampled buffer from [`crate::Frame`] is what lets the compositor feed it either a
+/// resident full-res frame or a just-loaded (or downscaled) streaming buffer without copying.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameView<'a> {
+    pub rgb: &'a [f32],
+    pub width: usize,
+    pub height: usize,
 }
 
 /// A single frame warped onto the canvas, stored only over its own bounding sub-rect to stream memory.
@@ -164,8 +208,9 @@ impl PanoMap {
     }
 }
 
-/// Resolve the used cameras (index-aligned with `reg.used_indices`).
-pub(crate) fn build_used_cams(frames: &[Frame], reg: &Registration) -> Vec<UsedCam> {
+/// Resolve the used cameras (index-aligned with `reg.used_indices`). `dims` are the FULL-RES
+/// `(width, height)` of every input frame — pixels are never touched here, only geometry.
+pub(crate) fn build_used_cams(dims: &[(usize, usize)], reg: &Registration) -> Vec<UsedCam> {
     reg.used_indices
         .iter()
         .map(|&idx| {
@@ -179,8 +224,8 @@ pub(crate) fn build_used_cams(frames: &[Frame], reg: &Registration) -> Vec<UsedC
                 r: cam.rotation,
                 rt: cam.rotation.transpose(),
                 focal: cam.focal_px,
-                w: frames[idx].width,
-                h: frames[idx].height,
+                w: dims[idx].0,
+                h: dims[idx].1,
             }
         })
         .collect()
@@ -385,7 +430,7 @@ fn frame_canvas_rect(cam: &UsedCam, map: &PanoMap) -> Option<(usize, usize, usiz
 
 /// Bilinear sample of an interleaved RGB frame at `(sx, sy)` (caller guarantees it is in-bounds).
 #[inline]
-fn bilinear_rgb(frame: &Frame, sx: f64, sy: f64) -> [f32; 3] {
+fn bilinear_rgb(frame: FrameView<'_>, sx: f64, sy: f64) -> [f32; 3] {
     let x0 = sx.floor() as usize;
     let y0 = sy.floor() as usize;
     let x1 = (x0 + 1).min(frame.width - 1);
@@ -411,7 +456,7 @@ fn bilinear_rgb(frame: &Frame, sx: f64, sy: f64) -> [f32; 3] {
 /// Each output pixel in the frame's sub-rect is mapped back through the pano surface to a source
 /// pixel; in-bounds hits are bilinear-sampled and given a distance-to-edge feather weight (in source
 /// pixels), normalized against `0.1·min(w,h)` and clamped to `0..1`.
-pub(crate) fn warp(cam: &UsedCam, frame: &Frame, map: &PanoMap) -> Option<Warped> {
+pub(crate) fn warp(cam: &UsedCam, frame: FrameView<'_>, map: &PanoMap) -> Option<Warped> {
     let (x0, y0, rw, rh) = frame_canvas_rect(cam, map)?;
     let feather_denom = 0.1 * (cam.w.min(cam.h) as f64);
     let feather_denom = if feather_denom > 1e-6 {
@@ -457,27 +502,16 @@ pub(crate) fn warp(cam: &UsedCam, frame: &Frame, map: &PanoMap) -> Option<Warped
     })
 }
 
-/// Warp every used frame at a fixed low resolution (long side ≈ [`SEAM_LONG_SIDE`]) for exposure and
-/// seam finding; the map itself is [`PanoMap::scaled`] from the full map.
-pub(crate) fn warp_lowres(
-    cams: &[UsedCam],
-    frames: &[usize],
-    all_frames: &[Frame],
-    full_map: &PanoMap,
-) -> (PanoMap, Vec<Option<Warped>>) {
+/// The canvas downscale that puts the exposure/seam pass at a long side of ≈ [`SEAM_LONG_SIDE`]
+/// (1.0 when the full canvas is already that small). The caller builds `full_map.scaled(ratio)` and
+/// warps every used frame into it — see `compose`.
+pub(crate) fn seam_ratio(full_map: &PanoMap) -> f64 {
     let long = full_map.width.max(full_map.height) as f64;
-    let ratio = if long > SEAM_LONG_SIDE {
+    if long > SEAM_LONG_SIDE {
         SEAM_LONG_SIDE / long
     } else {
         1.0
-    };
-    let low_map = full_map.scaled(ratio);
-    let warps = cams
-        .iter()
-        .zip(frames.iter())
-        .map(|(cam, &fidx)| warp(cam, &all_frames[fidx], &low_map))
-        .collect();
-    (low_map, warps)
+    }
 }
 
 #[cfg(test)]

@@ -283,7 +283,10 @@ pub fn replace_cluster_groups(
                  SELECT DISTINCT group_id FROM pano_detect_members
                  WHERE image_id IN ({placeholders}))"
         );
-        let binds: Vec<&dyn ToSql> = cluster_image_ids.iter().map(|id| id as &dyn ToSql).collect();
+        let binds: Vec<&dyn ToSql> = cluster_image_ids
+            .iter()
+            .map(|id| id as &dyn ToSql)
+            .collect();
         tx.execute(&sql, binds.as_slice())?;
     }
 
@@ -334,6 +337,10 @@ pub struct PanoMemberRow {
     pub capture_date: Option<i64>,
     pub format: Option<String>,
     pub position: i64,
+    /// `false` when the source image's file is missing (`images.status != 'present'` — a soft
+    /// delete via `reconcile.rs`, the link row itself survives). Gates the merge handoff in the UI:
+    /// `PanoSuggestions` disables "Preview & Merge…" while any member isn't present.
+    pub present: bool,
 }
 
 /// One suggestion group for the review panel. `all_raw` gates the merge handoff (stitch is RAW-only).
@@ -400,7 +407,8 @@ pub fn list_groups(
 
 fn group_members(conn: &Connection, group_id: i64) -> Result<Vec<PanoMemberRow>, LibError> {
     let mut stmt = conn.prepare(
-        "SELECT m.image_id, i.content_hash, i.original_filename, i.capture_date, i.format, m.position
+        "SELECT m.image_id, i.content_hash, i.original_filename, i.capture_date, i.format, m.position,
+                i.status
          FROM pano_detect_members m
          JOIN images i ON i.id = m.image_id
          WHERE m.group_id = ?1
@@ -415,6 +423,7 @@ fn group_members(conn: &Connection, group_id: i64) -> Result<Vec<PanoMemberRow>,
         } else {
             String::new()
         };
+        let status: String = r.get(6)?;
         Ok(PanoMemberRow {
             image_id: r.get(0)?,
             content_hash,
@@ -422,6 +431,7 @@ fn group_members(conn: &Connection, group_id: i64) -> Result<Vec<PanoMemberRow>,
             capture_date: r.get(3)?,
             format: r.get(4)?,
             position: r.get(5)?,
+            present: status == "present",
         })
     })?;
     Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
@@ -464,6 +474,38 @@ pub fn set_group_merged(
         params![group_id, merged_image_id],
     )?;
     Ok(())
+}
+
+/// Delete `status='suggested'` groups that can never be reviewed again because fewer than 2 of
+/// their members still EXIST as catalog rows — a group whose members were hard-deleted (e.g.
+/// `core-dedup`'s resolve → migration 019's `ON DELETE CASCADE` takes the `pano_detect_members`
+/// rows with them), leaving an unreachable husk that no rescan can clean up: `replace_cluster_groups`
+/// only stale-deletes groups intersecting a *re-verified* cluster, and a cluster needs ≥2 present
+/// candidates to be emitted at all.
+///
+/// Deliberately keyed on row EXISTENCE, not `status='present'`. A member that is merely *missing*
+/// (`reconcile.rs` soft-deletes when a volume is unmounted) must NOT prune its group: the images
+/// come back when the volume does, but the per-image scan markers would suppress re-verification, so
+/// pruning here would silently drop the suggestion until a forced rescan. Missing members are
+/// surfaced instead — [`PanoMemberRow::present`] dims them in review and blocks the merge.
+///
+/// Dismissed/merged groups are never touched — pruning clears review-queue noise, never a recorded
+/// user decision. Caller owns the transaction; returns the number of groups deleted.
+pub fn prune_stale_groups(tx: &Transaction) -> Result<usize, LibError> {
+    let n = tx.execute(
+        "DELETE FROM pano_detect_groups
+         WHERE status = 'suggested' AND id IN (
+             SELECT pg.id
+             FROM pano_detect_groups pg
+             LEFT JOIN pano_detect_members pm ON pm.group_id = pg.id
+             LEFT JOIN images i ON i.id = pm.image_id
+             WHERE pg.status = 'suggested'
+             GROUP BY pg.id
+             HAVING SUM(CASE WHEN i.id IS NOT NULL THEN 1 ELSE 0 END) < 2
+         )",
+        [],
+    )?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -767,7 +809,11 @@ mod tests {
         let group_b = groups.iter().find(|g| g.members.len() == 2).unwrap();
         // Members ordered by position (capture order).
         assert_eq!(
-            group_a.members.iter().map(|m| m.image_id).collect::<Vec<_>>(),
+            group_a
+                .members
+                .iter()
+                .map(|m| m.image_id)
+                .collect::<Vec<_>>(),
             vec![a1, a2, a3]
         );
         assert_eq!(group_a.members[0].content_hash, hexhash(1));
@@ -853,7 +899,10 @@ mod tests {
         let tx = db.conn.transaction().unwrap();
         let n = replace_cluster_groups(&tx, &[a1, a2, a3], &[ga()], ALGO_VERSION, 2000).unwrap();
         tx.commit().unwrap();
-        assert_eq!(n, 0, "re-found group A stays dismissed, not counted as suggested");
+        assert_eq!(
+            n, 0,
+            "re-found group A stays dismissed, not counted as suggested"
+        );
 
         // A survived as dismissed; gc (suggested, intersecting, not re-found) was deleted; B untouched.
         let status_a: String = db
@@ -874,7 +923,10 @@ mod tests {
             )
             .unwrap()
             == 0;
-        assert!(gc_gone, "stale suggested group not re-found must be deleted");
+        assert!(
+            gc_gone,
+            "stale suggested group not re-found must be deleted"
+        );
         let b_present: bool = db
             .conn
             .query_row(
@@ -916,6 +968,170 @@ mod tests {
         assert_eq!(groups[0].status, "merged");
         assert_eq!(groups[0].merged_image_id, Some(merged));
         assert_eq!(count_suggested(&db.conn).unwrap(), 0);
+    }
+
+    // ---- prune_stale_groups / present ----
+
+    fn set_missing(conn: &Connection, image_id: i64) {
+        conn.execute(
+            "UPDATE images SET status = 'missing' WHERE id = ?1",
+            params![image_id],
+        )
+        .unwrap();
+    }
+
+    /// The zombie case prune exists for: members hard-deleted (dedup resolve) cascade their
+    /// `pano_detect_members` rows away, leaving a husk no rescan can reach.
+    #[test]
+    fn prune_removes_suggested_group_whose_members_were_deleted() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a1 = insert_image(&db.conn, 1, 100, "Canon", "R7", None, None, "raw");
+        let a2 = insert_image(&db.conn, 2, 105, "Canon", "R7", None, None, "raw");
+        let ga = GroupUpsert {
+            member_ids: vec![a1, a2],
+            member_hashes: vec![hexhash(1), hexhash(2)],
+            confidence: 1.0,
+        };
+        let tx = db.conn.transaction().unwrap();
+        replace_cluster_groups(&tx, &[a1, a2], &[ga], ALGO_VERSION, 1000).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(group_count(&db.conn), 1);
+
+        // a1 is hard-deleted (dedup resolve → ON DELETE CASCADE drops its member row).
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", params![a1])
+            .unwrap();
+
+        let tx = db.conn.transaction().unwrap();
+        let pruned = prune_stale_groups(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(pruned, 1);
+        assert_eq!(
+            group_count(&db.conn),
+            0,
+            "group with <2 surviving member rows must be pruned"
+        );
+    }
+
+    /// A merely-*missing* member (unmounted volume) must NOT prune: the images come back, but the
+    /// per-image scan markers would suppress re-verification, so the suggestion would be lost until
+    /// a forced rescan. Review UI dims such members instead.
+    #[test]
+    fn prune_keeps_group_whose_member_is_only_missing() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a1 = insert_image(&db.conn, 1, 100, "Canon", "R7", None, None, "raw");
+        let a2 = insert_image(&db.conn, 2, 105, "Canon", "R7", None, None, "raw");
+        let ga = GroupUpsert {
+            member_ids: vec![a1, a2],
+            member_hashes: vec![hexhash(1), hexhash(2)],
+            confidence: 1.0,
+        };
+        let tx = db.conn.transaction().unwrap();
+        replace_cluster_groups(&tx, &[a1, a2], &[ga], ALGO_VERSION, 1000).unwrap();
+        tx.commit().unwrap();
+
+        set_missing(&db.conn, a1);
+
+        let tx = db.conn.transaction().unwrap();
+        let pruned = prune_stale_groups(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(pruned, 0, "a soft-deleted member must not drop the group");
+        assert_eq!(group_count(&db.conn), 1);
+        // …and the member is reported as absent so review can dim it + block the merge.
+        let groups = list_groups(&db.conn, false).unwrap();
+        let m1 = groups[0].members.iter().find(|m| m.image_id == a1).unwrap();
+        assert!(!m1.present);
+    }
+
+    #[test]
+    fn prune_leaves_dismissed_group_alone() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a1 = insert_image(&db.conn, 1, 100, "Canon", "R7", None, None, "raw");
+        let a2 = insert_image(&db.conn, 2, 105, "Canon", "R7", None, None, "raw");
+        let ga = GroupUpsert {
+            member_ids: vec![a1, a2],
+            member_hashes: vec![hexhash(1), hexhash(2)],
+            confidence: 1.0,
+        };
+        let tx = db.conn.transaction().unwrap();
+        replace_cluster_groups(&tx, &[a1, a2], &[ga], ALGO_VERSION, 1000).unwrap();
+        tx.commit().unwrap();
+        let gid: i64 = db
+            .conn
+            .query_row("SELECT id FROM pano_detect_groups", [], |r| r.get(0))
+            .unwrap();
+        set_group_status(&db.conn, gid, "dismissed").unwrap();
+
+        // Both members go missing — would qualify for pruning if the group weren't dismissed.
+        set_missing(&db.conn, a1);
+        set_missing(&db.conn, a2);
+
+        let tx = db.conn.transaction().unwrap();
+        let pruned = prune_stale_groups(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            pruned, 0,
+            "prune only ever touches status='suggested' groups"
+        );
+        assert_eq!(group_count(&db.conn), 1);
+        let status: String = db
+            .conn
+            .query_row(
+                "SELECT status FROM pano_detect_groups WHERE id = ?1",
+                params![gid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "dismissed");
+    }
+
+    #[test]
+    fn prune_leaves_healthy_group_alone() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a1 = insert_image(&db.conn, 1, 100, "Canon", "R7", None, None, "raw");
+        let a2 = insert_image(&db.conn, 2, 105, "Canon", "R7", None, None, "raw");
+        let ga = GroupUpsert {
+            member_ids: vec![a1, a2],
+            member_hashes: vec![hexhash(1), hexhash(2)],
+            confidence: 1.0,
+        };
+        let tx = db.conn.transaction().unwrap();
+        replace_cluster_groups(&tx, &[a1, a2], &[ga], ALGO_VERSION, 1000).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.conn.transaction().unwrap();
+        let pruned = prune_stale_groups(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            group_count(&db.conn),
+            1,
+            "healthy 2-present-member group survives"
+        );
+    }
+
+    #[test]
+    fn list_groups_reports_present_false_for_missing_member() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a1 = insert_image(&db.conn, 1, 100, "Canon", "R7", None, None, "raw");
+        let a2 = insert_image(&db.conn, 2, 105, "Canon", "R7", None, None, "raw");
+        let ga = GroupUpsert {
+            member_ids: vec![a1, a2],
+            member_hashes: vec![hexhash(1), hexhash(2)],
+            confidence: 1.0,
+        };
+        let tx = db.conn.transaction().unwrap();
+        replace_cluster_groups(&tx, &[a1, a2], &[ga], ALGO_VERSION, 1000).unwrap();
+        tx.commit().unwrap();
+
+        set_missing(&db.conn, a2);
+
+        let groups = list_groups(&db.conn, false).unwrap();
+        assert_eq!(groups.len(), 1);
+        let m1 = groups[0].members.iter().find(|m| m.image_id == a1).unwrap();
+        let m2 = groups[0].members.iter().find(|m| m.image_id == a2).unwrap();
+        assert!(m1.present, "present image must report present=true");
+        assert!(!m2.present, "missing image must report present=false");
     }
 
     #[test]

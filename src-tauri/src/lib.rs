@@ -3,10 +3,10 @@ mod events;
 mod features;
 mod logging;
 mod model_mgmt;
+mod pano_detect;
+mod panorama;
 mod prefetch;
 mod protocol;
-mod panorama;
-mod pano_detect;
 mod state;
 mod thumb_queue;
 mod watch;
@@ -186,6 +186,9 @@ pub fn run() {
             commands::import_thumb,
             commands::import_commit,
             commands::hdr_merge,
+            commands::hdr_cancel,
+            commands::hdr_export_dng,
+            commands::image_sources,
             commands::thumb_cache_cap,
             commands::thumb_cache_size,
             commands::set_thumb_cache_cap,

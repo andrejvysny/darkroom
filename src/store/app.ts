@@ -1,6 +1,24 @@
 import { create } from "zustand";
-import type { ImageRow } from "../lib/ipc";
+import type { ImageRow, PanoGroupRow } from "../lib/ipc";
 import type { ExportTarget } from "../lib/export";
+
+/** Live phase/progress of a running panorama-detection scan (`pano_detect:progress` payload), or
+ *  `null` when idle. */
+export type PanoDetectProgress = {
+  phase: string;
+  done: number;
+  total: number;
+} | null;
+
+/** Panorama-detection scan state, shared by every consumer (see `panoDetect` below). */
+export interface PanoDetectStoreState {
+  running: boolean;
+  suggested: number;
+  groups: PanoGroupRow[];
+  /** True while the initial (or a manual) status+groups fetch is in flight. */
+  loading: boolean;
+  progress: PanoDetectProgress;
+}
 
 interface AppState {
   view: "library" | "develop" | "dedup";
@@ -35,9 +53,14 @@ interface AppState {
   /** Images queued in the Export modal; null = modal closed. */
   exportTargets: ExportTarget[] | null;
   setExportTargets: (t: ExportTarget[] | null) => void;
-  /** Image ids queued for the Panorama merge modal; null = modal closed. */
-  panoramaSources: number[] | null;
-  setPanoramaSources: (ids: number[] | null) => void;
+  /** Image ids (+ originating detect-group, if any) queued for the Panorama merge modal; null =
+   *  modal closed. `detectGroupId` rides along here (rather than a separate ambient store field) so
+   *  it's threaded through the actual `panorama_merge` IPC call and echoed back on `panorama:done` —
+   *  no stale field to mis-attribute a later manual merge to an earlier detected group. */
+  panoramaSources: { ids: number[]; detectGroupId: number | null } | null;
+  setPanoramaSources: (
+    v: { ids: number[]; detectGroupId: number | null } | null,
+  ) => void;
   /** Active panorama merge job (current backend phase); null = no merge in flight. Drives the
    *  PanoramaPill; fed by the `panorama:progress` event, cleared on `panorama:done`/`panorama:error`. */
   panoramaJob: { phase: string } | null;
@@ -45,11 +68,13 @@ interface AppState {
   /** Panorama-suggestions review overlay open state (see `views/Panorama/PanoSuggestions.tsx`). */
   panoSuggestOpen: boolean;
   setPanoSuggestOpen: (b: boolean) => void;
-  /** Detected panorama group currently staged into the merge modal (`PanoramaModal`), so
-   *  `usePanorama`'s `panorama:done` handler knows to call `panoDetectMarkMerged` once the stitch
-   *  lands. null = no detected-group merge in flight (e.g. a manual multi-select merge). */
-  activePanoDetectGroupId: number | null;
-  setActivePanoDetectGroup: (id: number | null) => void;
+  /** Panorama-detection scan state: running flag, suggested-group count, the group list, and a
+   *  fetch-in-flight flag. Lifted here (rather than per-hook-instance state) so `LibraryView`,
+   *  `LeftNav`, and `PanoSuggestions` — every `usePanoDetect()` call site — see one consistent
+   *  picture regardless of mount order; the module-level singleton listeners in
+   *  `lib/usePanoDetect.ts` are the sole writers besides the actions it exposes. */
+  panoDetect: PanoDetectStoreState;
+  setPanoDetect: (patch: Partial<PanoDetectStoreState>) => void;
   /** AI Models manager modal open state. */
   modelManagerOpen: boolean;
   setModelManagerOpen: (b: boolean) => void;
@@ -109,13 +134,14 @@ export const useAppStore = create<AppState>((set) => ({
   exportTargets: null,
   setExportTargets: (t) => set({ exportTargets: t }),
   panoramaSources: null,
-  setPanoramaSources: (ids) => set({ panoramaSources: ids }),
+  setPanoramaSources: (v) => set({ panoramaSources: v }),
   panoramaJob: null,
   setPanoramaJob: (job) => set({ panoramaJob: job }),
   panoSuggestOpen: false,
   setPanoSuggestOpen: (b) => set({ panoSuggestOpen: b }),
-  activePanoDetectGroupId: null,
-  setActivePanoDetectGroup: (id) => set({ activePanoDetectGroupId: id }),
+  panoDetect: { running: false, suggested: 0, groups: [], loading: false, progress: null },
+  setPanoDetect: (patch) =>
+    set((s) => ({ panoDetect: { ...s.panoDetect, ...patch } })),
   modelManagerOpen: false,
   setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
   onImport: null,

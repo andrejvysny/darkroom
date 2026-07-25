@@ -15,6 +15,7 @@ import {
   type FacetRow,
 } from "../../lib/ipc";
 import type { AnalysisState, AnalysisActions } from "../../lib/useAnalysis";
+import { usePanoDetect } from "../../lib/usePanoDetect";
 
 interface LeftNavProps {
   dateTree: DateTreeYear[];
@@ -87,6 +88,10 @@ export default function LeftNav({
   const noFilters = !hasActiveFilters(params);
   const picksActive = params.flag === "pick";
   const recentActive = params.sort === "imported_desc";
+  // Safe to call here too (module-singleton listeners — see usePanoDetect.ts): LibraryView already
+  // calls this hook for `panoSuggested`/`onOpenPanoSuggestions`; this instance reads the same shared
+  // store slice, just to drive the Detect/Re-detect header button below.
+  const panoDetect = usePanoDetect();
 
   const staticCollections = collections.filter((c) => !c.isSmart);
   const smartCollections = collections.filter((c) => c.isSmart);
@@ -251,26 +256,36 @@ export default function LeftNav({
       <div>
         <SectionHeading
           action={
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onOpenPanoSuggestions();
-              }}
-              title="Review panorama suggestions"
-              aria-label="Review panorama suggestions"
-              style={{
-                fontSize: 10,
-                padding: "1px 6px",
-                borderRadius: "var(--radius-sm)",
-                border: "1px solid var(--color-line)",
-                background: "transparent",
-                color: "var(--color-t2)",
-                cursor: "pointer",
-                lineHeight: 1.5,
-              }}
-            >
-              Review
-            </button>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <RunButton
+                running={panoDetect.running}
+                onRun={() => void panoDetect.detect(false)}
+                onRerun={() => void panoDetect.detect(true)}
+                label="Detect"
+                runTitle="Detect panorama sequences"
+                rerunTitle="Re-scan entire library"
+              />
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenPanoSuggestions();
+                }}
+                title="Review panorama suggestions"
+                aria-label="Review panorama suggestions"
+                style={{
+                  fontSize: 10,
+                  padding: "1px 6px",
+                  borderRadius: "var(--radius-sm)",
+                  border: "1px solid var(--color-line)",
+                  background: "transparent",
+                  color: "var(--color-t2)",
+                  cursor: "pointer",
+                  lineHeight: 1.5,
+                }}
+              >
+                Review
+              </button>
+            </span>
           }
         >
           Panoramas
@@ -287,12 +302,15 @@ export default function LeftNav({
       <div>
         <SectionHeading
           action={
-            <AnalyzeButton
+            <RunButton
               running={
                 analysis.status?.running === true || analysis.progress !== null
               }
-              onAnalyze={() => void analysis.triggerAnalysis(false)}
-              onReanalyze={() => void analysis.triggerAnalysis(true)}
+              onRun={() => void analysis.triggerAnalysis(false)}
+              onRerun={() => void analysis.triggerAnalysis(true)}
+              label="Analyze"
+              runTitle="Analyze new images"
+              rerunTitle="Re-analyze all images"
             />
           }
         >
@@ -777,15 +795,23 @@ function iconBtn(): React.CSSProperties {
   };
 }
 
-/** Small header-action button for the Detected section. */
-function AnalyzeButton({
+/** Small header-action button pair (primary run + rescan-icon toggle). Shared by the Detected
+ *  section (AI analysis) and the Panoramas section (detection scan) headers — same behavior
+ *  (label flips to "Running…" + disables/dims while running) and style, just different labels. */
+function RunButton({
   running,
-  onAnalyze,
-  onReanalyze,
+  onRun,
+  onRerun,
+  label,
+  runTitle,
+  rerunTitle,
 }: {
   running: boolean;
-  onAnalyze: () => void;
-  onReanalyze: () => void;
+  onRun: () => void;
+  onRerun: () => void;
+  label: string;
+  runTitle: string;
+  rerunTitle: string;
 }) {
   const [hover, setHover] = useState(false);
 
@@ -795,11 +821,11 @@ function AnalyzeButton({
         disabled={running}
         onClick={(e) => {
           e.stopPropagation();
-          onAnalyze();
+          onRun();
         }}
         onMouseEnter={() => setHover(false)}
-        title="Analyze new images"
-        aria-label="Analyze new images"
+        title={runTitle}
+        aria-label={runTitle}
         style={{
           fontSize: 10,
           padding: "1px 6px",
@@ -812,18 +838,18 @@ function AnalyzeButton({
           opacity: running ? 0.5 : 1,
         }}
       >
-        {running ? "Running…" : "Analyze"}
+        {running ? "Running…" : label}
       </button>
       {!running && (
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onReanalyze();
+            onRerun();
           }}
           onMouseEnter={() => setHover(true)}
           onMouseLeave={() => setHover(false)}
-          title="Re-analyze all images"
-          aria-label="Re-analyze all images"
+          title={rerunTitle}
+          aria-label={rerunTitle}
           style={{
             fontSize: 10,
             padding: "1px 5px",

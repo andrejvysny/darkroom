@@ -117,10 +117,9 @@ fn non_pq_heif_rejected_cleanly() {
         Ok(_) => panic!("non-PQ profile must be rejected"),
         Err(e) => e.to_string(),
     };
-    assert!(
-        msg.contains("expected BT.2020 PQ"),
-        "unexpected error text: {msg}"
-    );
+    // Either nclx rejection branch is fine (missing profile, or a present-but-wrong one — this
+    // fixture reports Unspecified primaries/transfer); both name the required profile.
+    assert!(msg.contains("BT.2020 PQ"), "unexpected error text: {msg}");
     // The thumbnail path goes through the same decode and must fail the same clean way.
     assert!(core_raw::thumbnail_jpeg(&src, 128, 82).is_err());
 

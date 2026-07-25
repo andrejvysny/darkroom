@@ -69,6 +69,15 @@ function GroupRow({
   const overflow = group.members.length - PREVIEW_CAP;
   const merged = group.status === "merged";
   const dismissed = group.status === "dismissed";
+  // Derived client-side from members rather than a backend `missingCount` field — trivial to
+  // compute and keeps `PanoGroupRow` from carrying a second representation of the same data.
+  const hasMissing = group.members.some((m) => !m.present);
+  const canMerge = group.allRaw && !hasMissing;
+  const mergeBlockedReason = !group.allRaw
+    ? "Merging requires RAW source files"
+    : hasMissing
+      ? "A source file for this group is missing"
+      : undefined;
 
   return (
     <div
@@ -88,6 +97,7 @@ function GroupRow({
           <div
             key={m.imageId}
             style={{
+              position: "relative",
               width: 62,
               height: 42,
               borderRadius: "var(--radius-sm)",
@@ -103,9 +113,30 @@ function GroupRow({
                 height: "100%",
                 objectFit: "cover",
                 display: "block",
+                opacity: m.present ? 1 : 0.35,
               }}
               loading="lazy"
             />
+            {!m.present && (
+              <span
+                title={`${m.filename} is missing`}
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 8.5,
+                  fontWeight: 700,
+                  letterSpacing: ".04em",
+                  textTransform: "uppercase",
+                  color: "var(--color-t1)",
+                  background: "rgba(0,0,0,.45)",
+                }}
+              >
+                Missing
+              </span>
+            )}
           </div>
         ))}
         {overflow > 0 && (
@@ -199,21 +230,19 @@ function GroupRow({
             </button>
             <button
               onClick={onMerge}
-              disabled={!group.allRaw}
-              title={
-                !group.allRaw ? "Merging requires RAW source files" : undefined
-              }
+              disabled={!canMerge}
+              title={mergeBlockedReason}
               style={{
                 border: "none",
-                background: group.allRaw
+                background: canMerge
                   ? "var(--color-accent)"
                   : "var(--color-line-2)",
                 color: "#fff",
                 borderRadius: "var(--radius-sm)",
                 padding: "6px 14px",
                 fontSize: 12,
-                cursor: group.allRaw ? "pointer" : "default",
-                opacity: group.allRaw ? 1 : 0.6,
+                cursor: canMerge ? "pointer" : "default",
+                opacity: canMerge ? 1 : 0.6,
                 whiteSpace: "nowrap",
               }}
             >
@@ -241,11 +270,11 @@ export default function PanoSuggestions() {
 
   if (!open) return null;
 
-  const busy = panoDetect.status?.running === true || panoDetect.progress !== null;
+  const busy = panoDetect.running || panoDetect.progress !== null;
   const visibleGroups = panoDetect.groups.filter(
     (g) => g.status !== "dismissed" || showDismissed,
   );
-  const suggestedCount = panoDetect.status?.suggested ?? 0;
+  const suggestedCount = panoDetect.suggested;
 
   return (
     <div

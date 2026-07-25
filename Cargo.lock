@@ -767,7 +767,9 @@ name = "core-hdr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-pano",
  "core-raw",
+ "rayon",
  "thiserror 2.0.18",
 ]
 
@@ -790,7 +792,9 @@ name = "core-library"
 version = "0.1.0"
 dependencies = [
  "core-db",
+ "core-pano",
  "core-raw",
+ "image",
  "rayon",
  "serde",
  "serde_json",

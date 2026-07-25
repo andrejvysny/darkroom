@@ -128,13 +128,26 @@ fn sample_base(base: &[f32], u: f64, v: f64) -> [f32; 3] {
 /// Render one yawed view by inverse-warping the base through the view's camera model, multiplying the
 /// sampled colour by `exposure` (1.0 = unmodified) to simulate per-frame exposure offsets.
 pub fn render_view(base: &[f32], angle_deg: f64, exposure: f32) -> Frame {
+    render_view_scaled(base, angle_deg, exposure, 1.0)
+}
+
+/// [`render_view`] with the sensor scaled by `scale`: same angular field (focal and principal point
+/// scale with the dimensions), just more pixels. `scale = 1.0` reproduces [`render_view`] exactly
+/// (every factor is an exact ×1.0), which is what keeps the P1/P2 tests untouched.
+///
+/// WHY: the streaming stitcher only downscales frames whose long side exceeds its ~1400 px seam
+/// resolution, so exercising that path needs views bigger than the canonical 700×500.
+pub fn render_view_scaled(base: &[f32], angle_deg: f64, exposure: f32, scale: f64) -> Frame {
+    let view_w = ((VIEW_W as f64 * scale).round() as usize).max(1);
+    let view_h = ((VIEW_H as f64 * scale).round() as usize).max(1);
+    let fv = FV * scale;
     let k_view = Matrix3::new(
-        FV,
+        fv,
         0.0,
-        (VIEW_W as f64) * 0.5,
+        (view_w as f64) * 0.5,
         0.0,
-        FV,
-        (VIEW_H as f64) * 0.5,
+        fv,
+        (view_h as f64) * 0.5,
         0.0,
         0.0,
         1.0,
@@ -154,24 +167,24 @@ pub fn render_view(base: &[f32], angle_deg: f64, exposure: f32) -> Frame {
     let r = view_rotation(angle_deg); // world -> camera
     let rt = r.transpose();
 
-    let mut rgb = vec![0.0f32; VIEW_W * VIEW_H * 3];
-    for y in 0..VIEW_H {
-        for x in 0..VIEW_W {
+    let mut rgb = vec![0.0f32; view_w * view_h * 3];
+    for y in 0..view_h {
+        for x in 0..view_w {
             let d = rt * (k_view_inv * Vector3::new(x as f64, y as f64, 1.0));
             let p = k_base * d;
             if p.z.abs() < 1e-9 {
                 continue;
             }
             let c = sample_base(base, p.x / p.z, p.y / p.z);
-            let idx = (y * VIEW_W + x) * 3;
+            let idx = (y * view_w + x) * 3;
             rgb[idx] = c[0] * exposure;
             rgb[idx + 1] = c[1] * exposure;
             rgb[idx + 2] = c[2] * exposure;
         }
     }
     Frame {
-        width: VIEW_W,
-        height: VIEW_H,
+        width: view_w,
+        height: view_h,
         rgb,
         focal_seed_px: None,
     }

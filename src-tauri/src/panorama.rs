@@ -13,15 +13,17 @@
 //! lesson — ALL decode/stitch/encode work runs without the DB lock; the mutex is taken only for the
 //! brief source-path lookup and the final insert+link transaction.
 //!
-//! v1 memory note: `merge` holds every source's full-res camera-native buffer while stitching
-//! (~0.4 GB per 32 MP frame) plus the blender accumulators. Fine for the 2–10 frame target; a
-//! decode-on-demand streaming `Frame` source is the documented follow-up if larger merges matter.
+//! Memory: `merge` never holds more than ONE full-res camera-native buffer. It hands the stitcher a
+//! [`CatalogFrameSource`] (`core_pano::FrameSource`), which decodes on demand — every source is
+//! materialized once downscaled for registration/exposure/seam work, then once at full resolution
+//! during the blend, dropped before the next is read. Peak is therefore ~0.4 GB (one 32 MP decode)
+//! plus ~16 MB per source for the low-res pass, instead of ~0.4 GB × N.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use core_pano::{Frame, Phase, Projection, StitchOptions};
+use core_pano::{Frame, FrameSource, LoadedFrame, PanoError, Phase, Projection, StitchOptions};
 use core_raw::{CameraNativeImage, PanoColorMeta};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
@@ -122,17 +124,24 @@ fn validate_ids(ids: &[i64]) -> Result<(), String> {
 /// Refuse mixed-camera merges up front: the output DNG carries ONE camera's color matrix, so
 /// frames from different bodies would silently develop with the wrong color.
 fn check_same_camera(metas: &[PanoColorMeta]) -> Result<(), String> {
-    let first = metas[0].camera_id();
     for m in &metas[1..] {
-        if m.camera_id() != first {
-            return Err(format!(
-                "all frames must come from the same camera (found {} {} and {} {})",
-                first.0,
-                first.1,
-                m.camera_id().0,
-                m.camera_id().1
-            ));
-        }
+        same_camera(&metas[0], m)?;
+    }
+    Ok(())
+}
+
+/// One-against-the-reference form of [`check_same_camera`], for the streaming source (which sees
+/// frames one at a time and compares each against the first it decoded).
+fn same_camera(reference: &PanoColorMeta, other: &PanoColorMeta) -> Result<(), String> {
+    let first = reference.camera_id();
+    if other.camera_id() != first {
+        return Err(format!(
+            "all frames must come from the same camera (found {} {} and {} {})",
+            first.0,
+            first.1,
+            other.camera_id().0,
+            other.camera_id().1
+        ));
     }
     Ok(())
 }
@@ -165,13 +174,19 @@ fn split_native(native: CameraNativeImage) -> (LinearImage3, PanoColorMeta) {
 }
 
 /// Downscale a camera-native buffer (reuses the colorspace-agnostic `LinearImage` resize).
+///
+/// **Lanczos3, not the cheaper Triangle**: these buffers are what registration extracts features
+/// from, and a ~5× Triangle reduction aliases enough to cost real matches. Measured on a 14-frame
+/// R7 sweep, Triangle lows put only 8 frames in the largest component where full-res registration
+/// found 10 — i.e. two frames silently dropped out of the panorama. The extra filter cost is
+/// nothing next to the RAW decode that produced the buffer.
 fn downscale_native(img: LinearImage3, max_edge: u32) -> LinearImage3 {
     let li = core_raw::LinearImage {
         width: img.width,
         height: img.height,
         data: img.data,
     }
-    .downscale_into(max_edge);
+    .downscale_into_hq(max_edge);
     LinearImage3 {
         width: li.width,
         height: li.height,
@@ -198,7 +213,10 @@ pub fn preview<R: Runtime>(
 
     // Serialize preview work (and cache access) on one mutex — a second preview waits rather than
     // duplicating a multi-second decode burst.
-    let mut cache = st.panorama_preview_cache.lock().map_err(|e| e.to_string())?;
+    let mut cache = st
+        .panorama_preview_cache
+        .lock()
+        .map_err(|e| e.to_string())?;
     if cache.as_ref().map(|c| &c.ids) != Some(&ids) {
         let paths = resolve_paths(&st, &ids)?;
         let mut frames = Vec::with_capacity(paths.len());
@@ -211,7 +229,11 @@ pub fn preview<R: Runtime>(
             metas.push(meta);
         }
         check_same_camera(&metas)?;
-        *cache = Some(PreviewCache { ids: ids.clone(), frames, metas });
+        *cache = Some(PreviewCache {
+            ids: ids.clone(),
+            frames,
+            metas,
+        });
     }
     let c = cache.as_ref().expect("cache filled above");
 
@@ -233,6 +255,78 @@ pub fn preview<R: Runtime>(
         82,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Decode-on-demand [`FrameSource`] over catalog paths — the reason a merge's peak memory is one
+/// full-res frame rather than all of them.
+///
+/// Side effect by design: every `load` records that frame's [`PanoColorMeta`] (the color matrix /
+/// WB / EXIF the output DNG must carry) and, from the second frame on, rejects a body that doesn't
+/// match the first one decoded. Because the stitcher's low-resolution pass reads every frame before
+/// any compositing starts, a mixed-camera selection still fails fast — the same guarantee the old
+/// eager decode loop gave via `check_same_camera`.
+struct CatalogFrameSource {
+    paths: Vec<String>,
+    metas: Mutex<Vec<Option<PanoColorMeta>>>,
+}
+
+impl CatalogFrameSource {
+    fn new(paths: Vec<String>) -> CatalogFrameSource {
+        let metas = (0..paths.len()).map(|_| None).collect();
+        CatalogFrameSource {
+            paths,
+            metas: Mutex::new(metas),
+        }
+    }
+
+    fn record_meta(&self, i: usize, meta: PanoColorMeta) -> Result<(), PanoError> {
+        let mut metas = self
+            .metas
+            .lock()
+            .map_err(|e| PanoError::Load(e.to_string()))?;
+        if let Some(first) = metas.iter().flatten().next() {
+            same_camera(first, &meta).map_err(PanoError::Load)?;
+        }
+        metas[i] = Some(meta);
+        Ok(())
+    }
+
+    /// The metadata captured during the low-resolution pass, consumed after the stitch.
+    fn into_metas(self) -> Result<Vec<Option<PanoColorMeta>>, String> {
+        self.metas.into_inner().map_err(|e| e.to_string())
+    }
+}
+
+impl FrameSource for CatalogFrameSource {
+    fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    fn load(&self, i: usize, max_long_side: Option<u32>) -> Result<LoadedFrame, PanoError> {
+        let path = self
+            .paths
+            .get(i)
+            .ok_or_else(|| PanoError::Load(format!("frame index {i} out of range")))?;
+        let src = core_raw::source_from_path(Path::new(path))
+            .map_err(|e| PanoError::Load(format!("{path}: {e}")))?;
+        let native = core_raw::develop_camera_native(&src)
+            .map_err(|e| PanoError::Load(format!("{path}: {e}")))?;
+        let (img, meta) = split_native(native);
+        let (full_width, full_height) = (img.width as usize, img.height as usize);
+        self.record_meta(i, meta)?;
+        let img = match max_long_side {
+            Some(edge) => downscale_native(img, edge),
+            None => img,
+        };
+        Ok(LoadedFrame {
+            width: img.width as usize,
+            height: img.height as usize,
+            rgb: img.data,
+            full_width,
+            full_height,
+            focal_seed_px: None,
+        })
+    }
 }
 
 /// Non-colliding `<first-source-stem>-Pano[-N].dng` next to the first source.
@@ -257,15 +351,20 @@ fn pano_dest_path(first_source: &Path) -> Result<PathBuf, String> {
     Err("could not find a free panorama filename".into())
 }
 
-/// Full-resolution merge: decode → stitch → LinearRaw DNG → catalog insert + source links.
-/// Returns the new catalog image id. Emits `panorama:progress`/`panorama:done`; cancellation is
-/// honored between sources/phases (a mid-phase stitch completes its phase first).
+/// Full-resolution merge: stream-decode → stitch → LinearRaw DNG → catalog insert + source links.
+/// Returns the new catalog image id. Emits `panorama:progress`/`panorama:done`.
+///
+/// The sources are never all resident: a [`CatalogFrameSource`] feeds the stitcher, which decodes
+/// each frame small for registration/seams and then one at a time at full resolution for the blend.
+/// Cancellation is polled throughout — between source loads, inside registration's parallel sweeps,
+/// and between blended frames — so a stop request lands within a frame rather than a whole phase.
 pub fn merge<R: Runtime>(
     app: &AppHandle<R>,
     ids: Vec<i64>,
     projection: String,
     boundary_warp: f32,
     auto_crop: bool,
+    detect_group_id: Option<i64>,
 ) -> Result<i64, String> {
     let st = app.state::<AppState>();
     validate_ids(&ids)?;
@@ -279,7 +378,10 @@ pub fn merge<R: Runtime>(
     };
     st.panorama_cancel.store(false, Ordering::SeqCst);
 
-    let cancelled = || st.panorama_cancel.load(Ordering::SeqCst);
+    // Borrow the flag itself (not the `State` wrapper) so the closure is `Sync` — core-pano polls it
+    // from inside its rayon-parallel phases.
+    let cancel_flag = &st.panorama_cancel;
+    let cancelled = move || cancel_flag.load(Ordering::SeqCst);
 
     // Brief lock: resolve paths + the first source's folder (the pano lands in the same folder).
     let paths = resolve_paths(&st, &ids)?;
@@ -293,24 +395,6 @@ pub fn merge<R: Runtime>(
             )
             .map_err(|e| e.to_string())?
     };
-
-    // Decode every source full-res (unlocked). Sequential on purpose: each decode is internally
-    // parallel (rawler) and the buffers are the dominant memory cost.
-    emit_phase(app, "register");
-    let mut frames = Vec::with_capacity(paths.len());
-    let mut metas = Vec::with_capacity(paths.len());
-    for path in &paths {
-        if cancelled() {
-            return Err("cancelled".into());
-        }
-        let src = core_raw::source_from_path(Path::new(path)).map_err(|e| e.to_string())?;
-        let native = core_raw::develop_camera_native(&src)
-            .map_err(|e| format!("{path}: {e}"))?;
-        let (img, meta) = split_native(native);
-        frames.push(to_frame(img));
-        metas.push(meta);
-    }
-    check_same_camera(&metas)?;
 
     // The composite must stay openable in the (tiling-free) GPU develop pipeline.
     let device_cap = st
@@ -326,12 +410,17 @@ pub fn merge<R: Runtime>(
         preview: false,
     };
 
+    // Stitch straight off the catalog paths: core-pano pulls each source in (low-res first, then
+    // full-res one at a time during the blend) instead of us decoding them all up front.
     let app_for_progress = app.clone();
-    let result = core_pano::stitch(&frames, &opt, &move |phase| {
-        emit_phase(&app_for_progress, phase_name(phase));
-    })
+    let source = CatalogFrameSource::new(paths.clone());
+    let result = core_pano::stitch_streaming(
+        &source,
+        &opt,
+        &move |phase| emit_phase(&app_for_progress, phase_name(phase)),
+        &cancelled,
+    )
     .map_err(|e| e.to_string())?;
-    drop(frames);
     if cancelled() {
         return Err("cancelled".into());
     }
@@ -339,7 +428,10 @@ pub fn merge<R: Runtime>(
     // Author the DNG next to the first source (unlocked).
     emit_phase(app, "encode");
     let dest = pano_dest_path(Path::new(&paths[0]))?;
-    let ref_meta = &metas[result.reference_index];
+    let metas = source.into_metas()?;
+    let ref_meta = metas[result.reference_index]
+        .as_ref()
+        .ok_or_else(|| "reference frame metadata missing".to_string())?;
     core_raw::write_pano_dng(
         &dest,
         result.width as u32,
@@ -347,7 +439,11 @@ pub fn merge<R: Runtime>(
         &result.rgb,
         ref_meta,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        // write_pano_dng creates the file up front, so a failed write can leave a truncated DNG.
+        let _ = std::fs::remove_file(&dest);
+        e.to_string()
+    })?;
     if cancelled() {
         let _ = std::fs::remove_file(&dest);
         return Err("cancelled".into());
@@ -359,23 +455,29 @@ pub fn merge<R: Runtime>(
         let _ = std::fs::remove_file(&dest);
         e.to_string()
     })?;
-    let new_id: i64 = {
+    let new_id: i64 = (|| -> Result<i64, String> {
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
         let id = core_library::insert_image(&tx, folder_id, core_library::now_epoch(), &processed)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "merged panorama is already in the catalog".to_string())?;
-        for (pos, source_id) in ids.iter().enumerate() {
+        // Only link frames the stitcher actually used — registration can drop non-overlapping
+        // frames from `ids`, and a source row for a frame that isn't in the output would lie about
+        // what went into the pano.
+        for (pos, &idx) in result.used_indices.iter().enumerate() {
             tx.execute(
                 "INSERT OR IGNORE INTO panorama_sources (pano_image_id, source_image_id, position)
                  VALUES (?1, ?2, ?3)",
-                core_db::rusqlite::params![id, source_id, pos as i64],
+                core_db::rusqlite::params![id, ids[idx], pos as i64],
             )
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
-        id
-    };
+        Ok(id)
+    })()
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(&dest);
+    })?;
 
     // Free the dialog's cached preview frames — the merge is done, the memory matters more.
     if let Ok(mut cache) = st.panorama_preview_cache.lock() {
@@ -383,7 +485,15 @@ pub fn merge<R: Runtime>(
     }
 
     let _ = app.emit("library:changed", ());
-    let _ = app.emit("panorama:done", serde_json::json!({ "imageId": new_id }));
+    let _ = app.emit(
+        "panorama:done",
+        serde_json::json!({
+            "imageId": new_id,
+            "detectGroupId": detect_group_id,
+            "used": result.used_indices.len(),
+            "total": ids.len(),
+        }),
+    );
     Ok(new_id)
 }
 

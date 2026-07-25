@@ -371,7 +371,8 @@ mod tests {
     }
 
     fn temp_dng(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("darkroom-pano-{}-{}.dng", name, std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("darkroom-pano-{}-{}.dng", name, std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -516,7 +517,10 @@ mod tests {
             .expect("write CR3-derived DNG");
         let dng_src = crate::source_from_path(&path).expect("open written DNG");
         let developed = crate::develop_linear(&dng_src).expect("develop written DNG");
-        assert_eq!((developed.width, developed.height), (small.width, small.height));
+        assert_eq!(
+            (developed.width, developed.height),
+            (small.width, small.height)
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

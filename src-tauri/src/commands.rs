@@ -4,8 +4,8 @@
 use crate::state::{AppState, GpuRender};
 use core_library::{
     CaptionRow, CollectionRow, DateTreeYear, DetectionRow, FacetRow, FolderRow, ImageFaceRow,
-    ImageRow, IndexStats, KeywordRow, PersonFaceRow, PersonRow, PresenceRow, QueryParams,
-    UserLabels,
+    ImageRow, IndexStats, KeywordRow, MergeSources, PersonFaceRow, PersonRow, PresenceRow,
+    QueryParams, UserLabels,
 };
 use core_pipeline::{DevelopParams, Histogram};
 use rayon::prelude::*;
@@ -2275,15 +2275,27 @@ pub async fn panorama_merge(
     projection: String,
     boundary_warp: f32,
     auto_crop: bool,
+    detect_group_id: Option<i64>,
 ) -> Result<i64, String> {
     let emitter = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::panorama::merge(&app, image_ids, projection, boundary_warp, auto_crop)
+        crate::panorama::merge(
+            &app,
+            image_ids,
+            projection,
+            boundary_warp,
+            auto_crop,
+            detect_group_id,
+        )
     })
     .await
     .map_err(|e| e.to_string())?;
     if let Err(msg) = &result {
         let _ = emitter.emit("panorama:error", serde_json::json!({ "message": msg }));
+        // A failed merge can leave the dialog's cached preview frames stale (same cleanup the
+        // success path does in panorama::merge) — drop them here too.
+        let st = emitter.state::<AppState>();
+        crate::panorama::clear_preview_cache(&st);
     }
     result
 }
@@ -2322,10 +2334,9 @@ pub fn panorama_preview_release(app: AppHandle) {
 #[tauri::command]
 pub async fn pano_detect_run(app: AppHandle, force: bool) -> Result<usize, String> {
     let emitter = app.clone();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || crate::pano_detect::run(&app, force))
-            .await
-            .map_err(|e| e.to_string())?;
+    let result = tauri::async_runtime::spawn_blocking(move || crate::pano_detect::run(&app, force))
+        .await
+        .map_err(|e| e.to_string())?;
     if let Err(msg) = &result {
         let _ = emitter.emit("pano_detect:error", serde_json::json!({ "message": msg }));
     }
@@ -2808,6 +2819,19 @@ pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<His
             return Ok(None);
         };
         Ok(core_pipeline::histogram_from_jpeg(&jpeg))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Source frames behind `image_id` (an HDR bracket or a panorama stitch) for the metadata panel's
+/// "Source frames" section. `None` when `image_id` is an ordinary, un-merged image.
+#[tauri::command]
+pub async fn image_sources(app: AppHandle, image_id: i64) -> Result<Option<MergeSources>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::merge_sources(&db.conn, image_id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3505,16 +3529,28 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
         if st.hdr_running.swap(true, Ordering::SeqCst) {
             return Err("an HDR merge is already running".to_string());
         }
-        struct Running<'a>(&'a AtomicBool);
+        st.hdr_cancel.store(false, Ordering::SeqCst);
+        // Resets BOTH the running gate and the cancel flag on drop, so an early return / error can
+        // never wedge the gate or leave a stale cancel latched for the next merge.
+        struct Running<'a>(&'a AtomicBool, &'a AtomicBool);
         impl Drop for Running<'_> {
             fn drop(&mut self) {
                 self.0.store(false, Ordering::SeqCst);
+                self.1.store(false, Ordering::SeqCst);
             }
         }
-        let _running = Running(&st.hdr_running);
+        let _running = Running(&st.hdr_running, &st.hdr_cancel);
         // Gate the FS watcher so it can't index the freshly-renamed EXR before our own catalog
         // step (insert is hash-idempotent, but the watcher path would race the returned row).
         let _watch_guard = crate::watch::ImportGuard::new(app.clone());
+
+        // Dedupe while preserving selection order — a duplicate id would double-count a frame and
+        // skew the exposure-weighted merge.
+        let mut seen_ids = std::collections::HashSet::new();
+        let image_ids: Vec<i64> = image_ids
+            .into_iter()
+            .filter(|id| seen_ids.insert(*id))
+            .collect();
 
         if !(2..=9).contains(&image_ids.len()) {
             return Err(format!(
@@ -3579,9 +3615,14 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                 .collect::<Result<_, String>>()?
         };
 
-        // Numeric exposure per frame → EV, reference (median EV), shortest (max EV).
+        // Numeric exposure per frame → EV, reference (median EV), shortest (max EV). Metadata-only
+        // (no pixel decode) alongside, to catch a mixed-camera selection before the expensive
+        // full-res decode loop below.
+        // TODO(P4): auto-bracket suggestion — burst edges in pano_detect already absorb HDR
+        // brackets; a varying-EV burst category can reuse that pipeline.
         progress(0, "reading exposure");
-        let exposures: Vec<core_hdr::ExposureInfo> = frames
+        type CamId = (Option<String>, Option<String>);
+        let (exposures, cam_ids): (Vec<core_hdr::ExposureInfo>, Vec<CamId>) = frames
             .iter()
             .map(|f| {
                 let src = core_raw::source_from_path(&f.path)
@@ -3594,13 +3635,34 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                             f.path.display()
                         )
                     })?;
-                Ok(core_hdr::ExposureInfo {
-                    exposure_time_s: t,
-                    f_number: n,
-                    iso,
-                })
+                let meta = core_raw::read_metadata(&src)
+                    .map_err(|e| format!("{}: {e}", f.path.display()))?;
+                Ok((
+                    core_hdr::ExposureInfo {
+                        exposure_time_s: t,
+                        f_number: n,
+                        iso,
+                    },
+                    (meta.camera_make, meta.camera_model),
+                ))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .unzip();
+        // Refuse mixed-camera brackets up front: the merged EXR carries one reference frame's
+        // metadata, so frames from different bodies would silently blend mismatched color/WB.
+        let (first_make, first_model) = &cam_ids[0];
+        for (make, model) in &cam_ids[1..] {
+            if (make, model) != (first_make, first_model) {
+                return Err(format!(
+                    "all frames must come from the same camera (found {} {} and {} {})",
+                    first_make.as_deref().unwrap_or("?"),
+                    first_model.as_deref().unwrap_or("?"),
+                    make.as_deref().unwrap_or("?"),
+                    model.as_deref().unwrap_or("?"),
+                ));
+            }
+        }
         let evs: Vec<f64> = exposures
             .iter()
             .map(|e| core_hdr::ev100(e).map_err(|e| e.to_string()))
@@ -3616,32 +3678,83 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
             .max_by(|&a, &b| evs[a].total_cmp(&evs[b]))
             .expect("non-empty");
 
-        // Decode the reference first (capturing its as-shot WB), then stream the rest.
+        // Decode the reference first (capturing its as-shot WB), then stream the rest. The reference
+        // stays resident because each moving frame is aligned against its pixels; `with_reference`
+        // clones it into the accumulator for deghosting, so the original is dropped only after the
+        // alignment loop.
         let ref_src = core_raw::source_from_path(&frames[ref_idx].path)
             .map_err(|e| format!("{}: {e}", frames[ref_idx].path.display()))?;
         let (ref_img, ref_wb) =
             core_raw::develop_linear_wb(&ref_src, None).map_err(|e| e.to_string())?;
-        let mut acc = core_hdr::MergeAccumulator::new(ref_img.width, ref_img.height);
-        acc.add_frame(&ref_img, 1.0, ref_idx == shortest_idx)
-            .map_err(|e| e.to_string())?;
-        drop(ref_img);
+        let (ref_w, ref_h) = (ref_img.width, ref_img.height);
+        let mut acc = core_hdr::MergeAccumulator::with_reference(
+            &ref_img,
+            ref_idx == shortest_idx,
+            core_hdr::DeghostParams::default(),
+        )
+        .map_err(|e| e.to_string())?;
         let mut done = 1;
+        // Frames the aligner couldn't confidently register — merged unaligned, surfaced to the user.
+        let mut warnings: Vec<String> = Vec::new();
         progress(done, "merging");
         for (i, frame) in frames.iter().enumerate() {
             if i == ref_idx {
                 continue;
+            }
+            // Poll cancel between frames (each frame is a multi-second decode + align + warp).
+            if st.hdr_cancel.load(Ordering::SeqCst) {
+                return Err("cancelled".to_string());
             }
             let src = core_raw::source_from_path(&frame.path)
                 .map_err(|e| format!("{}: {e}", frame.path.display()))?;
             let (img, _) = core_raw::develop_linear_wb(&src, Some(ref_wb))
                 .map_err(|e| format!("{}: {e}", frame.path.display()))?;
             let scale = core_hdr::relative_scale(&exposures[i], &exposures[ref_idx])
-                .map_err(|e| e.to_string())?;
-            acc.add_frame(&img, scale as f32, i == shortest_idx)
-                .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+                .map_err(|e| e.to_string())? as f32;
+
+            // Hand-held alignment: recover the affine transform mapping this frame onto the
+            // reference grid, warp it there (with a validity mask), and merge the aligned pixels.
+            // If the pair won't register, fall back to an unaligned merge with a warning.
+            progress(done, "aligning");
+            let aligned = core_pano::align::estimate_alignment_rgb(
+                &ref_img.data,
+                ref_w as usize,
+                ref_h as usize,
+                &img.data,
+                img.width as usize,
+                img.height as usize,
+                core_pano::align::AlignModel::Affine,
+            );
+            progress(done, "merging");
+            match aligned {
+                Some(m) => {
+                    let (warped, mask) = core_hdr::warp_into_reference(&img, ref_w, ref_h, &m);
+                    let warped_img = core_raw::LinearImage {
+                        width: ref_w,
+                        height: ref_h,
+                        data: warped,
+                    };
+                    acc.add_frame_masked(&warped_img, scale, i == shortest_idx, &mask)
+                        .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+                }
+                None => {
+                    warnings.push(format!(
+                        "frame {} ({}) couldn't be aligned — merged unaligned",
+                        i + 1,
+                        frame
+                            .path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?"),
+                    ));
+                    acc.add_frame(&img, scale, i == shortest_idx)
+                        .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+                }
+            }
             done += 1;
             progress(done, "merging");
         }
+        drop(ref_img);
         let merged = acc.finish().map_err(|e| e.to_string())?;
 
         // Destination: library_root/YYYY/YYYY-MM-DD (import's date routing) when a root is set,
@@ -3682,8 +3795,11 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                 relative_ev: (evs[i] - evs[ref_idx]) as f32,
             })
             .collect();
-        core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx)
-            .map_err(|e| e.to_string())?;
+        core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx).map_err(|e| {
+            // The writer stages through `.part` + rename; a failure can still leave the part file.
+            let _ = std::fs::remove_file(dest.with_extension("exr.part"));
+            e.to_string()
+        })?;
         drop(merged);
         done += 1;
         progress(done, "writing");
@@ -3692,8 +3808,15 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
         // then a brief lock to insert. Folder row: the library root when routing under it,
         // else the reference frame's own folder.
         let processed = core_library::process_file(&dest, &st.thumbs, core_library::THUMB_SIZE)
-            .map_err(|e| e.to_string())?;
-        let row = {
+            .map_err(|e| {
+                // A written-but-uncatalogable EXR would sit orphaned in the library folder.
+                let _ = std::fs::remove_file(&dest);
+                e.to_string()
+            })?;
+        // Any catalog failure after a successful write would leave the EXR orphaned on disk —
+        // remove it on every error path out of this block (the collision branch's own remove
+        // stays; a second remove is a no-op).
+        let row = (|| -> Result<ImageRow, String> {
             let db = st.db.lock().map_err(|e| e.to_string())?;
             let conn = &db.conn;
             let folder_id = match &library_root {
@@ -3712,19 +3835,81 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
             .map_err(|e| e.to_string())?
             .ok_or_else(|| {
                 // Byte-identical EXR already catalogued (same bracket merged before).
-                let _ = std::fs::remove_file(&dest);
                 "an identical merge of these frames is already in the library".to_string()
             })?;
+            // Link the bracket frames for the "Source frames" panel — mirrors the `sources` vec
+            // already embedded in the EXR's `darkroom:sources` attribute, just queryable without a
+            // file decode. `OR IGNORE` mirrors panorama.rs's insert (idempotent on a retry).
+            for (pos, s) in sources.iter().enumerate() {
+                conn.execute(
+                    "INSERT OR IGNORE INTO hdr_sources (hdr_image_id, source_image_id, position, relative_ev)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    core_db::rusqlite::params![id, s.image_id, pos as i64, s.relative_ev],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             core_library::image_by_id(conn, id)
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| "merged image row vanished after insert".to_string())?
-        };
+                .ok_or_else(|| "merged image row vanished after insert".to_string())
+        })()
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&dest);
+        })?;
         done += 1;
         progress(done, "done");
-        let _ = app.emit("hdr:done", serde_json::json!({ "image": &row }));
+        let _ = app.emit(
+            "hdr:done",
+            serde_json::json!({ "image": &row, "warnings": warnings }),
+        );
         let _ = app.emit("library:changed", ());
         crate::thumb_queue::enqueue_all(&app);
         Ok(row)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Request the running HDR merge to stop (honored between frames). No-op if idle.
+#[tauri::command]
+pub fn hdr_cancel(app: AppHandle) {
+    let st = app.state::<AppState>();
+    if st.hdr_running.load(Ordering::SeqCst) {
+        st.hdr_cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Export a merged-HDR image (`format='hdr'`) as an uncompressed FLOAT LinearRaw DNG for
+/// Lightroom/ACR interop — the full >1.0 scene-referred headroom Merge-to-HDR produced survives
+/// untouched (no bit-depth quantization). Export-only: the written DNG is never re-imported into the
+/// catalog (Darkroom itself always reads the source `.exr`).
+#[tauri::command]
+pub async fn hdr_export_dng(app: AppHandle, image_id: i64, dest: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let (path, format) = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            db.conn
+                .query_row(
+                    "SELECT path, IFNULL(format,'raw') FROM images WHERE id = ?1",
+                    core_db::rusqlite::params![image_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .map_err(|_| format!("image {image_id} not found"))?
+        };
+        if format != "hdr" {
+            return Err(format!(
+                "image {image_id} is not a merged-HDR image (format={format})"
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let lin = core_raw::hdr_file::read_hdr_linear(&bytes).map_err(|e| e.to_string())?;
+        let meta = core_raw::hdr_file::read_hdr_meta(&bytes);
+        let dest_path = Path::new(&dest);
+        core_raw::write_hdr_dng(dest_path, &lin, &meta).map_err(|e| {
+            // The writer stages through `.part` + rename; a failure can still leave the part file.
+            let _ = std::fs::remove_file(dest_path.with_extension("dng.part"));
+            e.to_string()
+        })
     })
     .await
     .map_err(|e| e.to_string())?

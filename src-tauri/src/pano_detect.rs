@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use core_library::pano_detect::{
     cluster_candidates, count_suggested, detect_candidates, images_scanned_at, list_groups,
-    mark_scanned, replace_cluster_groups, set_group_merged, set_group_status, Candidate,
-    ClusterParams, GroupUpsert, PanoGroupRow, ALGO_VERSION,
+    mark_scanned, prune_stale_groups, replace_cluster_groups, set_group_merged, set_group_status,
+    Candidate, ClusterParams, GroupUpsert, PanoGroupRow, ALGO_VERSION,
 };
 use core_pano::{detect_groups, DetectOptions, Frame};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -68,11 +68,18 @@ fn emit_progress<R: Runtime>(app: &AppHandle<R>, phase: &str, done: usize, total
 /// thumb is missing or fails to decode — the caller skips it (dedup's similarity-backfill precedent
 /// for treating an unreadable/missing thumb as skip-not-fail).
 fn load_frame(st: &AppState, c: &Candidate) -> Option<Frame> {
-    let bytes = st.thumbs.read(&c.content_hash_hex, core_library::THUMB_SIZE).ok()?;
+    let bytes = st
+        .thumbs
+        .read(&c.content_hash_hex, core_library::THUMB_SIZE)
+        .ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
     let rgb = img.to_rgb8();
     let (width, height) = (rgb.width() as usize, rgb.height() as usize);
-    let data: Vec<f32> = rgb.into_raw().into_iter().map(|b| b as f32 / 255.0).collect();
+    let data: Vec<f32> = rgb
+        .into_raw()
+        .into_iter()
+        .map(|b| b as f32 / 255.0)
+        .collect();
     Some(Frame {
         width,
         height,
@@ -96,6 +103,19 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<usize, String>
         cancel: &st.pano_detect_cancel,
     };
     let cancelled = || st.pano_detect_cancel.load(Ordering::SeqCst);
+
+    // Brief lock: prune zombie suggestions (members gone missing, or a group whose member rows
+    // fully cascaded away) before scanning — keeps the review queue honest even for a cluster this
+    // pass never re-touches.
+    {
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+        let pruned = prune_stale_groups(&tx).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        if pruned > 0 {
+            tracing::debug!(pruned, "pano_detect: pruned stale suggestion groups");
+        }
+    }
 
     // Brief lock: candidate query + pure clustering.
     let clusters: Vec<Vec<Candidate>> = {
@@ -121,7 +141,8 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<usize, String>
         if !force {
             let scanned = {
                 let db = st.db.lock().map_err(|e| e.to_string())?;
-                images_scanned_at(&db.conn, &cluster_ids, ALGO_VERSION).map_err(|e| e.to_string())?
+                images_scanned_at(&db.conn, &cluster_ids, ALGO_VERSION)
+                    .map_err(|e| e.to_string())?
             };
             if cluster_ids.iter().all(|id| scanned.contains(id)) {
                 emit_progress(app, "verify", idx + 1, total);
@@ -163,8 +184,11 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<usize, String>
             .groups
             .iter()
             .map(|g| {
-                let member_ids: Vec<i64> =
-                    g.members.iter().map(|&fi| frame_candidates[fi].id).collect();
+                let member_ids: Vec<i64> = g
+                    .members
+                    .iter()
+                    .map(|&fi| frame_candidates[fi].id)
+                    .collect();
                 let member_hashes: Vec<String> = g
                     .members
                     .iter()
@@ -196,7 +220,10 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<usize, String>
 
     // Cancellation ends the scan early but is not an error — report whatever was found so far
     // (mirrors `analysis.rs::run_pass`, which emits `analysis:done` with partial stats on cancel).
-    let _ = app.emit("pano_detect:done", serde_json::json!({ "found": found_total }));
+    let _ = app.emit(
+        "pano_detect:done",
+        serde_json::json!({ "found": found_total }),
+    );
     Ok(found_total)
 }
 

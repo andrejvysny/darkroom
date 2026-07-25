@@ -2,6 +2,187 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## HDR/Pano review + remaining-work pass (2026-07-20, UNCOMMITTED on `main`) — CURRENT
+
+> Plan: `~/.claude/plans/act-as-senior-software-elegant-flurry.md` (review verdict + 4 tracks).
+> All four code tracks (A–D) are **done + headless-green**: `cargo test --workspace` 52 suites /
+> 0 failures, `cargo clippy --workspace --examples`, `npx tsc --noEmit`, `npm run build` all clean.
+> **What's left is QA that needs the dev Mac + real captures** — the checklist directly below.
+
+### Real-corpus validation round (2026-07-20) — 2137 files, 38 GB, `~/Pictures/DCIM/100EOSR7`
+
+Ran the whole stack against a real R7 card dump (1911 CR3 · 171 HIF · 52 JPG). **Two hard bugs
+found that made large parts of the library unusable — both fixed, both now covered by tests.**
+
+- [x] **ALL 171 real `.HIF` files were rejected** (`develop_linear` → "unsupported color profile").
+      Root cause: a real Canon HIF's primary item is a **4×5 grid** (derived item), and
+      `heif_image_handle_get_nclx_color_profile` reports `Unspecified/Unspecified` for it even
+      though `heif-info` lists an nclx and every tile is BT.2020 PQ — libheif only surfaces nclx
+      from a `colr` box on the item it was asked about. The committed synthetic fixtures are
+      single-item, so this never showed up; the one "validated" real file regressed the same way on
+      Homebrew libheif 1.21.1. Fix: `core-raw/src/heif.rs::container_nclx` parses the container's
+      own `colr` boxes (`meta/iprp/ipco`) and treats them as authoritative, falling back to the
+      handle only when the container carries none; **every** nclx found must agree on BT.2020 PQ.
+      Now 171/171 decode; the Apple gain-map negative test still rejects (its `colr` is an ICC
+      `prof`, not nclx). Guarded by 4 unit tests over hand-built ISOBMFF boxes (no fixture needed).
+- [x] **557 of 1911 CR3s failed to index** — every Canon **HDR-PQ CR3** (`CanonCR3_003`, written
+      whenever the body shoots HDR PQ). rawler cannot extract their embedded preview (it's HEVC,
+      not JPEG) and returns a hard error, which the indexer treated as a failed file — even though
+      **the mosaic beside it decodes perfectly**. Fix: `thumb.rs` folds preview-extraction errors
+      into "no preview" and falls back to developing the RAW (`embedded_preview` +
+      `developed_preview`), for the thumbnail path *and* the AI-scan preview paths. Full index is
+      now **2134/2134, 0 failed**. Dimension care: the fallback reports true sensor dims (`src_*`
+      feeds the capture fingerprint) and true oriented dims (`disp_*`), never the thumbnail's —
+      a first cut got this wrong and reported 512×341. Regression test `tests/hdrpq_cr3.rs`
+      (fixture-gated on `$DARKROOM_CR3_FIXTURES`).
+- [x] **Panorama streaming recall regression (mine, from Track C)**: `downscale_native` used a
+      **Triangle** filter, and at ~5× reduction the aliasing cost real feature matches — on a real
+      14-frame sweep the streaming path put only **8 frames** in the largest component where
+      full-res registration found 10. Switched the pano low-res pass to `downscale_into_hq`
+      (Lanczos3): now **12 frames**, a wider composite (9660×3069 vs 8196×3003), and the faint
+      vertical seam band is gone. Registration itself was never wrong (focal within 1.1%).
+- [x] **Risk R4 (portrait `.HIF`) RESOLVED — no code change needed.** 82 of the 171 HIFs are
+      portrait. `heif_gate` shows decoded dims differ with vs without container transforms
+      (4640×6960 vs 6960×4640) → libheif applies `irot` itself, so `.oriented()` must NOT be added.
+- [x] Detection on the real library: 2134 candidates → 460 clusters → **73 groups in 8.2 s**,
+      identical headless and in-app. Spot-checked visually: genuine multi-frame sweeps are found;
+      **~15 % (11/73) are continuous-drive bursts** (e.g. a bird tracked across the sky) that
+      geometrically mimic a sweep because the camera panned. Capture rate separates them cleanly
+      (bursts ≥2 fps, real sweeps ≤1.4 fps) — deliberately NOT gated on, because a missed pano is
+      silent while a junk suggestion costs one dismissal click. Recorded as a tuning lever.
+- [x] HDR merge on real ±3 EV brackets (the corpus has 141 such runs; note **no AEB** — all
+      manual): 7 of 8 non-reference frames aligned at 99.7–100 % coverage, including a portrait
+      bracket; the one failure (the +3 EV frame, blown out) fell back to unaligned with a warning
+      exactly as designed. Merged output recovers headroom (max 1.33) with no visible ghosting.
+- [x] New harnesses: `core-library --example detect_catalog` (headless mirror of the app's
+      detection job over a real catalog) and `--example index_root` (reference-mode import);
+      `stitch_cr3` now exercises the **streaming** `FrameSource` like the app does, instead of the
+      old resident path.
+
+**Open from this round:**
+
+- [ ] **One unexplained crash** (`SIGABRT`, main thread, symbols unresolved) ~15 min after a
+      detection scan. NOT reproduced in a clean 2-minute run, and the crashed process had been
+      orphaned from its dev server by an earlier process kill, so it may be an artifact of that.
+      Worth a deliberate long-running soak (scan → browse → develop) before trusting it.
+- [ ] Import dialog now defaults to **Reference** (was Copy in code). Consider also reordering the
+      options so the destructive **Move** isn't the middle click-target.
+- [ ] Burst-vs-sweep precision (above) if the review queue feels noisy in practice.
+
+### BLOCKING QA (needs the Mac / real files) — do this next
+
+- [ ] **Panorama, real captures** (the long-standing blocking gate): `cargo run --release -p
+      core-raw --example stitch_cr3 -- <dir-of-pano-CR3s> /tmp/o.dng`, then open the DNG in Develop
+      (WB must behave raw-like). Judge seam/gain/boundary-warp quality on REAL parallax + exposure
+      drift — everything so far is synthetic scenes. Then in-app: select → preview → merge → the
+      pano appears linked + editable. **New this pass, so QA it deliberately:** the streaming path
+      changed how frames reach the compositor (2 decodes/frame; seams/gains now estimated from
+      1400 px buffers), so compare a streamed result against a pre-change stitch if anything looks
+      off; also exercise Stop mid-merge (cancel is now honored inside `stitch`, not just between
+      frames) and confirm no partial `.dng` is left behind.
+- [ ] **Hand-held HDR** on a genuinely hand-held bracket (the validated set was tripod, so
+      alignment was near-identity): confirm frames register (the merge warns per-frame when they
+      don't, and falls back to unaligned rather than failing), and shoot something with a MOVING
+      subject to judge deghosting — `DeghostParams { sigma 0.05, k 0.25 }` in `core-hdr/src/lib.rs`
+      are the tuning knobs. Also exercise Stop on the HDR pill.
+- [ ] **`.dmg` build end-to-end** — `npm run tauri build -- --bundles dmg`, then verify the app
+      launches HEIF decode on a machine WITHOUT Homebrew libheif (that's the whole point of the
+      bundling), e.g. `otool -L Darkroom.app/Contents/MacOS/darkroom | grep heif` shows
+      `@executable_path/../Frameworks/...`, and Contents/Frameworks holds the 6 dylibs.
+- [ ] **HIF in-app QA** (unchanged from the earlier list): HIF opens in Develop at ≈ the CR3
+      sibling's brightness, all modules respond, thumbs/preview latency acceptable on 33 MP.
+- [ ] Detection in-app: Detect from the new LeftNav button, dismiss/undo persistence across
+      restart, merge handoff drops the group from review immediately, incremental re-run after new
+      imports only scans new clusters.
+- [ ] Fixtures still wanted: a PORTRAIT `.HIF` (risk R4 — decides whether `heif.rs` needs
+      `.oriented()`), a bracket with CLIPPED highlights, and a plain RAW+HIF simultaneous pair to
+      refine the 300-nit anchor.
+
+### Landed this pass
+
+- [x] **Track A — correctness fixes** (headless-green): A1 detect-merge attribution via IPC echo
+      (`detectGroupId` rides `panorama_merge` → echoed on `panorama:done`; `activePanoDetectGroupId`
+      store field DELETED); A2 `panorama_sources` links only `result.used_indices` + "stitched N of
+      M" toast; A3 `hdr_merge` dedupes ids + refuses mixed camera bodies + SelectionBar 2–9/RAW
+      gate; A4 pano failure cleanup (truncated/orphan DNG removed, preview cache cleared on failed
+      merge, `canMerge` blocks on `previewError`); A5 docs reconciled.
+- [x] **B-P6 — release plumbing**: `scripts/macos-bundle-dylibs.sh` (BFS libheif closure →
+      version-stripped staging in `src-tauri/frameworks/` + install_name_tool rewrites; wired as
+      `build.beforeBundleCommand`; tauri-bundler copies+signs but never rewrites names — verified),
+      `bundle.macOS.frameworks` (6 stable names), CI `brew install libheif` (ci.yml macOS job +
+      release.yml macOS legs; no Linux jobs exist). NOT yet exercised: a real
+      `npm run tauri build -- --bundles dmg` on the dev Mac (QA item).
+- [x] **Track B — hand-held HDR** (headless-green + validated on the real ±3 EV R7 bracket):
+      shared `features::extract_at` (keypoints in TRUE full-res units regardless of buffer
+      downscale; `extract` is now a wrapper — behavior-preserving, existing pano tests untouched);
+      **`core_pano::align`** (`estimate_alignment_rgb`, nalgebra-free `[[f64;3];3]` out) with a new
+      **affine RANSAC** (`ransac::verify_pair_affine`, 3-pt fit, `w³` adaptive exit, same
+      SplitMix64 + Brown&Lowe gate) — affine by default because projective terms extrapolate
+      wildly across textureless sky; **`core_hdr::warp_into_reference`** (bilinear inverse warp +
+      validity mask, rayon rows); **`add_frame_masked`** (masked-out pixels SKIPPED — `hat_weight(0)
+      = W_LOW_FLOOR = 0.05` would otherwise paint dark halos at warp borders) and
+      **`with_reference` + `DeghostParams{sigma 0.05, k 0.25}`** (consistency weight
+      `w *= 1 − ref_conf·(1−consist)`; deghost auto-disables where the reference clips so darker
+      frames still fill highlights). Unregisterable frames merge unaligned + warn (never fail).
+      `hdr_cancel` IPC + `AtomicBool` polled per frame + Stop button on the pill; `hdr:done` carries
+      `warnings[]`. Harness: `cargo run --release -p core-hdr --example merge_one HDR` →
+      both frames "aligned (99.9% valid)", EV math exact (×7.81/×0.125).
+      Alignment accuracy on synthetic scenes: affine **0.048 px**, homography 0.043 px.
+- [x] **B-P5 — interop**: migration **020 `hdr_sources`** (mirrors `panorama_sources`, cascade-
+      tested) populated at merge; `core_library::merge_sources` + `image_sources` IPC + RightInfo
+      **"Source frames"** section (HDR shows per-frame relative EV; missing sources dimmed). Rows
+      are non-clickable by design — `selectedImage` is derived from the loaded grid page only, so
+      click-to-select would silently no-op for off-page sources.
+      **fp16-DNG spike verdict: rawler CAN write float DNG** — `RawImageData::Float` +
+      `DngCompression::Uncompressed` (Lossless silently force-converts float→u16; commented in
+      code). f32 only (no fp16 writer), no compression → **388 MB** for a 33 MP export. Shipped as
+      `core_raw::write_hdr_dng` + `hdr_export_dng` IPC + RightInfo "Export DNG…" (hdr rows only).
+      ColorMatrix1 = `XYZ_TO_PROPHOTO_D50` (buffer is ProPhoto, not camera-native), AsShotNeutral
+      [1,1,1]. Verified on the real merged EXR: raw SubIFD reads `Float/32/Linear Raw/Uncompressed`
+      (IFD0 "Unsigned" is the 8-bit preview — check with `exiftool -a -G1`). Harness:
+      `cargo run --release -p core-raw --example export_hdr_dng -- <in.exr> [out.dng]`.
+- [x] **Track C — pano streaming + cancel + reconnect** (headless-green): **`FrameSource`** trait
+      (`load(i, max_long_side) -> LoadedFrame` carrying buffer dims **and** true full-res dims) with
+      a blanket `impl for &[Frame]`; `stitch_streaming`/`register_streaming` alongside the
+      UNCHANGED public `stitch`/`register`/`compose` (thin wrappers, resident path byte-identical —
+      guarded by `slice_source_reproduces_the_resident_stitch_exactly`).
+      Data-flow verified first: **no stage needs all full-res warps at once** — seams + gains
+      consume only the ~1400 px `low_warps`, and the 5-band blend already streamed one frame's
+      pyramids at a time. So: load all N at seam resolution → register via `extract_at` (poses in
+      TRUE full-res units — the units trap that naive "register on low-res" hits) → seams/gains on
+      lows → `release_low()` → blend loads full-res ONE frame at a time. **Peak frame RAM ~3.8 GB →
+      ~0.55 GB** for a 10-frame 32 MP merge, at 2 decodes/frame. `UsedCam::scaled(ratio, w, h)`
+      takes explicit dims (the source's downscaler owns rounding; a 1-px disagreement would let
+      `warp` index past the buffer). Mixed-camera check moved into `CatalogFrameSource::load`
+      (still fails fast — the low pass reads every frame before compositing).
+      **Cancel** now threads `&(dyn Fn()->bool + Sync)` through load/feature/pair/warp/blend loops
+      and finally constructs the long-dead `PanoError::Cancelled`; `panorama_status` gained an
+      `ipc.ts` wrapper + a one-shot `usePanorama` reconnect probe so the pill returns after a
+      renderer reload.
+- [x] **Track D — detection hardening** (headless-green): detect state (running/suggested/groups/
+      loading/progress) lifted into the zustand store with **module-singleton listeners** (mirrors
+      `usePanorama.ts`) — kills the duplicate toasts + doubled IPC from the two always-live
+      `usePanoDetect()` consumers, and keeps the LeftNav badge and the review overlay in sync after
+      dismiss/merge. **`prune_stale_groups`** runs at scan start (brief DB lock): deletes
+      `status='suggested'` groups with <2 members whose image ROW still exists — the unreachable
+      husks left when dedup hard-deletes members (cascade drops the member rows, and
+      `replace_cluster_groups` can only stale-delete groups intersecting a re-verified cluster).
+      **Deliberately keyed on row existence, not `status='present'`**: a merely-missing member
+      (unmounted volume) must not drop the group, because the per-image scan markers would then
+      suppress re-verification and lose the suggestion until a forced rescan — those are surfaced
+      instead via `PanoMemberRow.present` (dimmed in review, merge blocked with a distinct reason
+      from the `allRaw` gate). LeftNav "Panoramas" gains a Detect/Re-detect button + running
+      indicator (generalized `AnalyzeButton` → `RunButton`), so a scan is startable without opening
+      the overlay.
+      ~~Known layering wart~~ **FIXED**: `usePanoDetect` now listens to `panorama:done` itself and
+      owns mark+refresh, so `ipc.ts` is pure transport again (no hook import, no import cycle) and
+      `usePanorama` no longer knows about detection at all.
+
+**Fixed en route (pre-existing):** `heif_decode::non_pq_heif_rejected_cleanly` asserted the wrong
+rejection branch's wording — the Apple gain-map fixture reports *Unspecified* primaries, so it hits
+the "only BT.2020 PQ … is supported" message, not "expected BT.2020 PQ". Rejection behavior was
+always correct; the assertion now matches both branches. (Confirmed pre-existing by stashing.)
+
 ## HDR pass follow-ups (2026-07-18, branch `claude/hdr-heif-support-5r5ztx`) — CURRENT
 
 Landed: Canon HDR PQ `.hif` full develop support (libheif → PQ → linear ProPhoto) + Merge-to-HDR
@@ -72,8 +253,13 @@ already gitignored):**
 **Deferred increments (do NOT creep into this pass):** alignment (MTB) + deghosting + auto
 bracket detection; hand-held merge; fp16 DNG export (Lightroom interop); HEIF *export*; general
 `.heic`/iPhone (non-PQ profiles get a clean error today); Windows HIF decode (vcpkg libheif — cfg
-stub ships); embedded-thumbnail fast path for HIF thumbs; `hdr_sources` DB table + "show source
-frames" UI (parentage lives in the EXR's `darkroom:sources` attr); HDR/EDR display output.
+stub ships); `hdr_sources` DB table + "show source frames" UI (parentage lives in the EXR's
+`darkroom:sources` attr); HDR/EDR display output.
+
+**Known dedup interaction:** the merged `_HDR.exr` shares the reference CR3's `capture_fingerprint`
+(same model/date/shutter-count/dims), so it surfaces as a same-capture dedup group with its own
+source frame — expected, manual resolve only, same class as RAW+HIF pairs (see the in-app QA item
+above).
 
 ## IN PROGRESS: Panorama merge (branch `claude/darkroom-panorama-research-ruvw38`, 2026-07-18)
 

@@ -6,7 +6,13 @@ license.workspace = true
 
 [dependencies]
 core-raw = { path = "../core-raw" }
+# Hand-held alignment (FAST/BRIEF + RANSAC affine/homography). No dependency cycle: core-raw only
+# DEV-depends on core-pano, and core-pano never links core-raw, so the normal-dependency graph
+# (core-hdr → {core-raw, core-pano}) stays acyclic.
+core-pano = { path = "../core-pano" }
 thiserror = "2"
+# Row-parallel inverse warp of each moving frame onto the reference grid.
+rayon = "1"
 
 [dev-dependencies]
 anyhow = "1"

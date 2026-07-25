@@ -1,4 +1,5 @@
 import { Fragment, useState, useEffect } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   thumbUrl,
   imageDetections,
@@ -8,6 +9,8 @@ import {
   setImageUserLabel,
   imageHistogram,
   imageFaces,
+  imageSources,
+  hdrExportDng,
   DETECTION_CATEGORIES,
   type HistData,
   type ImageRow,
@@ -18,6 +21,7 @@ import {
   type Presence,
   type UserLabels,
   type ImageFace,
+  type MergeSources,
 } from "../../lib/ipc";
 import { useAppStore } from "../../store/app";
 
@@ -127,6 +131,7 @@ export default function RightInfo({
 }: RightInfoProps) {
   const meta = selectedImage;
   const thumbVersions = useAppStore((s) => s.thumbVersions);
+  const setToast = useAppStore((s) => s.setToast);
   const [kwInput, setKwInput] = useState("");
   const [aiCaption, setAiCaption] = useState<ImageCaption | null>(null);
   const [aiDetections, setAiDetections] = useState<Detection[]>([]);
@@ -137,6 +142,8 @@ export default function RightInfo({
     containsAnimal: null,
   });
   const [hist, setHist] = useState<HistData | null>(null);
+  const [sources, setSources] = useState<MergeSources | null>(null);
+  const [exportingDng, setExportingDng] = useState(false);
 
   useEffect(() => {
     if (meta === null) {
@@ -146,12 +153,17 @@ export default function RightInfo({
       setAiFaces([]);
       setLabels({ containsPerson: null, containsAnimal: null });
       setHist(null);
+      setSources(null);
       return;
     }
     let cancelled = false;
     setHist(null);
+    setSources(null);
     void imageHistogram(meta.id).then((h) => {
       if (!cancelled) setHist(h);
+    });
+    void imageSources(meta.id).then((s) => {
+      if (!cancelled) setSources(s);
     });
     void Promise.all([
       imageCaption(meta.id),
@@ -172,6 +184,33 @@ export default function RightInfo({
       cancelled = true;
     };
   }, [meta?.id, analysisVersion]);
+
+  // Export HDR as DNG (Lightroom interop): save-file dialog → IPC → toast. Mirrors
+  // `usePresets.ts`'s `exportPreset` save-dialog pattern.
+  const doExportDng = async () => {
+    if (!meta) return;
+    const stem = meta.filename.replace(/\.[^.]+$/, "");
+    let dest: string | null;
+    try {
+      dest = await save({
+        title: "Export HDR as DNG",
+        defaultPath: `${stem}.dng`,
+        filters: [{ name: "DNG", extensions: ["dng"] }],
+      });
+    } catch {
+      return;
+    }
+    if (!dest) return;
+    setExportingDng(true);
+    try {
+      await hdrExportDng(meta.id, dest);
+      setToast(`Exported "${stem}.dng"`);
+    } catch {
+      setToast("Couldn't export DNG");
+    } finally {
+      setExportingDng(false);
+    }
+  };
 
   const toggleLabel = (field: "person" | "animal", checked: boolean) => {
     if (meta === null) return;
@@ -490,7 +529,121 @@ export default function RightInfo({
             ))}
           </dl>
         )}
+        {meta !== null && meta.format === "hdr" && (
+          <button
+            onClick={() => void doExportDng()}
+            disabled={exportingDng}
+            title="Uncompressed float DNG (~400 MB at 33 MP) — opens in Lightroom"
+            style={{
+              marginTop: 12,
+              width: "100%",
+              border: "1px solid var(--color-line)",
+              background: "var(--color-elev)",
+              color: "var(--color-t1)",
+              borderRadius: "var(--radius-sm)",
+              padding: "6px 10px",
+              fontSize: 12,
+              cursor: exportingDng ? "default" : "pointer",
+              opacity: exportingDng ? 0.6 : 1,
+            }}
+          >
+            {exportingDng ? "Exporting…" : "Export DNG…"}
+          </button>
+        )}
       </div>
+
+      {/* Source frames — only for a merged (HDR bracket / panorama) image. Rows are informational
+          only, not clickable: `selectedImage` above resolves purely against the currently-loaded
+          library grid page (`lib.images.find` in LibraryView), so selecting a source frame that
+          isn't in that page would silently no-op — there's no cross-page "jump to image" path in
+          this app yet (the unused `imageMeta` IPC looks like a stub for exactly that gap). */}
+      {sources !== null && (
+        <div
+          style={{
+            padding: "14px 16px",
+            borderTop: "1px solid var(--color-line)",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 10.5,
+              letterSpacing: ".06em",
+              textTransform: "uppercase",
+              color: "var(--color-t3)",
+              fontWeight: 600,
+              marginBottom: 10,
+            }}
+          >
+            Source frames
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            {sources.sources.map((s) => (
+              <div
+                key={s.imageId}
+                title={s.present ? s.filename : `${s.filename} — file is missing`}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  fontSize: 11.5,
+                  padding: "5px 8px",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--color-elev)",
+                  border: "1px solid var(--color-line)",
+                  opacity: s.present ? 1 : 0.55,
+                }}
+              >
+                <span
+                  style={{
+                    color: "var(--color-t3)",
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 10,
+                    minWidth: 14,
+                    flexShrink: 0,
+                  }}
+                >
+                  {s.position + 1}
+                </span>
+                <span
+                  style={{
+                    color: "var(--color-t2)",
+                    flex: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {s.filename}
+                </span>
+                {sources.kind === "hdr" && s.relativeEv != null && (
+                  <span
+                    style={{
+                      color: "var(--color-t3)",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: 10.5,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {s.relativeEv >= 0 ? "+" : ""}
+                    {s.relativeEv.toFixed(1)} EV
+                  </span>
+                )}
+                {!s.present && (
+                  <span
+                    style={{
+                      color: "var(--color-reject)",
+                      fontSize: 10,
+                      flexShrink: 0,
+                    }}
+                  >
+                    missing
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Keywords */}
       <div

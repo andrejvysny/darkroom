@@ -60,8 +60,9 @@ pub use presets::{
     unique_name, update_preset, PresetFull, PresetSummary,
 };
 pub use query::{
-    count_images, date_tree, image_by_id, list_folders, present_image_ids, query_images, DateNode,
-    DateTreeYear, FolderRow, ImageRow, QueryParams,
+    count_images, date_tree, image_by_id, list_folders, merge_sources, present_image_ids,
+    query_images, DateNode, DateTreeYear, FolderRow, ImageRow, MergeSources, QueryParams,
+    SourceRow,
 };
 pub use reconcile::{reconcile, ReconcileStats};
 pub use settings::{

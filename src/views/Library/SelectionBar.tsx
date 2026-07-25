@@ -25,6 +25,9 @@ interface SelectionBarProps {
   onMergeHdr: () => void;
   /** True while a merge is running (disables the button \u2014 merges are single-flight). */
   merging: boolean;
+  /** True when the selection count is in the mergeable range (2..=9) and every selected image is
+   *  RAW (or format is null/undefined, i.e. a legacy row \u2014 treated as RAW). */
+  canMergeHdr: boolean;
   /** Opens the panorama merge modal for the current selection. */
   onMergePanorama: () => void;
   /** True when the selection count is in the mergeable range (2..=10). */
@@ -83,6 +86,7 @@ export default function SelectionBar({
   onExport,
   onMergeHdr,
   merging,
+  canMergeHdr,
   onMergePanorama,
   canMergePanorama,
   onClear,
@@ -306,10 +310,18 @@ export default function SelectionBar({
 
       <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
         <button
-          style={{ ...btn(), opacity: merging ? 0.5 : 1 }}
-          disabled={merging}
-          onClick={onMergeHdr}
-          title="Merge selected bracketed RAW frames into one HDR image (tripod sets, 2\u20139 frames)"
+          style={{
+            ...btn(),
+            opacity: !canMergeHdr ? 0.45 : merging ? 0.5 : 1,
+            cursor: canMergeHdr ? "pointer" : "default",
+          }}
+          disabled={!canMergeHdr || merging}
+          onClick={canMergeHdr ? onMergeHdr : undefined}
+          title={
+            canMergeHdr
+              ? "Merge selected bracketed RAW frames into one HDR image (tripod sets, 2\u20139 frames)"
+              : "Select 2\u20139 RAW photos"
+          }
         >
           <Icon name="photos" size={12} /> Merge to HDR
         </button>

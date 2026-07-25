@@ -24,6 +24,7 @@ import {
   collectionRename,
   smartQueryFromParams,
   hasActiveFilters,
+  hdrCancel,
 } from "../../lib/ipc";
 import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
@@ -94,6 +95,7 @@ export default function LibraryView() {
   const panoDetect = usePanoDetect();
   const setPanoSuggestOpen = useAppStore((s) => s.setPanoSuggestOpen);
   const [stoppingAnalysis, setStoppingAnalysis] = useState(false);
+  const [stoppingHdr, setStoppingHdr] = useState(false);
 
   // While analysis runs (doneVersion bumps as batches commit), keep the filtered grid in sync so
   // partial detection results appear without re-clicking the category.
@@ -108,6 +110,11 @@ export default function LibraryView() {
   useEffect(() => {
     if (!analysis.progress) setStoppingAnalysis(false);
   }, [analysis.progress]);
+
+  // Same, for the HDR-merge Stop affordance.
+  useEffect(() => {
+    if (!hdr.progress) setStoppingHdr(false);
+  }, [hdr.progress]);
 
   // Register library action callbacks so TopBar/CommandPalette can call them
   useEffect(() => {
@@ -465,7 +472,7 @@ export default function LibraryView() {
 
   const batchMergePanorama = useCallback(() => {
     if (selectedIds.length < 2 || selectedIds.length > 10) return;
-    setPanoramaSources(selectedIds);
+    setPanoramaSources({ ids: selectedIds, detectGroupId: null });
   }, [selectedIds, setPanoramaSources]);
 
   const collapseSelection = useCallback(() => {
@@ -488,6 +495,16 @@ export default function LibraryView() {
       setToast(error ? `HDR merge failed: ${error}` : "HDR merge failed");
     }
   }, [hdr.merge, lib.refresh, setSelectedId, setToast]);
+
+  // Mirrors `canMergePanorama` below, plus the HDR-specific RAW-only constraint (merge decodes
+  // through the raw-native path; a non-RAW source has no exposure/WB latitude to bracket-merge).
+  const canMergeHdr = useMemo(() => {
+    if (selectedIds.length < 2 || selectedIds.length > 9) return false;
+    return selectedIds.every((id) => {
+      const row = lib.images.find((r) => r.id === id);
+      return row == null || row.format == null || row.format === "raw";
+    });
+  }, [selectedIds, lib.images]);
 
   // Register for the command palette (the SelectionBar calls the handler directly).
   useEffect(() => {
@@ -538,7 +555,7 @@ export default function LibraryView() {
           onRenameCollection={handleRenameCollection}
           onDeleteKeyword={handleDeleteKeyword}
           analysis={analysis}
-          panoSuggested={panoDetect.status?.suggested ?? 0}
+          panoSuggested={panoDetect.suggested}
           onOpenPanoSuggestions={() => setPanoSuggestOpen(true)}
         />
       </div>
@@ -581,6 +598,7 @@ export default function LibraryView() {
                 onExport={batchExport}
                 onMergeHdr={handleMergeHdr}
                 merging={hdr.merging}
+                canMergeHdr={canMergeHdr}
                 onMergePanorama={batchMergePanorama}
                 canMergePanorama={selectedIds.length >= 2 && selectedIds.length <= 10}
                 onClear={collapseSelection}
@@ -673,9 +691,34 @@ export default function LibraryView() {
                 fontSize: 12,
                 color: "var(--color-t2)",
                 whiteSpace: "nowrap",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
               }}
             >
-              {`Merging to HDR ${hdr.progress.done} / ${hdr.progress.total}\u2026`}
+              <span>
+                {`Merging to HDR ${hdr.progress.done} / ${hdr.progress.total}\u2026`}
+              </span>
+              <button
+                disabled={stoppingHdr}
+                onClick={() => {
+                  setStoppingHdr(true);
+                  void hdrCancel();
+                }}
+                title="Stop HDR merge (frames merged so far are discarded)"
+                style={{
+                  border: "1px solid var(--color-line)",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--color-hover)",
+                  color: "var(--color-t1)",
+                  fontSize: 11,
+                  padding: "2px 8px",
+                  cursor: stoppingHdr ? "default" : "pointer",
+                  opacity: stoppingHdr ? 0.6 : 1,
+                }}
+              >
+                {stoppingHdr ? "Stopping\u2026" : "Stop"}
+              </button>
             </div>
           )}
 
