@@ -468,7 +468,13 @@ replace_all) → DevelopParams` (merged, NOT persisted — FE commits), `presets
 - HDR: `hdr_merge(image_ids) → ImageRow` (Merge-to-HDR, tripod v1; events `hdr:progress
   {done,total,stage}` + `hdr:done {image}` + `library:changed`)
 - Culling: `cull_set_rating`, `cull_set_flag`, `cull_set_label`,
-  `cull_set_rating_many`, `cull_set_flag_many`, `cull_set_label_many` (batch)
+  `cull_set_rating_many`, `cull_set_flag_many`, `cull_set_label_many` (batch),
+  `cull_rejected_summary(params) → {images, companions, bytes}` (**NEW**, read-only),
+  `cull_delete_rejected(params) → {trashed, failed, companions}` (**NEW**, destructive). Both take
+  the grid's `QueryParams` and **force `flag='reject'` backend-side** — the frontend never passes
+  image ids, so no unflagged/picked photo is reachable. Companions of a rejected RAW ride along
+  (otherwise the pair link cascades and the orphan JPEG pops into the grid) and are counted
+  separately. Files go to the OS Trash; two-step confirm lives in `DeleteRejectedModal.tsx`.
 - Keywords: `keywords_list`, `keywords_for_image`, `keyword_add_to_image`,
   `keyword_add_to_images` (batch), `keyword_remove_from_image`, `keyword_delete`
 - Collections: `collections_list`, `collections_for_image`, `collection_create`,

@@ -25,6 +25,7 @@ export type IconName =
   | "zoom"
   | "tag"
   | "scan"
+  | "trash"
   | "cog";
 
 interface IconProps {
@@ -134,6 +135,13 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <rect x="3" y="3" width="10" height="10" rx="1.5" />
       <circle cx="6" cy="6.5" r="1.2" />
       <path d="M9 5.5h2M9 7.5h2M5 10h6" />
+    </>
+  ),
+  trash: (
+    <>
+      <path d="M2.5 4h11M6.5 4V2.5h3V4" />
+      <path d="M4 4l.7 9a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9L12 4" />
+      <path d="M6.7 6.5v5M9.3 6.5v5" />
     </>
   ),
   cog: (

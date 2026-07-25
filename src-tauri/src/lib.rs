@@ -162,6 +162,8 @@ pub fn run() {
             commands::cull_set_rating_many,
             commands::cull_set_flag_many,
             commands::cull_set_label_many,
+            commands::cull_rejected_summary,
+            commands::cull_delete_rejected,
             commands::keywords_list,
             commands::keywords_for_image,
             commands::keyword_add_to_image,

@@ -17,10 +17,12 @@ pub mod pano_detect;
 pub mod presets;
 pub mod query;
 pub mod reconcile;
+pub mod reject;
 pub mod settings;
 pub mod sidecar;
 pub mod snapshots;
 pub mod thumbs;
+pub mod trash;
 
 pub use analysis::{
     analysis_facets, caption_for_image, detections_for_image, existing_analysis, insert_analysis,
@@ -63,10 +65,13 @@ pub use presets::{
 };
 pub use query::{
     count_images, date_tree, image_by_id, list_folders, merge_sources, present_image_ids,
-    query_images, DateNode, DateTreeYear, FolderRow, ImageRow, MergeSources, QueryParams,
-    SourceRow,
+    query_images, rejected_ids, DateNode, DateTreeYear, FolderRow, ImageRow, MergeSources,
+    QueryParams, SourceRow,
 };
 pub use reconcile::{reconcile, ReconcileStats};
+pub use reject::{
+    delete_rejected, delete_rejected_with, summarize_rejected, RejectDeleteResult, RejectSummary,
+};
 pub use settings::{
     animal_detector_size, face_stage_enabled, get_meta, library_root, mask_ai_tier, preview_edge,
     set_animal_detector_size, set_face_stage_enabled, set_library_root, set_mask_ai_tier, set_meta,

@@ -629,6 +629,73 @@ pub fn present_image_ids(conn: &Connection) -> Result<Vec<i64>, LibError> {
     Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Ids of every image matching `p` that the user has flagged `reject`, ignoring paging.
+///
+/// **The `reject` predicate is applied here, not by the caller**: `p.flag` is overridden to
+/// `"reject"` whatever it held, so a caller can never widen the set to non-rejected images. Camera
+/// companions are included (`include_paired`) so a companion the user rejected individually is not
+/// silently skipped; the reverse direction (companions *of* a rejected RAW) is a separate,
+/// explicitly-reported expansion — see `crate::reject`.
+pub fn rejected_ids(conn: &Connection, p: &QueryParams) -> Result<Vec<i64>, LibError> {
+    let p = QueryParams {
+        flag: Some("reject".to_string()),
+        include_paired: Some(true),
+        ..clone_filters(p)
+    };
+    let sql = format!(
+        "SELECT i.id FROM images i
+         LEFT JOIN ratings_flags rf ON rf.image_id = i.id
+         WHERE {WHERE}
+         ORDER BY i.id"
+    );
+    let search = p.search.as_ref().map(|s| format!("%{s}%"));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        named_params! {
+            ":folder_id": p.folder_id,
+            ":min_stars": p.min_stars,
+            ":flag": p.flag,
+            ":color_label": p.color_label,
+            ":keyword_id": p.keyword_id,
+            ":collection_id": p.collection_id,
+            ":import_session_id": p.import_session_id,
+            ":capture_year": p.capture_year,
+            ":capture_date": p.capture_date,
+            ":detected_category": p.detected_category,
+            ":person_id": p.person_id,
+            ":format": p.format,
+            ":include_paired": p.include_paired,
+            ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
+            ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
+            ":search": search,
+        },
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Copy only the filter dimensions of `p` (drops sort/paging/cursor, which a whole-set query must
+/// not inherit — a `limit` would silently truncate a destructive operation's target set).
+fn clone_filters(p: &QueryParams) -> QueryParams {
+    QueryParams {
+        folder_id: p.folder_id,
+        min_stars: p.min_stars,
+        flag: p.flag.clone(),
+        color_label: p.color_label.clone(),
+        keyword_id: p.keyword_id,
+        collection_id: p.collection_id,
+        import_session_id: p.import_session_id,
+        capture_year: p.capture_year.clone(),
+        capture_date: p.capture_date.clone(),
+        detected_category: p.detected_category.clone(),
+        person_id: p.person_id,
+        format: p.format.clone(),
+        include_paired: p.include_paired,
+        search: p.search.clone(),
+        ..Default::default()
+    }
+}
+
 pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError> {
     let sql = format!(
         "SELECT COUNT(*) FROM images i

@@ -1421,6 +1421,71 @@ pub async fn cull_set_label_many(
     .map_err(|e| e.to_string())?
 }
 
+/// Count + on-disk size of the rejected photos matching `params` — what `cull_delete_rejected`
+/// would remove. Read-only; drives the confirmation dialog so the user sees the real number rather
+/// than the grid's (possibly paged) one.
+#[tauri::command]
+pub async fn cull_rejected_summary(
+    app: AppHandle,
+    params: QueryParams,
+) -> Result<core_library::RejectSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::summarize_rejected(&db.conn, &params).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Send every rejected photo matching `params` (plus the camera companions of a rejected RAW) to the
+/// OS Trash and drop its catalog rows.
+///
+/// The frontend passes only the *filter*, never image ids: the target set is re-derived here with
+/// the `reject` flag forced on (`core_library::rejected_ids`), so a stale or malformed request can
+/// never reach a picked or unflagged photo. Files remain recoverable from the Trash; the catalog
+/// removal is not undoable in-app.
+#[tauri::command]
+pub async fn cull_delete_rejected(
+    app: AppHandle,
+    params: QueryParams,
+) -> Result<core_library::RejectDeleteResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let res = core_library::delete_rejected(&db.conn, &params).map_err(|e| e.to_string())?;
+        gc_orphan_thumbs(&db.conn, &st.thumbs, &res.hashes);
+        tracing::info!(
+            trashed = res.trashed,
+            failed = res.failed,
+            companions = res.companions,
+            "deleted rejected photos"
+        );
+        let _ = core_library::append_event(
+            &db.conn,
+            &crate::events::stamp(
+                st.inner(),
+                core_library::Event {
+                    event_type: "culling.delete_rejected".into(),
+                    flag: Some("reject".into()),
+                    touch_count: Some(res.trashed as i64),
+                    context: Some(
+                        serde_json::json!({
+                            "companions": res.companions,
+                            "failed": res.failed,
+                        })
+                        .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        );
+        Ok::<_, String>(res)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ---------- Keywords / tags ----------
 
 #[tauri::command]

@@ -87,6 +87,7 @@ export default function LeftNav({
 }: LeftNavProps) {
   const noFilters = !hasActiveFilters(params);
   const picksActive = params.flag === "pick";
+  const rejectsActive = params.flag === "reject";
   const recentActive = params.sort === "imported_desc";
   // Safe to call here too (module-singleton listeners — see usePanoDetect.ts): LibraryView already
   // calls this hook for `panoSuggested`/`onOpenPanoSuggestions`; this instance reads the same shared
@@ -153,6 +154,13 @@ export default function LeftNav({
           count=""
           active={picksActive}
           onClick={() => patchParams({ flag: picksActive ? null : "pick" })}
+        />
+        <NavRow
+          icon="trash"
+          label="Rejected"
+          count=""
+          active={rejectsActive}
+          onClick={() => patchParams({ flag: rejectsActive ? null : "reject" })}
         />
         <NavRow
           icon="clock"

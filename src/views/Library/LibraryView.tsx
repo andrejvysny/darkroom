@@ -40,6 +40,7 @@ import SelectionBar from "./SelectionBar";
 import Loupe from "./Loupe";
 import ImportDialog from "./ImportDialog";
 import SettingsModal from "./SettingsModal";
+import DeleteRejectedModal from "./DeleteRejectedModal";
 
 // Map color label name to CSS var for the dot color in ThumbGrid
 const LABEL_COLOR_MAP: Record<string, string> = {
@@ -85,6 +86,7 @@ export default function LibraryView() {
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [importOpen, setImportOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [deleteRejectedOpen, setDeleteRejectedOpen] = useState(false);
   const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
   const [selectedCollections, setSelectedCollections] = useState<
     CollectionRow[]
@@ -831,6 +833,7 @@ export default function LibraryView() {
           patchParams={lib.patchParams}
           clearFilters={lib.clearFilters}
           setSort={lib.setSort}
+          onDeleteRejected={() => setDeleteRejectedOpen(true)}
         />
       </div>
 
@@ -844,6 +847,18 @@ export default function LibraryView() {
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
+      />
+
+      <DeleteRejectedModal
+        open={deleteRejectedOpen}
+        params={lib.params}
+        onClose={() => setDeleteRejectedOpen(false)}
+        onDeleted={(msg) => {
+          setToast(msg);
+          // Rows are gone catalog-side; drop any stale selection and re-query from scratch.
+          setSelection([], null);
+          void lib.refresh();
+        }}
       />
     </div>
   );

@@ -196,6 +196,12 @@ function filterRows(q: QueryParams): ImageRow[] {
   return r;
 }
 
+/** Rows the "delete rejected" commands would target: the caller's filter with `flag` forced to
+ *  `reject` (paging dropped), matching how the Rust side derives the set. */
+function rejectedRows(p: Record<string, unknown>): ImageRow[] {
+  return filterRows({ ...getParams(p), flag: "reject" });
+}
+
 function sortRows(r: ImageRow[], sort: QueryParams["sort"]): ImageRow[] {
   const by = [...r];
   switch (sort) {
@@ -595,6 +601,20 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
       const r = rowById(id);
       if (r) r.colorLabel = p.label == null ? null : String(p.label);
     }),
+  // Mirrors the backend contract: the reject flag is forced on, so the caller's `flag` (whatever it
+  // is) can never widen the set beyond rejects. The fixture has no pairs, so companions are always 0.
+  cull_rejected_summary: (p) => {
+    const hit = rejectedRows(p);
+    return { images: hit.length, companions: 0, bytes: hit.length * 24_000_000 };
+  },
+  cull_delete_rejected: (p) => {
+    const hit = rejectedRows(p);
+    for (const r of hit) {
+      const i = rows.indexOf(r);
+      if (i !== -1) rows.splice(i, 1);
+    }
+    return { trashed: hit.length, failed: 0, companions: 0 };
+  },
 
   // Keywords
   keywords_list: () => [

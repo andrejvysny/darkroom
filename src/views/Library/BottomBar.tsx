@@ -13,6 +13,8 @@ interface BottomBarProps {
   patchParams: (patch: Partial<QueryParams>) => void;
   clearFilters: () => void;
   setSort: (sort: SortKey) => void;
+  /** Opens the two-step delete confirmation. Only offered while the Rejects filter is active. */
+  onDeleteRejected: () => void;
 }
 
 const SORT_LABELS: Record<SortKey, string> = {
@@ -53,6 +55,7 @@ export default function BottomBar({
   patchParams,
   clearFilters,
   setSort,
+  onDeleteRejected,
 }: BottomBarProps) {
   const thumbSize = useAppStore((s) => s.thumbSize);
   const setThumbSize = useAppStore((s) => s.setThumbSize);
@@ -153,6 +156,23 @@ export default function BottomBar({
         >
           Rejects
         </button>
+        {/* Only reachable from inside the Rejects view, so the set being deleted is the set on
+            screen. Opens a two-step confirmation — this button itself deletes nothing. */}
+        {flag === "reject" && total > 0 && (
+          <button
+            data-testid="delete-rejected"
+            onClick={onDeleteRejected}
+            title="Move all rejected photos to the Trash"
+            style={{
+              ...pillStyle(false),
+              color: "var(--color-danger, #e5685f)",
+              borderColor: "var(--color-line-2)",
+            }}
+          >
+            <Icon name="trash" size={12} />
+            Delete rejected…
+          </button>
+        )}
       </div>
 
       <Divider />

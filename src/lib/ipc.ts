@@ -699,6 +699,45 @@ export function cullSetLabelMany(
   return invoke<void>("cull_set_label_many", { imageIds, label, groupId });
 }
 
+/** What "delete all rejected" would remove, for the confirmation dialog. */
+export type RejectSummary = {
+  /** Photos flagged `reject`. */
+  images: number;
+  /** Camera companions (paired JPEG/HEIF) riding on a rejected RAW. */
+  companions: number;
+  /** Total bytes on disk across both. */
+  bytes: number;
+};
+
+export type RejectDeleteResult = {
+  /** Files trashed and rows removed (images + companions). */
+  trashed: number;
+  /** Files that could not be trashed; their catalog rows were kept. */
+  failed: number;
+  /** Of `trashed`, how many were camera companions. */
+  companions: number;
+};
+
+/** Read-only count/size of the rejects matching `params` (the reject flag is forced backend-side). */
+export function cullRejectedSummary(
+  params: QueryParams,
+): Promise<RejectSummary> {
+  return invoke<RejectSummary>("cull_rejected_summary", { params });
+}
+
+/**
+ * Move every rejected photo matching `params` to the OS Trash and drop its catalog rows.
+ *
+ * Deliberately takes the *filter*, never image ids: the backend re-derives the target set with the
+ * `reject` flag forced on, so nothing unflagged or picked can be reached. Destructive — the caller
+ * must have collected an explicit two-step confirmation first.
+ */
+export function cullDeleteRejected(
+  params: QueryParams,
+): Promise<RejectDeleteResult> {
+  return invoke<RejectDeleteResult>("cull_delete_rejected", { params });
+}
+
 // ── Keywords / tags ──────────────────────────────────────────────────────────
 
 export type KeywordRow = {
