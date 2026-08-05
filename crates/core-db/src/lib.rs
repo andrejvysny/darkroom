@@ -3,6 +3,7 @@
 //! Schema lives in `migrations/001_init.sql` and is applied via `rusqlite_migration`.
 //! The app layer wraps [`Db`] in a `Mutex` inside Tauri `State`.
 
+pub mod backup;
 pub mod error;
 
 pub use error::DbError;

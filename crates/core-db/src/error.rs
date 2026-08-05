@@ -12,4 +12,6 @@ pub enum DbError {
     Corrupt(String),
     #[error("catalog schema version {found} is newer than this build supports ({supported})")]
     SchemaTooNew { found: i64, supported: i64 },
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }

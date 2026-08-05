@@ -1,6 +1,6 @@
 [package]
 name = "darkroom"
-version = "0.1.1"
+version = "0.1.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -26,6 +26,11 @@ e2e-testing = ["dep:tauri-plugin-playwright", "tauri/dynamic-acl"]
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+# Fatal-startup dialog (lib.rs `fatal_startup_error`): a SYNC native modal shown from the setup
+# hook, where tauri-plugin-dialog's blocking API can't be used (it must not block the main
+# thread). Same rfd 0.16 node the dialog plugin already pulls — no new tree weight; features
+# come from unification with the plugin's own selection.
+rfd = { version = "0.16", default-features = false }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-playwright = { version = "0.4", optional = true }

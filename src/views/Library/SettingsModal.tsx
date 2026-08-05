@@ -25,6 +25,9 @@ import {
   logsExportZip,
   logsDeleteAll,
   type LogsStatus,
+  catalogBackupNow,
+  catalogBackupStatus,
+  type BackupStatus,
 } from "../../lib/ipc";
 import { pickFolder } from "../../lib/importFlow";
 import { useAppStore } from "../../store/app";
@@ -34,6 +37,16 @@ const GB = 1024 * 1024 * 1024;
 function fmtBytes(n: number): string {
   if (n >= GB) return `${(n / GB).toFixed(2)} GB`;
   return `${(n / (1024 * 1024)).toFixed(0)} MB`;
+}
+
+function fmtAgo(ms: number): string {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
 }
 
 interface SettingsModalProps {
@@ -107,6 +120,8 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [logs, setLogs] = useState<LogsStatus | null>(null);
   const [logsBusy, setLogsBusy] = useState(false);
   const [confirmLogsDelete, setConfirmLogsDelete] = useState(false);
+  const [backup, setBackup] = useState<BackupStatus | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [autoCheck, setAutoCheck] = useState(autoCheckEnabled());
 
@@ -138,13 +153,15 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       appLibraryRoot(),
       previewEdge(),
       logsStatus(),
+      catalogBackupStatus(),
     ])
-      .then(([cap, used, root, pe, logStatus]) => {
+      .then(([cap, used, root, pe, logStatus, backupStatus]) => {
         setCapGb((cap / GB).toFixed(2).replace(/\.?0+$/, ""));
         setUsedBytes(used);
         setLibRoot(root);
         setPEdge(pe);
         setLogs(logStatus);
+        setBackup(backupStatus);
         initializedRef.current = true;
       })
       .catch(() => showStatus("Failed to load settings"));
@@ -260,6 +277,17 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
       setLogsBusy(false);
       setConfirmLogsDelete(false);
     }
+  };
+
+  const handleBackupNow = () => {
+    setBackupBusy(true);
+    void catalogBackupNow()
+      .then((next) => {
+        setBackup(next);
+        showStatus("Backup complete");
+      })
+      .catch(() => showStatus("Backup failed"))
+      .finally(() => setBackupBusy(false));
   };
 
   const handleWriteSidecars = () => {
@@ -592,6 +620,34 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
                 }}
               >
                 {sidecarBusy ? "Working…" : "Rebuild from sidecars"}
+              </button>
+            </div>
+          </div>
+
+          {/* Catalog backups */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>Catalog backups</div>
+            <div style={descStyle}>
+              A compacted copy of the catalog (index, edits, ratings, keywords —
+              not your photo files) is snapshotted automatically once a day and
+              kept as the last 7 copies.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ flex: 1, fontSize: 12, color: "var(--color-t2)" }}>
+                Last backup:{" "}
+                {backup?.lastMs == null ? "never" : fmtAgo(backup.lastMs)} ·{" "}
+                {backup?.count ?? 0} kept
+              </div>
+              <button
+                onClick={handleBackupNow}
+                disabled={backupBusy}
+                style={{
+                  ...btnSecondary,
+                  opacity: backupBusy ? 0.6 : 1,
+                  cursor: backupBusy ? "default" : "pointer",
+                }}
+              >
+                {backupBusy ? "Backing up…" : "Back up now"}
               </button>
             </div>
           </div>

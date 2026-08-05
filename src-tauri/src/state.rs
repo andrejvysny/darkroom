@@ -184,8 +184,22 @@ impl AppState {
             .map_err(|e| format!("app_data_dir: {e}"))?;
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
 
-        let db =
-            Db::open(&data_dir.join("catalog.db")).map_err(|e| format!("open catalog: {e}"))?;
+        // Map catalog-open failures to actionable, user-facing text — this string ends up in the
+        // fatal startup dialog (`fatal_startup_error`), not just a log line.
+        let db = Db::open(&data_dir.join("catalog.db")).map_err(|e| match e {
+            core_db::DbError::SchemaTooNew { found, supported } => format!(
+                "Your photo catalog was last opened by a newer version of Darkroom \
+                 (catalog format v{found}; this version supports up to v{supported}).\n\n\
+                 Install the latest Darkroom release to keep using this catalog. \
+                 Your photos and edits are safe and untouched."
+            ),
+            core_db::DbError::Corrupt(detail) => format!(
+                "The photo catalog failed its integrity check ({detail}).\n\n\
+                 You can restore a recent copy from the \"backups\" folder next to the catalog \
+                 in Application Support, or rebuild the catalog from your library's sidecar files."
+            ),
+            other => format!("The photo catalog could not be opened: {other}"),
+        })?;
         let thumbs =
             ThumbCache::new(data_dir.join("thumbs")).map_err(|e| format!("thumb cache: {e}"))?;
         // Bound the cache to the configured cap on startup (best-effort).

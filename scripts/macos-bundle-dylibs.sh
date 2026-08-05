@@ -19,10 +19,30 @@
 #
 # If Homebrew ever changes the closure membership, staging fails loudly — update EXPECTED here
 # and `bundle.macOS.frameworks` in src-tauri/tauri.conf.json together.
+#   fix-adhoc — AFTER a local (unsigned) `tauri build --bundles app`: re-sign the bundled .app
+#             ad-hoc WITHOUT the hardened runtime. tauri-bundler's ad-hoc signature sets the
+#             hardened-runtime flag, and library validation then refuses the ad-hoc Frameworks
+#             dylibs at launch (dyld: "code signature ... different Team IDs"). CI Developer ID
+#             builds are unaffected (every Mach-O carries the same real Team ID) and must NOT run
+#             this — notarization requires the hardened runtime.
 set -euo pipefail
 
 [ "$(uname)" = "Darwin" ] || exit 0
 MODE="${1:-bundle}"
+
+if [ "$MODE" = "fix-adhoc" ]; then
+  APP="${2:-target/release/bundle/macos/Darkroom.app}"
+  [ -d "$APP" ] || { echo "macos-bundle-dylibs: no .app at $APP" >&2; exit 1; }
+  if codesign -dv "$APP/Contents/MacOS/darkroom" 2>&1 | grep -q 'Signature=adhoc'; then
+    for lib in "$APP"/Contents/Frameworks/*.dylib; do codesign --force -s - "$lib"; done
+    codesign --force -s - "$APP"
+    codesign --verify --strict "$APP"
+    echo "macos-bundle-dylibs: re-signed $APP ad-hoc without hardened runtime"
+  else
+    echo "macos-bundle-dylibs: $APP is not ad-hoc signed — leaving it alone" >&2
+  fi
+  exit 0
+fi
 
 # Version-stripped stable name: libheif.1.dylib → libheif.dylib.
 stable() { basename "$1" | sed -E 's/\.[0-9]+(\.[0-9]+)*\.dylib$/.dylib/'; }
@@ -87,6 +107,10 @@ for lib in "${closure[@]}"; do
   chmod u+w "$out"
   install_name_tool -id "@executable_path/../Frameworks/$(stable "$lib")" "$out" 2>/dev/null
   repoint "$out"
+  # The rewrites invalidate Homebrew's signature, and an ad-hoc ("-") bundle does NOT re-sign
+  # Frameworks — dyld then kills the .app at launch ("code signature not valid for use in
+  # process"). Leave a fresh ad-hoc signature; the CI Developer ID pass force-re-signs over it.
+  codesign --force -s - "$out" 2>/dev/null
 done
 echo "macos-bundle-dylibs: staged ${#closure[@]} dylibs into $STAGE"
 

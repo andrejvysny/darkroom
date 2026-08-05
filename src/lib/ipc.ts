@@ -564,6 +564,22 @@ export function logsDeleteAll(): Promise<LogsStatus> {
   return invoke<LogsStatus>("logs_delete_all", {});
 }
 
+export type BackupStatus = {
+  /** Epoch millis of the newest backup, or null if none exist yet. */
+  lastMs: number | null;
+  count: number;
+  dir: string;
+};
+
+/** Take a catalog backup now (VACUUM INTO + rotation), returning the refreshed status. */
+export function catalogBackupNow(): Promise<BackupStatus> {
+  return invoke<BackupStatus>("catalog_backup_now", {});
+}
+
+export function catalogBackupStatus(): Promise<BackupStatus> {
+  return invoke<BackupStatus>("catalog_backup_status", {});
+}
+
 /** Clamp bounds for the preview edge (mirror of the Rust `PREVIEW_EDGE_MIN/MAX`). */
 export const PREVIEW_EDGE_MIN = 2560;
 export const PREVIEW_EDGE_MAX = 4096;

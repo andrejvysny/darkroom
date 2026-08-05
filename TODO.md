@@ -2,6 +2,58 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## Professional-ready roadmap (2026-08-02) — CURRENT
+
+> Plan: `~/.claude/plans/act-as-senior-software-misty-quasar.md`. Decisions: serious personal tool ·
+> enthusiast + landscape/fine-art + own R7 workflow · macOS-first · priorities = color+export,
+> trust+stability, workflow speed. Non-goals: i18n, telemetry, tethering, camera-brand campaign,
+> Windows QA (deferred), video, IPTC editor, slideshow.
+
+### Phase 0 — Stabilize & ship (IN PROGRESS)
+
+- [ ] Consolidated in-app QA campaign — checklist in `QA_CAMPAIGN.md` (needs dev Mac + real library)
+- [x] Catalog backup: `VACUUM INTO` daily rotation + Settings "Back up now" (2026-08-02, uncommitted; live QA in QA_CAMPAIGN.md §F)
+- [x] Panic hook → tracing log (2026-08-02, uncommitted)
+- [x] Fix 0.1.1 launch SIGABRT (2026-08-05, uncommitted): installed release + dev catalog (schema v22 > v20)
+      → `SchemaTooNew` → setup `Err` → Tauri panic in AppKit launch callback → abort. Now: any
+      `AppState::new` failure shows a native `rfd` error dialog (friendly SchemaTooNew/Corrupt text
+      in `state.rs`) + clean `exit(1)`; `logging::init` failure is non-fatal. Live-verified both
+      paths (v99 catalog → dialog + clean exit; real v22 catalog → normal open). Version → 0.1.2.
+- [ ] Cut v0.1.2 release (commit + tag + push; CI signs/notarizes). NOTE: installed 0.1.1 crashes
+      before its updater runs — manual install of 0.1.2 required once.
+- [x] Local ad-hoc bundles dyld-killed at launch (2026-08-05, uncommitted): tauri-bundler's ad-hoc
+      signature carries the hardened-runtime flag → library validation rejects the ad-hoc Frameworks
+      dylibs. Fixed: staged dylibs get fresh ad-hoc signatures (stage mode), and NEW
+      `scripts/macos-bundle-dylibs.sh fix-adhoc` re-signs a locally bundled .app without the
+      hardened runtime (run it after `tauri build --bundles app`; CI must never run it —
+      notarization needs the hardened runtime). Verified: local .app launches.
+- [ ] `.dmg` end-to-end + libheif `otool -L` verify (QA_CAMPAIGN.md §F)
+- [ ] First Developer ID signed + notarized release (`beta-*` tag; needs Apple secrets)
+- [ ] SIGABRT soak (QA_CAMPAIGN.md §F)
+- [ ] Push `main` to origin (user call)
+
+### Phase 1 — Color management + export (NEXT)
+
+- [ ] Spike: WKWebView canvas `display-p3` support (go/no-go for 1a)
+- [ ] 1a Display P3 output path (shader flag + tagged canvas, sRGB fallback)
+- [ ] 1b Export overhaul: linear-ProPhoto f32 readback → CPU resize/convert/encode; 16-bit TIFF;
+      sRGB/P3/AdobeRGB/ProPhoto + embedded ICC; long-edge resize + output sharpen; EXIF copy +
+      copyright string; export presets (format+quality+size+colorspace)
+
+### Phase 2 — Workflow speed
+
+- [ ] Survey/compare N-up culling view (shared zoom, per-pane rate/flag)
+- [ ] Missing-files UI + folder-level relink
+- [ ] Import mode reorder (Move off middle position)
+- [ ] Optional: card-mount detection, full-screen loupe
+
+### Phase 3 — Fine-art tail
+
+- [ ] Soft proofing (printer ICC via moxcms/lcms2, gamut warning)
+- [ ] Print v1 (color-managed PDF handoff) — pending decision
+- [ ] 3D LUT stage @binding(16) + `.cube`/HaldCLUT import
+- [ ] Grain
+
 ## HDR/Pano review + remaining-work pass (2026-07-20, UNCOMMITTED on `main`) — CURRENT
 
 > Plan: `~/.claude/plans/act-as-senior-software-elegant-flurry.md` (review verdict + 4 tracks).

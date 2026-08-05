@@ -1,3 +1,4 @@
+mod backup;
 mod commands;
 mod events;
 mod features;
@@ -56,7 +57,11 @@ pub fn run() {
             protocol::handle_thumb(ctx, req, responder)
         })
         .setup(|app| {
-            logging::init(app.handle()).map_err(std::io::Error::other)?;
+            // Logging must never keep the app from starting — fall back to stderr-only.
+            if let Err(e) = logging::init(app.handle()) {
+                eprintln!("darkroom: file logging unavailable: {e}");
+            }
+            install_panic_hook();
             // Grant the playwright permission at runtime (debug-only `dynamic-acl`), so the
             // capability never lives in capabilities/ and feature-off builds stay clean.
             #[cfg(feature = "e2e-testing")]
@@ -65,7 +70,10 @@ pub fn run() {
                     .add_capability(include_str!("../e2e-capability.json"))?;
             }
 
-            let state = AppState::new(app.handle()).map_err(std::io::Error::other)?;
+            let state = match AppState::new(app.handle()) {
+                Ok(state) => state,
+                Err(msg) => fatal_startup_error(&msg),
+            };
             app.manage(state);
 
             // Crash recovery: stamp `finished_at` on any import sessions a previous run left open
@@ -101,6 +109,9 @@ pub fn run() {
 
             // Start the background canonical-thumbnail worker (parks until there's work).
             thumb_queue::spawn_worker(app.handle().clone());
+
+            // Best-effort daily catalog backup (own background thread; logs its own outcome).
+            backup::maybe_backup_on_startup(app.handle().clone());
 
             // Reconcile against disk, then start the FS watcher — off the setup thread so a slow
             // stat sweep can't delay window creation. The watcher is parked in AppState to stay alive.
@@ -270,6 +281,8 @@ pub fn run() {
             commands::set_log_level,
             commands::logs_export_zip,
             commands::logs_delete_all,
+            commands::catalog_backup_now,
+            commands::catalog_backup_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -284,4 +297,42 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Show a native error dialog, then exit cleanly. Returning `Err` from the setup hook instead
+/// would panic inside the AppKit/Win32 launch callback and abort the process — the user sees only
+/// "Darkroom quit unexpectedly" with no explanation (exactly how the 0.1.1 schema-guard refusal
+/// presented). A blocking modal here is safe: setup runs on the main thread before the window
+/// shows, the same stage where macOS itself presents launch modals.
+fn fatal_startup_error(msg: &str) -> ! {
+    tracing::error!(%msg, "startup failed");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Darkroom cannot start")
+        .set_description(msg)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    std::process::exit(1)
+}
+
+/// Route panics into the tracing log (in addition to the default stderr hook), so a crash on a
+/// background thread — whose stderr nobody is watching in a packaged app — still leaves a trace
+/// in `darkroom.log`. Chains to the previous hook so default behavior (stderr message) is kept.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(%location, %payload, %backtrace, "panic");
+        previous(info);
+    }));
 }

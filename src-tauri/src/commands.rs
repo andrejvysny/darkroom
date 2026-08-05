@@ -2167,6 +2167,18 @@ pub fn logs_delete_all() -> Result<crate::logging::LogsStatus, String> {
     crate::logging::delete_all()
 }
 
+#[tauri::command]
+pub async fn catalog_backup_now(app: AppHandle) -> Result<crate::backup::BackupStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::backup::run_now(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn catalog_backup_status(app: AppHandle) -> Result<crate::backup::BackupStatus, String> {
+    crate::backup::status(&app)
+}
+
 /// Configured thumbnail-cache cap in bytes (default when unset).
 #[tauri::command]
 pub async fn thumb_cache_cap(app: AppHandle) -> Result<u64, String> {

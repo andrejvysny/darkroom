@@ -27,10 +27,17 @@ import {
   type QueryParams,
   type PanoGroupRow,
   type PanoMemberRow,
+  type BackupStatus,
 } from "../lib/ipc";
 
 const LIB_ROOT = "/Users/you/Pictures/Darkroom";
 const FIXTURE_COUNT = 48;
+
+let mockBackupStatus: BackupStatus = {
+  lastMs: Date.now() - 2 * 60 * 60 * 1000,
+  count: 3,
+  dir: `${LIB_ROOT}/../../Library/Application Support/com.andrejvysny.darkroom/backups`,
+};
 
 // ── Fixture dataset ──────────────────────────────────────────────────────────
 
@@ -572,6 +579,17 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     fileCount: 0,
     level: "debug",
   }),
+
+  // Catalog backups
+  catalog_backup_status: () => ({ ...mockBackupStatus }),
+  catalog_backup_now: () => {
+    mockBackupStatus = {
+      lastMs: Date.now(),
+      count: Math.min(7, mockBackupStatus.count + 1),
+      dir: mockBackupStatus.dir,
+    };
+    return { ...mockBackupStatus };
+  },
 
   // Cull (persisted to fixtures)
   cull_set_rating: (p) => {

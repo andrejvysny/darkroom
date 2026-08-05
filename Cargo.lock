@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "core-analyze"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "core-db",
@@ -701,8 +701,9 @@ dependencies = [
 
 [[package]]
 name = "core-db"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "chrono",
  "rusqlite",
  "rusqlite_migration",
  "serde",
@@ -712,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "core-dedup"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "core-db",
  "image",
@@ -764,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "core-hdr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "core-pano",
@@ -775,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "core-import"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "core-db",
@@ -789,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "core-library"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "core-db",
  "core-pano",
@@ -805,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "core-pano"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "image",
@@ -819,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "core-pipeline"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -834,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "core-preset"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "roxmltree",
  "serde",
@@ -844,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "core-raw"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -979,7 +980,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "darkroom"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "core-analyze",
  "core-db",
@@ -994,6 +995,7 @@ dependencies = [
  "image",
  "notify",
  "rayon",
+ "rfd",
  "serde",
  "serde_json",
  "tauri",
