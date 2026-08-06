@@ -13,6 +13,8 @@
 
 </div>
 
+<img src="darkroom_intro.gif" alt="Darkroom Library View" width="100%" />
+
 Darkroom lets you import, organize, and edit your camera's RAW photos — entirely on your Mac.
 No account, no cloud, no subscription. Your original files are never modified and never leave your
 computer.
