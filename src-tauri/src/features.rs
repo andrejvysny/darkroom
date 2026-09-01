@@ -1,8 +1,12 @@
-//! One-shot backfill of per-image `image_features` (model inputs for lighting/best-shot/dedup).
-//! Explicit/lazy (not run on every import). Decode + compute run UNLOCKED in parallel; rows are
-//! written in brief batched transactions so `library_query` stays responsive.
+//! Backfill of per-image `image_features` (model inputs for lighting/best-shot/dedup).
+//!
+//! Runs automatically after an import commit and after each AI scan (see [`spawn_backfill`]), plus
+//! on demand from Settings — the pass is a no-op for images that already have a row, so the
+//! automatic triggers cost one query when there is nothing to do. Decode + compute run UNLOCKED in
+//! parallel; rows are written in brief batched transactions so `library_query` stays responsive.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -11,10 +15,38 @@ use crate::state::AppState;
 
 const BATCH: usize = 16;
 
+/// Clears `features_running` on drop, so an error path can't wedge the gate.
+struct RunGuard<'a>(&'a AtomicBool);
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Kick off a backfill in the background and forget it — the automatic trigger.
+///
+/// Deliberately fire-and-forget: neither an import nor a scan should block on (or fail because of)
+/// feature computation, and a second trigger while one is in flight is a no-op rather than a queued
+/// duplicate pass. The images the first pass missed are simply picked up by the next trigger.
+pub fn spawn_backfill<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || match run_backfill(&app) {
+        Ok(n) if n > 0 => tracing::info!(computed = n, "feature backfill finished"),
+        Err(e) => tracing::debug!(error = %e, "feature backfill skipped"),
+        _ => {}
+    });
+}
+
 /// Compute + persist features for every present image that lacks a row. Returns the count computed.
 /// Emits `features:progress` `{done,total}` and a final `features:done` `{computed}`.
 pub fn run_backfill<R: Runtime>(app: &AppHandle<R>) -> Result<usize, String> {
     let st = app.state::<AppState>();
+    // Two passes over the same `images_missing_features` set would decode every image twice and
+    // race each other to the same rows.
+    if st.features_running.swap(true, Ordering::SeqCst) {
+        return Err("feature backfill already running".into());
+    }
+    let _guard = RunGuard(&st.features_running);
 
     let todo: Vec<(i64, String)> = {
         let db = st.db.lock().map_err(|e| e.to_string())?;

@@ -12,6 +12,7 @@ members = [
     "crates/core-preset",
     "crates/core-hdr",
     "crates/core-pano",
+    "crates/core-suggest",
 ]
 
 [workspace.package]

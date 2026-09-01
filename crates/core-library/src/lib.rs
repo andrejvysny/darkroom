@@ -21,17 +21,19 @@ pub mod reject;
 pub mod settings;
 pub mod sidecar;
 pub mod snapshots;
+pub mod suggest;
 pub mod thumbs;
 pub mod trash;
 
 pub use analysis::{
-    analysis_facets, caption_for_image, detections_for_image, existing_analysis, image_scan_state,
-    insert_analysis, labeled_images, presence_for_image, present_image_count, present_images,
-    present_targets_after, present_targets_in, record_attempts, scope_image_ids, set_user_label,
-    set_user_label_many, stale_count, stale_count_in, stale_targets, stale_targets_in, user_labels,
-    AnalysisInput, AnalyzeTarget, CaptionRow, DetectionRow, FacetRow, ImageScanState, LabeledImage,
-    PresenceRow, ScanScope, ScopeCounts, StageAttempt, StageId, StagePending, StageSpec,
-    StageState, StaleTarget, UserLabels, FACE_DETECTION_ID, PANORAMA_STAGE_ID, SCOPE_CHUNK,
+    analysis_facets, caption_for_image, detections_for_image, embedding_for_image,
+    existing_analysis, image_scan_state, insert_analysis, labeled_images, presence_for_image,
+    present_image_count, present_images, present_targets_after, present_targets_in,
+    record_attempts, scope_image_ids, set_user_label, set_user_label_many, stale_count,
+    stale_count_in, stale_targets, stale_targets_in, user_labels, AnalysisInput, AnalyzeTarget,
+    CaptionRow, DetectionRow, FacetRow, ImageScanState, LabeledImage, PresenceRow, ScanScope,
+    ScopeCounts, StageAttempt, StageId, StagePending, StageSpec, StageState, StaleTarget,
+    UserLabels, CLIP_EMBEDDING_ID, FACE_DETECTION_ID, PANORAMA_STAGE_ID, SCOPE_CHUNK,
 };
 pub use collections::{
     add_images_to_collection, collections_for_image, create_collection, delete_collection,
@@ -40,7 +42,7 @@ pub use collections::{
 pub use cull::{set_flag, set_flag_many, set_label, set_label_many, set_rating, set_rating_many};
 pub use edits::{get_edit, get_edit_with_version, set_edit};
 pub use error::LibError;
-pub use events::{append_event, event_count, ids_json, Event};
+pub use events::{append_event, context_with_suggested, event_count, ids_json, Event};
 pub use face::{
     assign_face_person, confirm_face, create_person, delete_all_face_data, faces_for_clustering,
     faces_summary, image_faces, list_people, merge_people, person_faces, prune_empty_unnamed,
@@ -90,5 +92,9 @@ pub use sidecar::{
 pub use snapshots::{
     create_snapshot, delete_snapshot, get_snapshot_params, list_snapshots, rename_snapshot,
     unique_snapshot_name, SnapshotSummary,
+};
+pub use suggest::{
+    assemble_samples, current_model, label_count_delta, score_all, suggest_status, train_and_store,
+    LabelCounts, SuggestStatus, TrainOutcome,
 };
 pub use thumbs::ThumbCache;

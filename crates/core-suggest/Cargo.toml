@@ -1,0 +1,13 @@
+[package]
+name = "core-suggest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Model/report (de)serialization — the trained head is persisted as JSON, like the presence probe.
+serde_json = "1"
+# Parallel gradient accumulation (pointwise + pairwise) over the sample set.
+rayon = "1"
+thiserror = "2"

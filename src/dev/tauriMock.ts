@@ -43,10 +43,28 @@ let mockBackupStatus: BackupStatus = {
 
 const FLAGS: ImageRow["flag"][] = ["none", "none", "pick", "none", "reject"];
 
+/** Model badges over the fixture set. Only unflagged rows get one (the grid hides a suggestion once
+ *  the user has decided), and the cycle leaves most rows un-badged — matching a real library, where
+ *  a badge is the exception. Index 0 = suggested pick, index 3 = suggested reject. */
+const SUGGESTED: ImageRow["suggested"][] = [
+  "pick",
+  null,
+  null,
+  "reject",
+  null,
+  null,
+  null,
+  null,
+];
+const SUGGESTION_SCORES: Record<string, number> = { pick: 0.91, reject: 0.07 };
+
 function makeRows(n: number): ImageRow[] {
   const base = Math.floor(Date.UTC(2026, 4, 1) / 1000); // capture dates in epoch seconds
   return Array.from({ length: n }, (_, i): ImageRow => {
     const num = String(i + 1).padStart(4, "0");
+    const flag = FLAGS[i % FLAGS.length];
+    const suggested =
+      flag === "none" ? SUGGESTED[i % SUGGESTED.length] : null;
     return {
       id: i + 1,
       contentHash: `mockhash${num}`,
@@ -64,7 +82,7 @@ function makeRows(n: number): ImageRow[] {
       height: 4640,
       orientation: 1,
       stars: i % 6,
-      flag: FLAGS[i % FLAGS.length],
+      flag,
       colorLabel: null,
       editedAt: null,
       importedAt: base - i * 3600,
@@ -72,6 +90,8 @@ function makeRows(n: number): ImageRow[] {
       // Every 7th fixture stands in for a RAW+JPEG shot, so the pair badge is exercisable.
       pairedCount: i % 7 === 0 ? 1 : 0,
       pairedTo: null,
+      suggested,
+      suggestionScore: suggested ? SUGGESTION_SCORES[suggested] : null,
     };
   });
 }
@@ -185,6 +205,9 @@ function filterRows(q: QueryParams): ImageRow[] {
   let r = rows;
   if (q.minStars != null) r = r.filter((x) => x.stars >= q.minStars!);
   if (q.flag != null) r = r.filter((x) => x.flag === q.flag);
+  // Withheld rows are joined away backend-side, so a fixture with no `suggested` simply never
+  // matches — the mock needs no separate withheld concept.
+  if (q.suggested != null) r = r.filter((x) => x.suggested === q.suggested);
   if (q.colorLabel != null) {
     r = r.filter((x) =>
       q.colorLabel === LABEL_NONE
@@ -809,6 +832,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
         stage("animals"),
         stage("faces", false),
         stage("captions"),
+        stage("embeddings"),
         stage("panoramas", true, true),
       ],
     };
@@ -821,7 +845,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   }),
   scan_cancel: () => undefined,
   scan_running: () => false,
-  scan_prefs_get: () => ["objects", "animals", "captions"],
+  scan_prefs_get: () => ["objects", "animals", "captions", "embeddings"],
   scan_prefs_set: () => undefined,
   image_scan_state: () => ({
     lastScanAt: null,
@@ -830,10 +854,40 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
       { id: "animal_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
       { id: "face_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
       { id: "caption", status: "pending", attemptedAt: null, modelVersion: null, error: null },
+      { id: "clip_embedding", status: "pending", attemptedAt: null, modelVersion: null, error: null },
       { id: "panorama", status: "pending", attemptedAt: null, modelVersion: null, error: null },
     ],
   }),
   features_backfill: () => 0,
+
+  // Pick/reject suggestions. A plausible mid-life model: trained a while ago, a few labels since,
+  // and a handful of images in the withheld (badge-hidden) slice.
+  suggest_status: () => ({
+    modelId: 3,
+    trainedAt: Date.now() - 36 * 60 * 60 * 1000,
+    embeddingModelTag: "mobileclip-s1-v1",
+    cvAuc: 0.871,
+    cvAuprc: 0.783,
+    top1Agreement: 0.72,
+    trainedPos: 41,
+    trainedNeg: 63,
+    labels: {
+      picks: 44,
+      rejects: 66,
+      unprompted: 78,
+      overrides: 9,
+      agreeLo: 12,
+      agreeHi: 8,
+      batch: 3,
+    },
+    embedded: FIXTURE_COUNT,
+    scored: FIXTURE_COUNT,
+    withheld: 4,
+    labelsDelta: 6,
+    trainable: true,
+    running: false,
+  }),
+  suggest_train: () => undefined,
   analysis_facets: () => [],
   image_detections: () => [],
   image_caption: () => null,

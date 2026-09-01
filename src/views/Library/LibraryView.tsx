@@ -25,6 +25,7 @@ import {
   smartQueryFromParams,
   hasActiveFilters,
   hdrCancel,
+  suggestionCtx,
 } from "../../lib/ipc";
 import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
@@ -34,6 +35,7 @@ import { useHdrMerge } from "../../lib/useHdrMerge";
 import { usePanoDetect } from "../../lib/usePanoDetect";
 import { useScan, scanProgressLabel } from "../../lib/useScan";
 import { useScanScope } from "../../lib/useScanScope";
+import { useSuggest, hasSuggestions } from "../../lib/useSuggest";
 import LeftNav from "./LeftNav";
 import ThumbGrid, { GridImage, SelectMods } from "./ThumbGrid";
 import RightInfo, { RightInfoHandlers } from "./RightInfo";
@@ -54,7 +56,11 @@ const LABEL_COLOR_MAP: Record<string, string> = {
   purple: "var(--color-lab-purple)",
 };
 
-function toGridImage(r: ImageRow, token?: number): GridImage {
+function toGridImage(
+  r: ImageRow,
+  token: number | undefined,
+  showSuggestions: boolean,
+): GridImage {
   return {
     id: r.id,
     filename: r.filename,
@@ -68,6 +74,7 @@ function toGridImage(r: ImageRow, token?: number): GridImage {
     height: r.height,
     format: r.format,
     pairedCount: r.pairedCount,
+    suggested: showSuggestions ? r.suggested : null,
   };
 }
 
@@ -83,6 +90,7 @@ export default function LibraryView() {
   const setPanoramaSources = useAppStore((s) => s.setPanoramaSources);
   const thumbVersions = useAppStore((s) => s.thumbVersions);
   const scanScopeLabel = useAppStore((s) => s.scanScopeLabel);
+  const showSuggestions = useAppStore((s) => s.showSuggestions);
   const setOnImport = useAppStore((s) => s.setOnImport);
   const setOnMergeHdr = useAppStore((s) => s.setOnMergeHdr);
   const setToast = useAppStore((s) => s.setToast);
@@ -104,6 +112,7 @@ export default function LibraryView() {
   const panoDetect = usePanoDetect();
   const setPanoSuggestOpen = useAppStore((s) => s.setPanoSuggestOpen);
   const scan = useScan();
+  const suggest = useSuggest();
   // Scope + per-stage pending counts for the scan modal. Re-priced when a scan finishes, since
   // completing work shrinks the pending numbers.
   const scanScope = useScanScope(
@@ -123,6 +132,14 @@ export default function LibraryView() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [analysis.doneVersion, scan.doneVersion]);
+
+  // A promoted fit rewrites every badge in the catalog, so the loaded page is stale the moment
+  // `suggest:done` fires. Refetch it (not the sidebar — folder/keyword counts are untouched) so the
+  // rings appear without the user reloading or re-filtering.
+  useEffect(() => {
+    if (suggest.doneVersion > 0) void lib.refreshImages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [suggest.doneVersion]);
 
   // Clear the "Stopping…" affordance once the scan actually ends.
   useEffect(() => {
@@ -240,6 +257,14 @@ export default function LibraryView() {
   // RightInfo panel actions. When more than one image is selected they apply to the whole
   // selection (matching the keyboard shortcuts + SelectionBar); otherwise single-image path keeps
   // the behavioral-log signal (latency) and culling auto-advance.
+  // What the badge said for the primary selection, threaded into every single-image cull below so
+  // the backend can tell an agreement from an override. The `*Many` paths deliberately carry none —
+  // a bulk flag is keyboard work, not judgement, and is classified as a batch.
+  const primarySuggestion = useCallback(
+    () => suggestionCtx(lib.images.find((r) => r.id === selectedId)),
+    [lib.images, selectedId],
+  );
+
   const handleSetRating = useCallback(
     (stars: number) => {
       if (selectedIds.length > 1) {
@@ -249,9 +274,9 @@ export default function LibraryView() {
       }
       if (selectedId === null) return;
       lib.patchImage(selectedId, { stars });
-      void cullSetRating(selectedId, stars);
+      void cullSetRating(selectedId, stars, primarySuggestion());
     },
-    [selectedId, selectedIds, lib.patchImage],
+    [selectedId, selectedIds, lib.patchImage, primarySuggestion],
   );
 
   const handleSetFlag = useCallback(
@@ -263,9 +288,9 @@ export default function LibraryView() {
       }
       if (selectedId === null) return;
       lib.patchImage(selectedId, { flag });
-      void cullSetFlag(selectedId, flag);
+      void cullSetFlag(selectedId, flag, primarySuggestion());
     },
-    [selectedId, selectedIds, lib.patchImage],
+    [selectedId, selectedIds, lib.patchImage, primarySuggestion],
   );
 
   const handleSetLabel = useCallback(
@@ -277,9 +302,9 @@ export default function LibraryView() {
       }
       if (selectedId === null) return;
       lib.patchImage(selectedId, { colorLabel: label });
-      void cullSetLabel(selectedId, label);
+      void cullSetLabel(selectedId, label, primarySuggestion());
     },
-    [selectedId, selectedIds, lib.patchImage],
+    [selectedId, selectedIds, lib.patchImage, primarySuggestion],
   );
 
   const handleAddToCollection = useCallback(
@@ -544,8 +569,11 @@ export default function LibraryView() {
   };
 
   const gridImages = useMemo(
-    () => lib.images.map((r) => toGridImage(r, thumbVersions[r.id])),
-    [lib.images, thumbVersions],
+    () =>
+      lib.images.map((r) =>
+        toGridImage(r, thumbVersions[r.id], showSuggestions),
+      ),
+    [lib.images, thumbVersions, showSuggestions],
   );
 
   return (
@@ -574,6 +602,9 @@ export default function LibraryView() {
           onDeleteCollection={handleDeleteCollection}
           onRenameCollection={handleRenameCollection}
           onDeleteKeyword={handleDeleteKeyword}
+          showSuggestions={
+            showSuggestions && hasSuggestions(suggest.status ?? null)
+          }
           analysis={analysis}
           panoSuggested={panoDetect.suggested}
           onOpenPanoSuggestions={() => setPanoSuggestOpen(true)}

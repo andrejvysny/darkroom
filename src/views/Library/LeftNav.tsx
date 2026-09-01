@@ -31,6 +31,9 @@ interface LeftNavProps {
   onDeleteCollection: (id: number) => void;
   onRenameCollection: (id: number, name: string) => void;
   onDeleteKeyword: (id: number) => void;
+  /** Show the "Suggested picks" shelf — off when the user hid suggestions, or when nothing has been
+   *  scored yet (an always-empty row is worse than no row). */
+  showSuggestions: boolean;
   /** AI analysis facets + actions — passed from LibraryView via useAnalysis */
   analysis: AnalysisState & AnalysisActions;
   /** Count of panorama groups awaiting review — passed from LibraryView via usePanoDetect,
@@ -83,6 +86,7 @@ export default function LeftNav({
   onDeleteCollection,
   onRenameCollection,
   onDeleteKeyword,
+  showSuggestions,
   analysis,
   panoSuggested,
   onOpenPanoSuggestions,
@@ -91,6 +95,7 @@ export default function LeftNav({
   const noFilters = !hasActiveFilters(params);
   const picksActive = params.flag === "pick";
   const rejectsActive = params.flag === "reject";
+  const suggestedActive = params.suggested === "pick";
   const recentActive = params.sort === "imported_desc";
   // Module-singleton listeners (see useScan.ts), so calling it here as well as in LibraryView is
   // safe — both read the same shared state.
@@ -164,6 +169,17 @@ export default function LeftNav({
           active={rejectsActive}
           onClick={() => patchParams({ flag: rejectsActive ? null : "reject" })}
         />
+        {showSuggestions && (
+          <NavRow
+            icon="bolt"
+            label="Suggested picks"
+            count=""
+            active={suggestedActive}
+            onClick={() =>
+              patchParams({ suggested: suggestedActive ? null : "pick" })
+            }
+          />
+        )}
         <NavRow
           icon="clock"
           label="Recent import"

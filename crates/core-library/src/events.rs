@@ -93,3 +93,77 @@ pub fn ids_json(ids: &[i64]) -> String {
 pub fn event_count(conn: &Connection) -> Result<i64, LibError> {
     Ok(conn.query_row("SELECT COUNT(*) FROM user_events", [], |r| r.get(0))?)
 }
+
+/// Fold what the suggestion badge said into an event's `context` JSON.
+///
+/// `suggest::classify` reads `context.suggested` to tell an agreement from an override, so the key
+/// has to survive next to whatever else a caller already put in `context` — hence a merge rather
+/// than an overwrite. A context that is not a JSON *object* (or does not parse) is replaced: a
+/// malformed blob would otherwise swallow the one field provenance depends on. Only the two badge
+/// values are honoured; anything else leaves the context untouched and `classify` falls back to the
+/// score's own side.
+pub fn context_with_suggested(context: Option<String>, suggested: Option<&str>) -> Option<String> {
+    let Some(flag @ ("pick" | "reject")) = suggested else {
+        return context;
+    };
+    let mut obj = context
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    obj.insert(
+        "suggested".to_string(),
+        serde_json::Value::String(flag.to_string()),
+    );
+    serde_json::to_string(&serde_json::Value::Object(obj)).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn suggested_key(json: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(json)
+            .ok()?
+            .get("suggested")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn a_badge_is_recorded_without_losing_the_rest_of_the_context() {
+        // Nothing on screen: the context is whatever the caller had (usually nothing).
+        assert_eq!(context_with_suggested(None, None), None);
+        assert_eq!(
+            context_with_suggested(Some(r#"{"a":1}"#.into()), None).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+
+        // No context yet → one is created.
+        let created = context_with_suggested(None, Some("pick")).unwrap();
+        assert_eq!(suggested_key(&created).as_deref(), Some("pick"));
+
+        // An existing object keeps its keys.
+        let merged = context_with_suggested(Some(r#"{"a":1}"#.into()), Some("reject")).unwrap();
+        assert_eq!(suggested_key(&merged).as_deref(), Some("reject"));
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v.get("a").and_then(|x| x.as_i64()), Some(1));
+
+        // A pre-existing badge is overwritten by the one actually shown.
+        let replaced =
+            context_with_suggested(Some(r#"{"suggested":"pick"}"#.into()), Some("reject")).unwrap();
+        assert_eq!(suggested_key(&replaced).as_deref(), Some("reject"));
+
+        // Junk / non-object context must not hide the key provenance depends on.
+        for junk in ["not json", "[1,2]", "\"scalar\""] {
+            let out = context_with_suggested(Some(junk.into()), Some("pick")).unwrap();
+            assert_eq!(suggested_key(&out).as_deref(), Some("pick"), "{junk}");
+        }
+
+        // An unknown badge value is not a badge.
+        assert_eq!(context_with_suggested(None, Some("maybe")), None);
+    }
+}

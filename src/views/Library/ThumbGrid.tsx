@@ -15,6 +15,9 @@ export interface GridImage {
   format?: string | null;
   /** Camera companions paired to this RAW — drives the "+JPG" chip (they have no cell of their own). */
   pairedCount?: number;
+  /** The pick/reject model's badge, drawn only while `flag` is unset (a decision always wins over a
+   *  suggestion). Already null for withheld images — the grid never learns they were scored. */
+  suggested?: "pick" | "reject" | null;
 }
 
 export interface SelectMods {
@@ -53,6 +56,35 @@ function StarRow({ count }: { count: number }) {
         </svg>
       ))}
     </div>
+  );
+}
+
+/** The model's badge: an OUTLINE, deliberately never a fill — the filled ● / ⌀ mean the user
+ *  decided, and a suggestion must not be mistakable for one at a glance. Reject is additionally
+ *  dashed, so the two read apart without relying on color alone. */
+function SuggestionRing({ kind }: { kind: "pick" | "reject" }) {
+  const pick = kind === "pick";
+  return (
+    <span
+      title={
+        pick
+          ? "Suggested pick — press P to accept"
+          : "Suggested reject — press X to accept"
+      }
+      style={{
+        marginLeft: "auto",
+        width: 10,
+        height: 10,
+        borderRadius: "50%",
+        border: `1.5px ${pick ? "solid" : "dashed"} ${
+          pick ? "var(--color-pick)" : "var(--color-reject)"
+        }`,
+        background: "transparent",
+        boxShadow: "0 0 0 1px rgba(0,0,0,.45)",
+        display: "block",
+        flex: "0 0 auto",
+      }}
+    />
   );
 }
 
@@ -159,8 +191,15 @@ export default function ThumbGrid({
                 const primary = img.id === selectedId;
                 const isHdr = img.format === "hdr";
                 const paired = (img.pairedCount ?? 0) > 0;
+                // A decision always wins over a suggestion: once flagged, the badge is gone.
+                const suggested = img.flag ? null : (img.suggested ?? null);
                 const hasOverlay =
-                  !!img.label || !!img.flag || img.stars > 0 || isHdr || paired;
+                  !!img.label ||
+                  !!img.flag ||
+                  img.stars > 0 ||
+                  isHdr ||
+                  paired ||
+                  !!suggested;
                 return (
                   <div
                     key={img.id}
@@ -293,6 +332,7 @@ export default function ThumbGrid({
                             ⌀
                           </span>
                         )}
+                        {suggested && <SuggestionRing kind={suggested} />}
                       </div>
                       {/* Bottom row: stars + filename */}
                       <div

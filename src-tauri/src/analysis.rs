@@ -12,8 +12,8 @@ use core_analyze::models::{
     ModelStore, ANIMAL_DETECTOR_FILES, CAPTION_FILES, DETECTOR_FILES, VERIFIER_FILES,
 };
 use core_analyze::{
-    AnalysisCtx, Analyzer, AnalyzerRegistry, Captioner, MegaDetector, ObjectDetector,
-    PresenceProbe, Verifier, CAPTION_ID,
+    AnalysisCtx, Analyzer, AnalyzerRegistry, Captioner, EmbeddingStage, MegaDetector,
+    ObjectDetector, PresenceProbe, Verifier, CAPTION_ID,
 };
 use core_library::{
     apply_cluster_plan, cluster_snapshot, existing_analysis, has_dirty_faces, insert_analysis,
@@ -46,6 +46,10 @@ pub const ANIMAL_DETECTOR_VERSION_640: &str = "mdv5a-640-v1";
 /// MobileCLIP linear-probe presence classifier (full-image scene scores). Bump when the bundled
 /// `presence_probe.json` weights are regenerated.
 pub const PRESENCE_VERSION: &str = "mobileclip-s1-probe-v1";
+/// MobileCLIP-S1 scene embedding kept per image (the feature downstream suggestion models train on).
+/// Doubles as the row's `model_tag`, so bumping it invalidates every stored vector — never bump it
+/// for anything but an actual encoder change.
+pub const EMBEDDING_VERSION: &str = "mobileclip-s1-v1";
 
 /// Longest-edge the analysis decode is downscaled to (boxes are normalized, so this is loss-only).
 const ANALYZE_EDGE: u32 = 1024;
@@ -96,6 +100,8 @@ pub fn stage_models_ready(st: &AppState, stage: StageId) -> bool {
         StageId::Objects => store.has_all(DETECTOR_FILES) && store.has_all(VERIFIER_FILES),
         StageId::Animals => store.has_all(ANIMAL_DETECTOR_FILES) && store.has_all(VERIFIER_FILES),
         StageId::Captions => store.has_all(CAPTION_FILES),
+        // The embedding stage IS the CLIP verifier — nothing else to install.
+        StageId::Embeddings => store.has_all(VERIFIER_FILES),
         StageId::Faces => faces_models_ready(st),
         // Panorama detection is pure geometry over cached thumbnails — no model to download.
         StageId::Panoramas => true,
@@ -181,6 +187,9 @@ fn phase_a_mask(stages: &[StageId]) -> u8 {
     if stages.contains(&StageId::Animals) {
         m |= 2;
     }
+    if stages.contains(&StageId::Embeddings) {
+        m |= 4;
+    }
     m
 }
 
@@ -188,8 +197,11 @@ fn phase_a_mask(stages: &[StageId]) -> u8 {
 ///
 /// Only the requested detectors are constructed: selecting Captions alone must not load D-FINE and
 /// MegaDetector, which is the whole point of per-stage selection. The CLIP verifier is built when
-/// either detector is present — both use it, and the presence probe reuses its vision encoder for
-/// free, which is why presence has no separate stage.
+/// either detector OR the embedding stage is present — all three use it, and the presence probe
+/// reuses its vision encoder for free, which is why presence has no separate stage.
+///
+/// The embedding stage registers BEFORE the presence probe so the probe can score the vector it
+/// already produced (`AnalysisCtx::prior`) instead of running a second identical vision pass.
 ///
 /// The captioner (Florence-2, ~280 MB) is NOT here — it's built lazily in Phase B via
 /// [`build_captioner`] so it never sits in memory during the detection+faces phase.
@@ -202,15 +214,19 @@ fn registry(st: &AppState, stages: &[StageId]) -> Result<Arc<AnalyzerRegistry>, 
     }
     let want_objects = mask & 1 != 0;
     let want_animals = mask & 2 != 0;
+    let want_embed = mask & 4 != 0;
     if want_objects && !stage_models_ready(st, StageId::Objects) {
         return Err("object-detection models not downloaded".into());
     }
     if want_animals && !stage_models_ready(st, StageId::Animals) {
         return Err("animal-detection models not downloaded".into());
     }
+    if want_embed && !stage_models_ready(st, StageId::Embeddings) {
+        return Err("embedding models not downloaded".into());
+    }
     let store = ModelStore::new(st.models_dir.clone());
     let mut reg = AnalyzerRegistry::new();
-    if !want_objects && !want_animals {
+    if !want_objects && !want_animals && !want_embed {
         // No Phase-A work selected (e.g. captions-only): skip the verifier load entirely.
         let arc = Arc::new(reg);
         *st.analyzers.lock().map_err(|e| e.to_string())? = Some((mask, arc.clone()));
@@ -242,6 +258,13 @@ fn registry(st: &AppState, stages: &[StageId]) -> Result<Arc<AnalyzerRegistry>, 
                 .map_err(|e| e.to_string())?
                 .with_verifier(verifier.clone()),
         ));
+    }
+    // Kept vector first, scored vector second: the probe reads the embedding out of `prior`.
+    if want_embed {
+        reg.register(Arc::new(EmbeddingStage::new(
+            verifier.clone(),
+            EMBEDDING_VERSION,
+        )));
     }
     // Full-image linear-probe presence classifier — reuses the already-built CLIP verifier (vision
     // encoder), so no extra model load. Catches subjects the box detectors miss; fused at query time.
@@ -943,6 +966,10 @@ pub fn stage_spec(st: &AppState, stage: StageId) -> Result<StageSpec, String> {
         StageId::Captions => StageSpec {
             analyzer_id: core_analyze::CAPTION_ID,
             model_version: CAPTION_VERSION,
+        },
+        StageId::Embeddings => StageSpec {
+            analyzer_id: core_analyze::CLIP_EMBEDDING_ID,
+            model_version: EMBEDDING_VERSION,
         },
         StageId::Panoramas => StageSpec {
             analyzer_id: core_library::PANORAMA_STAGE_ID,

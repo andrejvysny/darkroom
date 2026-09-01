@@ -3,6 +3,11 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use crate::state::AppState;
 
+/// The encoder tag stored embeddings carry. This target cannot PRODUCE them, but it can still read a
+/// catalog that has them (synced, or written by another machine) — and the suggestion model is pure
+/// math, so training and scoring stay available here. Must match `analysis.rs`.
+pub const EMBEDDING_VERSION: &str = "mobileclip-s1-v1";
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisStatus {

@@ -120,6 +120,12 @@ pub struct AppState {
     pub scan_running: AtomicBool,
     /// Cancels the unified scan job in whatever phase it is currently in.
     pub scan_cancel: AtomicBool,
+    /// Guards the `image_features` backfill, which now runs automatically after imports and scans as
+    /// well as from Settings — without this the triggers would overlap and decode everything twice.
+    pub features_running: AtomicBool,
+    /// Guards the pick/reject suggestion fit + scoring pass. Both the manual command and the
+    /// post-scan trigger go through it, so a scan finishing mid-training queues nothing.
+    pub suggest_running: AtomicBool,
     /// Guards against two analysis passes running at once.
     pub analysis_running: AtomicBool,
     /// Set by `analysis_cancel` to request the running pass stop between batches.
@@ -264,6 +270,8 @@ impl AppState {
             models_dir,
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             analyzers: Mutex::new(None),
+            features_running: AtomicBool::new(false),
+            suggest_running: AtomicBool::new(false),
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),
             cluster_cancel: AtomicBool::new(false),

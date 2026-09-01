@@ -88,6 +88,9 @@ export type QueryParams = {
   personId?: number | null;
   /** Source format bucket filter: "raw" | "jpeg" | "png" | "heif" | "hdr". */
   format?: string | null;
+  /** Restrict to images the pick/reject model badged this way. Withheld (badge-hidden) images never
+   *  match — their labels have to stay uninfluenced to measure the model. */
+  suggested?: "pick" | "reject" | null;
   /** Show camera companions (the JPEG/HEIF paired to a RAW at import) as their own grid cells.
    *  Default/omitted hides them, so a paired shot occupies one cell. */
   includePaired?: boolean;
@@ -118,6 +121,7 @@ export const FILTER_DIMENSIONS: (keyof QueryParams)[] = [
   "detectedCategory",
   "personId",
   "format",
+  "suggested",
 ];
 
 /** True when any filter dimension is active. Single source of truth for nav/footer state. */
@@ -140,6 +144,7 @@ export function clearedFilters(): Partial<QueryParams> {
     detectedCategory: null,
     personId: null,
     format: null,
+    suggested: null,
   };
 }
 
@@ -224,6 +229,11 @@ export type ImageRow = {
   pairedCount: number;
   /** The primary this row is a companion of (only visible with `includePaired`); null otherwise. */
   pairedTo: number | null;
+  /** The pick/reject model's badge. Null covers "no model", "no verdict" AND "badge withheld" —
+   *  indistinguishable on purpose, so a withheld image collects an uninfluenced label. */
+  suggested: "pick" | "reject" | null;
+  /** The score behind `suggested`; null whenever `suggested` is. */
+  suggestionScore: number | null;
 };
 
 /** One image's place in a RAW+JPEG/HEIF pair (mirrors Rust `PairInfo`). */
@@ -696,7 +706,24 @@ export type CullCtx = {
   latencyMs?: number;
   groupId?: string;
   candidateIds?: number[];
+  /** Non-null marks the label as *prompted* — the backend then classifies it as an agreement or an
+   *  override instead of unprompted evidence. Set only when a badge was actually on screen. */
+  suggesterId?: string;
+  suggestionScore?: number;
+  /** The badge that was showing (recorded as `context.suggested` on the event). */
+  suggestedFlag?: "pick" | "reject";
 };
+
+/** The suggestion half of a {@link CullCtx}, as the Rust `SuggestionCtx` expects it (one nested
+ *  argument rather than three loose ones). `undefined` when nothing was on screen. */
+function suggestionArg(ctx?: CullCtx) {
+  if (ctx?.suggesterId == null) return undefined;
+  return {
+    suggesterId: ctx.suggesterId,
+    suggestionScore: ctx.suggestionScore,
+    suggestedFlag: ctx.suggestedFlag,
+  };
+}
 
 export function cullSetRating(
   imageId: number,
@@ -709,6 +736,7 @@ export function cullSetRating(
     latencyMs: ctx?.latencyMs,
     groupId: ctx?.groupId,
     candidateIds: ctx?.candidateIds,
+    suggestion: suggestionArg(ctx),
   });
 }
 
@@ -723,6 +751,7 @@ export function cullSetFlag(
     latencyMs: ctx?.latencyMs,
     groupId: ctx?.groupId,
     candidateIds: ctx?.candidateIds,
+    suggestion: suggestionArg(ctx),
   });
 }
 
@@ -736,7 +765,21 @@ export function cullSetLabel(
     label,
     latencyMs: ctx?.latencyMs,
     groupId: ctx?.groupId,
+    suggestion: suggestionArg(ctx),
   });
+}
+
+/** The cull context describing what the model was suggesting for `row`, or `{}` when it had no
+ *  badge. Every single-image cull path funnels through this so provenance is recorded identically
+ *  from the keyboard, the grid, and the metadata panel. */
+export function suggestionCtx(row?: ImageRow | null): CullCtx {
+  if (!row?.suggested) return {};
+  return {
+    // The backend only checks that this is non-null; a literal keeps the event readable.
+    suggesterId: "model",
+    suggestionScore: row.suggestionScore ?? undefined,
+    suggestedFlag: row.suggested,
+  };
 }
 
 // Batch culling (apply one value to a whole selection). The selection is the candidate group.
@@ -1604,7 +1647,13 @@ export function analysisCancel(): Promise<void> {
 // ── Unified AI scan ──────────────────────────────────────────────────────────
 
 /** A selectable scan stage. Mirrors the Rust `StageId`; the backend rejects anything else. */
-export type StageId = "objects" | "animals" | "faces" | "captions" | "panoramas";
+export type StageId =
+  | "objects"
+  | "animals"
+  | "faces"
+  | "captions"
+  | "embeddings"
+  | "panoramas";
 
 /** Stage order + labels for the scan modal and the per-photo readout. */
 export const SCAN_STAGES: { id: StageId; label: string; hint?: string }[] = [
@@ -1612,6 +1661,11 @@ export const SCAN_STAGES: { id: StageId; label: string; hint?: string }[] = [
   { id: "animals", label: "Animals", hint: "slower — about 1s per photo" },
   { id: "faces", label: "Faces", hint: "groups people in the People sidebar" },
   { id: "captions", label: "Captions & keywords" },
+  {
+    id: "embeddings",
+    label: "Embeddings (for suggestions)",
+    hint: "scene fingerprint used by pick/reject suggestions",
+  },
   {
     id: "panoramas",
     label: "Panorama suggestions",
@@ -1840,6 +1894,67 @@ export function maskAiPrompt(
  *  them. Emits `features:progress` `{done,total}` then `features:done`. Resolves to count computed. */
 export function featuresBackfill(): Promise<number> {
   return invoke<number>("features_backfill", {});
+}
+
+// ── Pick/reject suggestions ──────────────────────────────────────────────────
+
+/** Label census over the images the model can actually see (present + embedded), split by how much
+ *  each label is worth. `batch` labels are counted but never trained on. */
+export type SuggestLabelCounts = {
+  picks: number;
+  rejects: number;
+  unprompted: number;
+  overrides: number;
+  agreeLo: number;
+  agreeHi: number;
+  batch: number;
+};
+
+/** The suggester's state: the live model's honest (out-of-fold) metrics plus the label situation. */
+export type SuggestStatus = {
+  modelId: number | null;
+  trainedAt: number | null;
+  embeddingModelTag: string | null;
+  cvAuc: number | null;
+  cvAuprc: number | null;
+  /** How often the model's top-ranked frame in a burst is the one the user picked. */
+  top1Agreement: number | null;
+  trainedPos: number | null;
+  trainedNeg: number | null;
+  labels: SuggestLabelCounts;
+  /** Present images carrying an embedding from the running encoder (the scorable universe). */
+  embedded: number;
+  scored: number;
+  /** Scored but badge-hidden, so those labels stay uninfluenced and can measure the model. */
+  withheld: number;
+  /** Trainable labels gained (negative: lost) since the live model was fit. */
+  labelsDelta: number;
+  trainable: boolean;
+  running: boolean;
+};
+
+/** Payload of the `suggest:done` event — what one training run produced. */
+export type SuggestTrainOutcome = {
+  modelId: number;
+  /** False when the fit lost materially against the live model and was kept out of the badges. */
+  promoted: boolean;
+  nPos: number;
+  nNeg: number;
+  cvAuc: number;
+  cvAuprc: number;
+  top1Agreement: number | null;
+  bestLambda: number;
+};
+
+/** Fit the suggestion model on the current labels in the background. Resolves once the job is
+ *  queued; the outcome arrives as `suggest:done` (a `SuggestTrainOutcome`) or `suggest:error`. */
+export function suggestTrain(): Promise<void> {
+  return invoke<void>("suggest_train", {});
+}
+
+/** Live-model metrics, the label census, and the scored counts. */
+export function suggestStatus(): Promise<SuggestStatus> {
+  return invoke<SuggestStatus>("suggest_status", {});
 }
 
 /** Write a `<raw>.json` sidecar (edits + rating + keywords) next to every present RAW. Migrates an

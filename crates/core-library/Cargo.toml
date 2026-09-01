@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 core-db = { path = "../core-db" }
 core-raw = { path = "../core-raw" }
+# Pick/reject preference model (pure math). The catalog seam lives in `suggest.rs`.
+core-suggest = { path = "../core-suggest" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -1,6 +1,27 @@
 import { create } from "zustand";
-import type { ImageRow, PanoGroupRow } from "../lib/ipc";
+import type { ImageRow, PanoGroupRow, SuggestStatus } from "../lib/ipc";
 import type { ExportTarget } from "../lib/export";
+
+/** localStorage key backing `showSuggestions` (default ON). */
+const SHOW_SUGGESTIONS_KEY = "darkroom.suggestions.show";
+
+function readShowSuggestions(): boolean {
+  try {
+    return localStorage.getItem(SHOW_SUGGESTIONS_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+/** Pick/reject suggester state shared by every consumer (see `suggest` below). */
+export interface SuggestStoreState {
+  /** Live-model metrics + label census; null until the first fetch lands (or if it failed). */
+  status: SuggestStatus | null;
+  /** True while a status fetch is in flight. */
+  loading: boolean;
+  /** Bumped on every `suggest:done` — a refetch token for views showing scored data. */
+  doneVersion: number;
+}
 
 /** Live phase/progress of a running panorama-detection scan (`pano_detect:progress` payload), or
  *  `null` when idle. */
@@ -75,6 +96,15 @@ interface AppState {
    *  `lib/usePanoDetect.ts` are the sole writers besides the actions it exposes. */
   panoDetect: PanoDetectStoreState;
   setPanoDetect: (patch: Partial<PanoDetectStoreState>) => void;
+  /** Pick/reject suggester state, shared the same way as `panoDetect` (Settings reads the metrics,
+   *  LeftNav gates its shelf on them, LibraryView refetches on `doneVersion`). Written only by the
+   *  singleton listeners in `lib/useSuggest.ts`. */
+  suggest: SuggestStoreState;
+  setSuggest: (patch: Partial<SuggestStoreState>) => void;
+  /** Show suggestion badges in the grid + the "Suggested picks" shelf. A user preference, not
+   *  server state — persisted to localStorage so it survives restarts. */
+  showSuggestions: boolean;
+  setShowSuggestions: (b: boolean) => void;
   /** AI Models manager modal open state. */
   modelManagerOpen: boolean;
   setModelManagerOpen: (b: boolean) => void;
@@ -150,6 +180,17 @@ export const useAppStore = create<AppState>((set) => ({
   panoDetect: { running: false, suggested: 0, groups: [], loading: false, progress: null },
   setPanoDetect: (patch) =>
     set((s) => ({ panoDetect: { ...s.panoDetect, ...patch } })),
+  suggest: { status: null, loading: false, doneVersion: 0 },
+  setSuggest: (patch) => set((s) => ({ suggest: { ...s.suggest, ...patch } })),
+  showSuggestions: readShowSuggestions(),
+  setShowSuggestions: (b) => {
+    try {
+      localStorage.setItem(SHOW_SUGGESTIONS_KEY, b ? "1" : "0");
+    } catch {
+      /* private mode / storage disabled — the toggle just won't persist */
+    }
+    set({ showSuggestions: b });
+  },
   modelManagerOpen: false,
   setModelManagerOpen: (b) => set({ modelManagerOpen: b }),
   scanScopeLabel: null,

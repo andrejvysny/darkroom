@@ -202,6 +202,7 @@ mod tests {
         let d = scan_stages(&db.conn).unwrap();
         assert!(d.contains(&StageId::Objects) && d.contains(&StageId::Captions));
         assert!(d.contains(&StageId::Faces));
+        assert!(d.contains(&StageId::Embeddings));
         assert!(!d.contains(&StageId::Panoramas));
 
         set_face_stage_enabled(&db.conn, false).unwrap();

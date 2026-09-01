@@ -1217,6 +1217,30 @@ fn flag_event_type(flag: &str) -> &'static str {
     }
 }
 
+/// What the suggestion badge said when the user acted on THIS image — the provenance half of a cull
+/// event. All three fields are absent on a photo with no badge (and on every batch path, which is
+/// deliberately classified as bulk keyboard work rather than judgement).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionCtx {
+    /// Non-null marks the label as *prompted*; the value is only ever read by a human.
+    pub suggester_id: Option<String>,
+    pub suggestion_score: Option<f64>,
+    /// "pick" | "reject" — the badge that was on screen.
+    pub suggested_flag: Option<String>,
+}
+
+impl SuggestionCtx {
+    /// Fold this context into an event: suggester + score onto their own columns, the badge into
+    /// `context.suggested` (merged, so an existing context survives).
+    fn apply(self, e: &mut core_library::Event) {
+        e.suggester_id = self.suggester_id;
+        e.suggestion_score = self.suggestion_score;
+        e.context =
+            core_library::context_with_suggested(e.context.take(), self.suggested_flag.as_deref());
+    }
+}
+
 #[tauri::command]
 pub async fn cull_set_rating(
     app: AppHandle,
@@ -1225,27 +1249,24 @@ pub async fn cull_set_rating(
     latency_ms: Option<i64>,
     group_id: Option<String>,
     candidate_ids: Option<Vec<i64>>,
+    suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_rating(&db.conn, image_id, stars).map_err(|e| e.to_string())?;
         sync_sidecar(&db.conn, image_id);
-        let _ = core_library::append_event(
-            &db.conn,
-            &crate::events::stamp(
-                st.inner(),
-                core_library::Event {
-                    event_type: "culling.rate".into(),
-                    image_id: Some(image_id),
-                    stars: Some(stars),
-                    group_id,
-                    candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
-                    latency_ms,
-                    ..Default::default()
-                },
-            ),
-        );
+        let mut event = core_library::Event {
+            event_type: "culling.rate".into(),
+            image_id: Some(image_id),
+            stars: Some(stars),
+            group_id,
+            candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
+            latency_ms,
+            ..Default::default()
+        };
+        suggestion.unwrap_or_default().apply(&mut event);
+        let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
         Ok(())
     })
     .await
@@ -1260,28 +1281,25 @@ pub async fn cull_set_flag(
     latency_ms: Option<i64>,
     group_id: Option<String>,
     candidate_ids: Option<Vec<i64>>,
+    suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_flag(&db.conn, image_id, &flag).map_err(|e| e.to_string())?;
         sync_sidecar(&db.conn, image_id);
-        let _ = core_library::append_event(
-            &db.conn,
-            &crate::events::stamp(
-                st.inner(),
-                core_library::Event {
-                    event_type: flag_event_type(&flag).into(),
-                    image_id: Some(image_id),
-                    chosen_id: (flag == "pick").then_some(image_id),
-                    flag: Some(flag),
-                    group_id,
-                    candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
-                    latency_ms,
-                    ..Default::default()
-                },
-            ),
-        );
+        let mut event = core_library::Event {
+            event_type: flag_event_type(&flag).into(),
+            image_id: Some(image_id),
+            chosen_id: (flag == "pick").then_some(image_id),
+            flag: Some(flag),
+            group_id,
+            candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
+            latency_ms,
+            ..Default::default()
+        };
+        suggestion.unwrap_or_default().apply(&mut event);
+        let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
         Ok(())
     })
     .await
@@ -1295,26 +1313,23 @@ pub async fn cull_set_label(
     label: Option<String>,
     latency_ms: Option<i64>,
     group_id: Option<String>,
+    suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_label(&db.conn, image_id, label.as_deref()).map_err(|e| e.to_string())?;
         sync_sidecar(&db.conn, image_id);
-        let _ = core_library::append_event(
-            &db.conn,
-            &crate::events::stamp(
-                st.inner(),
-                core_library::Event {
-                    event_type: "culling.label".into(),
-                    image_id: Some(image_id),
-                    color_label: label,
-                    group_id,
-                    latency_ms,
-                    ..Default::default()
-                },
-            ),
-        );
+        let mut event = core_library::Event {
+            event_type: "culling.label".into(),
+            image_id: Some(image_id),
+            color_label: label,
+            group_id,
+            latency_ms,
+            ..Default::default()
+        };
+        suggestion.unwrap_or_default().apply(&mut event);
+        let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
         Ok(())
     })
     .await
@@ -2130,6 +2145,9 @@ pub async fn import_commit(
         enforce_thumb_cap(&st);
         let _ = app2.emit("import:done", &stats);
         crate::thumb_queue::enqueue_all(&app2);
+        // Freshly-imported photos get their feature vectors without the user having to know the
+        // Settings button exists. Background + skips images that already have a row.
+        crate::features::spawn_backfill(&app2);
         Ok::<_, String>(stats)
     })
     .await
@@ -2968,6 +2986,31 @@ pub async fn faces_delete_all(app: AppHandle) -> Result<(), String> {
         let tx = db.conn.transaction().map_err(|e| e.to_string())?;
         core_library::delete_all_face_data(&tx).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Fit the pick/reject suggestion model on the current labels, in the background. Returns as soon as
+/// the job is queued; the outcome arrives as `suggest:done` (a `TrainOutcome`) or `suggest:error`.
+/// A promoted fit re-scores the library before `suggest:done` fires.
+#[tauri::command]
+pub async fn suggest_train(app: AppHandle) -> Result<(), String> {
+    crate::suggest::spawn_train(&app)
+}
+
+/// The suggester's state: live-model metrics, the label census by provenance, and scored counts.
+#[tauri::command]
+pub async fn suggest_status(app: AppHandle) -> Result<core_library::SuggestStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let mut status =
+            core_library::suggest_status(&db.conn, crate::analysis::EMBEDDING_VERSION)
+                .map_err(|e| e.to_string())?;
+        // The run flag lives in app state, not the catalog — see `SuggestStatus::running`.
+        status.running = crate::suggest::is_running(&st);
+        Ok(status)
     })
     .await
     .map_err(|e| e.to_string())?

@@ -31,6 +31,7 @@ import {
 } from "../../lib/ipc";
 import { pickFolder } from "../../lib/importFlow";
 import { useAppStore } from "../../store/app";
+import { useSuggest } from "../../lib/useSuggest";
 
 const GB = 1024 * 1024 * 1024;
 
@@ -38,6 +39,9 @@ function fmtBytes(n: number): string {
   if (n >= GB) return `${(n / GB).toFixed(2)} GB`;
   return `${(n / (1024 * 1024)).toFixed(0)} MB`;
 }
+
+const pct = (v: number | null): string =>
+  v == null ? "—" : `${(v * 100).toFixed(1)}%`;
 
 function fmtAgo(ms: number): string {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -124,6 +128,9 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [backupBusy, setBackupBusy] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [autoCheck, setAutoCheck] = useState(autoCheckEnabled());
+  const suggest = useSuggest();
+  const showSuggestions = useAppStore((s) => s.showSuggestions);
+  const setShowSuggestions = useAppStore((s) => s.setShowSuggestions);
 
   // Track whether the initial load has settled so debounce doesn't fire on open
   const initializedRef = useRef(false);
@@ -147,6 +154,8 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
     void getVersion()
       .then(setAppVersion)
       .catch(() => setAppVersion(null));
+    // Cheap catalog aggregate; re-read on open so the census reflects culling done since mount.
+    void suggest.reload();
     void Promise.all([
       thumbCacheCap(),
       thumbCacheSize(),
@@ -588,6 +597,116 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
             >
               {backfilling ? "Computing…" : "Compute features"}
             </button>
+          </div>
+
+          {/* Pick suggestions */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>Pick suggestions</div>
+            <div style={descStyle}>
+              Learns which photos you keep from your own picks and rejects, and
+              badges likely keepers in the grid with a hollow ring. It never
+              flags anything for you — accepting a suggestion is always a
+              keypress. A small slice of photos is deliberately left un-badged
+              so the accuracy below stays honest.
+            </div>
+            {suggest.status && (
+              <div
+                style={{
+                  fontSize: 11.5,
+                  color: "var(--color-t2)",
+                  lineHeight: 1.7,
+                  marginBottom: 10,
+                }}
+              >
+                {suggest.status.modelId == null ? (
+                  <div>Not trained yet — no photos are badged.</div>
+                ) : (
+                  <>
+                    <div>
+                      Trained{" "}
+                      {suggest.status.trainedAt == null
+                        ? "—"
+                        : fmtAgo(suggest.status.trainedAt)}{" "}
+                      on {suggest.status.trainedPos ?? 0} picks +{" "}
+                      {suggest.status.trainedNeg ?? 0} rejects
+                    </div>
+                    <div>
+                      Accuracy {pct(suggest.status.cvAuc)} · Precision{" "}
+                      {pct(suggest.status.cvAuprc)} · Best of burst{" "}
+                      {pct(suggest.status.top1Agreement)}
+                    </div>
+                    <div>
+                      Scored {suggest.status.scored.toLocaleString()} of{" "}
+                      {suggest.status.embedded.toLocaleString()} scanned photos
+                      · {suggest.status.withheld.toLocaleString()} held back
+                    </div>
+                  </>
+                )}
+                <div>
+                  Labels: {suggest.status.labels.picks.toLocaleString()} picks ·{" "}
+                  {suggest.status.labels.rejects.toLocaleString()} rejects (
+                  {suggest.status.labels.unprompted.toLocaleString()} unprompted
+                  · {suggest.status.labels.overrides.toLocaleString()} overrides
+                  ·{" "}
+                  {(
+                    suggest.status.labels.agreeLo + suggest.status.labels.agreeHi
+                  ).toLocaleString()}{" "}
+                  agreements · {suggest.status.labels.batch.toLocaleString()}{" "}
+                  bulk)
+                </div>
+                {suggest.status.modelId != null &&
+                  suggest.status.labelsDelta !== 0 && (
+                    <div>
+                      {suggest.status.labelsDelta > 0 ? "+" : ""}
+                      {suggest.status.labelsDelta.toLocaleString()} labels since
+                      the last training
+                    </div>
+                  )}
+                {!suggest.status.trainable && (
+                  <div style={{ color: "var(--color-t3)" }}>
+                    Needs at least 10 picks and 10 rejects on scanned (AI-run)
+                    photos before it can learn anything.
+                  </div>
+                )}
+              </div>
+            )}
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button
+                onClick={() => void suggest.train()}
+                disabled={
+                  suggest.status?.running === true ||
+                  suggest.status?.trainable === false
+                }
+                style={{
+                  ...btnSecondary,
+                  opacity:
+                    suggest.status?.running || suggest.status?.trainable === false
+                      ? 0.6
+                      : 1,
+                  cursor: suggest.status?.running ? "default" : "pointer",
+                }}
+              >
+                {suggest.status?.running ? "Training…" : "Train now"}
+              </button>
+            </div>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 12,
+                color: "var(--color-t2)",
+                marginTop: 10,
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showSuggestions}
+                onChange={(e) => setShowSuggestions(e.target.checked)}
+              />
+              Show suggestion badges and the "Suggested picks" shelf
+            </label>
           </div>
 
           {/* Edit backups */}

@@ -16,6 +16,7 @@ pub const OBJECT_DETECTION_ID: &str = "object_detection";
 pub const ANIMAL_DETECTION_ID: &str = "animal_detection";
 pub const CAPTION_ID: &str = "caption";
 pub const PRESENCE_ID: &str = "presence_probe";
+pub const CLIP_EMBEDDING_ID: &str = "clip_embedding";
 
 /// Facet/filter fusion threshold for the MobileCLIP presence probe. Set to 1.1 (> any probability) to
 /// **disable** OR-fusion — the probe ships **advisory-only** (RightInfo readout via `presence_for_image`),
@@ -58,7 +59,15 @@ pub fn insert_analysis(
     records: &[AnalysisInput],
 ) -> Result<(), LibError> {
     for rec in records {
-        let payload = serde_json::to_string(&rec.payload)?;
+        // The CLIP-embedding stage projects BEFORE the canonical row is written, because it is the
+        // one stage whose payload must not be stored as handed in: 512 floats per image belong in
+        // `image_embedding`'s BLOB, not in `analysis_results` as text. What is kept is the marker
+        // `project_embedding` returns — enough for the staleness join, nothing more.
+        let payload = if rec.analyzer_id == CLIP_EMBEDDING_ID {
+            serde_json::to_string(&project_embedding(conn, image_id, ran_at, rec)?)?
+        } else {
+            serde_json::to_string(&rec.payload)?
+        };
         conn.execute(
             "INSERT OR REPLACE INTO analysis_results
                (image_id, analyzer_id, model_version, ran_at, status, payload)
@@ -110,16 +119,18 @@ pub enum StageId {
     Animals,
     Faces,
     Captions,
+    Embeddings,
     Panoramas,
 }
 
 impl StageId {
     /// Every stage, in the order the UI lists them.
-    pub const ALL: [StageId; 5] = [
+    pub const ALL: [StageId; 6] = [
         StageId::Objects,
         StageId::Animals,
         StageId::Faces,
         StageId::Captions,
+        StageId::Embeddings,
         StageId::Panoramas,
     ];
 
@@ -130,6 +141,7 @@ impl StageId {
             StageId::Animals => ANIMAL_DETECTION_ID,
             StageId::Faces => FACE_DETECTION_ID,
             StageId::Captions => CAPTION_ID,
+            StageId::Embeddings => CLIP_EMBEDDING_ID,
             StageId::Panoramas => PANORAMA_STAGE_ID,
         }
     }
@@ -354,6 +366,81 @@ fn project_presence(conn: &Connection, image_id: i64, rec: &AnalysisInput) -> Re
         params![image_id, p_person, p_animal, rec.model_version],
     )?;
     Ok(())
+}
+
+/// Store the CLIP scene embedding in `image_embedding` and return the marker to keep in
+/// `analysis_results` in its place.
+///
+/// The payload carries the vector as hex-encoded f32 little-endian bytes (written by
+/// `core_analyze::embed_stage`); those bytes ARE the BLOB, so nothing here parses a float and no
+/// precision can be lost. A malformed or truncated payload is rejected rather than stored as a short
+/// vector — a silently wrong-length embedding would poison every model trained on it.
+fn project_embedding(
+    conn: &Connection,
+    image_id: i64,
+    ran_at: i64,
+    rec: &AnalysisInput,
+) -> Result<serde_json::Value, LibError> {
+    let dim = rec.payload.get("dim").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let hex = rec
+        .payload
+        .get("vector_hex")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let vector = hex_to_bytes(hex).ok_or_else(|| {
+        LibError::Other(format!("clip embedding for image {image_id} is not hex"))
+    })?;
+    if dim == 0 || vector.len() != dim * 4 {
+        return Err(LibError::Other(format!(
+            "clip embedding for image {image_id}: dim {dim} != {} bytes",
+            vector.len()
+        )));
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO image_embedding
+           (image_id, dim, vector, model_tag, computed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![image_id, dim as i64, vector, rec.model_version, ran_at],
+    )?;
+    Ok(serde_json::json!({ "dim": dim }))
+}
+
+/// Lowercase/uppercase hex → bytes. `None` for an odd length or a non-hex digit.
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|p| {
+            let hi = (p[0] as char).to_digit(16)?;
+            let lo = (p[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect()
+}
+
+/// The stored CLIP scene embedding for one image (vector + the tag it was produced by), or `None`
+/// when the stage hasn't run for it. Callers MUST check `model_tag` before comparing two vectors —
+/// embeddings from different encoders share no space.
+pub fn embedding_for_image(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Option<(Vec<f32>, String)>, LibError> {
+    let row = conn
+        .query_row(
+            "SELECT vector, model_tag FROM image_embedding WHERE image_id = ?1",
+            [image_id],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(blob, tag)| {
+        let v = blob
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        (v, tag)
+    }))
 }
 
 /// A present image to (potentially) analyze.
@@ -1585,6 +1672,93 @@ mod tests {
             "the old attempt is still reported so the UI can explain WHY it is pending"
         );
         assert_eq!(state.stages[0].model_version.as_deref(), Some("v1"));
+    }
+
+    // ---- CLIP embedding: the vector lands in its own table, never in the result payload ----
+
+    /// What `core_analyze::embed_stage` writes: hex of the f32 little-endian bytes.
+    fn hex_of(v: &[f32]) -> String {
+        v.iter()
+            .flat_map(|x| x.to_le_bytes())
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn embed_input(v: &[f32]) -> AnalysisInput {
+        AnalysisInput {
+            analyzer_id: CLIP_EMBEDDING_ID.to_string(),
+            model_version: "mobileclip-s1-v1".into(),
+            payload: serde_json::json!({ "dim": v.len(), "vector_hex": hex_of(v) }),
+        }
+    }
+
+    #[test]
+    fn the_embedding_vector_is_projected_and_kept_out_of_the_result_payload() {
+        let db = Db::open_in_memory().unwrap();
+        let a = img(&db.conn, 1, Some(0));
+        let v: Vec<f32> = vec![0.5, -0.25, f32::MIN_POSITIVE, 0.100000024];
+        insert_analysis(&db.conn, a, 42, &[embed_input(&v)]).unwrap();
+
+        let (stored, tag) = embedding_for_image(&db.conn, a).unwrap().unwrap();
+        assert_eq!(tag, "mobileclip-s1-v1");
+        for (x, y) in v.iter().zip(&stored) {
+            assert_eq!(x.to_bits(), y.to_bits(), "hex transport must be bit-exact");
+        }
+
+        let payload: String = db
+            .conn
+            .query_row(
+                "SELECT payload FROM analysis_results WHERE image_id = ?1 AND analyzer_id = ?2",
+                params![a, CLIP_EMBEDDING_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            payload, r#"{"dim":4}"#,
+            "the vector must never be stored as JSON text"
+        );
+
+        // Still a normal stage as far as staleness goes: the marker row satisfies the dirty join.
+        let spec = StageSpec {
+            analyzer_id: CLIP_EMBEDDING_ID,
+            model_version: "mobileclip-s1-v1",
+        };
+        assert_eq!(stale_count_in(&db.conn, &[spec], &[a]).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_malformed_embedding_is_rejected_rather_than_stored_short() {
+        let db = Db::open_in_memory().unwrap();
+        let a = img(&db.conn, 1, Some(0));
+        for bad in [
+            serde_json::json!({ "dim": 4, "vector_hex": "0000" }),
+            serde_json::json!({ "dim": 4, "vector_hex": "zzzz" }),
+            serde_json::json!({ "dim": 0, "vector_hex": "" }),
+            serde_json::json!({ "vector": [0.5, 0.5] }),
+        ] {
+            let rec = AnalysisInput {
+                analyzer_id: CLIP_EMBEDDING_ID.to_string(),
+                model_version: "v1".into(),
+                payload: bad,
+            };
+            assert!(insert_analysis(&db.conn, a, 42, &[rec]).is_err());
+        }
+        assert!(embedding_for_image(&db.conn, a).unwrap().is_none());
+    }
+
+    #[test]
+    fn re_embedding_replaces_the_previous_vector() {
+        let db = Db::open_in_memory().unwrap();
+        let a = img(&db.conn, 1, Some(0));
+        insert_analysis(&db.conn, a, 1, &[embed_input(&[1.0, 0.0])]).unwrap();
+        insert_analysis(&db.conn, a, 2, &[embed_input(&[0.0, 1.0])]).unwrap();
+        let (v, _) = embedding_for_image(&db.conn, a).unwrap().unwrap();
+        assert_eq!(v, vec![0.0, 1.0]);
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM image_embedding", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "one vector per image");
     }
 
     #[test]

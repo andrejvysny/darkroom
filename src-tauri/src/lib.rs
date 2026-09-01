@@ -10,6 +10,7 @@ mod prefetch;
 mod protocol;
 mod scan;
 mod state;
+mod suggest;
 mod thumb_queue;
 mod watch;
 
@@ -272,6 +273,8 @@ pub fn run() {
             commands::face_assign,
             commands::faces_delete_all,
             commands::features_backfill,
+            commands::suggest_train,
+            commands::suggest_status,
             commands::sidecars_write_all,
             commands::sidecars_rebuild,
             commands::image_histogram,

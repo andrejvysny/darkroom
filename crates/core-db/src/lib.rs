@@ -40,6 +40,8 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/020_hdr_sources.sql"),
     include_str!("../migrations/021_image_pairs.sql"),
     include_str!("../migrations/022_image_stage_attempt.sql"),
+    include_str!("../migrations/023_clip_embedding.sql"),
+    include_str!("../migrations/024_suggestions.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -138,7 +140,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 22, "expected 22 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 24, "expected 24 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -583,6 +585,146 @@ mod tests {
         assert_eq!(left, 0, "deleting an image must cascade its attempt rows");
     }
 
+    /// v22 → v23: the embedding table, and the saved scan selection gaining the new stage.
+    #[test]
+    fn migration_023_adds_embeddings_to_a_saved_scan_selection() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        MIGRATIONS.to_version(&mut conn, 22).unwrap();
+
+        let img = insert_folder_and_image(&conn, 1);
+        let set_pref = |v: &str| {
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key, value) VALUES ('scan_stages', ?1)",
+                rusqlite::params![v],
+            )
+            .unwrap();
+        };
+        set_pref(r#"["objects","captions"]"#);
+
+        MIGRATIONS.to_version(&mut conn, 23).unwrap();
+
+        let pref: String = conn
+            .query_row(
+                "SELECT value FROM app_meta WHERE key = 'scan_stages'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pref, r#"["objects","captions","embeddings"]"#,
+            "an existing selection must gain the new stage, not lose the old ones"
+        );
+
+        // STRICT: the vector column is a BLOB, so a text vector is rejected outright.
+        assert!(
+            conn.execute(
+                "INSERT INTO image_embedding(image_id, dim, vector, model_tag, computed_at)
+                 VALUES (?1, 512, 'not-a-blob', 'tag', 0)",
+                rusqlite::params![img],
+            )
+            .is_err(),
+            "STRICT must reject a non-BLOB vector"
+        );
+        conn.execute(
+            "INSERT INTO image_embedding(image_id, dim, vector, model_tag, computed_at)
+             VALUES (?1, 2, ?2, 'tag', 5)",
+            rusqlite::params![img, vec![0u8; 8]],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM images WHERE id = ?1", rusqlite::params![img])
+            .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM image_embedding", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "deleting an image must cascade its embedding");
+    }
+
+    /// The pref bump is a one-way edit over user data, so it must never corrupt a value it does not
+    /// understand, and must not run twice.
+    #[test]
+    fn migration_023_leaves_junk_and_already_ticked_selections_alone() {
+        for (before, after) in [
+            // Unparseable → left for `scan_stages()` to fall back on the defaults.
+            ("not json at all", "not json at all"),
+            // Valid JSON but not an array (a downgraded/hand-edited catalog).
+            (r#"{"objects":true}"#, r#"{"objects":true}"#),
+            // Already ticked (re-run / a catalog written by a newer build then downgraded).
+            (r#"["embeddings"]"#, r#"["embeddings"]"#),
+        ] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            MIGRATIONS.to_version(&mut conn, 22).unwrap();
+            conn.execute(
+                "INSERT INTO app_meta(key, value) VALUES ('scan_stages', ?1)",
+                rusqlite::params![before],
+            )
+            .unwrap();
+            MIGRATIONS.to_version(&mut conn, 23).unwrap();
+            let got: String = conn
+                .query_row(
+                    "SELECT value FROM app_meta WHERE key = 'scan_stages'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(got, after);
+        }
+    }
+
+    /// v23 → v24: the suggestion model history + per-image scores.
+    #[test]
+    fn migration_024_suggestion_tables_constrain_and_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        let img = insert_folder_and_image(&db.conn, 1);
+        db.conn
+            .execute(
+                "INSERT INTO suggestion_model
+                     (created_at, model_json, feature_version, embedding_model_tag,
+                      n_pos, n_neg, cv_auc, cv_auprc)
+                 VALUES (0, '{}', 1, 'mobileclip-s1-v1', 12, 20, 0.8, 0.7)",
+                [],
+            )
+            .unwrap();
+        let model_id = db.conn.last_insert_rowid();
+
+        // CHECK: only the three flag values the UI can render.
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO image_suggestion(image_id, model_id, score, suggested, scored_at)
+                     VALUES (?1, ?2, 0.9, 'maybe', 0)",
+                    rusqlite::params![img, model_id],
+                )
+                .is_err(),
+            "suggested must be constrained to none/pick/reject"
+        );
+        db.conn
+            .execute(
+                "INSERT INTO image_suggestion(image_id, model_id, score, suggested, scored_at)
+                 VALUES (?1, ?2, 0.9, 'pick', 7)",
+                rusqlite::params![img, model_id],
+            )
+            .unwrap();
+
+        // Deleting the image drops its score; the model row (an audit trail) survives.
+        db.conn
+            .execute("DELETE FROM images WHERE id = ?1", rusqlite::params![img])
+            .unwrap();
+        let scores: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM image_suggestion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(scores, 0, "deleting an image must cascade its suggestion");
+        let models: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM suggestion_model", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            models, 1,
+            "the trained model must outlive its scored images"
+        );
+    }
+
     #[test]
     fn opens_and_creates_all_tables() {
         let db = Db::open_in_memory().unwrap();
@@ -614,12 +756,14 @@ mod tests {
             "hdr_sources",
             "image_captions",
             "image_detections",
+            "image_embedding",
             "image_features",
             "image_keywords",
             "image_pairs",
             "image_presence",
             "image_similarity_features",
             "image_stage_attempt",
+            "image_suggestion",
             "image_user_labels",
             "images",
             "import_sessions",
@@ -631,6 +775,7 @@ mod tests {
             "person",
             "presets",
             "ratings_flags",
+            "suggestion_model",
             "user_events",
         ];
         expected.sort();

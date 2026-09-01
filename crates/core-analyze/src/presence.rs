@@ -62,6 +62,24 @@ impl PresenceProbe {
         let z = head.b + head.w.iter().zip(emb).map(|(a, b)| a * b).sum::<f32>();
         Ok(1.0 / (1.0 + (-z).exp()))
     }
+
+    /// The full-image embedding to score. Reuses the vector the CLIP-embedding stage produced for
+    /// this photo when that stage ran first in the same pass, otherwise computes it.
+    ///
+    /// Both paths are `Verifier::embed_full` over the same pixels, so the scores are identical — this
+    /// only avoids a second vision forward pass per image now that two stages want the same feature.
+    fn embedding(&self, ctx: &AnalysisCtx) -> Result<Vec<f32>, AnalyzeError> {
+        let prior = ctx
+            .prior
+            .iter()
+            .find(|r| r.analyzer_id == crate::CLIP_EMBEDDING_ID)
+            .and_then(|r| r.parse::<crate::EmbeddingPayload>())
+            .and_then(|p| crate::embed_stage::from_hex(&p.vector_hex));
+        match prior {
+            Some(v) => Ok(v),
+            None => self.verifier.embed_full(ctx.image),
+        }
+    }
 }
 
 impl Analyzer for PresenceProbe {
@@ -74,7 +92,7 @@ impl Analyzer for PresenceProbe {
     }
 
     fn analyze(&self, ctx: &AnalysisCtx) -> Result<AnalysisRecord, AnalyzeError> {
-        let emb = self.verifier.embed_full(ctx.image)?;
+        let emb = self.embedding(ctx)?;
         let payload = serde_json::to_value(PresencePayload {
             p_person: Self::score(&self.person, &emb)?,
             p_animal: Self::score(&self.animal, &emb)?,

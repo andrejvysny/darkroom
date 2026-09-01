@@ -11,6 +11,7 @@ pub mod caption;
 pub mod coco;
 pub mod denoise;
 pub mod detector;
+pub mod embed_stage;
 pub mod error;
 pub mod face;
 pub mod face_aligner;
@@ -28,6 +29,7 @@ use std::sync::Arc;
 
 pub use caption::Captioner;
 pub use detector::ObjectDetector;
+pub use embed_stage::{EmbeddingPayload, EmbeddingStage};
 pub use error::AnalyzeError;
 pub use face::{FaceAnalyzer, FaceRecord};
 pub use megadetector::MegaDetector;
@@ -58,6 +60,7 @@ pub const OBJECT_DETECTION_ID: &str = "object_detection";
 pub const ANIMAL_DETECTION_ID: &str = "animal_detection";
 pub const CAPTION_ID: &str = "caption";
 pub const PRESENCE_ID: &str = "presence_probe";
+pub const CLIP_EMBEDDING_ID: &str = "clip_embedding";
 
 /// Per-image input handed to each analyzer. sRGB pixels are already decoded (analyzers resize as
 /// needed). `prior` holds the records produced by earlier analyzers for this same image, so a later

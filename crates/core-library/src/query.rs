@@ -31,6 +31,9 @@ pub struct QueryParams {
     pub person_id: Option<i64>,
     /// Restrict to a source format bucket ("raw" | "jpeg" | "png").
     pub format: Option<String>,
+    /// Restrict to images the model badged this way ("pick" | "reject"). Withheld rows never match:
+    /// their badge is hidden precisely so those labels stay uninfluenced.
+    pub suggested: Option<String>,
     /// Include camera companions (the JPEG/HEIF paired to a RAW at import). Default/`None` hides
     /// them so a paired shot occupies ONE grid cell; `Some(true)` shows every file individually.
     pub include_paired: Option<bool>,
@@ -84,6 +87,12 @@ pub struct ImageRow {
     /// The primary this row is a companion of, when it is one (only ever visible with
     /// `include_paired`); `None` for primaries and unpaired images.
     pub paired_to: Option<i64>,
+    /// The model's badge for this image ("pick" | "reject"), or `None` when there is no model, no
+    /// verdict, or the badge is withheld — the frontend cannot tell those three apart, which is the
+    /// point: a withheld image must look exactly like an unscored one.
+    pub suggested: Option<String>,
+    /// The score behind `suggested`. `None` whenever `suggested` is.
+    pub suggestion_score: Option<f64>,
 }
 
 const COLUMNS: &str = "i.id, i.content_hash, i.path, i.original_filename, i.capture_date,
@@ -92,10 +101,18 @@ const COLUMNS: &str = "i.id, i.content_hash, i.path, i.original_filename, i.capt
     COALESCE(rf.stars,0), COALESCE(rf.flag,'none'), rf.color_label, e.updated_at, i.imported_at,
     i.format,
     (SELECT COUNT(*) FROM image_pairs ip WHERE ip.primary_image_id = i.id),
-    (SELECT ip.primary_image_id FROM image_pairs ip WHERE ip.secondary_image_id = i.id)";
+    (SELECT ip.primary_image_id FROM image_pairs ip WHERE ip.secondary_image_id = i.id),
+    s.suggested, s.score";
 
 // Joined into every row-returning query so `edited_at` is populated.
 const EDIT_JOIN: &str = "LEFT JOIN edits e ON e.image_id = i.id";
+
+// Joined into every row-returning query so the grid can badge a suggestion. Withheld rows and
+// 'none' verdicts are joined AWAY rather than selected and nulled out afterwards, so the frontend
+// never learns that a hidden score exists — those images have to keep collecting *unprompted*
+// labels, the only kind that can honestly measure the model later.
+const SUGGEST_JOIN: &str = "LEFT JOIN image_suggestion s
+         ON s.image_id = i.id AND s.withheld = 0 AND s.suggested <> 'none'";
 
 // All filter dimensions are bound named params; NULL no-ops each clause. Keyword/collection
 // membership use EXISTS subqueries so there is no row duplication and the static SELECT stays
@@ -134,6 +151,9 @@ const WHERE: &str = "i.status = 'present'
          (SELECT 1 FROM face fa WHERE fa.asset_id = i.id AND fa.person_id = :person_id
             AND fa.status IN ('confirmed','unconfirmed')))
     AND (:format IS NULL OR i.format = :format)
+    AND (:suggested IS NULL OR EXISTS
+         (SELECT 1 FROM image_suggestion sg WHERE sg.image_id = i.id
+            AND sg.suggested = :suggested AND sg.withheld = 0))
     AND (COALESCE(:include_paired, 0) = 1
          OR NOT EXISTS (SELECT 1 FROM image_pairs ip WHERE ip.secondary_image_id = i.id))
     AND (:search IS NULL OR i.original_filename LIKE :search
@@ -189,6 +209,8 @@ fn map_row(r: &Row<'_>) -> core_db::rusqlite::Result<ImageRow> {
         format: r.get(20)?,
         paired_count: r.get(21)?,
         paired_to: r.get(22)?,
+        suggested: r.get(23)?,
+        suggestion_score: r.get(24)?,
     })
 }
 
@@ -204,6 +226,7 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
         "SELECT {COLUMNS} FROM images i
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
          {EDIT_JOIN}
+         {SUGGEST_JOIN}
          WHERE {WHERE}
          ORDER BY {} LIMIT :limit OFFSET :offset",
         sort_sql(p.sort.as_deref())
@@ -224,6 +247,7 @@ pub fn query_images(conn: &Connection, p: &QueryParams) -> Result<Vec<ImageRow>,
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
             ":format": p.format,
+            ":suggested": p.suggested,
             ":include_paired": p.include_paired,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
@@ -277,6 +301,7 @@ fn run_seek_phase(
         "SELECT {COLUMNS} FROM images i
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
          {EDIT_JOIN}
+         {SUGGEST_JOIN}
          WHERE {WHERE} AND ({extra_where})
          ORDER BY {order} LIMIT :limit"
     );
@@ -296,6 +321,7 @@ fn run_seek_phase(
         (":detected_category", &p.detected_category),
         (":person_id", &p.person_id),
         (":format", &p.format),
+        (":suggested", &p.suggested),
         (":include_paired", &p.include_paired),
         (":tau_person", &crate::analysis::PRESENCE_TAU_PERSON),
         (":tau_animal", &crate::analysis::PRESENCE_TAU_ANIMAL),
@@ -540,6 +566,7 @@ pub fn image_by_id(conn: &Connection, id: i64) -> Result<Option<ImageRow>, LibEr
         "SELECT {COLUMNS} FROM images i
          LEFT JOIN ratings_flags rf ON rf.image_id = i.id
          {EDIT_JOIN}
+         {SUGGEST_JOIN}
          WHERE i.id = ?1"
     );
     Ok(conn.query_row(&sql, [id], map_row).optional()?)
@@ -664,6 +691,7 @@ pub fn rejected_ids(conn: &Connection, p: &QueryParams) -> Result<Vec<i64>, LibE
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
             ":format": p.format,
+            ":suggested": p.suggested,
             ":include_paired": p.include_paired,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
@@ -690,6 +718,9 @@ fn clone_filters(p: &QueryParams) -> QueryParams {
         detected_category: p.detected_category.clone(),
         person_id: p.person_id,
         format: p.format.clone(),
+        // Carried through like every other dimension: it can only ever NARROW the set (the `reject`
+        // flag is forced on separately), so a whole-set operation still matches what is on screen.
+        suggested: p.suggested.clone(),
         include_paired: p.include_paired,
         search: p.search.clone(),
         ..Default::default()
@@ -718,6 +749,7 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
             ":detected_category": p.detected_category,
             ":person_id": p.person_id,
             ":format": p.format,
+            ":suggested": p.suggested,
             ":include_paired": p.include_paired,
             ":tau_person": crate::analysis::PRESENCE_TAU_PERSON,
             ":tau_animal": crate::analysis::PRESENCE_TAU_ANIMAL,
@@ -726,4 +758,140 @@ pub fn count_images(conn: &Connection, p: &QueryParams) -> Result<i64, LibError>
         |r| r.get(0),
     )?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_db::rusqlite::params;
+    use core_db::Db;
+
+    fn img(conn: &Connection, tag: u8, filename: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO images(content_hash, file_size, path, original_filename, status,
+                 format, imported_at)
+             VALUES (?1, 1, ?2, ?3, 'present', 'raw', 0)",
+            params![vec![tag; 32], format!("/lib/{filename}"), filename],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// A model row to hang the scores off (`image_suggestion.model_id` is a foreign key).
+    fn model(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO suggestion_model
+                 (created_at, model_json, feature_version, embedding_model_tag, n_pos, n_neg,
+                  cv_auc, cv_auprc)
+             VALUES (0, '{}', 1, 'tag', 1, 1, 0.5, 0.5)",
+            [],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn score(conn: &Connection, model_id: i64, image_id: i64, suggested: &str, withheld: i64) {
+        conn.execute(
+            "INSERT INTO image_suggestion(image_id, model_id, score, suggested, withheld, scored_at)
+             VALUES (?1, ?2, 0.87, ?3, ?4, 0)",
+            params![image_id, model_id, suggested, withheld],
+        )
+        .unwrap();
+    }
+
+    fn ids(rows: &[ImageRow]) -> Vec<i64> {
+        rows.iter().map(|r| r.id).collect()
+    }
+
+    fn row_of(conn: &Connection, id: i64) -> ImageRow {
+        image_by_id(conn, id).unwrap().expect("row")
+    }
+
+    #[test]
+    fn the_suggested_filter_and_badge_never_surface_a_withheld_score() {
+        let db = Db::open_in_memory().unwrap();
+        let c = &db.conn;
+        let m = model(c);
+        let pick = img(c, 1, "A.cr3");
+        let held_pick = img(c, 2, "B.cr3");
+        let reject = img(c, 3, "C.cr3");
+        let none = img(c, 4, "D.cr3");
+        let unscored = img(c, 5, "E.cr3");
+        score(c, m, pick, "pick", 0);
+        score(c, m, held_pick, "pick", 1);
+        score(c, m, reject, "reject", 0);
+        score(c, m, none, "none", 0);
+
+        // The filter matches only the visible badge of that side.
+        let p = |s: &str| QueryParams {
+            suggested: Some(s.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ids(&query_images(c, &p("pick")).unwrap()), vec![pick]);
+        assert_eq!(count_images(c, &p("pick")).unwrap(), 1);
+        assert_eq!(ids(&query_images(c, &p("reject")).unwrap()), vec![reject]);
+        assert_eq!(count_images(c, &p("reject")).unwrap(), 1);
+        // Seek pagination runs a different SQL shape over the same WHERE — it must agree.
+        let seeked = query_images(
+            c,
+            &QueryParams {
+                seek: Some(true),
+                ..p("pick")
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&seeked), vec![pick]);
+
+        // The row fields: only a visible, non-'none' verdict is reported.
+        let badged = row_of(c, pick);
+        assert_eq!(badged.suggested.as_deref(), Some("pick"));
+        assert_eq!(badged.suggestion_score, Some(0.87));
+        for (id, why) in [
+            (
+                held_pick,
+                "a withheld badge must look exactly like no badge",
+            ),
+            (none, "'none' is not a badge"),
+            (unscored, "an unscored image has nothing to report"),
+        ] {
+            let r = row_of(c, id);
+            assert_eq!(r.suggested, None, "{why}");
+            assert_eq!(r.suggestion_score, None, "{why}");
+        }
+
+        // Unfiltered: every image is still returned, badge or not (one row each — the join must not
+        // duplicate).
+        let all = query_images(c, &QueryParams::default()).unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(count_images(c, &QueryParams::default()).unwrap(), 5);
+    }
+
+    #[test]
+    fn deleting_rejects_ignores_a_suggested_reject() {
+        let db = Db::open_in_memory().unwrap();
+        let c = &db.conn;
+        let m = model(c);
+        let suggested_only = img(c, 1, "A.cr3");
+        let really_rejected = img(c, 2, "B.cr3");
+        score(c, m, suggested_only, "reject", 0);
+        crate::cull::set_flag(c, really_rejected, "reject").unwrap();
+
+        // The badge is a hint, never a flag: only the user's own `reject` is deletable.
+        assert_eq!(
+            rejected_ids(c, &QueryParams::default()).unwrap(),
+            vec![really_rejected]
+        );
+        // ...and viewing the suggested-reject shelf cannot widen that set either.
+        assert_eq!(
+            rejected_ids(
+                c,
+                &QueryParams {
+                    suggested: Some("reject".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap(),
+            Vec::<i64>::new(),
+        );
+    }
 }

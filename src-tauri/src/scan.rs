@@ -24,11 +24,12 @@ use crate::state::AppState;
 
 /// Every stage that runs inside the unified analysis pass (i.e. all but panorama detection, which
 /// is a separate job). Used as the default for the legacy `analysis_run` entry point.
-pub const AI_STAGES: [StageId; 4] = [
+pub const AI_STAGES: [StageId; 5] = [
     StageId::Objects,
     StageId::Animals,
     StageId::Faces,
     StageId::Captions,
+    StageId::Embeddings,
 ];
 
 /// What one scan run should do.
@@ -150,6 +151,14 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, sel: &ScanSelection) -> Result<ScanRe
 
 fn finish<R: Runtime>(app: &AppHandle<R>, out: ScanResult) -> ScanResult {
     let _ = app.emit("scan:done", &out);
+    // Top up `image_features` for anything still missing it. Not on the cancel path: the user just
+    // asked for the machine back, and the next scan or import picks the work up anyway.
+    if !out.cancelled {
+        crate::features::spawn_backfill(app);
+        // Fresh embeddings can make previously unusable labels trainable, so this is the natural
+        // place to (re)fit — but only when the labels themselves have actually moved on.
+        crate::suggest::maybe_spawn_train(app);
+    }
     out
 }
 
@@ -159,6 +168,7 @@ fn stage_label(stage: StageId) -> &'static str {
         StageId::Animals => "Animal detection",
         StageId::Faces => "Face detection",
         StageId::Captions => "Caption",
+        StageId::Embeddings => "Embedding",
         StageId::Panoramas => "Panorama",
     }
 }

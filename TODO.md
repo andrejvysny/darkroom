@@ -19,8 +19,11 @@
       `AppState::new` failure shows a native `rfd` error dialog (friendly SchemaTooNew/Corrupt text
       in `state.rs`) + clean `exit(1)`; `logging::init` failure is non-fatal. Live-verified both
       paths (v99 catalog → dialog + clean exit; real v22 catalog → normal open). Version → 0.1.2.
-- [ ] Cut v0.1.2 release (commit + tag + push; CI signs/notarizes). NOTE: installed 0.1.1 crashes
-      before its updater runs — manual install of 0.1.2 required once.
+- [x] Cut v0.1.2 release (2026-08-06): f704b63 + tag v0.1.2 pushed, CI green — signed, notarized,
+      stapled dmg + latest.json on the release page. Verified end-to-end: downloaded dmg passes
+      `spctl` (Notarized Developer ID), installed to /Applications, opens the real catalog. NOTE:
+      installed 0.1.1 crashed before its updater ran — 0.1.2 was installed manually; future
+      updates go in-app.
 - [x] Local ad-hoc bundles dyld-killed at launch (2026-08-05, uncommitted): tauri-bundler's ad-hoc
       signature carries the hardened-runtime flag → library validation rejects the ad-hoc Frameworks
       dylibs. Fixed: staged dylibs get fresh ad-hoc signatures (stage mode), and NEW
@@ -53,6 +56,38 @@
 - [ ] Print v1 (color-managed PDF handoff) — pending decision
 - [ ] 3D LUT stage @binding(16) + `.cube`/HaldCLUT import
 - [ ] Grain
+
+## IN PROGRESS: Pick/Reject suggestion ML pipeline (2026-08-06) — plan: `~/.claude/plans/act-as-senior-ml-stateful-pretzel.md`
+
+> Learns user's pick/reject taste on-device: MobileCLIP embed (persisted) ‖ hand features → hand-rolled
+> linear head (BCE + within-burst Bradley-Terry pairwise), full-retrain, promote-if-CV-improves.
+> Override = strong signal (provenance weighting, agree-mass cap, 8% withhold bucket). Badge+filter UX,
+> never auto-flag. Details in plan file.
+
+- [x] Phase A — embeddings foundation (2026-08-06, reviewed, gates green): migration 023
+      `image_embedding` (BLOB f32-LE, bit-exact hex transport, `{"dim":512}` marker in
+      analysis_results), `StageId::Embeddings` default-on stage (presence probe reuses its vector via
+      `prior` — no double CLIP pass), auto `image_features` backfill after import + scan (RunGuard)
+- [x] Phase B — trainer DONE (2026-08-06, reviewed, gates green): `crates/core-suggest` math crate
+      (22 tests) + migration 024 + `core-library/src/suggest.rs` (assembly w/ provenance matrix,
+      train_and_store + promote gate AUPRC−0.02 slack, score_all + FNV 8% withhold + stale cleanup,
+      13 tests) + `src-tauri/src/suggest.rs` (spawn_train guard, post-scan auto-retrain Δ≥25)
+      + `suggest_train`/`suggest_status` IPC + `train_suggest` read-only harness
+- [x] Phase C — UI + provenance wiring DONE (2026-08-06, reviewed, gates green): `suggested` query
+      dim (EXISTS, withheld never surfaces; ImageRow LEFT JOIN joins withheld/'none' away — frontend
+      cannot tell withheld from unscored), SuggestionRing outline badges (flag wins), gated
+      "Suggested picks" LeftNav shelf, Settings "Pick suggestions" panel (census/metrics/Train now/
+      visibility toggle), `CullCtx` suggestion ctx → `suggester_id`+`suggestion_score`+
+      `context.suggested` on single-image paths only (batch stays Batch), `useSuggest` hook +
+      `suggest:done` refetch. Tier-1 mock UI verified by agent.
+- [x] Phase D — golden tests all present (gradient FD check, pairwise synthetic, fold round-trip,
+      serde round-trip, promote-gate regression, group-CV no-leakage, provenance matrix, withhold
+      determinism). Override-rate TREND + temporal-holdout report DEFERRED until real override data
+      exists (no suggestion was ever on screen yet — trend is meaningless before first live use).
+- [ ] `train_suggest` harness on dev library real flags (needs embeddings scan on dev Mac first):
+      `cargo run -p core-library --example train_suggest`
+- [ ] Live GUI QA: scan w/ Embeddings stage → flag ~30 imgs → Settings Train now → badges/shelf/
+      override logging (check user_events.suggester_id rows) → auto-retrain after Δ≥25
 
 ## HDR/Pano review + remaining-work pass (2026-07-20, UNCOMMITTED on `main`) — CURRENT
 

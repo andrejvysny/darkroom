@@ -5,6 +5,7 @@ import {
   cullSetFlag,
   cullSetRatingMany,
   cullSetFlagMany,
+  suggestionCtx,
 } from "../lib/ipc";
 import type { ImageRow } from "../lib/ipc";
 
@@ -60,6 +61,9 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
       if (id === null) return;
       const ids = useAppStore.getState().selectedIds;
       const multi = ids.length > 1;
+      // What the badge said when this key was pressed. Single-image paths only: a multi-select flag
+      // is keyboard work, not judgement, and the backend classifies it as a batch regardless.
+      const suggestion = suggestionCtx(images.find((img) => img.id === id));
 
       // Arrow navigation / bracket navigation (collapses any multi-selection to one).
       if (e.key === "ArrowLeft" || e.key === "[") {
@@ -83,6 +87,7 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
           patchImage(id, { stars });
           void cullSetRating(id, stars, {
             latencyMs: Date.now() - selectedAt.current,
+            ...suggestion,
           });
           advanceSelection(id);
         }
@@ -108,6 +113,7 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
           patchImage(id, { flag });
           void cullSetFlag(id, flag, {
             latencyMs: Date.now() - selectedAt.current,
+            ...suggestion,
           });
           advanceSelection(id);
         }
@@ -117,5 +123,5 @@ export function useCulling({ images, patchImage }: UseCullingParams) {
 
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [view, moveSelection, advanceSelection, patchImage]);
+  }, [view, images, moveSelection, advanceSelection, patchImage]);
 }

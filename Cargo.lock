@@ -795,6 +795,7 @@ dependencies = [
  "core-db",
  "core-pano",
  "core-raw",
+ "core-suggest",
  "image",
  "rayon",
  "serde",
@@ -856,6 +857,16 @@ dependencies = [
  "kamadak-exif",
  "libheif-rs",
  "rawler",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "core-suggest"
+version = "0.1.2"
+dependencies = [
  "rayon",
  "serde",
  "serde_json",
