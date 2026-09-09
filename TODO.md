@@ -23,9 +23,13 @@
       the 300-handler mock needs plain Chromium on the dev server); `e2e/tests/mock/develop-persistence.spec.ts`
       FAILS as designed (`develop_set_edit` ids `[47]` — A's edit lost); `stored_edit_is_unreadable`
       extracted + 4 guard tests; `npm run e2e:mock` / `e2e:real`
-- [ ] **C3 — `DevelopPersistenceCoordinator`** (`src/lib/developPersistence.ts`): per-image pending
+- [x] **C3 — `DevelopPersistenceCoordinator`** (`src/lib/developPersistence.ts`): per-image pending
       state, latest-wins, serialized saves, 250 ms idle / 1000 ms max-wait, flush on navigate /
-      unmount / Develop exit / blur, per-image `touchCount`, error banner + bounded retry
+      unmount / Develop exit / blur, per-image `touchCount`, error banner + retry with backoff.
+      Also moved `develop_regen_thumb` (a full RAW decode) OFF the save path onto a 1200 ms idle
+      timer — max-wait would otherwise have put a decode per second behind a live drag.
+      **NOTE: catalog writes now land mid-drag, and `develop_set_edit` still writes the sidecar
+      inside the DB lock — do C5 next, before C4.**
 - [ ] **C4 — quit save barrier**: `RunEvent::ExitRequested` + `prevent_exit` (AtomicBool guard),
       `app:flush-edits` → ack with 1500 ms timeout → sidecar flush → WAL checkpoint → `exit(0)`
 - [ ] **C5 — sidecar decoupling**: split `write_sidecar` into snapshot (locked) + write (unlocked);

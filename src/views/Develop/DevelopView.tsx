@@ -23,6 +23,7 @@ export default function DevelopView() {
   const setOnCopySettings = useAppStore((s) => s.setOnCopySettings);
   const setOnPasteSettings = useAppStore((s) => s.setOnPasteSettings);
   const rendering = useDevelopStore((s) => s.rendering);
+  const saveError = useDevelopStore((s) => s.saveError);
   const showBefore = useDevelopStore((s) => s.showBefore);
   const setShowBefore = useDevelopStore((s) => s.setShowBefore);
 
@@ -242,6 +243,22 @@ export default function DevelopView() {
         minHeight: 0,
       }}
     >
+      {/* Only surfaced when something is wrong — a healthy save shows no UI at all. */}
+      {saveError !== null && (
+        <div
+          data-testid="develop-save-error"
+          role="status"
+          style={{
+            padding: "6px 12px",
+            fontSize: 12,
+            color: "var(--color-t1)",
+            background: "var(--color-reject)",
+            borderBottom: "1px solid var(--color-line-2)",
+          }}
+        >
+          {saveError}
+        </div>
+      )}
       <div
         style={{
           display: "flex",

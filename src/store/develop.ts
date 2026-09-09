@@ -43,6 +43,9 @@ interface DevelopState {
   setPreviewUrl: (url: string | null) => void;
   rendering: boolean;
   setRendering: (b: boolean) => void;
+  /** Non-null while Develop edits are failing to reach the catalog; cleared on the next success. */
+  saveError: string | null;
+  setSaveError: (message: string | null) => void;
   showBefore: boolean;
   setShowBefore: (b: boolean) => void;
   histogram: HistData | null;
@@ -121,6 +124,8 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setPreviewUrl: (url) => set({ previewUrl: url }),
   rendering: false,
   setRendering: (b) => set({ rendering: b }),
+  saveError: null,
+  setSaveError: (message) => set({ saveError: message }),
   showBefore: false,
   setShowBefore: (b) => set({ showBefore: b }),
   histogram: null,

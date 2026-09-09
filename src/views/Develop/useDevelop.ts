@@ -40,6 +40,10 @@ import {
   DEFAULT_CROP,
 } from "../../lib/ipc";
 import type { DerivedView } from "../../lib/viewport";
+import {
+  developPersistence,
+  configureDevelopPersistence,
+} from "../../lib/developPersistence";
 import { log } from "../../lib/logger";
 
 // Warm-cache renders are single-digit ms; a short debounce keeps sliders feeling real-time.
@@ -65,8 +69,6 @@ export function useDevelop() {
 
   // Sequence counter for stale-drop: only the latest render wins.
   const renderSeq = useRef(0);
-  // Slider interactions since the last persist.
-  const touchCount = useRef(0);
   // Preview object URL we own (revoke on image change / unmount).
   const previewObjUrl = useRef<string | null>(null);
   // Tracks the last before/after value so the toggle effect ignores selection changes.
@@ -244,48 +246,18 @@ export function useDevelop() {
     [rerenderCurrent],
   );
 
-  // Debounced persist (~500 ms).
-  const debouncedPersist = useCallback(
-    (() => {
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      const run = (id: number, p: DevelopParams) => {
-        if (timer !== null) clearTimeout(timer);
-        timer = setTimeout(() => {
-          const tc = touchCount.current;
-          touchCount.current = 0;
-          developSetEdit(id, p, tc)
-            .then(() => developRegenThumb(id))
-            .catch((e) =>
-              log.warn("develop", "set edit failed", {
-                imageId: id,
-                ...log.errorSummary(e),
-              }),
-            );
-        }, 500);
-      };
-      return Object.assign(run, {
-        cancel: () => {
-          if (timer !== null) clearTimeout(timer);
-          timer = null;
-        },
-      });
-    })(),
-    [],
-  );
-
   // Update the store, debounce-render, and persist — WITHOUT touching undo history. Used by undo/redo
   // and snapshot restore (which manage history themselves).
   const persistAndRender = useCallback(
     (id: number, next: DevelopParams) => {
-      touchCount.current += 1;
       useDevelopStore.setState({ params: next });
       if (!useDevelopStore.getState().showBefore) {
         debouncedRerender();
         debouncedHistogram(id);
       }
-      debouncedPersist(id, next);
+      developPersistence.queue(id, next);
     },
-    [debouncedRerender, debouncedHistogram, debouncedPersist],
+    [debouncedRerender, debouncedHistogram],
   );
 
   // Apply a new param set as a user edit: record one undo step per edit burst, then persist.
@@ -370,6 +342,10 @@ export function useDevelop() {
 
   // Load + render on image change.
   useEffect(() => {
+    // This effect body runs AFTER selectedId has already changed, so the outgoing image can only be
+    // reached through the pending map — flush every dirty image before the new one loads.
+    void developPersistence.flushAll();
+
     if (selectedId === null) {
       setPreview(null);
       setHistogram(null);
@@ -497,6 +473,30 @@ export function useDevelop() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [maskOverlayVisible, selectedMaskIndex]);
 
+  // Wire the persistence coordinator's store-facing side effects, and make the app's "going away"
+  // moments (tab hidden, window blur, leaving Develop) durable write points.
+  useEffect(() => {
+    configureDevelopPersistence({
+      onError: (m) => useDevelopStore.getState().setSaveError(m),
+      afterSave: (id) => {
+        void developRegenThumb(id);
+      },
+    });
+    const flush = () => {
+      void developPersistence.flushAll();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", flush);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", flush);
+      flush();
+    };
+  }, []);
+
   // Cleanup on unmount.
   useEffect(() => {
     return () => {
@@ -576,14 +576,13 @@ export function useDevelop() {
       const cur = useDevelopStore.getState().params;
       const next = { ...cur, crop: { ...cur.crop, ...patch } };
       if (useDevelopStore.getState().cropMode) {
-        touchCount.current += 1;
         useDevelopStore.setState({ params: next });
-        debouncedPersist(selectedId, next);
+        developPersistence.queue(selectedId, next);
       } else {
         commit(selectedId, next);
       }
     },
-    [selectedId, commit, debouncedPersist],
+    [selectedId, commit],
   );
 
   const onColorBalanceChange = useCallback(
@@ -868,9 +867,9 @@ export function useDevelop() {
     // Make the reset one undoable step (snapshot the pre-reset state).
     useDevelopStore.getState().pushUndo(useDevelopStore.getState().params);
     lastCommitAt.current = 0;
-    debouncedPersist.cancel();
+    // Explicit Reset discards the pending edit — defaults are force-written below instead.
+    developPersistence.forget(selectedId);
     debouncedRerender.cancel();
-    touchCount.current = 0;
     resetParams();
     const p = freshDefaults();
     rerenderCurrent();
@@ -883,13 +882,7 @@ export function useDevelop() {
         }),
       );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    selectedId,
-    resetParams,
-    debouncedPersist,
-    debouncedRerender,
-    rerenderCurrent,
-  ]);
+  }, [selectedId, resetParams, debouncedRerender, rerenderCurrent]);
 
   // Apply a complete params set (from a preset / paste / snapshot restore): commit + persist.
   const applyDevelopParams = useCallback(

@@ -63,3 +63,51 @@ test("editing A then switching to B inside the debounce still persists A", async
   expect(saved, `develop_set_edit image ids: ${JSON.stringify(saved)}`).toContain(a);
   expect(saved).toContain(b);
 });
+
+test("a continuous gesture still persists while it is happening", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.waitForSelector("[data-testid=thumb-cell]");
+  await page.click("[data-testid=thumb-cell]");
+  await page.click("[data-testid=nav-develop]");
+  const exposure = page.locator("[data-testid=slider-exposure]");
+  await exposure.waitFor();
+  await page.evaluate("window.__darkroomIpcLog.length = 0");
+
+  // Keep editing for well over MAX_WAIT_MS without ever pausing long enough for the idle debounce.
+  const start = Date.now();
+  for (let i = 0; Date.now() - start < 2400; i++) {
+    await exposure.click({ position: { x: 40 + (i % 12) * 8, y: 7 } });
+    await page.waitForTimeout(120); // shorter than the idle debounce, so only max-wait can fire
+  }
+  const elapsed = Date.now() - start;
+  const during = await savedIds(page);
+
+  // Without a max-wait, an eight-second drag would sit entirely unsaved. Two full MAX_WAIT_MS
+  // windows elapsed, so two saves must have landed mid-gesture.
+  expect(elapsed).toBeGreaterThan(2 * 1000);
+  expect(
+    during.length,
+    `saves during a ${elapsed} ms gesture: ${during.length}`,
+  ).toBeGreaterThanOrEqual(2);
+});
+
+test("leaving Develop persists the pending edit immediately", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.waitForSelector("[data-testid=thumb-cell]");
+  await page.click("[data-testid=thumb-cell]");
+  await page.click("[data-testid=nav-develop]");
+  const exposure = page.locator("[data-testid=slider-exposure]");
+  await exposure.waitFor();
+  await page.evaluate("window.__darkroomIpcLog.length = 0");
+
+  await exposure.click({ position: { x: 120, y: 7 } });
+  await page.click("[data-testid=nav-library]"); // unmounts Develop mid-debounce
+  await page.waitForSelector("[data-testid=library-search]");
+  await page.waitForTimeout(200);
+
+  expect((await savedIds(page)).length).toBeGreaterThan(0);
+});
