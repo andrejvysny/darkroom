@@ -17,12 +17,20 @@ pub struct KeywordRow {
 
 /// All keywords with present-image counts, ordered by name (for the left nav).
 pub fn list_keywords(conn: &Connection) -> Result<Vec<KeywordRow>, LibError> {
+    // Counted with ONE grouped pass, not a correlated subquery per keyword. `image_keywords` is
+    // indexed only by its `(image_id, keyword_id)` primary key, so a per-keyword `WHERE
+    // keyword_id = k.id` has no index to walk and re-scans the whole table — 40 keywords over a
+    // 100k catalog measured at ~500 ms, the only left-nav query over its 300 ms budget
+    // (`examples/bench_catalog.rs`). The grouped form scans `image_keywords` once and probes
+    // `images` by primary key.
     let mut stmt = conn.prepare(
-        "SELECT k.id, k.name,
-                (SELECT COUNT(*) FROM image_keywords ik
-                 JOIN images i ON i.id = ik.image_id
-                 WHERE ik.keyword_id = k.id AND i.status = 'present') AS cnt
+        "SELECT k.id, k.name, COALESCE(c.cnt, 0) AS cnt
          FROM keywords k
+         LEFT JOIN (SELECT ik.keyword_id AS kid, COUNT(*) AS cnt
+                      FROM image_keywords ik
+                      JOIN images i ON i.id = ik.image_id
+                     WHERE i.status = 'present'
+                     GROUP BY ik.keyword_id) c ON c.kid = k.id
          ORDER BY k.name COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], |r| {

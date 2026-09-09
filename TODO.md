@@ -79,8 +79,19 @@
             found: `.part`, `.exr.part`, `.dng.part`, `.db.part`, `.part.<pid>.<seq>` (models),
             `.tmp` (sidecars), `<hash>_*.<pid>.<seq>.tmp` (thumbs — orphaned on rename failure).
 - [ ] **C11 — import worker benchmark**, then cap (separate commits)
-- [ ] **C12 — 100k synthetic catalog benchmark**, then only measured SQL fixes (strftime → UTC epoch
-      range first)
+- [x] **C12 — 100k catalog benchmark** (`cargo run --release -p core-library --example bench_catalog
+      -- 100000`) + the ONE fix it justified. Measured on the dev Mac, 100k synthetic rows:
+      - `list_keywords` **504 ms** — the only thing over the 300 ms budget. A correlated `COUNT(*)`
+        per keyword re-scanned `image_keywords` (indexed only by its `(image_id, keyword_id)` PK)
+        40 times. Rewritten as one grouped pass: **28 ms**, no migration, no new index.
+      - The report predicted `strftime(...,'unixepoch')` date filters would be the first thing to
+        fix. They measured **9 ms** — leaving them alone.
+      - Substring search is **54 ms**, so no FTS (matches the report's own "benchmark first").
+      - First page 1.1 ms, filters 1-14 ms, `date_tree` 48 ms, `count_images` 16 ms.
+      - Known ceiling, still under budget: deep OFFSET pages on the filename/rating sorts are
+        195/236 ms vs 1.4 ms for the keyset (time-sorted) path — those two sorts have no index to
+        walk, so SQLite materialises and sorts the whole filtered set. Scales with catalog size, not
+        page depth. Revisit only if someone actually pages deep on those sorts.
 - [x] **C13 — CI wiring + fail-closed `v*` release**: `ci.yml` gains `cargo fmt --check` + the
       mock-IPC Playwright suite; `release.yml` gains a `gate` job that runs fmt/clippy/tests/build/
       UI on the EXACT tagged commit with `build: needs: gate`, and a stable `v*` tag now aborts
