@@ -433,6 +433,13 @@ pub async fn develop_set_edit(
     .map_err(|e| e.to_string())?
 }
 
+/// The frontend's answer to the quit barrier's `app:flush-edits` request: `ok = false` means an
+/// edit is still unsaved, which cancels this quit attempt (see `crate::quit`).
+#[tauri::command]
+pub fn develop_flush_ack(app: AppHandle, ok: bool) {
+    app.state::<AppState>().quit.ack(ok);
+}
+
 /// Hard cap on the full-res texture's long edge — keeps it within the GPU max texture dimension
 /// (8192 on the wgpu defaults). A no-op for the validated EOS R7 (6960 px).
 pub(crate) const FULL_MAX_EDGE: u32 = 8192;

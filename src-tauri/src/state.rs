@@ -1,3 +1,4 @@
+use crate::quit::QuitBarrier;
 use crate::sidecar_queue::SidecarQueue;
 use crate::thumb_queue::ThumbQueue;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
@@ -34,6 +35,8 @@ pub struct AppState {
     /// Coalescing writer for per-image sidecars. Edits mark an image dirty here instead of writing
     /// the file inline, so the single SQLite connection is never held across an SSD write.
     pub sidecar_queue: SidecarQueue,
+    /// Holds a normal quit open until the frontend has flushed its debounced Develop edits.
+    pub quit: QuitBarrier,
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
     /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
     /// `Arc` so renders clone the handle and DROP this lock before the GPU render+readback —
@@ -245,6 +248,7 @@ impl AppState {
             gpu,
             thumb_queue: ThumbQueue::new(),
             sidecar_queue: SidecarQueue::new(),
+            quit: QuitBarrier::new(),
             full_render_cache: Mutex::new(None),
             preview_render_cache: Mutex::new(None),
             denoise_cache: Mutex::new(None),

@@ -20,6 +20,7 @@ import {
   mockConvertFileSrc,
 } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import {
   DEFAULT_PARAMS,
   LABEL_NONE,
@@ -1052,6 +1053,8 @@ declare global {
     __darkroomThumbMock?: (url: string) => string;
     /** Dev-only invocation log; Tier-1 tests read it to assert which IPC commands the frontend issued. */
     __darkroomIpcLog?: { cmd: string; payload?: unknown; t: number }[];
+    /** Dev-only: fire a backend event (e.g. the quit barrier's `app:flush-edits`) at the frontend. */
+    __darkroomEmit?: (event: string, payload?: unknown) => void;
   }
 }
 
@@ -1063,6 +1066,7 @@ export function installTauriMock(): void {
   // plain browser; thumbUrl() reads this hook in dev to serve generated placeholders instead.
   window.__darkroomThumbMock = thumbPlaceholder;
   window.__darkroomIpcLog = [];
+  window.__darkroomEmit = (event, payload) => void emit(event, payload);
   mockIPC((cmd, payload) => handle(cmd, payload), { shouldMockEvents: true });
   console.info(
     `[tauriMock] active — mock Tauri backend installed (${FIXTURE_COUNT} fixture images). Browser test mode.`,

@@ -7,6 +7,7 @@ import {
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useUpdateStore } from "../store/update";
 import { useAppStore } from "../store/app";
+import { developPersistence } from "./developPersistence";
 import { log } from "./logger";
 
 const AUTO_CHECK_KEY = "darkroom.autoUpdateCheck";
@@ -105,6 +106,9 @@ export async function downloadAndInstall(): Promise<void> {
 /** Relaunch into the freshly-installed version. */
 export async function restartApp(): Promise<void> {
   try {
+    // The updater's restart tears the process down without the quit barrier, so flush here too —
+    // an in-memory Develop edit would otherwise be lost to an update the user just accepted.
+    await developPersistence.flushAll();
     await relaunch();
   } catch (err) {
     log.warn("updater", "relaunch failed", log.errorSummary(err));

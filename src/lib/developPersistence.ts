@@ -99,6 +99,18 @@ export class DevelopPersistence {
   }
 
   /**
+   * True while ANY image still has unsaved edits. The quit barrier needs this: a failed save is
+   * swallowed into the retry schedule rather than rejecting, so `flushAll()` resolving is not by
+   * itself evidence that everything landed.
+   */
+  hasPending(): boolean {
+    for (const e of this.entries.values()) {
+      if (e.dirtyGen !== e.savedGen) return true;
+    }
+    return false;
+  }
+
+  /**
    * Persist everything `imageId` had pending AT CALL TIME, and resolve once that generation has
    * landed or a save has failed. Edits made *during* the flush keep their own schedule — waiting
    * for them too would let a live gesture stall the caller indefinitely.

@@ -8,6 +8,7 @@ mod pano_detect;
 mod panorama;
 mod prefetch;
 mod protocol;
+mod quit;
 mod scan;
 mod sidecar_queue;
 mod state;
@@ -155,6 +156,7 @@ pub fn run() {
             commands::database_reset,
             commands::app_default_library,
             commands::develop_get_edit,
+            commands::develop_flush_ack,
             commands::develop_set_edit,
             commands::develop_render,
             commands::develop_regen_thumb,
@@ -301,6 +303,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // A user-initiated quit is held until the webview has flushed its debounced Develop
+            // edits — the WAL checkpoint below cannot recover a row that was never written.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
+                if quit::on_exit_requested(app_handle, *code) {
+                    api.prevent_exit();
+                }
+            }
             // Flush the WAL into the main catalog file on quit so recent rows aren't stranded in
             // `catalog.db-wal` (and a later corrupt-check sees a consistent file). Best-effort.
             if let tauri::RunEvent::Exit = event {

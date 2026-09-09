@@ -30,8 +30,15 @@
       timer — max-wait would otherwise have put a decode per second behind a live drag.
       **NOTE: catalog writes now land mid-drag, and `develop_set_edit` still writes the sidecar
       inside the DB lock — do C5 next, before C4.**
-- [ ] **C4 — quit save barrier**: `RunEvent::ExitRequested` + `prevent_exit` (AtomicBool guard),
-      `app:flush-edits` → ack with 1500 ms timeout → sidecar flush → WAL checkpoint → `exit(0)`
+- [x] **C4 — quit save barrier**: `src-tauri/src/quit.rs` — `ExitRequested{code:None}` holds the
+      exit, emits `app:flush-edits`, waits ≤1500 ms on `develop_flush_ack`, then `exit(0)`; a failed
+      flush cancels the quit once and a retry within 30 s exits regardless. Re-entry guard is
+      Tauri's own `code: Some(..)` for programmatic exits (verified in tauri 2.11.5 source).
+      Frontend `useQuitFlush` acks with `!hasPending()` (a failed save is swallowed into the retry
+      schedule, so a resolved `flushAll()` proves nothing on its own); `restartApp()` flushes before
+      the updater's relaunch, which bypasses the barrier.
+      - [ ] Live check: edit + ⌘Q + relaunch on the real app (the Rust half has unit tests but has
+            not run against a window yet)
 - [x] **C5 — sidecar decoupling** (done before C4 — max-wait made drags write sidecars under the DB
       lock): `sidecar_snapshot`/`write_snapshot` split; `src-tauri/src/sidecar_queue.rs` (single
       worker, 10 s coalesce, `flush_blocking`, poison-recovering locks); all 11 `sync_sidecar(s)`

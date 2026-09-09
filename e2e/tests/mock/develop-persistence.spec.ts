@@ -111,3 +111,28 @@ test("leaving Develop persists the pending edit immediately", async ({
 
   expect((await savedIds(page)).length).toBeGreaterThan(0);
 });
+
+test("the quit barrier's flush request saves and is acknowledged", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.waitForSelector("[data-testid=thumb-cell]");
+  await page.click("[data-testid=thumb-cell]");
+  await page.click("[data-testid=nav-develop]");
+  const exposure = page.locator("[data-testid=slider-exposure]");
+  await exposure.waitFor();
+  await page.evaluate("window.__darkroomIpcLog.length = 0");
+
+  // Edit, then immediately do what ⌘Q does: the backend holds the exit and asks for a flush.
+  await exposure.click({ position: { x: 100, y: 7 } });
+  await page.evaluate(`window.__darkroomEmit("app:flush-edits")`);
+  await page.waitForFunction(
+    `(window.__darkroomIpcLog ?? []).some((c) => c.cmd === "develop_flush_ack")`,
+  );
+
+  const ack = await page.evaluate(
+    `(window.__darkroomIpcLog ?? []).filter((c) => c.cmd === "develop_flush_ack").pop()`,
+  );
+  expect((ack as { payload?: { ok?: boolean } }).payload?.ok).toBe(true);
+  expect((await savedIds(page)).length).toBeGreaterThan(0);
+});

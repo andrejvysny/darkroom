@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useAppStore } from "./store/app";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useEditSync } from "./hooks/useEditSync";
+import { useQuitFlush } from "./hooks/useQuitFlush";
 import { useModelDownloadListeners } from "./lib/useModelDownloads";
 import { useUpdaterStartup } from "./lib/useUpdater";
 import { effectivePreviewEdge } from "./lib/ipc";
@@ -22,6 +23,7 @@ import DedupView from "./views/Dedup/DedupView";
 export default function App() {
   useKeyboard();
   useEditSync();
+  useQuitFlush();
   // Subscribe once to all AI-model download progress streams (drives the manager + the global pill).
   useModelDownloadListeners();
   // Silent check for app updates shortly after launch (if auto-check is enabled).
