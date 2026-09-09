@@ -348,6 +348,13 @@ pub fn app_default_library() -> Option<String> {
 
 // ---------- Develop ----------
 
+/// `true` when a stored develop-edit blob exists but no longer parses into the current
+/// `DevelopParams` schema (corruption, or a breaking schema change). Callers must never overwrite
+/// such a blob without an explicit user Reset — that would destroy the real adjustments.
+pub(crate) fn stored_edit_is_unreadable(stored: Option<&str>) -> bool {
+    matches!(stored, Some(json) if serde_json::from_str::<DevelopParams>(json).is_err())
+}
+
 /// Saved develop params for an image (defaults if none).
 #[tauri::command]
 pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopParams, String> {
@@ -390,15 +397,11 @@ pub async fn develop_set_edit(
         // (corruption / breaking change). Overwriting it would permanently destroy the user's real
         // adjustments — the non-destructive guarantee. An explicit Reset passes `force=true` to
         // discard it deliberately; a stray slider commit (no force) cannot.
-        if !force.unwrap_or(false) {
-            if let Some(prev) = &before {
-                if serde_json::from_str::<DevelopParams>(prev).is_err() {
-                    return Err(format!(
-                        "stored edit for image {image_id} is unreadable (schema mismatch or \
-                         corruption); Reset to discard it"
-                    ));
-                }
-            }
+        if !force.unwrap_or(false) && stored_edit_is_unreadable(before.as_deref()) {
+            return Err(format!(
+                "stored edit for image {image_id} is unreadable (schema mismatch or \
+                 corruption); Reset to discard it"
+            ));
         }
         core_library::set_edit(
             &db.conn,
@@ -4340,5 +4343,48 @@ mod preset_tests {
         let out: core_pipeline::DevelopParams = serde_json::from_value(merged).unwrap();
         assert_eq!(out.contrast, 30.0, "preset field must be applied");
         assert_eq!(out.exposure, 1.5, "untouched edit field must be preserved");
+    }
+}
+
+/// These guard the non-destructive contract: a stored edit that no longer parses into the current
+/// schema must never be silently overwritten by an auto-save — only by an explicit user Reset.
+#[cfg(test)]
+mod develop_edit_tests {
+    use super::stored_edit_is_unreadable;
+    use core_pipeline::DevelopParams;
+
+    /// An image with no stored edit is the normal first-touch case — auto-save must proceed.
+    #[test]
+    fn no_stored_edit_is_not_unreadable() {
+        assert!(!stored_edit_is_unreadable(None));
+    }
+
+    /// A blob written by this build round-trips, so it is safe to overwrite.
+    #[test]
+    fn a_valid_stored_edit_is_readable() {
+        let json = serde_json::to_string(&DevelopParams::default()).unwrap();
+        assert!(!stored_edit_is_unreadable(Some(&json)));
+    }
+
+    /// Truncated or non-JSON rows (interrupted write, disk corruption) must be protected.
+    #[test]
+    fn garbage_is_unreadable() {
+        assert!(stored_edit_is_unreadable(Some("not json at all")));
+        assert!(stored_edit_is_unreadable(Some("{")));
+    }
+
+    /// Well-formed JSON whose field types no longer match the struct (a breaking schema change)
+    /// is just as unreadable — and just as destructive to clobber.
+    #[test]
+    fn a_wrong_typed_field_is_unreadable() {
+        let mut v = serde_json::to_value(DevelopParams::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        assert!(
+            obj.contains_key("exposure"),
+            "DevelopParams no longer serializes an 'exposure' field"
+        );
+        obj.insert("exposure".into(), serde_json::json!("very bright"));
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(stored_edit_is_unreadable(Some(&json)));
     }
 }

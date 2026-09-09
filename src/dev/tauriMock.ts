@@ -708,6 +708,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   develop_preview_jpeg: () => makeDevelopJpeg(undefined),
   develop_get_histogram: () => makeHistogram(),
   develop_histogram: () => undefined,
+  develop_prefetch: () => undefined,
   develop_regen_thumb: () => Date.now(),
   thumb_prioritize: () => undefined,
   develop_session: () => undefined,
@@ -1009,7 +1010,16 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   faces_delete_all: () => undefined,
 };
 
+// Cap the dev invocation log — a slider drag issues ~50 render calls a second, each carrying a
+// full DevelopParams, so an unbounded log would grow through a long manual mock session.
+const IPC_LOG_MAX = 5000;
+
 function handle(cmd: string, payload?: InvokeArgs): unknown {
+  const log = window.__darkroomIpcLog;
+  if (log) {
+    log.push({ cmd, payload, t: Date.now() });
+    if (log.length > IPC_LOG_MAX) log.splice(0, log.length - IPC_LOG_MAX);
+  }
   const h = HANDLERS[cmd];
   if (h) return h((payload ?? {}) as Record<string, unknown>);
   // Folder picker: return a fake source so the staged-import flow is drivable in the mock browser.
@@ -1040,6 +1050,8 @@ declare global {
   interface Window {
     /** Dev hook read by `thumbUrl()` in ipc.ts to substitute placeholders for `thumb://` URLs. */
     __darkroomThumbMock?: (url: string) => string;
+    /** Dev-only invocation log; Tier-1 tests read it to assert which IPC commands the frontend issued. */
+    __darkroomIpcLog?: { cmd: string; payload?: unknown; t: number }[];
   }
 }
 
@@ -1050,6 +1062,7 @@ export function installTauriMock(): void {
   // Grid thumbnails and the loupe build `thumb://` URLs, which have no protocol handler in a
   // plain browser; thumbUrl() reads this hook in dev to serve generated placeholders instead.
   window.__darkroomThumbMock = thumbPlaceholder;
+  window.__darkroomIpcLog = [];
   mockIPC((cmd, payload) => handle(cmd, payload), { shouldMockEvents: true });
   console.info(
     `[tauriMock] active — mock Tauri backend installed (${FIXTURE_COUNT} fixture images). Browser test mode.`,

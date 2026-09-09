@@ -92,6 +92,7 @@ export default function Slider({
       {/* Track */}
       <div
         ref={trackRef}
+        data-testid={`slider-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
         onPointerDown={(e) => {
           dragging.current = true;
           (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);

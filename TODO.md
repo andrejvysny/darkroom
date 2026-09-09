@@ -18,8 +18,11 @@
       guard for `panic = "abort"` in `core-raw/src/panic.rs`; cfg-gate the 13 HEIF-only PQ/BT.2020
       items in `core-raw/src/color.rs` (verified set — Windows clippy `-D warnings`); drop the stale
       `packageManager: yarn` field; `cargo fmt`
-- [ ] **C2 — persistence regression tests** (must fail first): mock-IPC Playwright A→B spec;
-      `src-tauri` test for the unreadable-blob guard
+- [x] **C2 — persistence regression tests**: new `mock` Playwright project (the plugin's own
+      `browser` mode injects `__TAURI_INTERNALS__`, so `src/dev/tauriMock.ts` never installs there —
+      the 300-handler mock needs plain Chromium on the dev server); `e2e/tests/mock/develop-persistence.spec.ts`
+      FAILS as designed (`develop_set_edit` ids `[47]` — A's edit lost); `stored_edit_is_unreadable`
+      extracted + 4 guard tests; `npm run e2e:mock` / `e2e:real`
 - [ ] **C3 — `DevelopPersistenceCoordinator`** (`src/lib/developPersistence.ts`): per-image pending
       state, latest-wins, serialized saves, 250 ms idle / 1000 ms max-wait, flush on navigate /
       unmount / Develop exit / blur, per-image `touchCount`, error banner + bounded retry

@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "e2e:mock": "playwright test --config e2e/playwright.config.ts --project=mock",
+    "e2e:real": "playwright test --config e2e/playwright.config.ts --project=tauri --workers=1"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.1",

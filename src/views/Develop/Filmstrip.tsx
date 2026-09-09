@@ -85,6 +85,7 @@ export default function Filmstrip() {
             <button
               key={img.id}
               ref={active ? selRef : undefined}
+              data-image-id={img.id}
               onClick={() => setSelectedId(img.id)}
               title={img.filename}
               style={{
