@@ -93,6 +93,34 @@ only ever rendered the error boundary. The `mock` project uses plain Chromium ag
 Five specs in `e2e/tests/mock/`. The mock records invocations on `window.__darkroomIpcLog` and
 exposes `__darkroomEmit` / `__darkroomEditUnreadable` as dev-only test hooks.
 
+**P1 landed (88c9db9, 1db9042, 07ae4c1, f3078a3, 2ff943a, 45ddddf):**
+
+- **Prefetch bounded to one speculative decode.** A thread per request meant holding `next` left
+  several 70-140 MB decodes racing the foreground one. Preview LRU 768 MiB/8 → 384 MiB/5, both
+  overridable (`DARKROOM_PREVIEW_LRU_MB`, `_ENTRIES`).
+- **Poisoned locks recover by class**: `render_lock` is an ordering token (a panic in one GPU render
+  used to poison it and kill every later render of that image); `write_hashes`/`mask_layer_hash`
+  recover AND reset so nothing stale is trusted; `ai_coverages` recovers only; the thumb queue
+  recovers with a once-per-launch warning. The catalog lock still uses `map_err` — a poisoned DB
+  lock means an interrupted mutation and must surface.
+- **Release is fail-closed**: a `gate` job runs fmt/Clippy/tests/build/UI on the EXACT tagged commit
+  and `build` needs it; a stable `v*` tag aborts without signing OR notarization. `beta-*` keeps the
+  unsigned path. CI gained `cargo fmt --check` and the mock UI suite.
+- **Generated files are complete or absent.** Panorama DNG wrote straight to its final path (a
+  truncated `.dng` was handed to `process_file` and INDEXED); the catalog backup `VACUUM INTO`'d
+  over the just-deleted previous backup; export and the log ZIP wrote in place. All four now
+  `.part`+rename.
+- **100k catalog measured** (`examples/bench_catalog.rs`). Only `list_keywords` was over budget at
+  504 ms — a correlated `COUNT(*)` per keyword over a table indexed only by its PK. One grouped pass
+  instead: 28 ms. The `strftime` date filters the report expected to fix first measure 9 ms, and
+  search 54 ms, so neither was touched.
+- **Import worker benchmark** (`examples/bench_import.rs` + `DARKROOM_IMPORT_WORKERS`). The caps are
+  UNCHANGED — the dev Mac (14 cores / 26 GB) cannot show the 8 GB behaviour that motivates a change.
+
+**Not done, with reasons:** cancellation tests per stage and fault injection at each boundary; the
+startup sweep for stale app-owned temps (deliberately not rushed — it deletes files); the import cap
+change (needs a real card); the RC soak/updater pass.
+
 **Still pending live QA on the dev Mac:** ⌘Q with a dirty edit → relaunch; sidecar file updates
 within ~10 s and on quit; the save-error banner against a real failure.
 
