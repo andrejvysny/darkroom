@@ -275,7 +275,19 @@ const CHUNK: usize = 16;
 /// it takes every core. Copy/Move additionally streams the file through the destination volume;
 /// past ~4 concurrent writers a card reader or spinning disk slows down instead of speeding up, and
 /// the extra threads only inflate peak memory (each holds a whole RAW in a buffer).
+///
+/// `DARKROOM_IMPORT_WORKERS`, when set to a positive integer, overrides the computed value outright
+/// (any mode). Unset, non-numeric, or zero falls through to the default below. This is a pure
+/// override — `bench_import` uses it to force a worker count per benchmark run; a future
+/// user-facing setting is expected to reuse the same knob.
 fn worker_count(mode: ImportMode) -> usize {
+    if let Some(n) = std::env::var("DARKROOM_IMPORT_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);

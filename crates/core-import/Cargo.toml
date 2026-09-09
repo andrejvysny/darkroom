@@ -22,3 +22,6 @@ rayon = "1"
 [dev-dependencies]
 tempfile = "3"
 core-raw = { path = "../core-raw" }
+# bench_import example only: getrusage(RUSAGE_SELF) for peak-RSS measurement. Already a transitive
+# dependency of the workspace (via rayon et al.), just not previously linked directly.
+libc = "0.2"

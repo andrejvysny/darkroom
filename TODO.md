@@ -78,7 +78,15 @@
             boundary, and the conservative startup sweep for stale app-owned temps. Temp conventions
             found: `.part`, `.exr.part`, `.dng.part`, `.db.part`, `.part.<pid>.<seq>` (models),
             `.tmp` (sidecars), `<hash>_*.<pid>.<seq>.tmp` (thumbs — orphaned on rename failure).
-- [ ] **C11 — import worker benchmark**, then cap (separate commits)
+- [~] **C11 — import worker benchmark** shipped (`cargo run --release -p core-import --example
+      bench_import -- /path/to/card`), plus a `DARKROOM_IMPORT_WORKERS` override so a count can be
+      forced without a rebuild. Refuses to run without a real directory (a decode benchmark over
+      fake bytes measures nothing, and copying one fixture N times is deduplicated by hash) and
+      never benchmarks Move, which deletes the user's originals.
+      - [ ] **Run it on a real card and set the caps.** Reference is still `cores`, Copy/Move
+            `min(cores, 4)`. Each worker holds a WHOLE RAW in memory before hashing, so on 8 GB the
+            all-cores default is the suspect — but the dev Mac (14 cores / 26 GB) cannot show that.
+            Benchmark and tuning stay separate commits on purpose.
 - [x] **C12 — 100k catalog benchmark** (`cargo run --release -p core-library --example bench_catalog
       -- 100000`) + the ONE fix it justified. Measured on the dev Mac, 100k synthetic rows:
       - `list_keywords` **504 ms** — the only thing over the 300 ms budget. A correlated `COUNT(*)`

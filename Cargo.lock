@@ -782,6 +782,7 @@ dependencies = [
  "core-db",
  "core-library",
  "core-raw",
+ "libc",
  "rayon",
  "serde",
  "tempfile",
