@@ -24,6 +24,12 @@ export default function DevelopView() {
   const setOnPasteSettings = useAppStore((s) => s.setOnPasteSettings);
   const rendering = useDevelopStore((s) => s.rendering);
   const saveError = useDevelopStore((s) => s.saveError);
+  const editUnreadable = useDevelopStore((s) => s.editUnreadable);
+  // The unreadable-edit notice outranks a save failure: auto-save is suspended in that state, so
+  // "Darkroom will keep trying" would be a lie.
+  const notice = editUnreadable
+    ? "Darkroom couldn't read this photo's saved adjustments. The original adjustments have been preserved — reset the edits only if you want to discard them."
+    : saveError;
   const showBefore = useDevelopStore((s) => s.showBefore);
   const setShowBefore = useDevelopStore((s) => s.setShowBefore);
 
@@ -244,7 +250,7 @@ export default function DevelopView() {
       }}
     >
       {/* Only surfaced when something is wrong — a healthy save shows no UI at all. */}
-      {saveError !== null && (
+      {notice !== null && (
         <div
           data-testid="develop-save-error"
           role="status"
@@ -256,7 +262,7 @@ export default function DevelopView() {
             borderBottom: "1px solid var(--color-line-2)",
           }}
         >
-          {saveError}
+          {notice}
         </div>
       )}
       <div

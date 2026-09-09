@@ -1303,6 +1303,12 @@ export function developGetEdit(imageId: number): Promise<DevelopParams> {
   return invoke<DevelopParams>("develop_get_edit", { imageId });
 }
 
+/** `true` when the image's stored develop edit no longer parses — the sliders below it are defaults,
+ *  and the backend will refuse to overwrite the stored blob until an explicit Reset. */
+export function developEditUnreadable(imageId: number): Promise<boolean> {
+  return invoke<boolean>("develop_edit_status", { imageId });
+}
+
 export function developSetEdit(
   imageId: number,
   params: DevelopParams,

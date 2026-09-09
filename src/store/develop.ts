@@ -46,6 +46,10 @@ interface DevelopState {
   /** Non-null while Develop edits are failing to reach the catalog; cleared on the next success. */
   saveError: string | null;
   setSaveError: (message: string | null) => void;
+  /** Set when the open image's stored edit is unreadable: auto-save is suspended until an explicit
+   *  Reset, so the user cannot silently edit into a rejected write. */
+  editUnreadable: boolean;
+  setEditUnreadable: (b: boolean) => void;
   showBefore: boolean;
   setShowBefore: (b: boolean) => void;
   histogram: HistData | null;
@@ -126,6 +130,8 @@ export const useDevelopStore = create<DevelopState>((set) => ({
   setRendering: (b) => set({ rendering: b }),
   saveError: null,
   setSaveError: (message) => set({ saveError: message }),
+  editUnreadable: false,
+  setEditUnreadable: (b) => set({ editUnreadable: b }),
   showBefore: false,
   setShowBefore: (b) => set({ showBefore: b }),
   histogram: null,

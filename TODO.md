@@ -45,7 +45,9 @@
       call sites now just mark dirty; flush + shutdown on `RunEvent::Exit`
       - [ ] Live check: edit a photo in the running app, confirm `<raw>.json` updates within ~10 s
             and immediately on quit (no GUI QA run yet)
-- [ ] **C6 — corrupt stored edit visible**: new `develop_edit_status` IPC + banner + Reset(force)
+- [x] **C6 — corrupt stored edit visible**: new `develop_edit_status` IPC (kept `develop_get_edit`'s
+      shape — it has four call sites treating the result as params) + Develop banner + auto-save
+      suspended until Reset force-writes defaults; mock spec covers it
 - [ ] **C7 — bounded prefetch**: one persistent worker (≤1 speculative decode), LRU 384 MiB / 5 with
       `DARKROOM_PREVIEW_LRU_MB` override
 - [ ] **C8 — kill duplicate RAW decode**: `develop_regen_thumb` reuses the warm preview LRU; batch

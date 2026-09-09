@@ -710,6 +710,7 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   develop_get_histogram: () => makeHistogram(),
   develop_histogram: () => undefined,
   develop_prefetch: () => undefined,
+  develop_edit_status: () => window.__darkroomEditUnreadable === true,
   develop_regen_thumb: () => Date.now(),
   thumb_prioritize: () => undefined,
   develop_session: () => undefined,
@@ -1055,6 +1056,8 @@ declare global {
     __darkroomIpcLog?: { cmd: string; payload?: unknown; t: number }[];
     /** Dev-only: fire a backend event (e.g. the quit barrier's `app:flush-edits`) at the frontend. */
     __darkroomEmit?: (event: string, payload?: unknown) => void;
+    /** Dev-only: make `develop_edit_status` report an unreadable stored edit. */
+    __darkroomEditUnreadable?: boolean;
   }
 }
 

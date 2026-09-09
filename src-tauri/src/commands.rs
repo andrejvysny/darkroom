@@ -377,6 +377,21 @@ pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopPa
     .map_err(|e| e.to_string())?
 }
 
+/// `true` when this image has a stored develop edit that no longer parses into the current schema.
+/// Develop calls this on open: the sliders show defaults in that case, so without it the UI would
+/// silently invite edits that `develop_set_edit` then refuses. Cheap — one row read.
+#[tauri::command]
+pub async fn develop_edit_status(app: AppHandle, image_id: i64) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let stored = core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())?;
+        Ok::<_, String>(stored_edit_is_unreadable(stored.as_deref()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Persist develop params (non-destructive; originals are never touched).
 #[tauri::command]
 pub async fn develop_set_edit(

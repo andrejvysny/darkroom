@@ -156,6 +156,7 @@ pub fn run() {
             commands::database_reset,
             commands::app_default_library,
             commands::develop_get_edit,
+            commands::develop_edit_status,
             commands::develop_flush_ack,
             commands::develop_set_edit,
             commands::develop_render,

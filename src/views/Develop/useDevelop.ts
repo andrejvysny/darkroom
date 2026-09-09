@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../../store/app";
 import { useDevelopStore, freshDefaults } from "../../store/develop";
 import {
+  developEditUnreadable,
   developGetEdit,
   developGetHistogram,
   developHistogram,
@@ -255,7 +256,11 @@ export function useDevelop() {
         debouncedRerender();
         debouncedHistogram(id);
       }
-      developPersistence.queue(id, next);
+      // The backend refuses to overwrite a stored edit it cannot parse, so queueing saves here
+      // would just retry into a guaranteed rejection. Render, but do not persist, until Reset.
+      if (!useDevelopStore.getState().editUnreadable) {
+        developPersistence.queue(id, next);
+      }
     },
     [debouncedRerender, debouncedHistogram],
   );
@@ -359,6 +364,7 @@ export function useDevelop() {
     histogramSeededFor.current = null;
     retryUsed.current = false;
     setRenderError(null);
+    useDevelopStore.getState().setEditUnreadable(false);
     if (retryTimer.current !== null) {
       clearTimeout(retryTimer.current);
       retryTimer.current = null;
@@ -417,6 +423,13 @@ export function useDevelop() {
       }
       if (cancelled) return;
       useDevelopStore.setState({ params: p });
+      // `develop_get_edit` returns defaults for a blob it cannot parse, which looks exactly like an
+      // unedited photo — ask separately so the UI can say so instead of inviting rejected edits.
+      developEditUnreadable(id)
+        .then((bad) => {
+          if (!cancelled) useDevelopStore.getState().setEditUnreadable(bad);
+        })
+        .catch(() => {});
       // New image: reset session history; remember the opened state for "Revert to opened".
       openedParams.current = p;
       lastCommitAt.current = 0;
@@ -874,7 +887,11 @@ export function useDevelop() {
     const p = freshDefaults();
     rerenderCurrent();
     developSetEdit(selectedId, p, undefined, true)
-      .then(() => developRegenThumb(selectedId))
+      .then(() => {
+        // Reset is the sanctioned way to discard an unreadable stored blob; auto-save resumes.
+        useDevelopStore.getState().setEditUnreadable(false);
+        return developRegenThumb(selectedId);
+      })
       .catch((e) =>
         log.warn("develop", "reset edit failed", {
           imageId: selectedId,
