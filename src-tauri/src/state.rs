@@ -1,3 +1,4 @@
+use crate::sidecar_queue::SidecarQueue;
 use crate::thumb_queue::ThumbQueue;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use core_analyze::{AnalyzerRegistry, FaceAnalyzer, SamEmbedding, Segmenter};
@@ -30,6 +31,9 @@ pub struct AppState {
     /// Background queue that renders canonical develop thumbnails so the grid/filmstrip/loupe match
     /// the editor. The worker thread is spawned in setup; this is its shared control handle.
     pub thumb_queue: ThumbQueue,
+    /// Coalescing writer for per-image sidecars. Edits mark an image dirty here instead of writing
+    /// the file inline, so the single SQLite connection is never held across an SSD write.
+    pub sidecar_queue: SidecarQueue,
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
     /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
     /// `Arc` so renders clone the handle and DROP this lock before the GPU render+readback —
@@ -240,6 +244,7 @@ impl AppState {
             thumbs,
             gpu,
             thumb_queue: ThumbQueue::new(),
+            sidecar_queue: SidecarQueue::new(),
             full_render_cache: Mutex::new(None),
             preview_render_cache: Mutex::new(None),
             denoise_cache: Mutex::new(None),

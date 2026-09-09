@@ -94,7 +94,8 @@ pub use settings::{
     PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
 };
 pub use sidecar::{
-    hydrate_if_blank, rebuild_from_sidecars, write_all_sidecars, write_sidecar, Sidecar,
+    hydrate_if_blank, rebuild_from_sidecars, sidecar_snapshot, write_all_sidecars, write_sidecar,
+    write_snapshot, Sidecar, SidecarWrite,
 };
 pub use snapshots::{
     create_snapshot, delete_snapshot, get_snapshot_params, list_snapshots, rename_snapshot,

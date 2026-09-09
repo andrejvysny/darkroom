@@ -45,6 +45,14 @@ pub struct Sidecar {
     pub updated_at: i64,
 }
 
+/// A sidecar gathered from the catalog, plus its destination — everything needed to write the file
+/// with no database access, so the DB lock can be released first.
+#[derive(Debug, Clone)]
+pub struct SidecarWrite {
+    pub path: PathBuf,
+    pub sidecar: Sidecar,
+}
+
 /// `<raw path>.json` — the sidecar location for an image's RAW path.
 pub fn sidecar_path(image_path: &str) -> PathBuf {
     PathBuf::from(format!("{image_path}.json"))
@@ -93,6 +101,28 @@ pub fn gather(conn: &Connection, image_id: i64) -> Result<Option<Sidecar>, LibEr
     }
 }
 
+/// Gather `image_id`'s sidecar and its destination path (`None` when the row is gone). Needs the
+/// connection; does no filesystem work.
+pub fn sidecar_snapshot(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Option<SidecarWrite>, LibError> {
+    let Some(row) = crate::query::image_by_id(conn, image_id)? else {
+        return Ok(None);
+    };
+    let sidecar = build_sidecar(conn, &row)?;
+    Ok(Some(SidecarWrite {
+        path: sidecar_path(&row.path),
+        sidecar,
+    }))
+}
+
+/// Atomically write a previously gathered snapshot. No database access — safe to call with the DB
+/// lock released.
+pub fn write_snapshot(w: &SidecarWrite) -> Result<(), LibError> {
+    write_to_path(&w.path, &w.sidecar)
+}
+
 fn write_to_path(path: &Path, sc: &Sidecar) -> Result<(), LibError> {
     let json = serde_json::to_vec_pretty(sc)?;
     // Atomic: write a temp sibling then rename, so a crash never leaves a half-written sidecar.
@@ -105,11 +135,10 @@ fn write_to_path(path: &Path, sc: &Sidecar) -> Result<(), LibError> {
 /// Gather + atomically write `image_id`'s sidecar next to its RAW. Callers treat this as best-effort
 /// (log-and-continue) — a sidecar failure must never block or fail the catalog write.
 pub fn write_sidecar(conn: &Connection, image_id: i64) -> Result<(), LibError> {
-    let Some(row) = crate::query::image_by_id(conn, image_id)? else {
+    let Some(w) = sidecar_snapshot(conn, image_id)? else {
         return Ok(());
     };
-    let sc = build_sidecar(conn, &row)?;
-    write_to_path(&sidecar_path(&row.path), &sc)
+    write_snapshot(&w)
 }
 
 /// Read + parse the sidecar for a RAW path, or `None` if absent/unreadable.

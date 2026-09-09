@@ -249,6 +249,43 @@ fn keeps_the_row_when_the_file_cannot_be_trashed() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The split halves must produce exactly what the one-shot writer does: `sidecar_snapshot` needs the
+/// connection, `write_snapshot` needs only the snapshot — which is what lets the app write sidecars
+/// with the catalog lock released.
+#[test]
+fn snapshot_then_write_matches_write_sidecar() {
+    let dir = tempdir("sidecar_split");
+    let db = Db::open_in_memory().unwrap();
+    let id = insert_file(&db.conn, &dir, 1, "shot.cr3");
+    set_flag(&db.conn, id, "pick");
+
+    core_library::write_sidecar(&db.conn, id).unwrap();
+    let inline = std::fs::read_to_string(dir.join("shot.cr3.json")).unwrap();
+    std::fs::remove_file(dir.join("shot.cr3.json")).unwrap();
+
+    let snap = core_library::sidecar_snapshot(&db.conn, id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snap.path, dir.join("shot.cr3.json"));
+    core_library::write_snapshot(&snap).unwrap();
+    let split = std::fs::read_to_string(dir.join("shot.cr3.json")).unwrap();
+
+    // Identical but for `updatedAt`, which is stamped at gather time.
+    let strip = |raw: &str| {
+        let mut v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        v.as_object_mut().unwrap().remove("updatedAt");
+        v
+    };
+    assert_eq!(strip(&inline), strip(&split));
+
+    // A row that no longer exists yields no snapshot instead of an error.
+    assert!(core_library::sidecar_snapshot(&db.conn, 99_999)
+        .unwrap()
+        .is_none());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn removes_the_sidecar_and_cascades_dependents() {
     let dir = tempdir("sidecar");

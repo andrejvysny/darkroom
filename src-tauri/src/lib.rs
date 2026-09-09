@@ -9,6 +9,7 @@ mod panorama;
 mod prefetch;
 mod protocol;
 mod scan;
+mod sidecar_queue;
 mod state;
 mod suggest;
 mod thumb_queue;
@@ -116,6 +117,7 @@ pub fn run() {
 
             // Start the background canonical-thumbnail worker (parks until there's work).
             thumb_queue::spawn_worker(app.handle().clone());
+            sidecar_queue::spawn_worker(app.handle().clone());
 
             // Best-effort daily catalog backup (own background thread; logs its own outcome).
             backup::maybe_backup_on_startup(app.handle().clone());
@@ -303,6 +305,15 @@ pub fn run() {
             // `catalog.db-wal` (and a later corrupt-check sees a consistent file). Best-effort.
             if let tauri::RunEvent::Exit = event {
                 let st = app_handle.state::<AppState>();
+                // Sidecars first, and BEFORE taking the catalog lock — the worker needs it to gather
+                // each snapshot. Bounded: a stuck disk must not hold the process open.
+                if !st
+                    .sidecar_queue
+                    .flush_blocking(std::time::Duration::from_secs(2))
+                {
+                    tracing::warn!("sidecar queue did not drain before exit");
+                }
+                st.sidecar_queue.shutdown();
                 let lock = st.db.lock();
                 if let Ok(db) = lock {
                     let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");

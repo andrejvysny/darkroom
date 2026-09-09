@@ -32,8 +32,12 @@
       inside the DB lock — do C5 next, before C4.**
 - [ ] **C4 — quit save barrier**: `RunEvent::ExitRequested` + `prevent_exit` (AtomicBool guard),
       `app:flush-edits` → ack with 1500 ms timeout → sidecar flush → WAL checkpoint → `exit(0)`
-- [ ] **C5 — sidecar decoupling**: split `write_sidecar` into snapshot (locked) + write (unlocked);
-      new `src-tauri/src/sidecar_queue.rs` coalescing worker; out of `develop_set_edit`'s DB lock
+- [x] **C5 — sidecar decoupling** (done before C4 — max-wait made drags write sidecars under the DB
+      lock): `sidecar_snapshot`/`write_snapshot` split; `src-tauri/src/sidecar_queue.rs` (single
+      worker, 10 s coalesce, `flush_blocking`, poison-recovering locks); all 11 `sync_sidecar(s)`
+      call sites now just mark dirty; flush + shutdown on `RunEvent::Exit`
+      - [ ] Live check: edit a photo in the running app, confirm `<raw>.json` updates within ~10 s
+            and immediately on quit (no GUI QA run yet)
 - [ ] **C6 — corrupt stored edit visible**: new `develop_edit_status` IPC + banner + Reset(force)
 - [ ] **C7 — bounded prefetch**: one persistent worker (≤1 speculative decode), LRU 384 MiB / 5 with
       `DARKROOM_PREVIEW_LRU_MB` override
@@ -48,6 +52,11 @@
       range first)
 - [ ] **C13 — CI wiring + fail-closed `v*` release** (signing/notarize/staple/spctl/updater)
 - [ ] **C14 — RC stabilization**: packaged-app soak, memory/import/render soaks, updater from v0.1.2
+
+### Found along the way
+- `cargo clippy --workspace --all-targets` fails on 3 pre-existing `needless_range_loop` lints in
+  core-pipeline TEST code (`base_curve_ref.rs:154`, `params.rs:802,803`). CI only runs `--examples`,
+  so it is green today. Fix + widen the CI lint scope in C13.
 
 ### Open questions (answer before the commit that needs them)
 - C4: quit-failure UX = first quit cancelled + banner, second within 30 s proceeds. OK?

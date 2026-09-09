@@ -411,7 +411,7 @@ pub async fn develop_set_edit(
             core_library::now_epoch(),
         )
         .map_err(|e| e.to_string())?;
-        sync_sidecar(&db.conn, image_id);
+        sync_sidecar(st.inner(), image_id);
         let _ = core_library::append_event(
             &db.conn,
             &crate::events::stamp(
@@ -1277,18 +1277,16 @@ where
     .map_err(|e| e.to_string())?
 }
 
-/// Best-effort: (re)write the per-image sidecar after a catalog mutation so disk stays the durable
-/// source of edit intent. Never fails the command — a sidecar error is logged and swallowed.
-fn sync_sidecar(conn: &core_db::rusqlite::Connection, image_id: i64) {
-    if let Err(e) = core_library::write_sidecar(conn, image_id) {
-        tracing::warn!(image_id, error = %crate::logging::safe_error(&e), "sidecar write failed");
-    }
+/// Mark an image's sidecar stale after a catalog mutation. The coalescing worker
+/// (`sidecar_queue`) gathers and writes it with the DB lock released — writing inline here would
+/// hold the single SQLite connection across an SSD write on every edit, and edits now land during
+/// a slider drag. Sidecars stay the durable record of intent; the catalog is the live state.
+fn sync_sidecar(st: &AppState, image_id: i64) {
+    st.sidecar_queue.mark_dirty(image_id);
 }
 
-fn sync_sidecars(conn: &core_db::rusqlite::Connection, image_ids: &[i64]) {
-    for &id in image_ids {
-        sync_sidecar(conn, id);
-    }
+fn sync_sidecars(st: &AppState, image_ids: &[i64]) {
+    st.sidecar_queue.mark_dirty_many(image_ids);
 }
 
 /// `flag` value → event-type label (for the behavioral log).
@@ -1338,7 +1336,7 @@ pub async fn cull_set_rating(
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_rating(&db.conn, image_id, stars).map_err(|e| e.to_string())?;
-        sync_sidecar(&db.conn, image_id);
+        sync_sidecar(st.inner(), image_id);
         let mut event = core_library::Event {
             event_type: "culling.rate".into(),
             image_id: Some(image_id),
@@ -1370,7 +1368,7 @@ pub async fn cull_set_flag(
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_flag(&db.conn, image_id, &flag).map_err(|e| e.to_string())?;
-        sync_sidecar(&db.conn, image_id);
+        sync_sidecar(st.inner(), image_id);
         let mut event = core_library::Event {
             event_type: flag_event_type(&flag).into(),
             image_id: Some(image_id),
@@ -1402,7 +1400,7 @@ pub async fn cull_set_label(
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_label(&db.conn, image_id, label.as_deref()).map_err(|e| e.to_string())?;
-        sync_sidecar(&db.conn, image_id);
+        sync_sidecar(st.inner(), image_id);
         let mut event = core_library::Event {
             event_type: "culling.label".into(),
             image_id: Some(image_id),
@@ -1452,7 +1450,7 @@ pub async fn cull_set_rating_many(
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_rating_many(&mut db.conn, &image_ids, stars)
             .map_err(|e| e.to_string())?;
-        sync_sidecars(&db.conn, &image_ids);
+        sync_sidecars(st.inner(), &image_ids);
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
             core_library::Event {
                 event_type: "culling.rate".into(),
@@ -1477,7 +1475,7 @@ pub async fn cull_set_flag_many(
         let st = app.state::<AppState>();
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_flag_many(&mut db.conn, &image_ids, &flag).map_err(|e| e.to_string())?;
-        sync_sidecars(&db.conn, &image_ids);
+        sync_sidecars(st.inner(), &image_ids);
         let et = flag_event_type(&flag);
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |id| {
             core_library::Event {
@@ -1505,7 +1503,7 @@ pub async fn cull_set_label_many(
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::set_label_many(&mut db.conn, &image_ids, label.as_deref())
             .map_err(|e| e.to_string())?;
-        sync_sidecars(&db.conn, &image_ids);
+        sync_sidecars(st.inner(), &image_ids);
         log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
             core_library::Event {
                 event_type: "culling.label".into(),
@@ -1619,7 +1617,7 @@ pub async fn keyword_add_to_image(
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let row = core_library::add_keyword_to_image(&db.conn, image_id, &name)
             .map_err(|e| e.to_string())?;
-        sync_sidecar(&db.conn, image_id);
+        sync_sidecar(st.inner(), image_id);
         Ok(row)
     })
     .await
@@ -1637,7 +1635,7 @@ pub async fn keyword_add_to_images(
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let row = core_library::add_keyword_to_images(&db.conn, &image_ids, &name)
             .map_err(|e| e.to_string())?;
-        sync_sidecars(&db.conn, &image_ids);
+        sync_sidecars(st.inner(), &image_ids);
         Ok(row)
     })
     .await
@@ -1655,7 +1653,7 @@ pub async fn keyword_remove_from_image(
         let db = st.db.lock().map_err(|e| e.to_string())?;
         core_library::remove_keyword_from_image(&db.conn, image_id, keyword_id)
             .map_err(|e| e.to_string())?;
-        sync_sidecar(&db.conn, image_id);
+        sync_sidecar(st.inner(), image_id);
         Ok(())
     })
     .await
@@ -1679,7 +1677,7 @@ pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), Strin
             rows.filter_map(Result::ok).collect()
         };
         core_library::delete_keyword(&db.conn, keyword_id).map_err(|e| e.to_string())?;
-        sync_sidecars(&db.conn, &affected);
+        sync_sidecars(st.inner(), &affected);
         Ok(())
     })
     .await
