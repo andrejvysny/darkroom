@@ -916,12 +916,13 @@ fn ensure_preview_render_cache(
 /// Predictively decode the half-res previews of `image_ids` (the frontend's next/prev neighbors)
 /// into the CPU linear LRU, so stepping through a collection hits a warm buffer (GPU upload only,
 /// ~100 ms) instead of a multi-second decode. CPU-only — never touches the GPU queue. A newer call
-/// supersedes the previous set.
+/// REPLACES the previous set rather than adding to it, and one worker runs them, so holding `next`
+/// can never leave several speculative decodes competing with the image the user is looking at.
 #[tauri::command]
 pub async fn develop_prefetch(app: AppHandle, image_ids: Vec<i64>) -> Result<(), String> {
     let st = app.state::<AppState>();
     let my_gen = st.prefetch_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    crate::prefetch::run_prefetch(app.clone(), image_ids, my_gen);
+    st.prefetch_queue.request(my_gen, image_ids);
     Ok(())
 }
 

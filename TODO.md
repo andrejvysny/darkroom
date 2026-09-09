@@ -48,8 +48,11 @@
 - [x] **C6 — corrupt stored edit visible**: new `develop_edit_status` IPC (kept `develop_get_edit`'s
       shape — it has four call sites treating the result as params) + Develop banner + auto-save
       suspended until Reset force-writes defaults; mock spec covers it
-- [ ] **C7 — bounded prefetch**: one persistent worker (≤1 speculative decode), LRU 384 MiB / 5 with
-      `DARKROOM_PREVIEW_LRU_MB` override
+- [x] **C7 — bounded prefetch**: `PrefetchQueue` (single worker, newest request replaces the queued
+      one) + LRU default 384 MiB / 5 entries with `DARKROOM_PREVIEW_LRU_MB` /
+      `DARKROOM_PREVIEW_LRU_ENTRIES` overrides so the budget can be measured on an 8 GB machine
+      without a rebuild; 4 unit tests
+      - [ ] Measure: hit rate + next/back latency at 256/384/512 MB on a real library
 - [ ] **C8 — kill duplicate RAW decode**: `develop_regen_thumb` reuses the warm preview LRU; batch
       `render_one`'s per-image pre-check query
 - [ ] **C9 — mutex poisoning policy**: `render_lock` → `into_inner` (ordering token); cache mutexes

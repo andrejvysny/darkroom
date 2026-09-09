@@ -119,6 +119,7 @@ pub fn run() {
             // Start the background canonical-thumbnail worker (parks until there's work).
             thumb_queue::spawn_worker(app.handle().clone());
             sidecar_queue::spawn_worker(app.handle().clone());
+            prefetch::spawn_worker(app.handle().clone());
 
             // Best-effort daily catalog backup (own background thread; logs its own outcome).
             backup::maybe_backup_on_startup(app.handle().clone());
@@ -324,6 +325,7 @@ pub fn run() {
                     tracing::warn!("sidecar queue did not drain before exit");
                 }
                 st.sidecar_queue.shutdown();
+                st.prefetch_queue.shutdown();
                 let lock = st.db.lock();
                 if let Ok(db) = lock {
                     let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");

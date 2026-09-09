@@ -93,6 +93,9 @@ pub struct AppState {
     /// Generation of the newest `develop_prefetch` request; the worker aborts a stale set as soon
     /// as a newer one (or an image switch) arrives.
     pub prefetch_gen: AtomicU64,
+    /// The single speculative-decode worker's request slot. One worker = at most one speculative
+    /// RAW decode at a time, so predictions can never crowd out the foreground decode.
+    pub prefetch_queue: crate::prefetch::PrefetchQueue,
     /// Memo of `(image_id, is_display_referred)` so the per-slider-move `develop_render` doesn't hit
     /// the DB to learn whether the source is a JPEG/PNG (recomputed only on image change).
     pub display_referred_memo: Mutex<Option<(i64, bool)>>,
@@ -268,6 +271,7 @@ impl AppState {
             decode_cv: Condvar::new(),
             preview_linear_lru: Mutex::new(crate::prefetch::PreviewLru::default()),
             prefetch_gen: AtomicU64::new(0),
+            prefetch_queue: crate::prefetch::PrefetchQueue::new(),
             display_referred_memo: Mutex::new(None),
             hdr_running: AtomicBool::new(false),
             hdr_cancel: AtomicBool::new(false),
