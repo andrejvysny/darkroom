@@ -180,37 +180,57 @@ pub fn export_zip(dest: &Path) -> Result<u64, String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create zip parent: {e}"))?;
     }
-    let file = File::create(dest).map_err(|e| format!("create log zip: {e}"))?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    // Atomic: stream into a `.part` sibling, then rename into place. A truncated ZIP is
+    // indistinguishable from a finished export to the user browsing the folder and to any tool that
+    // opens it, so the destination must only ever appear complete. (Same shape as
+    // `core_raw::hdr_file` / `core_library::sidecar`.)
+    let part = dest.with_extension("zip.part");
+    let build = || -> Result<(), String> {
+        let file = File::create(&part).map_err(|e| format!("create log zip: {e}"))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
-    for entry in fs::read_dir(&state.directory).map_err(|e| format!("read log dir: {e}"))? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        if !is_log_file(&path) {
-            continue;
+        for entry in fs::read_dir(&state.directory).map_err(|e| format!("read log dir: {e}"))? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if !is_log_file(&path) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("darkroom.log");
+            zip.start_file(name, options).map_err(|e| e.to_string())?;
+            let mut src = File::open(&path).map_err(|e| e.to_string())?;
+            io::copy(&mut src, &mut zip).map_err(|e| e.to_string())?;
         }
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("darkroom.log");
-        zip.start_file(name, options).map_err(|e| e.to_string())?;
-        let mut src = File::open(&path).map_err(|e| e.to_string())?;
-        io::copy(&mut src, &mut zip).map_err(|e| e.to_string())?;
+        zip.start_file("diagnostics.json", options)
+            .map_err(|e| e.to_string())?;
+        let diagnostics = json!({
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "exportedAtMs": now_ms(),
+            "schema": 1,
+        });
+        zip.write_all(diagnostics.to_string().as_bytes())
+            .map_err(|e| e.to_string())?;
+        // `finish` writes the archive's central directory — without it the `.part` file is not a
+        // readable ZIP at all. It must return, and the handle be flushed and closed, *before* the
+        // rename below publishes the file.
+        let mut file = zip.finish().map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        drop(file);
+        Ok(())
+    };
+    if let Err(e) = build() {
+        let _ = fs::remove_file(&part);
+        return Err(e);
     }
-    zip.start_file("diagnostics.json", options)
-        .map_err(|e| e.to_string())?;
-    let diagnostics = json!({
-        "appVersion": env!("CARGO_PKG_VERSION"),
-        "platform": std::env::consts::OS,
-        "arch": std::env::consts::ARCH,
-        "exportedAtMs": now_ms(),
-        "schema": 1,
-    });
-    zip.write_all(diagnostics.to_string().as_bytes())
-        .map_err(|e| e.to_string())?;
-    let mut file = zip.finish().map_err(|e| e.to_string())?;
-    file.flush().map_err(|e| e.to_string())?;
+    fs::rename(&part, dest).map_err(|e| {
+        let _ = fs::remove_file(&part);
+        format!("finalize log zip: {e}")
+    })?;
     let bytes = fs::metadata(dest).map_err(|e| e.to_string())?.len();
     tracing::info!(bytes, "logs exported");
     Ok(bytes)

@@ -17,13 +17,21 @@ pub fn backup_now(conn: &Connection, backups_dir: &Path, keep: usize) -> Result<
 
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let dest = backups_dir.join(format!("{PREFIX}{stamp}{SUFFIX}"));
-    // Two backups within the same second would otherwise collide: VACUUM INTO refuses to
-    // overwrite an existing target file. Rare (manual double-click), but cheap to guard.
+    // Vacuum into a sibling `.part` and rename on success: a crash or a full disk mid-vacuum must
+    // not leave a truncated file under a real backup name, which rotation would then keep as if it
+    // were the good copy. `VACUUM INTO` refuses to write to an existing target file — that is why
+    // the pre-removal below exists at all, and why the temp path must be cleared BEFORE the vacuum
+    // rather than after. `dest` is cleared for the same reason: two backups within the same second
+    // would otherwise collide (rare — a manual double-click), and the vacuum runs before the rename.
+    let part = dest.with_extension("db.part");
+    if part.exists() {
+        std::fs::remove_file(&part)?;
+    }
     if dest.exists() {
         std::fs::remove_file(&dest)?;
     }
 
-    let dest_str = dest.to_str().ok_or_else(|| {
+    let part_str = part.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "backup path is not valid UTF-8",
@@ -31,8 +39,14 @@ pub fn backup_now(conn: &Connection, backups_dir: &Path, keep: usize) -> Result<
     })?;
     // VACUUM INTO takes a string literal, not a bound parameter — escape embedded single quotes
     // (standard SQL string-literal doubling) so a stray `'` in the path can't break out of it.
-    let escaped = dest_str.replace('\'', "''");
-    conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+    let escaped = part_str.replace('\'', "''");
+    if let Err(e) = conn.execute_batch(&format!("VACUUM INTO '{escaped}'")) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.into());
+    }
+    std::fs::rename(&part, &dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    })?;
 
     rotate(backups_dir, keep)?;
     Ok(dest)

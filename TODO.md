@@ -68,8 +68,16 @@
       cache-validity mutexes (`write_hashes`, `mask_layer_hash`) recover AND reset so nothing stale
       is trusted; `ai_coverages` recovers only (SAM coverage costs a segmentation run to rebuild);
       thumb queue recovers with a once-per-launch warning. The catalog lock still uses `map_err`.
-- [ ] **C10 — atomicity + failure injection**: export/HDR/pano temp+rename, orphan cleanup,
-      cancellation tests; conservative stale-temp sweep
+- [~] **C10 — atomicity**: audited every final-output write. HDR merge, model downloads and import
+      were already temp+rename+verify. Fixed the four that wrote straight to the final path:
+      **panorama DNG** (a truncated `.dng` would be handed to `process_file` and INDEXED as a real
+      photo), **catalog backup** (`VACUUM INTO` over the just-deleted previous backup — a crash left
+      a truncated file under a real backup name that rotation would keep), single-image/preset
+      export, and the log ZIP. `write_atomic` + 3 tests.
+      - [ ] Remaining: cancellation tests per stage (scan/HDR/pano/import), fault injection at each
+            boundary, and the conservative startup sweep for stale app-owned temps. Temp conventions
+            found: `.part`, `.exr.part`, `.dng.part`, `.db.part`, `.part.<pid>.<seq>` (models),
+            `.tmp` (sidecars), `<hash>_*.<pid>.<seq>.tmp` (thumbs — orphaned on rename failure).
 - [ ] **C11 — import worker benchmark**, then cap (separate commits)
 - [ ] **C12 — 100k synthetic catalog benchmark**, then only measured SQL fixes (strftime → UTC epoch
       range first)

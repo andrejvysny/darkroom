@@ -1180,6 +1180,27 @@ pub async fn develop_histogram(
 
 // ---------- Export ----------
 
+/// Write `bytes` to `dest` atomically: a `.part` sibling first, then rename into place.
+///
+/// A half-written export is indistinguishable from a finished one — to the user browsing the
+/// folder, and to any tool that opens it (a truncated JPEG still decodes to a partial image). The
+/// rename is atomic within a filesystem, so the destination either does not exist or is complete.
+/// Matches `core_raw::hdr_file` / `core_library::sidecar`.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    let part = dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.part"),
+        None => "part".to_string(),
+    });
+    std::fs::write(&part, bytes).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        e.to_string()
+    })?;
+    std::fs::rename(&part, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        e.to_string()
+    })
+}
+
 /// Export a single image at full resolution through the develop pipeline to `dest`.
 /// `format` is "png" or "jpeg". Originals are never modified.
 #[tauri::command]
@@ -1262,7 +1283,7 @@ pub async fn export_image(
         }
         .map_err(|e| e.to_string())?;
 
-        std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+        write_atomic(Path::new(&dest), &bytes)?;
         // Export is the strongest edit-quality endorsement — log it (best-effort, separate lock).
         crate::events::log_event(
             st.inner(),
@@ -3690,7 +3711,7 @@ pub async fn presets_export(
             params: serde_json::from_str(&p.params).map_err(|e| e.to_string())?,
         };
         let json = serde_json::to_string_pretty(&env).map_err(|e| e.to_string())?;
-        std::fs::write(&dest_path, json).map_err(|e| e.to_string())?;
+        write_atomic(Path::new(&dest_path), json.as_bytes())?;
         Ok(())
     })
     .await
@@ -4407,5 +4428,50 @@ mod develop_edit_tests {
         obj.insert("exposure".into(), serde_json::json!("very bright"));
         let json = serde_json::to_string(&v).unwrap();
         assert!(stored_edit_is_unreadable(Some(&json)));
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::write_atomic;
+    use std::path::PathBuf;
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dr-export-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The point of the `.part` dance: the destination is either absent or complete, and no debris
+    /// is left beside it for a startup sweep to reason about.
+    #[test]
+    fn leaves_no_part_file_behind() {
+        let dir = tempdir("ok");
+        let dest = dir.join("photo.jpg");
+        write_atomic(&dest, b"finished").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"finished");
+        assert!(!dir.join("photo.jpg.part").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Re-exporting over an existing file must replace it, not fail on the rename.
+    #[test]
+    fn overwrites_an_existing_export() {
+        let dir = tempdir("over");
+        let dest = dir.join("photo.jpg");
+        std::fs::write(&dest, b"old").unwrap();
+        write_atomic(&dest, b"new").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unwritable destination directory must surface as an error and leave nothing.
+    #[test]
+    fn a_failed_write_creates_nothing() {
+        let dir = tempdir("fail");
+        let dest = dir.join("missing-subdir").join("photo.jpg");
+        assert!(write_atomic(&dest, b"x").is_err());
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

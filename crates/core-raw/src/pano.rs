@@ -209,39 +209,53 @@ fn write_pano_dng_inner(
         false,
     );
 
-    let file = std::fs::File::create(dest).map_err(RawError::Io)?;
-    let mut dng = DngWriter::new(BufWriter::new(file), DNG_VERSION_V1_4).map_err(de)?;
+    // Encode into a sibling `.part` and rename only on success: a truncated `.dng` left at the
+    // final path would be handed to `process_file` and indexed as a real photo.
+    let part = dest.with_extension("dng.part");
+    let encode = || -> Result<(), RawError> {
+        let file = std::fs::File::create(&part).map_err(RawError::Io)?;
+        let mut dng = DngWriter::new(BufWriter::new(file), DNG_VERSION_V1_4).map_err(de)?;
 
-    // Raw subframe (type 0); thumbnail goes to the root IFD below, mirroring rawler's converter.
-    let mut raw_frame = dng.subframe(0);
-    raw_frame
-        .raw_image(
-            &rawimage,
-            CropMode::None,
-            DngCompression::Lossless,
-            DngPhotometricConversion::Original,
-            1,
-        )
-        .map_err(de)?;
-    raw_frame.finalize().map_err(de)?;
+        // Raw subframe (type 0); thumbnail goes to the root IFD below, mirroring rawler's converter.
+        let mut raw_frame = dng.subframe(0);
+        raw_frame
+            .raw_image(
+                &rawimage,
+                CropMode::None,
+                DngCompression::Lossless,
+                DngPhotometricConversion::Original,
+                1,
+            )
+            .map_err(de)?;
+        raw_frame.finalize().map_err(de)?;
 
-    // Embedded sRGB preview (subframe 1) + root thumbnail — this is what the library thumbnail
-    // path picks up, so a merged pano gets a grid thumb without a full raw develop.
-    let preview = preview_srgb(width, height, rgb_native, meta);
-    let mut preview_frame = dng.subframe(1);
-    preview_frame.preview(&preview, 0.85).map_err(de)?;
-    preview_frame.finalize().map_err(de)?;
-    dng.thumbnail(&preview).map_err(de)?;
+        // Embedded sRGB preview (subframe 1) + root thumbnail — this is what the library thumbnail
+        // path picks up, so a merged pano gets a grid thumb without a full raw develop.
+        let preview = preview_srgb(width, height, rgb_native, meta);
+        let mut preview_frame = dng.subframe(1);
+        preview_frame.preview(&preview, 0.85).map_err(de)?;
+        preview_frame.finalize().map_err(de)?;
+        dng.thumbnail(&preview).map_err(de)?;
 
-    dng.load_base_tags(&rawimage).map_err(de)?;
-    dng.load_metadata(&meta.metadata).map_err(de)?;
-    // The EXIF pass-through may re-emit the SOURCE orientation; our pixels are already upright.
-    // `add_tag` replaces, so this always wins.
-    dng.root_ifd_mut().add_tag(ExifTag::Orientation, 1_u16);
-    dng.root_ifd_mut()
-        .add_tag(rawler::tags::TiffCommonTag::Software, "Darkroom");
+        dng.load_base_tags(&rawimage).map_err(de)?;
+        dng.load_metadata(&meta.metadata).map_err(de)?;
+        // The EXIF pass-through may re-emit the SOURCE orientation; our pixels are already upright.
+        // `add_tag` replaces, so this always wins.
+        dng.root_ifd_mut().add_tag(ExifTag::Orientation, 1_u16);
+        dng.root_ifd_mut()
+            .add_tag(rawler::tags::TiffCommonTag::Software, "Darkroom");
 
-    dng.close().map_err(de)?;
+        dng.close().map_err(de)?;
+        Ok(())
+    };
+    if let Err(e) = encode() {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        de(e.to_string())
+    })?;
     Ok(())
 }
 
