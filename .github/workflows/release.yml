@@ -17,7 +17,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Prove the EXACT tagged commit is green before anything is built or published. "main was green
+  # when I cut the tag" is not evidence: the tag may point elsewhere, and a stable release that
+  # cannot be reproduced from its own commit is not a release.
+  gate:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install libheif
+        run: brew install libheif
+
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Frontend type-check + build
+        run: npm run build
+
+      - name: Clippy (warnings = errors)
+        run: cargo clippy --workspace --examples -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Mock-IPC UI tests
+        run: npm run e2e:mock
+
   build:
+    needs: gate
     permissions:
       contents: write
     strategy:
@@ -184,6 +233,12 @@ jobs:
           elif [ -n "${APPLE_CERTIFICATE:-}${APPLE_CERTIFICATE_PASSWORD:-}${APPLE_SIGNING_IDENTITY:-}" ]; then
             echo "::error::Partial macOS signing secrets. Set APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD and APPLE_SIGNING_IDENTITY together, or none of them."
             exit 1
+          elif [[ "$RELEASE_TAG" == v* ]]; then
+            # Beta tags may build unsigned for local testing; a stable v* tag may not. An unsigned
+            # .dmg is blocked by Gatekeeper on every machine but the one that built it, so shipping
+            # one is not a degraded release — it is a broken one.
+            echo "::error::Stable release $RELEASE_TAG requires macOS signing secrets (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY). Use a beta-* tag to build unsigned."
+            exit 1
           else
             echo "::warning::No macOS signing secrets — building an ad-hoc signed, unnotarized .dmg (Gatekeeper will block it on download)."
           fi
@@ -219,6 +274,11 @@ jobs:
                 echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
               } >> "$GITHUB_ENV"
               echo "Notarization: Apple ID ${APPLE_ID}"
+            elif [[ "$RELEASE_TAG" == v* ]]; then
+              # Signed-but-not-notarized is still Gatekeeper-blocked on download, so for a stable
+              # tag this is as broken as unsigned. Fail rather than publish it.
+              echo "::error::Stable release $RELEASE_TAG requires notarization credentials (APPLE_API_KEY + APPLE_API_ISSUER + APPLE_API_KEY_BASE64, or APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID)."
+              exit 1
             else
               echo "::warning::Signing without notarization credentials — the .app is Developer ID signed but NOT notarized, which Gatekeeper still blocks. Add the API-key or Apple-ID secret set."
             fi

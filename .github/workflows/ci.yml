@@ -57,11 +57,23 @@ jobs:
       - name: Frontend type-check + build
         run: npm run build
 
+      - name: Formatting
+        run: cargo fmt --all --check
+
       - name: Clippy (warnings = errors)
         run: cargo clippy --workspace --examples -- -D warnings
 
       - name: Tests
         run: cargo test --workspace
+
+      # Tier-1 UI: the frontend in Chromium against `src/dev/tauriMock.ts`. No GPU, no catalog, so it
+      # is deterministic on a hosted runner — unlike the real-backend `tauri` project, which needs a
+      # Metal device and a real library and stays a manual/RC gate.
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Mock-IPC UI tests
+        run: npm run e2e:mock
 
   # Compile-only gate so PRs catch Windows breakage (cross-platform cfg, ort/DirectML linking,
   # MSVC-built C deps). GPU/CR3 behaviour is validated by the macOS job + manual run-through; the

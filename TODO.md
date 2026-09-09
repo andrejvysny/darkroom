@@ -73,7 +73,12 @@
 - [ ] **C11 — import worker benchmark**, then cap (separate commits)
 - [ ] **C12 — 100k synthetic catalog benchmark**, then only measured SQL fixes (strftime → UTC epoch
       range first)
-- [ ] **C13 — CI wiring + fail-closed `v*` release** (signing/notarize/staple/spctl/updater)
+- [x] **C13 — CI wiring + fail-closed `v*` release**: `ci.yml` gains `cargo fmt --check` + the
+      mock-IPC Playwright suite; `release.yml` gains a `gate` job that runs fmt/clippy/tests/build/
+      UI on the EXACT tagged commit with `build: needs: gate`, and a stable `v*` tag now aborts
+      without signing OR notarization credentials (`beta-*` keeps the unsigned path). Real-backend
+      e2e stays a dev-Mac RC step — see `QA_CAMPAIGN.md` §G — because a hosted runner has neither a
+      Metal device nor the library.
 - [ ] **C14 — RC stabilization**: packaged-app soak, memory/import/render soaks, updater from v0.1.2
 
 ### Found along the way

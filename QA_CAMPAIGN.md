@@ -59,3 +59,22 @@
 - [ ] Signed release: set `APPLE_SIGNING_IDENTITY` + one notarization secret set → `beta-*` tag → `spctl -a -vv` passes on a clean Mac → drop "isn't notarized" from README.
 - [ ] Auto-update: prompt → download → restart from a previous installed version against the new release.
 - [ ] Catalog backup (new): backup file appears in app-data `backups/`, rotation keeps N, "Back up now" works.
+
+## G. Release candidate (run on the dev Mac before every stable `v*` tag)
+
+CI now proves the exact tagged commit is green (fmt, Clippy, `cargo test --workspace`, frontend
+build, mock-IPC UI) before anything is built, and a stable tag ABORTS without Developer ID signing
+or notarization credentials. These are the checks a hosted runner cannot do:
+
+- [ ] Real-backend Playwright: `npm run tauri -- dev --features e2e-testing`, then `npm run e2e:real`
+      (needs a Metal device and the real library — hosted runners have neither).
+- [ ] **Edit + ⌘Q + relaunch**: change exposure, quit immediately, reopen — the edit is there and the
+      quit took under ~1 s. The quit barrier's Rust half has unit tests but no live run yet.
+- [ ] **Sidecar catch-up**: edit a photo, wait ~10 s, confirm `<raw>.json` updated; edit again and
+      quit, confirm it updated on the way out.
+- [ ] **Save-error banner**: make the catalog unwritable mid-session and confirm the banner appears
+      and clears on the next success; ⌘Q once is refused, ⌘Q again exits.
+- [ ] RAW corpus job green (`DARKROOM_REQUIRE_CORPUS=1`).
+- [ ] Packaged-app soak, 45-60 min, on the built `.dmg` (not `tauri dev`) — memory pressure watched.
+- [ ] Updater from the installed public release into this build; the existing catalog and its edits
+      survive.
