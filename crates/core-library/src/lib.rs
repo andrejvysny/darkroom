@@ -46,7 +46,7 @@ pub use decode_failure::{
     record_decode_failure, record_failure_facts, skippable_failures, DecodeFailureCounts,
     DecodeFailureRow, FailureFacts,
 };
-pub use edits::{get_edit, get_edit_with_version, set_edit};
+pub use edits::{get_edit, get_edit_with_version, set_edit, thumb_precheck};
 pub use error::LibError;
 pub use events::{append_event, context_with_suggested, event_count, ids_json, Event};
 pub use face::{

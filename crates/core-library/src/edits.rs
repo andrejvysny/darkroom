@@ -15,6 +15,34 @@ pub fn get_edit(conn: &Connection, image_id: i64) -> Result<Option<String>, LibE
 }
 
 /// Saved develop params JSON + its `updated_at` version, if any. The version cache-busts previews.
+/// One-query pre-check for the thumbnail backfill: an image's content hash plus its edit version
+/// (`None` when unedited). The worker asks this for EVERY present image at startup, so two separate
+/// round-trips per id meant two catalog-lock acquisitions per id — 200k of them on a 100k library,
+/// all competing with foreground queries on the single connection.
+pub fn thumb_precheck(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Option<(String, Option<i64>)>, LibError> {
+    Ok(conn
+        .query_row(
+            "SELECT i.content_hash, e.updated_at
+               FROM images i LEFT JOIN edits e ON e.image_id = i.id
+              WHERE i.id = ?1",
+            params![image_id],
+            |r| {
+                // `content_hash` is 32 raw bytes on disk; every consumer (thumb cache keys included)
+                // uses the hex form, exactly as `query::map_row` produces it.
+                let bytes: Vec<u8> = r.get(0)?;
+                let hash = match <[u8; 32]>::try_from(bytes.as_slice()) {
+                    Ok(a) => core_raw::hex(&a),
+                    Err(_) => String::new(),
+                };
+                Ok((hash, r.get::<_, Option<i64>>(1)?))
+            },
+        )
+        .optional()?)
+}
+
 pub fn get_edit_with_version(
     conn: &Connection,
     image_id: i64,

@@ -1181,13 +1181,27 @@ impl DevelopPipeline {
         oh: u32,
     ) -> Result<Vec<u8>, PipelineError> {
         // One render at a time per image — every uniform/LUT/target below is shared state.
-        let _render_guard = prepared.render_lock.lock().unwrap();
+        // Poison policy: RECOVER. This mutex guards ordering, not data (`Mutex<()>` — there is no
+        // state inside it to be left inconsistent). A panic in one GPU render must not make every
+        // later render of that image panic too, which would kill the app on the second failure.
+        let _render_guard = prepared
+            .render_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let device = &ctx.device;
         let (w, h) = (prepared.width, prepared.height);
 
         // Every write below is diffed against its last payload (write_hashes): a pan/zoom frame
         // rewrites ONLY the view uniform; a slider move rewrites only what it feeds.
-        let mut hashes = prepared.write_hashes.lock().unwrap();
+        // Poison policy: RECOVER + RESET. These hashes are cache-validity data ("what is currently in
+        // each GPU buffer"); a panic can leave them mid-update and no longer describing the real
+        // buffer contents, so trusting them would skip a write that is actually needed. `None` is
+        // `write_buffer_if_changed`'s never-matches value, so clearing forces a full rewrite.
+        let mut hashes = prepared.write_hashes.lock().unwrap_or_else(|p| {
+            let mut g = p.into_inner();
+            g.fill(None);
+            g
+        });
         write_buffer_if_changed(
             &ctx.queue,
             &prepared.uniform,
@@ -1289,8 +1303,21 @@ impl DevelopPipeline {
         // Cache: a mask layer is recomputed only when its coverage geometry changes. Pan/zoom and
         // global/local SCALAR edits leave geometry untouched, so they reuse the persistent mask_tex
         // layer and skip the (full-res) pre-pass entirely.
-        let mut layer_hashes = prepared.mask_layer_hash.lock().unwrap();
-        let ai_covs = prepared.ai_coverages.lock().unwrap();
+        // Poison policy: RECOVER + RESET — same reasoning as `write_hashes`. These say which mask
+        // geometry is baked into each `mask_tex` layer; if that record may be stale, re-run the
+        // pre-pass for every layer rather than sample coverage that was never written.
+        let mut layer_hashes = prepared.mask_layer_hash.lock().unwrap_or_else(|p| {
+            let mut g = p.into_inner();
+            g.fill(None);
+            g
+        });
+        // Poison policy: RECOVER ONLY — read-only here, and this holds baked SAM coverage that costs
+        // a full segmentation run to rebuild, so it is never cleared. Worst case a stale coverage is
+        // used for one render; the next `develop_render` re-resolves it from the backend SAM cache.
+        let ai_covs = prepared
+            .ai_coverages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut enabled_count = 0usize;
         for (layer, mask) in params
             .masks
@@ -1570,7 +1597,14 @@ impl DevelopPipeline {
                 oh,
             );
         }
-        let mut target = prepared.view_target.lock().unwrap();
+        // Poison policy: RECOVER + RESET. The target is disposable and re-created below whenever the
+        // size differs; dropping it on poison just forces that re-creation, so a half-built target
+        // from a panicked render is never reused.
+        let mut target = prepared.view_target.lock().unwrap_or_else(|p| {
+            let mut g = p.into_inner();
+            *g = None;
+            g
+        });
         let target = target.get_or_insert_with(|| ViewTarget::new(&ctx.device, ow, oh));
         if target.width != ow || target.height != oh {
             *target = ViewTarget::new(&ctx.device, ow, oh);

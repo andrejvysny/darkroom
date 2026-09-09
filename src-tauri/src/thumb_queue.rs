@@ -18,7 +18,7 @@ use crate::commands::{decode_develop, enforce_thumb_cap, render_linear_cropped, 
 use crate::state::AppState;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Canonical thumbnail long-edge + JPEG quality. 1024 covers the grid (512) and filmstrip (256) via
@@ -63,6 +63,10 @@ impl Default for ThumbQueue {
     }
 }
 
+/// Logged at most once per launch — a poisoned scheduling lock is worth knowing about, but not worth
+/// a line per subsequent enqueue.
+static POISON_LOGGED: Once = Once::new();
+
 impl ThumbQueue {
     pub fn new() -> Self {
         Self {
@@ -76,7 +80,7 @@ impl ThumbQueue {
     /// Append ids to the bulk backfill (deduped). Already-cached ids are cheaply skipped by the
     /// worker's pre-check, so re-enqueuing the whole library after an import is idempotent.
     pub fn enqueue_bulk(&self, ids: impl IntoIterator<Item = i64>) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.lock();
         let mut added = false;
         for id in ids {
             if st.queued.insert(id) {
@@ -96,7 +100,7 @@ impl ThumbQueue {
         if ids.is_empty() {
             return;
         }
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.lock();
         // Reverse so the caller's first id ends up frontmost after the push_fronts.
         for &id in ids.iter().rev() {
             st.back.retain(|&x| x != id);
@@ -110,7 +114,7 @@ impl ThumbQueue {
 
     /// Mark whether a Develop session is open. Clearing it wakes the worker to resume backfill.
     pub fn set_interactive(&self, active: bool) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.lock();
         st.interactive = active;
         drop(st);
         self.inner.cv.notify_all();
@@ -118,7 +122,7 @@ impl ThumbQueue {
 
     /// Block until a renderable job is available and no Develop session is active. `None` on shutdown.
     fn next_job(&self) -> Option<i64> {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.lock();
         loop {
             if st.shutdown {
                 return None;
@@ -129,8 +133,29 @@ impl ThumbQueue {
                     return Some(id);
                 }
             }
-            st = self.inner.cv.wait(st).unwrap();
+            st = self.inner.cv.wait(st).unwrap_or_else(|p| {
+                Self::log_poison();
+                p.into_inner()
+            });
         }
+    }
+
+    /// Poisoned-lock policy: RECOVER, never panic. This mutex guards disposable scheduling state
+    /// (two id queues, a membership set and two flags) — a panic elsewhere can leave it inconsistent
+    /// at worst, and the next enqueue repairs that, whereas propagating the poison would kill the
+    /// background thumbnail backfill (and the worker thread) for the rest of the session. Nothing
+    /// here is worth taking the app down for: every job is re-derivable from the catalog.
+    fn lock(&self) -> MutexGuard<'_, QueueState> {
+        self.inner.state.lock().unwrap_or_else(|p| {
+            Self::log_poison();
+            p.into_inner()
+        })
+    }
+
+    fn log_poison() {
+        POISON_LOGGED.call_once(|| {
+            tracing::warn!("thumb queue lock was poisoned; recovering (state is disposable)");
+        });
     }
 }
 
@@ -185,14 +210,13 @@ fn render_one(app: &AppHandle, image_id: i64) {
     // Cheap pre-check (no decode): which tiers are missing? Also read the configured preview edge.
     let (pedge, need_thumb, need_preview) = {
         let Ok(db) = st.db.lock() else { return };
-        let hash = match core_library::image_by_id(&db.conn, image_id) {
-            Ok(Some(img)) => img.content_hash,
-            _ => return,
+        // ONE query for both: the startup backfill runs this pre-check for every present image, so
+        // a second round-trip per id meant a second catalog-lock acquisition per id — 200k of them
+        // on a 100k library, all contending with foreground queries on the single connection.
+        let Ok(Some((hash, edit_version))) = core_library::thumb_precheck(&db.conn, image_id)
+        else {
+            return;
         };
-        let edit_version = core_library::get_edit_with_version(&db.conn, image_id)
-            .ok()
-            .flatten()
-            .map(|(_, v)| v);
         let pedge = core_library::preview_edge(&db.conn).unwrap_or(0);
         let need_thumb = match edit_version {
             Some(v) => st.thumbs.read_edited(&hash, v).is_err(),

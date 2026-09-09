@@ -53,10 +53,21 @@
       `DARKROOM_PREVIEW_LRU_ENTRIES` overrides so the budget can be measured on an 8 GB machine
       without a rebuild; 4 unit tests
       - [ ] Measure: hit rate + next/back latency at 256/384/512 MB on a real library
-- [ ] **C8 — kill duplicate RAW decode**: `develop_regen_thumb` reuses the warm preview LRU; batch
-      `render_one`'s per-image pre-check query
-- [ ] **C9 — mutex poisoning policy**: `render_lock` → `into_inner` (ordering token); cache mutexes
-      clear on poison; thumb queue disables backfill instead of panicking
+- [x] **C8 — thumbnail scheduling cost**: `render_one`'s pre-check is now ONE query
+      (`core_library::thumb_precheck`) instead of two — the startup backfill took two catalog-lock
+      acquisitions per image (200k on a 100k library). Its test caught a real bug: the first draft
+      read `content_hash` as TEXT, but it is 32 raw bytes hex-encoded on read, so every row would
+      have failed.
+      - **Rejected**: sourcing the edited thumbnail from the warm half-res preview LRU. It would
+        change thumbnail pixels for newly written cache entries only, giving one library mixed
+        provenance under the same `PROCESS_VERSION`. C3 already removed the per-save decode (regen
+        is now one 1200 ms-idle decode per gesture), so the remaining win does not justify that.
+        Revisit with a PV bump if a benchmark says otherwise.
+- [x] **C9 — mutex poisoning policy**: `render_lock` recovers (it guards ordering, not data — a
+      panic in one GPU render used to make every later render of that image panic too); the
+      cache-validity mutexes (`write_hashes`, `mask_layer_hash`) recover AND reset so nothing stale
+      is trusted; `ai_coverages` recovers only (SAM coverage costs a segmentation run to rebuild);
+      thumb queue recovers with a once-per-launch warning. The catalog lock still uses `map_err`.
 - [ ] **C10 — atomicity + failure injection**: export/HDR/pano temp+rename, orphan cleanup,
       cancellation tests; conservative stale-temp sweep
 - [ ] **C11 — import worker benchmark**, then cap (separate commits)
