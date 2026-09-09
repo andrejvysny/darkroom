@@ -2,6 +2,52 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## IN PROGRESS: Stability/performance hardening patch — 2026-09-09 — plan: `~/.claude/plans/act-as-senior-rust-lively-storm.md`
+
+> External hardening review, verified against the tree. Target: edits feel continuously saved,
+> foreground beats background, one bad photo cannot destabilize the app, 100k catalogs stay
+> responsive, a release cannot publish past red validation. Scope P0+P1, committed on `main`.
+> **`PROCESS_VERSION` stays 5 — nothing here changes developed pixels.**
+>
+> Headline finding: `ci.yml` step "Release profile must unwind" runs
+> `grep -q 'panic = "abort"' Cargo.toml && exit 1 || true`, and `Cargo.toml:31`'s own guard comment
+> contains that literal, so the step fails every run and the macOS Clippy + `cargo test --workspace`
+> steps after it have never executed.
+
+- [ ] **C1 — green baseline** (no functional change): delete the ci.yml grep step; `compile_error!`
+      guard for `panic = "abort"` in `core-raw/src/panic.rs`; cfg-gate the 13 HEIF-only PQ/BT.2020
+      items in `core-raw/src/color.rs` (verified set — Windows clippy `-D warnings`); drop the stale
+      `packageManager: yarn` field; `cargo fmt`
+- [ ] **C2 — persistence regression tests** (must fail first): mock-IPC Playwright A→B spec;
+      `src-tauri` test for the unreadable-blob guard
+- [ ] **C3 — `DevelopPersistenceCoordinator`** (`src/lib/developPersistence.ts`): per-image pending
+      state, latest-wins, serialized saves, 250 ms idle / 1000 ms max-wait, flush on navigate /
+      unmount / Develop exit / blur, per-image `touchCount`, error banner + bounded retry
+- [ ] **C4 — quit save barrier**: `RunEvent::ExitRequested` + `prevent_exit` (AtomicBool guard),
+      `app:flush-edits` → ack with 1500 ms timeout → sidecar flush → WAL checkpoint → `exit(0)`
+- [ ] **C5 — sidecar decoupling**: split `write_sidecar` into snapshot (locked) + write (unlocked);
+      new `src-tauri/src/sidecar_queue.rs` coalescing worker; out of `develop_set_edit`'s DB lock
+- [ ] **C6 — corrupt stored edit visible**: new `develop_edit_status` IPC + banner + Reset(force)
+- [ ] **C7 — bounded prefetch**: one persistent worker (≤1 speculative decode), LRU 384 MiB / 5 with
+      `DARKROOM_PREVIEW_LRU_MB` override
+- [ ] **C8 — kill duplicate RAW decode**: `develop_regen_thumb` reuses the warm preview LRU; batch
+      `render_one`'s per-image pre-check query
+- [ ] **C9 — mutex poisoning policy**: `render_lock` → `into_inner` (ordering token); cache mutexes
+      clear on poison; thumb queue disables backfill instead of panicking
+- [ ] **C10 — atomicity + failure injection**: export/HDR/pano temp+rename, orphan cleanup,
+      cancellation tests; conservative stale-temp sweep
+- [ ] **C11 — import worker benchmark**, then cap (separate commits)
+- [ ] **C12 — 100k synthetic catalog benchmark**, then only measured SQL fixes (strftime → UTC epoch
+      range first)
+- [ ] **C13 — CI wiring + fail-closed `v*` release** (signing/notarize/staple/spctl/updater)
+- [ ] **C14 — RC stabilization**: packaged-app soak, memory/import/render soaks, updater from v0.1.2
+
+### Open questions (answer before the commit that needs them)
+- C4: quit-failure UX = first quit cancelled + banner, second within 30 s proceeds. OK?
+- C8: filmstrip edited-thumb refresh may lag ~1 s. Acceptable?
+- C13: real-backend e2e stays `workflow_dispatch` on the dev Mac unless a self-hosted runner exists.
+- C11: ship Reference cap `min(cores, 6)` + env override, or keep `cores` until an 8 GB Mac exists?
+
 ## IN PROGRESS: Import fix + optimize — 2026-09-09 — plan: `~/.claude/plans/act-as-senior-software-elegant-allen.md`
 
 > Bug: the Import dialog reset all its state in an effect keyed on the parent's inline `onClose`, so

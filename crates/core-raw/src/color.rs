@@ -19,7 +19,9 @@ pub(crate) const XYZ_TO_PROPHOTO_D50: M3 = [
     [0.0, 0.0, 1.2118128],
 ];
 
+// The HEIF PQ decode path's math — consumed only by `heif.rs`, which is not built on Windows.
 /// Standard Bradford chromatic-adaptation cone-response matrix.
+#[cfg(not(windows))]
 const BRADFORD: M3 = [
     [0.8951, 0.2664, -0.1614],
     [-0.7502, 1.7135, 0.0367],
@@ -27,16 +29,19 @@ const BRADFORD: M3 = [
 ];
 
 /// CIE D50 reference white (XYZ, Y=1) — the white [`XYZ_TO_PROPHOTO_D50`] maps to RGB [1,1,1].
+#[cfg(not(windows))]
 pub(crate) const WHITE_D50_XYZ: [f64; 3] = [0.96422, 1.0, 0.82521];
 
 /// Linear BT.2020 (D65) → XYZ (D65). Columns are the BT.2020 primaries' XYZ vectors scaled so that
 /// RGB=[1,1,1] maps to the D65 white point (derivation asserted in `bt2020_matrix_derivation`).
+#[cfg(not(windows))]
 pub(crate) const BT2020_TO_XYZ_D65: M3 = [
     [0.6369580, 0.1446169, 0.1688810],
     [0.2627002, 0.6779981, 0.0593017],
     [0.0000000, 0.0280727, 1.0609851],
 ];
 
+#[cfg(not(windows))]
 pub(crate) fn mat3_mul(a: &M3, b: &M3) -> M3 {
     let mut o = [[0.0; 3]; 3];
     for i in 0..3 {
@@ -81,6 +86,7 @@ pub(crate) fn mat3_inv(m: &M3) -> M3 {
 }
 
 /// Bradford CAT (XYZ→XYZ) adapting the source white to the destination white.
+#[cfg(not(windows))]
 pub(crate) fn bradford_cat(w_src: [f64; 3], w_dst: [f64; 3]) -> M3 {
     let ls = mat3_vec(&BRADFORD, w_src);
     let ld = mat3_vec(&BRADFORD, w_dst);
@@ -95,6 +101,7 @@ pub(crate) fn bradford_cat(w_src: [f64; 3], w_dst: [f64; 3]) -> M3 {
 
 /// Linear BT.2020 (D65) → linear ProPhoto (D50), Bradford-adapted. The one matrix the HEIF PQ
 /// decode needs: `XYZ→ProPhoto(D50) · CAT(D65→D50) · BT.2020→XYZ(D65)`, packed to f32.
+#[cfg(not(windows))]
 pub(crate) fn bt2020_to_prophoto_d50() -> [[f32; 3]; 3] {
     // Source white = the D65 the BT.2020 matrix itself encodes (its RGB=[1,1,1] image), not a
     // separately-rounded D65 constant — keeps white→white mapping exact through the CAT.
@@ -112,13 +119,19 @@ pub(crate) fn bt2020_to_prophoto_d50() -> [[f32; 3]; 3] {
 
 // --- SMPTE ST 2084 (PQ) ---------------------------------------------------------------------------
 
+#[cfg(not(windows))]
 const PQ_M1: f64 = 2610.0 / 16384.0; // 0.1593017578125
+#[cfg(not(windows))]
 const PQ_M2: f64 = 2523.0 / 4096.0 * 128.0; // 78.84375
+#[cfg(not(windows))]
 const PQ_C1: f64 = 3424.0 / 4096.0; // 0.8359375
+#[cfg(not(windows))]
 const PQ_C2: f64 = 2413.0 / 4096.0 * 32.0; // 18.8515625
+#[cfg(not(windows))]
 const PQ_C3: f64 = 2392.0 / 4096.0 * 32.0; // 18.6875
 
 /// PQ signal 1.0 corresponds to this absolute luminance.
+#[cfg(not(windows))]
 pub(crate) const PQ_MAX_NITS: f64 = 10000.0;
 
 /// The PQ luminance that maps to working-space 1.0. This is the single calibration knob for HEIF
@@ -138,6 +151,7 @@ pub const HDR_DIFFUSE_WHITE_NITS: f64 = 300.0;
 
 /// ST 2084 EOTF: PQ-encoded signal `e ∈ [0,1]` → normalized linear luminance `Y ∈ [0,1]`
 /// (multiply by [`PQ_MAX_NITS`] for cd/m²).
+#[cfg(not(windows))]
 pub(crate) fn pq_eotf(e: f64) -> f64 {
     let e = e.clamp(0.0, 1.0);
     let p = e.powf(1.0 / PQ_M2);
@@ -369,12 +383,14 @@ mod tests {
     use super::*;
 
     /// ST 2084 inverse EOTF (encode), test-only.
+    #[cfg(not(windows))]
     fn pq_oetf(y: f64) -> f64 {
         let y = y.clamp(0.0, 1.0);
         let p = y.powf(PQ_M1);
         ((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p)).powf(PQ_M2)
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn pq_endpoints() {
         assert_eq!(pq_eotf(0.0), 0.0);
@@ -382,6 +398,7 @@ mod tests {
     }
 
     /// The canonical spot value: PQ code ≈ 0.5081 encodes 100 cd/m² (SDR peak white).
+    #[cfg(not(windows))]
     #[test]
     fn pq_100_nits_spot_value() {
         let nits = pq_eotf(0.5081) * PQ_MAX_NITS;
@@ -391,6 +408,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn pq_round_trip() {
         for &y in &[0.0, 1e-6, 1e-4, 0.01, 0.1, 0.0203, 0.5, 0.9, 1.0] {
@@ -406,6 +424,7 @@ mod tests {
     /// Derive BT.2020→XYZ from the primaries' chromaticities (ITU-R BT.2020-2: R(0.708,0.292),
     /// G(0.170,0.797), B(0.131,0.046), white D65 (0.3127,0.3290)) and assert the hardcoded constant
     /// matches to ≤1e-6 per element.
+    #[cfg(not(windows))]
     #[test]
     fn bt2020_matrix_derivation() {
         let xy = [(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)];
@@ -436,6 +455,7 @@ mod tests {
     }
 
     /// BT.2020 white [1,1,1] must land on ProPhoto white [1,1,1] (proves the D65→D50 CAT chain).
+    #[cfg(not(windows))]
     #[test]
     fn bt2020_white_maps_to_prophoto_white() {
         let m = bt2020_to_prophoto_d50();

@@ -16,6 +16,15 @@ use std::panic::AssertUnwindSafe;
 
 use crate::error::RawError;
 
+// Hard guard: a `panic = "abort"` profile silently voids `catch_decode_panic`, turning one corrupt
+// RAW into a process abort. Fail the build instead. `not(test)` because cargo forces unwinding for
+// test-harness binaries, so the cfg would never fire there anyway.
+#[cfg(all(not(test), panic = "abort"))]
+compile_error!(
+    "core-raw requires panic = \"unwind\": catch_decode_panic isolates rawler decoder panics so one \
+     bad file is skipped instead of aborting the app. Remove `panic = \"abort\"` from the profile."
+);
+
 /// `true` when this build unwinds (so [`catch_decode_panic`] can actually catch). `false` under a
 /// `panic = "abort"` profile, where a decoder panic still kills the process.
 pub const ISOLATION_ACTIVE: bool = cfg!(panic = "unwind");

@@ -418,6 +418,10 @@ mod imp {
     pub fn read_heif_meta(_bytes: &[u8]) -> RawMeta {
         RawMeta::default()
     }
+
+    pub fn heif_exif_bytes(_bytes: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 pub use imp::*;

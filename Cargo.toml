@@ -28,7 +28,7 @@ strip = true
 opt-level = 3
 # Unwind (the default) is load-bearing: `core-raw` contains decoder panics from the rawler crate
 # with `catch_unwind` so one corrupt/odd RAW skips that file instead of aborting the whole app.
-# Do NOT set `panic = "abort"` here — CI greps for it.
+# Do NOT set `panic = "abort"` here — `core-raw` fails to compile if you do.
 
 # Faster RAW decode / image work even in dev
 [profile.dev.package."*"]

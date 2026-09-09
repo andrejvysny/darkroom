@@ -57,12 +57,6 @@ jobs:
       - name: Frontend type-check + build
         run: npm run build
 
-      # `core-raw` contains rawler's decoder panics with `catch_unwind` so one odd RAW is skipped
-      # instead of aborting the app. `panic = "abort"` in the release profile would silently turn
-      # every such file into a crash, and nothing else would notice.
-      - name: Release profile must unwind (decoder panic isolation)
-        run: grep -q 'panic = "abort"' Cargo.toml && exit 1 || true
-
       - name: Clippy (warnings = errors)
         run: cargo clippy --workspace --examples -- -D warnings
 
