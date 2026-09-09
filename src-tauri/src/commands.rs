@@ -29,7 +29,14 @@ pub fn frontend_log(
 // it replaces the fixed highlight shoulder, so v1/v2 rows re-render with the new tonality.
 // v4 fits the base tone curve to the real ACR default (mid-grey 0.18→0.388 ≈65% sRGB, ~+1.3 EV
 // brighter) + adds Color-balance-RGB; all prior rows re-render with the matched ACR brightness.
-pub const PROCESS_VERSION: i64 = 4;
+// v5 changes the decode itself (core-raw): clipped-highlight reconstruction (no more magenta blown
+// skies), dual-illuminant camera-matrix interpolation, rawler 0.8.0 demosaic. Canonical thumbnails
+// and previews re-render; stored edit params are untouched.
+pub const PROCESS_VERSION: i64 = 5;
+
+/// Default cap on the Unsupported list — enough to see every camera the library trips over without
+/// shipping a 50k-row table to the frontend.
+const DECODE_FAILURE_LIMIT: i64 = 500;
 
 /// Delete cached thumbnails for content hashes no longer referenced by any present row. A byte-
 /// identical keeper still shares its hash, so presence is re-checked before deleting (lowercase-hex
@@ -143,6 +150,50 @@ pub async fn library_index_root(app: AppHandle, path: String) -> Result<IndexSta
     .map_err(|e| e.to_string())?
 }
 
+/// The RAW files the catalog could NOT take, most recently seen first — what the "Unsupported"
+/// list renders. These paths have no `images` row by definition, so they are keyed by path.
+#[tauri::command]
+pub async fn decode_failures_list(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<core_library::DecodeFailureRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::list_decode_failures(&db.conn, limit.unwrap_or(DECODE_FAILURE_LIMIT))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Failure tallies by class, for the sidebar badge (`unsupported` / `corrupt` / `other`).
+#[tauri::command]
+pub async fn decode_failures_counts(
+    app: AppHandle,
+) -> Result<core_library::DecodeFailureCounts, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::decode_failure_counts(&db.conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Forget the recorded failures for `paths` ("Try again"), so the next scan decodes them again.
+/// Returns how many rows were removed. Touches only bookkeeping — no file is read or moved.
+#[tauri::command]
+pub async fn decode_failures_forget(app: AppHandle, paths: Vec<String>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::forget_decode_failures(&db.conn, &paths).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Index every supported RAW under `root` into the catalog: upsert the folder, enumerate
 /// (recursively), parallel hash+meta+thumbnail, then a single transactional insert. Emits
 /// `import:progress` / `import:done`. When `analyze`, kicks off background AI analysis of the
@@ -154,21 +205,31 @@ fn index_root_blocking(
     root: &Path,
     analyze: bool,
 ) -> Result<IndexStats, String> {
-    // --- brief lock: upsert folder + snapshot known paths ---
-    let (folder_id, known) = {
+    // --- brief lock: upsert folder + snapshot known paths + still-standing decode failures ---
+    let (folder_id, known, known_bad) = {
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let fid = core_library::add_root(&db.conn, root).map_err(|e| e.to_string())?;
         let known = core_library::existing_paths(&db.conn).map_err(|e| e.to_string())?;
-        (fid, known)
+        let known_bad = core_library::skippable_failures(&db.conn).map_err(|e| e.to_string())?;
+        (fid, known, known_bad)
     };
 
     // --- unlocked: enumerate + parallel process (hash + meta + thumbnail) ---
+    // Files whose recorded failure still stands (same decoder build, same bytes) are not re-opened.
+    let mut skipped_bad = 0usize;
     let todo: Vec<PathBuf> = core_library::enumerate_raws(root, true)
         .into_iter()
         .filter(|p| !known.contains(&p.display().to_string()))
+        .filter(|p| {
+            let bad = known_bad.contains(&p.display().to_string());
+            skipped_bad += usize::from(bad);
+            !bad
+        })
         .collect();
     let total = todo.len();
     let done = AtomicUsize::new(0);
+    // The path rides along with its result: a `LibError` carries no path, and every failure has to
+    // be recorded against the file that produced it.
     let results: Vec<_> = todo
         .par_iter()
         .map(|p| {
@@ -180,7 +241,7 @@ fn index_root_blocking(
                     serde_json::json!({"done": n, "total": total}),
                 );
             }
-            r
+            (p, r)
         })
         .collect();
 
@@ -188,20 +249,39 @@ fn index_root_blocking(
     let imported_at = core_library::now_epoch();
     let mut stats = IndexStats {
         scanned: total,
+        skipped: skipped_bad,
         ..Default::default()
     };
     {
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-        for r in &results {
+        for (path, r) in &results {
             match r {
                 Ok(p) => match core_library::insert_image(&tx, folder_id, imported_at, p)
                     .map_err(|e| e.to_string())?
                 {
-                    Some(_) => stats.added += 1,
+                    Some(_) => {
+                        stats.added += 1;
+                        // A file that used to fail and now indexes leaves no stale record behind.
+                        let _ = core_library::clear_decode_failure(&tx, &p.path);
+                    }
                     None => stats.skipped += 1,
                 },
-                Err(_) => stats.failed += 1,
+                Err(e) => {
+                    stats.failed += 1;
+                    // Best-effort: a bookkeeping write must never fail a whole scan.
+                    if core_library::record_decode_failure(
+                        &tx,
+                        Some(folder_id),
+                        path,
+                        e,
+                        imported_at,
+                    )
+                    .unwrap_or(false)
+                    {
+                        stats.unsupported += 1;
+                    }
+                }
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -3005,9 +3085,8 @@ pub async fn suggest_status(app: AppHandle) -> Result<core_library::SuggestStatu
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
-        let mut status =
-            core_library::suggest_status(&db.conn, crate::analysis::EMBEDDING_VERSION)
-                .map_err(|e| e.to_string())?;
+        let mut status = core_library::suggest_status(&db.conn, crate::analysis::EMBEDDING_VERSION)
+            .map_err(|e| e.to_string())?;
         // The run flag lives in app state, not the catalog — see `SuggestStatus::running`.
         status.running = crate::suggest::is_running(&st);
         Ok(status)

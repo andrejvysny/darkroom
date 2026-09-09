@@ -2,6 +2,64 @@
 
 > Continuation tracker. Full status + architecture + gotchas in `CURRENT_STATE.md`. Spec: `SPEC_V1.md`.
 
+## IN PROGRESS: Import fix + optimize — 2026-09-09 — plan: `~/.claude/plans/act-as-senior-software-elegant-allen.md`
+
+> Bug: the Import dialog reset all its state in an effect keyed on the parent's inline `onClose`, so
+> any LibraryView re-render (thumb-queue `thumb:rendered`, watcher `library:changed`, toasts) wiped
+> the listing seconds after picking a folder — "select folder, files appear, then vanish".
+
+- [x] `ImportDialog` mounted only while open; no reset effect; `onClose` via ref; unmount cancels dedup/preview
+- [x] Tier-1 mock QA: list survives forced `library:changed`/`thumb:rendered`/`import:done` + culling shortcut; Escape closes; reopen fresh
+- [x] mock: `decode_failures_{counts,list,forget}` handlers (were unhandled → console noise)
+- [x] backend: `process_bytes` (single read+hash per file), chunked rayon-parallel `import_files` (dest-name claim set, intra-chunk dup cleanup + orphan removal on `insert_image → None`), parallel `dedup_scan`; 5 new fixture-free tests (poppies.jpg copies); `cargo test -p core-import/-p core-library` + clippy `-D warnings` + `npm run build` green
+- [ ] Live GUI QA (`npm run tauri dev`) on a real card/folder: list persists after picking, dedup completes, commit time vs before (no local corpus to bench — only 1 CR3 committed)
+- [ ] Follow-up: virtualize the import list for >5k-file cards (DOM ≈ 7 nodes/row today)
+
+## IN PROGRESS: RAW multi-maker correctness (Canon/Nikon/Sony) — 2026-09-08 — plan: `~/.claude/plans/act-as-senior-rust-cozy-sutton.md`
+
+> Review found: magenta clipped highlights (no saturation handling after WB), Sony catalog dims =
+> 1616×1080 embedded preview, unsupported bodies/modes silently `failed`, rawler panics + release
+> `panic=abort` kill the app on one bad file. Baseline (rawler 0.7.2, R7 fixture): patch64 =
+> [0.10053, 0.09774, 0.08705], wb [1.7656, 1.0, 1.6572], hl_chroma 0.204.
+
+### Now
+- [ ] Live GUI QA (`npm run tauri dev`): import a Sony/Nikon folder → RightInfo dims true; blown sky + Highlights −100 stays neutral; Unsupported row/modal with an HE* NEF (`target/raw-corpus/Nikon/Z 8/…`); then commit (user call)
+
+### Phase 0 — rawler 0.8.0 go/no-go
+- [x] pin `=0.8.0`, `cargo check/clippy/test`, fixture stats unchanged
+
+### Phase 1 — Safety net (no render change)
+- [x] `RawError::{Unsupported, DecoderPanic}` + `From<RawlerError>` + call sites → `?`
+- [x] `panic.rs` catch_decode_panic at every public entry; hook early-return; release profile → unwind
+- [x] `guard_developable` pre-screens (mono path, non-2×2 CFA, crop containment)
+- [x] WB sanity; `preview_image` only (0.8.0 rename); skip dotfiles
+- [x] migration 025 `decode_failure` + record/skip/clear in index/commands/watch; import early-out + orphan cleanup
+- [x] IPC `decode_failures_list/counts/forget`; toast; LeftNav row + UnsupportedModal (ImportDialog badge skipped — no cheap per-file verdict in `list_source`)
+
+### Phase 2 — Colour correctness (PROCESS_VERSION 4→5)
+- [x] highlight reconstruction in `map_3ch_to_rgb` (+ rayon)
+- [x] true sensor dims via dummy decode (thumb.rs) — verify R7 crop dims == preview dims
+- [x] `select_cam_matrix` dual-illuminant CCT interpolation + fallback order
+
+### Phase 3 — Coverage
+- [x] `SUPPORTED_EXT` += crw nrw sr2 srf; explicit RAW list in `classify()`
+- [x] user-facing unsupported texts (HE/HE*, unknown body, ARW6)
+
+### Phase 4 — Corpus + CI
+- [x] `synth.rs` Bayer/mono DNG author + `tests/synthetic_bayer.rs`
+- [x] `tests/corpus/manifest.toml` + `expected.toml` + `scripts/fetch_raw_corpus.sh` + `tests/corpus.rs` + `corpus_index.rs`
+- [x] `raw-corpus` CI job (ubuntu, cache) ; `[profile.dev.package.core-raw] opt-level = 3`
+
+### Phase 5 — Docs
+- [x] CURRENT_STATE / TODO / SPEC_V1 / HAND_OFF / CLAUDE.md pins + format list
+
+### Left open
+- [ ] Live GUI QA: import a Sony/Nikon folder (RightInfo dims), blown sky + Highlights −100 stays neutral, Unsupported row/modal with an HE* NEF
+- [ ] Measure release binary size after the `panic = unwind` flip (`npm run tauri build`), record in CURRENT_STATE
+- [ ] `decode_failure` GC sweep in maintenance (rows for cards that never return)
+- [ ] X-Trans: validate rawler 0.8.0 Markesteijn path, then allow `raf` (guard in `guard_developable`)
+- [ ] Commit (user call) — 30+ files, all gates green 2026-09-09
+
 ## Professional-ready roadmap (2026-08-02) — CURRENT
 
 > Plan: `~/.claude/plans/act-as-senior-software-misty-quasar.md`. Decisions: serious personal tool ·
@@ -942,7 +1000,7 @@ Quality: `cargo test --workspace` (31 suites, all green) · `cargo clippy --work
 ## Remaining work (prioritized)
 
 > Full plan: `~/.claude/plans/act-as-senior-software-flickering-candle.md` (5 phases).
-> Scope locked: pragmatic develop · personal macOS · full-DAM catalog · CR3-only.
+> Scope locked: pragmatic develop · personal macOS · full-DAM catalog · CR3-first (Canon/Nikon/Sony correctness pass 2026-09-08, see top section).
 
 ### Phase 1 — Develop facade I — DONE ✅ (validated on real R7 CR3)
 
@@ -1007,7 +1065,7 @@ Quality: `cargo test --workspace` (31 suites, all green) · `cargo clippy --work
 
 ### Decode coverage
 
-- [ ] Validate Sony `.ARW` / Nikon `.NEF` (latent via rawler, untested); LibRaw fallback feature (`libraw`), off by default.
+- [ ] Validate Sony `.ARW` / Nikon `.NEF` → superseded by the "RAW multi-maker correctness" section at the top (corpus job); LibRaw fallback dropped (2026-09-08).
 
 ## Watch-outs for whoever continues (see CURRENT_STATE.md for detail)
 

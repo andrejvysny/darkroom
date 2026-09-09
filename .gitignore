@@ -52,3 +52,6 @@ library/2026/2026-06-06/*
 # UI-testing (playwright-cli) session artifacts.
 .playwright-cli/
 src-tauri/frameworks/
+
+# Claude Code subagent scratch memory (session-local)
+.claude/agent-memory/

@@ -117,7 +117,7 @@ pub(crate) fn sync(app: &AppHandle) {
 /// Index RAW files under `root` that aren't already in the catalog (idempotent). No progress events.
 /// Returns `true` if at least one new row was inserted.
 fn index_new(st: &AppState, root: &Path) -> bool {
-    let (folder_id, known) = {
+    let (folder_id, known, known_bad) = {
         let Ok(db) = st.db.lock() else { return false };
         let Ok(fid) = core_library::add_root(&db.conn, root) else {
             return false;
@@ -125,35 +125,63 @@ fn index_new(st: &AppState, root: &Path) -> bool {
         (
             fid,
             core_library::existing_paths(&db.conn).unwrap_or_default(),
+            core_library::skippable_failures(&db.conn).unwrap_or_default(),
         )
     };
 
+    // Files whose recorded failure still stands are not re-opened: the watcher wakes on every card
+    // mount and folder touch, so without this an undecodable file is re-decoded indefinitely.
     let todo: Vec<PathBuf> = core_library::enumerate_raws(root, true)
         .into_iter()
         .filter(|p| !known.contains(&p.display().to_string()))
+        .filter(|p| !known_bad.contains(&p.display().to_string()))
         .collect();
     if todo.is_empty() {
         return false;
     }
 
+    // The path rides along with its result: a `LibError` carries no path, and failures used to be
+    // dropped here entirely (`results.iter().flatten()`), so a watcher-seen bad file went unrecorded.
     let results: Vec<_> = todo
         .par_iter()
-        .map(|p| core_library::process_file(p, &st.thumbs, THUMB_SIZE))
+        .map(|p| (p, core_library::process_file(p, &st.thumbs, THUMB_SIZE)))
         .collect();
 
     let imported_at = core_library::now_epoch();
     let mut inserted_any = false;
+    let mut recorded = 0usize;
     if let Ok(mut db) = st.db.lock() {
         if let Ok(tx) = db.conn.transaction() {
-            for r in results.iter().flatten() {
-                if let Ok(Some(_)) = core_library::insert_image(&tx, folder_id, imported_at, r) {
-                    inserted_any = true;
+            for (path, r) in &results {
+                match r {
+                    Ok(p) => {
+                        if let Ok(Some(_)) =
+                            core_library::insert_image(&tx, folder_id, imported_at, p)
+                        {
+                            inserted_any = true;
+                        }
+                        let _ = core_library::clear_decode_failure(&tx, &p.path);
+                    }
+                    Err(e) => {
+                        if core_library::record_decode_failure(
+                            &tx,
+                            Some(folder_id),
+                            path,
+                            e,
+                            imported_at,
+                        )
+                        .is_ok()
+                        {
+                            recorded += 1;
+                        }
+                    }
                 }
             }
             let _ = tx.commit();
         }
     }
-    inserted_any
+    // A newly-recorded failure changes the sidebar's Unsupported count, so it counts as a change.
+    inserted_any || recorded > 0
 }
 
 /// RAII marker that an import is running, so the FS watcher defers its sync pass for the duration

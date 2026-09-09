@@ -14,8 +14,8 @@ import {
 } from "../../lib/ipc";
 import { commitImport, pickFolder, resolveDest } from "../../lib/importFlow";
 
+/** Mounted by the parent only while the dialog is open; unmounting is how it closes. */
 interface Props {
-  open: boolean;
   collections: CollectionRow[];
   onClose: () => void;
   onComplete: () => void;
@@ -97,7 +97,6 @@ function groupByDay(
 }
 
 export default function ImportDialog({
-  open,
   collections,
   onClose,
   onComplete,
@@ -146,34 +145,45 @@ export default function ImportDialog({
     previewUrlRef.current = null;
   }
 
-  // Reset everything each time the dialog opens; resolve the default destination up front.
+  // The dialog is mounted only while open (LibraryView), so every open starts from fresh state
+  // by construction. Nothing below may depend on a prop identity: an earlier version reset all
+  // state in an effect keyed on `onClose`, and since the parent passes a new closure on every
+  // render, any LibraryView re-render (thumb-queue bumps, watcher refreshes, toasts) wiped the
+  // listing seconds after the folder was picked.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // Resolve the default destination up front; ignore the answer if the dialog is gone.
   useEffect(() => {
-    if (!open) return;
-    setSource(null);
-    setFiles([]);
-    setSelected(new Set());
-    setListing(false);
-    setRecursive(true);
-    setKindFilter("all");
-    setPairing("pair");
-    setDedupProgress(null);
-    setPreviewPath(null);
-    setPreviewUrl(null);
-    setPreviewError(false);
-    revokePreview();
-    void resolveDest().then(setDest);
+    let cancelled = false;
+    void resolveDest().then((d) => {
+      if (!cancelled) setDest(d);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  // Unmount: drop the preview URL and cancel any in-flight dedup / preview so a late result
+  // neither leaks a listener nor an object URL.
+  useEffect(() => {
     return () => {
-      window.removeEventListener("keydown", handler);
       revokePreview();
-      dedupReqRef.current++; // cancel any in-flight dedup
+      dedupReqRef.current++;
+      previewReqRef.current++;
       dedupUnlistenRef.current?.();
       dedupUnlistenRef.current = null;
     };
-  }, [open, onClose]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /** Merge resolved dedup verdicts into the file list; auto-deselect duplicates when skip is on. */
   function applyDedup(results: DedupResult[]) {
@@ -207,6 +217,12 @@ export default function ImportDialog({
       applyDedup(ev.payload.results);
       setDedupProgress({ done: ev.payload.done, total: ev.payload.total });
     });
+    // Superseded (new listing) or unmounted while `listen` was registering: release the listener
+    // that the cleanup could not see yet, and never start the scan.
+    if (req !== dedupReqRef.current) {
+      un();
+      return;
+    }
     dedupUnlistenRef.current = un;
     try {
       const all = await importDedup(list.map((f) => f.path));
@@ -399,8 +415,6 @@ export default function ImportDialog({
       onComplete,
     );
   }
-
-  if (!open) return null;
 
   return (
     <div style={overlay()}>

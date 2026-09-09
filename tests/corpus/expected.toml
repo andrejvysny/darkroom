@@ -1,0 +1,217 @@
+# MACHINE-RECORDED goldens for the RAW corpus — do not hand-edit.
+#
+#   scripts/fetch_raw_corpus.sh --tier 2
+#   cargo run --release -p core-raw --example corpus_probe -- --record > tests/corpus/expected.toml
+#
+# One table per `tests/corpus/manifest.toml` id, for every entry with `support = "ok"` that is
+# present in the corpus directory. FETCH BOTH TIERS BEFORE RE-RECORDING: `> expected.toml` truncates
+# this file first, so an entry that is not on disk simply loses its golden (the recorder says so on
+# stderr).
+#
+# `orientation = 0` means the file carries no EXIF orientation tag. An empty `cfa` (with all-zero
+# levels) means the file never reaches the mosaic seam — monochrome, sRAW, or linear DNG.
+# See README.md for the tolerances each field is compared with.
+
+[canon-5d3-cr2]
+develop_w = 5760
+develop_h = 3840
+orientation = 1
+cfa = "RGGB"
+black = [2047.0, 2047.0, 2047.0, 2048.0]
+white = [15321.0, 15321.0, 15321.0, 15321.0]
+wb = [1.6494140625, 1.0, 2.1650390625]
+patch_mean_full = [0.1004728826299015, 0.08345136441545264, 0.05061862004406237]
+patch_mean_preview = [0.09974597833138432, 0.0833193730363746, 0.05119650643484874]
+highlight_chroma = 0.34378279089228
+
+[canon-5d2-sraw1]
+develop_w = 3861
+develop_h = 2574
+orientation = 1
+cfa = ""
+black = [0.0, 0.0, 0.0, 0.0]
+white = [0.0, 0.0, 0.0, 0.0]
+wb = [1.96875, 1.0, 2.2802734375]
+patch_mean_full = [0.16691342663398245, 0.15223650540792732, 0.014061242392472195]
+patch_mean_preview = [0.15282821158325532, 0.1397460227017291, 0.009003297119306808]
+highlight_chroma = 0.9018515146793459
+
+[canon-r5-craw]
+develop_w = 8192
+develop_h = 5464
+orientation = 1
+cfa = "RGGB"
+black = [510.0, 510.0, 510.0, 510.0]
+white = [14008.0, 14008.0, 14008.0, 14008.0]
+wb = [1.7294921875, 1.0, 2.1240234375]
+patch_mean_full = [0.11057385016647459, 0.08761485918694234, 0.010874264559788571]
+patch_mean_preview = [0.11054236015479546, 0.08760684001026675, 0.010901503831519221]
+highlight_chroma = 0.21447896869944189
+
+[nikon-d850-lossless]
+develop_w = 8256
+develop_h = 5504
+orientation = 1
+cfa = "RGGB"
+black = [400.0, 400.0, 400.0, 400.0]
+white = [15520.0, 15520.0, 15520.0, 15520.0]
+wb = [1.900390625, 1.0, 1.37548828125]
+patch_mean_full = [0.04794699026706439, 0.04953018331434578, 0.024803788396184245]
+patch_mean_preview = [0.04803425488171342, 0.04955591392717906, 0.024789031999716826]
+highlight_chroma = 0.387629202679849
+
+[nikon-d7500-12bit]
+develop_w = 5568
+develop_h = 3712
+orientation = 1
+cfa = "RGGB"
+black = [100.0, 100.0, 100.0, 100.0]
+white = [3880.0, 3880.0, 3880.0, 3880.0]
+wb = [2.30859375, 1.0, 1.56396484375]
+patch_mean_full = [0.015483745502592683, 0.00978313629400418, 0.007245384572172497]
+patch_mean_preview = [0.015456421113867691, 0.009757772193552228, 0.007365502243828814]
+highlight_chroma = 0.05628015733843273
+
+[sony-a7m3-compressed]
+develop_w = 6000
+develop_h = 4000
+orientation = 1
+cfa = "RGGB"
+black = [512.0, 512.0, 512.0, 512.0]
+white = [15360.0, 15360.0, 15360.0, 15360.0]
+wb = [2.21875, 1.0, 1.7578125]
+patch_mean_full = [0.1469198837849035, 0.14968142962970887, 0.12903366758746415]
+patch_mean_preview = [0.14745778059659642, 0.15055674131508567, 0.12748234850732842]
+highlight_chroma = 0.08600934983141204
+
+[sony-a7m3-uncompressed]
+develop_w = 6000
+develop_h = 4000
+orientation = 1
+cfa = "RGGB"
+black = [512.0, 512.0, 512.0, 512.0]
+white = [15360.0, 15360.0, 15360.0, 15360.0]
+wb = [2.28515625, 1.0, 1.625]
+patch_mean_full = [0.052490282432927415, 0.054781025922693516, 0.04683371918940793]
+patch_mean_preview = [0.05231586444824643, 0.05515679477866797, 0.046542188203602564]
+highlight_chroma = 0.012439842602175056
+
+[sony-a1-lossless]
+develop_w = 8640
+develop_h = 5760
+orientation = 1
+cfa = "RGGB"
+black = [512.0, 512.0, 512.0, 512.0]
+white = [15360.0, 15360.0, 15360.0, 15360.0]
+wb = [2.3671875, 1.0, 1.630859375]
+patch_mean_full = [0.03396167826394958, 0.03313660520598205, 0.02602841425277802]
+patch_mean_preview = [0.034025899545667926, 0.03320219701890892, 0.025864050649033743]
+highlight_chroma = 0.011830430492200736
+
+[google-pixel7pro-dng]
+develop_w = 3866
+develop_h = 2908
+orientation = 3
+cfa = "BGGR"
+black = [1024.109375, 1024.3125, 1024.30859375, 1024.1328125]
+white = [16368.0, 16368.0, 16368.0, 16368.0]
+wb = [1.5560908317565918, 1.0, 1.7886687517166138]
+patch_mean_full = [0.26299096954244305, 0.2865573182607477, 0.22677515061877784]
+patch_mean_preview = [0.2628747372655198, 0.28645779434009455, 0.22654044380760752]
+highlight_chroma = 0.11277255763349799
+
+[leica-m246-mono]
+develop_w = 5976
+develop_h = 3992
+orientation = 1
+cfa = ""
+black = [0.0, 0.0, 0.0, 0.0]
+white = [0.0, 0.0, 0.0, 0.0]
+wb = [1.0, 1.0, 1.0]
+patch_mean_full = [0.0735402344769227, 0.0735402344769227, 0.0735402344769227]
+patch_mean_preview = [0.07826145838771481, 0.07826145838771481, 0.07826145838771481]
+highlight_chroma = 0.0
+
+[nikon-z30-portrait]
+develop_w = 3712
+develop_h = 5568
+orientation = 8
+cfa = "RGGB"
+black = [252.0, 252.0, 252.0, 252.0]
+white = [3972.0, 3972.0, 3972.0, 3972.0]
+wb = [1.9296875, 1.0, 1.458984375]
+patch_mean_full = [0.3159760335984174, 0.11039202556275995, 0.08736415336625214]
+patch_mean_preview = [0.3161456954840105, 0.11043406437966041, 0.08704230128205381]
+highlight_chroma = 0.053788024592758145
+
+[sony-a7r4a-uncompressed]
+develop_w = 9504
+develop_h = 6336
+orientation = 1
+cfa = "RGGB"
+black = [512.0, 512.0, 512.0, 512.0]
+white = [15360.0, 15360.0, 15360.0, 15360.0]
+wb = [2.4765625, 1.0, 1.7109375]
+patch_mean_full = [0.007620483368949493, 0.009688343257209908, 0.008530710334184732]
+patch_mean_preview = [0.0072217789440855995, 0.009130530975653528, 0.0075183627423029975]
+highlight_chroma = 0.23613148572222062
+
+[canon-r5-raw]
+develop_w = 8192
+develop_h = 5464
+orientation = 1
+cfa = "RGGB"
+black = [510.0, 510.0, 510.0, 510.0]
+white = [14008.0, 14008.0, 14008.0, 14008.0]
+wb = [1.6201171875, 1.0, 2.2607421875]
+patch_mean_full = [0.08424709420978616, 0.06836039388053905, 0.010389505615421513]
+patch_mean_preview = [0.08421549208287615, 0.06834564290329581, 0.010443357161420863]
+highlight_chroma = 0.21653285139948827
+
+[apple-iphone12pro-dng]
+develop_w = 3024
+develop_h = 4032
+orientation = 6
+cfa = ""
+black = [0.0, 0.0, 0.0, 0.0]
+white = [0.0, 0.0, 0.0, 0.0]
+wb = [2.227294921875, 1.0, 1.848876953125]
+patch_mean_full = [0.05120643620011833, 0.049893685634742724, 0.048915380865764746]
+patch_mean_preview = [0.04746486172734876, 0.046215512113121804, 0.04653375071575283]
+highlight_chroma = 0.04409034476556321
+
+[pentax-k3iii-mono]
+develop_w = 6192
+develop_h = 4128
+orientation = 1
+cfa = ""
+black = [0.0, 0.0, 0.0, 0.0]
+white = [0.0, 0.0, 0.0, 0.0]
+wb = [1.0, 1.0, 1.0]
+patch_mean_full = [0.5358640847989591, 0.5358640847989591, 0.5358640847989591]
+patch_mean_preview = [0.5359812462702394, 0.5359812462702394, 0.5359812462702394]
+highlight_chroma = 0.0
+
+[canon-r10-portrait]
+develop_w = 4000
+develop_h = 6000
+orientation = 8
+cfa = "RGGB"
+black = [512.0, 512.0, 512.0, 512.0]
+white = [12735.0, 12735.0, 12735.0, 12735.0]
+wb = [1.7412109375, 1.0, 1.896484375]
+patch_mean_full = [0.25801970471366076, 0.21922926561637723, 0.19595782410578977]
+patch_mean_preview = [0.25687292944348883, 0.21872107495437376, 0.19824412575690076]
+highlight_chroma = 0.08461244881081127
+
+[sony-a6400-portrait]
+develop_w = 4000
+develop_h = 6000
+orientation = 8
+cfa = "RGGB"
+black = [512.0, 512.0, 512.0, 512.0]
+white = [15360.0, 15360.0, 15360.0, 15360.0]
+wb = [2.7109375, 1.0, 1.78125]
+patch_mean_full = [0.03622857204254615, 0.03799858950605994, 0.04314082603195857]
+patch_mean_preview = [0.0361787545025436, 0.03805051966992323, 0.04313964988614316]
+highlight_chroma = 0.07136888809409446

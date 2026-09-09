@@ -21,3 +21,5 @@ trash = "5"
 # which needs the detector (core-pano) and a thumb decoder (image). Not linked by the library.
 core-pano = { path = "../core-pano" }
 image = "0.25"
+# RAW-corpus manifest (`tests/corpus/manifest.toml`), read by `tests/corpus_index.rs`.
+toml = "0.8"

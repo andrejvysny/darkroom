@@ -782,9 +782,11 @@ dependencies = [
  "core-db",
  "core-library",
  "core-raw",
+ "rayon",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
  "trash",
 ]
 
@@ -801,6 +803,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "toml 0.8.2",
  "trash",
  "walkdir",
 ]
@@ -856,11 +859,13 @@ dependencies = [
  "image",
  "kamadak-exif",
  "libheif-rs",
+ "log",
  "rawler",
  "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "toml 0.8.2",
 ]
 
 [[package]]
@@ -4616,9 +4621,9 @@ dependencies = [
 
 [[package]]
 name = "rawler"
-version = "0.7.2"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f4cc35c23969a4a834e0b117c7da41ace812eb9053b5effc3fc5c77d114677"
+checksum = "51cb9d46a5b34946878eb236d1180adec0806eee260738ce299517b083a232e8"
 dependencies = [
  "backtrace",
  "bitstream-io",

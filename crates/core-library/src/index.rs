@@ -13,13 +13,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use walkdir::WalkDir;
 
-/// Extensions indexed: RAW (CR3 validated; others latent via rawler) + display-referred JPEG/PNG
-/// (decoded via the `image` crate in `core-raw::display`) + scene-referred HDR: Canon 10-bit PQ
-/// HEIF (`hif`, via libheif in `core-raw::heif`) and merged-HDR OpenEXR (`exr`,
-/// `core-raw::hdr_file`). Single source of truth for indexing, folder scan/watch, and import
-/// listing.
+/// Extensions indexed: RAW — every Canon (`cr3 cr2 crw`), Nikon (`nef nrw`) and Sony (`arw sr2
+/// srf`) container rawler decodes, plus DNG — + display-referred JPEG/PNG (decoded via the `image`
+/// crate in `core-raw::display`) + scene-referred HDR: Canon 10-bit PQ HEIF (`hif`, via libheif in
+/// `core-raw::heif`) and merged-HDR OpenEXR (`exr`, `core-raw::hdr_file`). Single source of truth
+/// for indexing, folder scan/watch, and import listing. Other makers (RAF/ORF/RW2/PEF) are
+/// deliberately absent until validated against the RAW corpus (X-Trans needs its own demosaic).
 pub const SUPPORTED_EXT: &[&str] = &[
-    "cr3", "cr2", "arw", "nef", "dng", "jpg", "jpeg", "png", "hif", "exr",
+    "cr3", "cr2", "crw", "nef", "nrw", "arw", "sr2", "srf", "dng", "jpg", "jpeg", "png", "hif",
+    "exr",
 ];
 
 /// Catalog format bucket for a path (`"raw" | "jpeg" | "png" | "heif" | "hdr"`), via
@@ -38,6 +40,9 @@ pub struct IndexStats {
     pub added: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Files this build can never decode (unknown body, unsupported compression). A strict subset
+    /// of `failed`, split out so the UI can say "3 unsupported" instead of the useless "3 failed".
+    pub unsupported: usize,
 }
 
 /// Fully processed (decoded/hashed) image, ready for DB insertion. No DB access required to build.
@@ -64,6 +69,16 @@ pub fn now_epoch() -> i64 {
 }
 
 fn is_supported(path: &Path) -> bool {
+    // Hidden files are never images: Finder writes `._IMG_0001.CR3` AppleDouble shadows onto
+    // exFAT cards, and they carry the RAW's extension while holding only metadata bytes.
+    let hidden = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.starts_with('.'))
+        .unwrap_or(true);
+    if hidden {
+        return false;
+    }
     path.extension()
         .and_then(|s| s.to_str())
         .map(|s| SUPPORTED_EXT.iter().any(|e| s.eq_ignore_ascii_case(e)))
@@ -125,6 +140,24 @@ pub fn process_file(
 ) -> Result<ProcessedImage, LibError> {
     let bytes = Arc::new(std::fs::read(path)?);
     let digest = content_hash(&bytes);
+    process_bytes(path, bytes, digest, thumbs, thumb_size)
+}
+
+/// Everything [`process_file`] does *after* the read + hash, over a buffer the caller already holds.
+///
+/// The importer reads each source exactly once and then needs the same metadata/thumbnail pass over
+/// those bytes; going back through `process_file` would re-read (and re-hash) the whole file a
+/// second time — a full extra pass over every 30 MB RAW in an import. `path` is the CATALOG path
+/// (the library copy for copy/move, the source itself for reference), which need not be where
+/// `bytes` were read from; `digest` must be `content_hash(&bytes)` and `file_size` is derived from
+/// the buffer, so both stay consistent with the bytes actually processed.
+pub fn process_bytes(
+    path: &Path,
+    bytes: Arc<Vec<u8>>,
+    digest: [u8; 32],
+    thumbs: &ThumbCache,
+    thumb_size: u32,
+) -> Result<ProcessedImage, LibError> {
     let hex_digest = hex(&digest);
     let file_size = bytes.len() as i64;
 
@@ -261,30 +294,42 @@ where
 {
     let all = enumerate_raws(root, true);
     let known = existing_paths(conn)?;
+    // Files whose recorded decode failure still stands (same decoder build, same bytes) are not
+    // re-opened: without this a card of unknown-body RAWs is fully re-decoded on every scan.
+    let known_bad = crate::decode_failure::skippable_failures(conn)?;
+    let mut skipped_bad = 0usize;
     let todo: Vec<PathBuf> = all
         .into_iter()
         .filter(|p| !known.contains(&p.display().to_string()))
+        .filter(|p| {
+            let bad = known_bad.contains(&p.display().to_string());
+            skipped_bad += usize::from(bad);
+            !bad
+        })
         .collect();
 
     let total = todo.len();
     let done = AtomicUsize::new(0);
-    let results: Vec<Result<ProcessedImage, LibError>> = todo
+    // The path rides along with its result: a `LibError` carries no path, and every failure has to
+    // be recorded against the file that produced it.
+    let results: Vec<(&PathBuf, Result<ProcessedImage, LibError>)> = todo
         .par_iter()
         .map(|p| {
             let r = process_file(p, thumbs, thumb_size);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress(n, total);
-            r
+            (p, r)
         })
         .collect();
 
     let imported_at = now_epoch();
     let mut stats = IndexStats {
         scanned: total,
+        skipped: skipped_bad,
         ..Default::default()
     };
     let tx = conn.transaction()?;
-    for r in &results {
+    for (path, r) in &results {
         match r {
             Ok(p) => match insert_image(&tx, folder_id, imported_at, p)? {
                 Some(id) => {
@@ -292,12 +337,72 @@ where
                     // Recover edits/rating/keywords from a sidecar next to the RAW (e.g. after a
                     // "delete catalog.db, rescan" rebuild). Only blank rows hydrate; best-effort.
                     let _ = crate::sidecar::hydrate_if_blank(&tx, id, &p.path);
+                    // A file that used to fail and now indexes leaves no stale record behind.
+                    crate::decode_failure::clear_decode_failure(&tx, &p.path)?;
                 }
                 None => stats.skipped += 1,
             },
-            Err(_) => stats.failed += 1,
+            Err(e) => {
+                stats.failed += 1;
+                // Recording is best-effort: a bookkeeping write must never fail a whole scan.
+                if crate::decode_failure::record_decode_failure(
+                    &tx,
+                    Some(folder_id),
+                    path,
+                    e,
+                    imported_at,
+                )
+                .unwrap_or(false)
+                {
+                    stats.unsupported += 1;
+                }
+            }
         }
     }
     tx.commit()?;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod supported_tests {
+    use super::*;
+
+    #[test]
+    fn maker_extensions_are_supported_case_insensitively() {
+        for ext in [
+            "cr3", "CR2", "crw", "NEF", "nrw", "arw", "SR2", "srf", "dng", "HIF", "exr",
+        ] {
+            assert!(is_supported(Path::new(&format!("IMG_0001.{ext}"))), "{ext}");
+        }
+        assert!(!is_supported(Path::new("IMG_0001.raf")));
+        assert!(!is_supported(Path::new("IMG_0001.xmp")));
+        assert!(!is_supported(Path::new("IMG_0001")));
+    }
+
+    /// The allowlist and core-raw's classifier must evolve together: every RAW extension core-raw
+    /// expects to see must be indexable, and every indexable extension must land in a known kind.
+    #[test]
+    fn allowlist_matches_core_raw_classifier() {
+        for ext in core_raw::RAW_EXT {
+            assert!(
+                SUPPORTED_EXT.contains(ext),
+                "core-raw RAW_EXT `{ext}` missing from SUPPORTED_EXT"
+            );
+        }
+        for ext in SUPPORTED_EXT {
+            let kind = core_raw::classify(Path::new(&format!("x.{ext}")));
+            let known = core_raw::RAW_EXT.contains(ext) || kind != core_raw::ImageKind::Raw;
+            assert!(
+                known,
+                "SUPPORTED_EXT `{ext}` is neither a known RAW ext nor a display/HDR kind"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_and_appledouble_files_are_skipped() {
+        assert!(!is_supported(Path::new("._IMG_0001.CR3")));
+        assert!(!is_supported(Path::new(".IMG_0001.CR3")));
+        assert!(!is_supported(Path::new("/cards/DCIM/._DSC0001.ARW")));
+    }
 }

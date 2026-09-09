@@ -58,6 +58,70 @@
 > Branch `feat/lens-corrections` (in progress) adds lens distortion/CA + pre-release signing scaffolding.
 > Everything below dated 2026-06-26 predates those merges.
 
+## RAW multi-maker correctness pass (2026-09-08, UNCOMMITTED on `main`) — CURRENT
+
+> Plan: `~/.claude/plans/act-as-senior-rust-cozy-sutton.md`; tracker: top of `TODO.md`. Review of
+> Canon/Nikon/Sony support against rawler's source + the DNG spec; every finding below is fixed
+> unless marked pending.
+>
+> **Snapshot 2026-09-09 10:30** — branch `main` at `43f0489` (0 ahead of `origin/main`), dirty:
+> 40 modified + 13 new files (2264+/198−), nothing staged. Gates: `cargo fmt --all -- --check` ✓ ·
+> `cargo clippy --workspace --examples -- -D warnings` ✓ · `DARKROOM_REQUIRE_FIXTURES=1
+> DARKROOM_REQUIRE_CORPUS=1 cargo test --workspace` ✓ (corpus Tier 1+2 present in
+> `target/raw-corpus`, 650 MB) · `npm run build` ✓. Blockers: none. Not done: live GUI QA, release
+> binary size measurement, commit.
+
+- **rawler `=0.7.2` → `=0.8.0`** (MSRV 1.89). API deltas: `Demosaic` trait → `imgop::sensor`,
+  `CFAConfig.sensor: SensorType{Bayer,Xtrans}`, embedded previews are `Decoder::preview_image`
+  (`full_image` is now the unimplemented default). R7 fixture develops identically to 5 decimals.
+  `core_raw::DECODER_VERSION` ("rawler-0.8.0") is persisted with decode failures — bump it with the pin.
+- **Error taxonomy** (`core-raw/src/error.rs`): `RawError::{Unsupported{make,model,mode,detail},
+  DecoderPanic, Decode, Io, NoPreview, Image}` + `FailureKind` + `kind()/camera()/user_detail()`.
+  `From<RawlerError>`; rawler's `DecoderFailed("… is not supported")` (Nikon HE/HE\*) is promoted to
+  `Unsupported`. User texts for HE/HE\*, ARW6, unknown body, "No decoder found".
+- **Panic containment** (`core-raw/src/panic.rs`): every public core-raw entry runs its body under
+  `catch_decode_panic` → `DecoderPanic`; thread-local in-flight counter; the app panic hook
+  (`src-tauri/src/lib.rs`) logs a contained decode panic at warn and skips the backtrace/default hook.
+  Root `Cargo.toml` release profile no longer sets `panic = "abort"` (CI greps for it). NOTE: cargo
+  ignores `panic` in the test profile, so tests never prove the shipped binary — the grep does.
+- **Pre-screens** (`develop::guard_developable`): monochrome sensors develop gray via `develop_mono`
+  (rawler's `apply_scaling` is `todo!()` for `BlackIsZero`); non-2×2 CFA (X-Trans) and odd `cpp`
+  are typed `Unsupported`; a `crop_area` outside `active_area` is dropped with a warn instead of
+  tripping rawler's `Rect::adapt` assert. `wb_or_neutral` requires finite, positive gains in
+  [1/16, 16].
+- **Colour path** (`develop::map_3ch_to_rgb`, `PROCESS_VERSION` 4→5): clipped-highlight
+  reconstruction — dcraw `blend_highlights` chroma shrink toward the min-gain-clipped pixel, weight
+  `smoothstep(0.92, 0.995, raw_max)`, channel sum preserved (a fully clipped pixel lands on
+  `mean(wb)` ≥ 1, so `core-hdr`'s `hat_weight` ≥ 0.9 cut still excludes it). Fixes magenta/pink
+  blown skies on every maker (R7 fixture top-0.05 % chroma 0.207 → 0.162; synthetic fully-clipped
+  frame 0.319 → < 0.02). Pixel loop is rayon-parallel (~1.3× on develop). Camera matrix now comes
+  from `color::select_cam_matrix`: DNG-spec dual-illuminant interpolation in 1/CCT (McCamy from the
+  as-shot neutral, 4 iterations, clamped, no extrapolation) when the DB has ≥ 2 illuminants (Canon
+  R7 and Nikon carry A + D65; R7 daylight fixture settles at 4970 K, patch mean +0.3 %), else a
+  deterministic priority (D65 > D55 > D50 > …) — never HashMap order. HDR bracket frames share the
+  reference WB and therefore the matrix.
+- **Catalog dims** (`thumb.rs::thumbnail_jpeg`): `src_*`/`disp_*` now come from a `dummy=true`
+  rawler decode (`crop_area` else `active_area` else sensor; ~13 ms) instead of the embedded
+  preview — Sony ARW previews are 1616×1080. R7: crop 6960×4640 == old preview dims, so existing
+  capture fingerprints did not move.
+- **Formats**: `SUPPORTED_EXT` += `crw nrw sr2 srf`; `core_raw::RAW_EXT` + a drift test; hidden /
+  AppleDouble (`._*`) files are never indexed.
+- **Decode-failure bookkeeping** (schema 25 `decode_failure`, `core-library/src/decode_failure.rs`,
+  IPC `decode_failures_{list,counts,forget}`, LeftNav "Unsupported" + `UnsupportedModal.tsx`): see
+  the IPC section. Import refuses an unsupported body before copying and removes orphan copies.
+- **Synthetic fixtures** (`core-raw/src/synth.rs`, `#[doc(hidden)]`): Bayer-CFA and monochrome DNG
+  authors → `tests/synthetic_bayer.rs` (clipped-neutral, neutral control, WB identity, orientation,
+  preview≈full, garbage file, mono) and `tests/decode_panic.rs` run on every CI job with no
+  downloads.
+- **Multi-maker corpus** (`tests/corpus/manifest.toml` + `expected.toml`, `scripts/fetch_raw_corpus.sh`,
+  `core-raw/tests/corpus.rs`, `core-library/tests/corpus_index.rs`, CI job `raw-corpus`): CC0
+  samples from raw.pixls.us cached by manifest hash; XFAIL lists invert (a passing xfail fails).
+  Env: `DARKROOM_RAW_CORPUS`, `DARKROOM_REQUIRE_CORPUS=1`, `DARKROOM_CORPUS_TIER`, `_QUICK`.
+- **Known / pending**: Nikon HE/HE\* (TicoRAW), Sony ARW6 and bodies missing from rawler's DB (e.g.
+  EOS R1) stay unsupported by design (no LibRaw); X-Trans typed-unsupported until rawler 0.8.0's
+  Markesteijn path is validated; `decode_failure` rows are never garbage-collected; release binary
+  size after the unwind flip not yet measured; live GUI QA of the Unsupported modal pending.
+
 ## Panorama detection (branch `claude/panorama-detection-ob1jjq`, 2026-07-19) — CURRENT
 
 **"Detect panoramas"**: one click scans the whole library incrementally in the background, suggests
@@ -454,6 +518,18 @@ Views: `views/Library/{LeftNav,ThumbGrid,RightInfo,BottomBar,Loupe,DedupModal}.t
 
 - Library: `app_default_library`, `app_library_root`, `library_query`, `library_count`,
   `library_folders`, `image_meta`, `library_index_root`
+- Decode failures (**NEW**, schema 25): `decode_failures_list(limit?) → DecodeFailureRow[]`
+  (`{path, filename, kind: "unsupported"|"corrupt"|"io"|"panic"|"other", make, model, detail,
+fileSize, firstSeen, lastSeen, attempts, decoderVersion}`, newest-seen first, default limit 500),
+  `decode_failures_counts() → {unsupported, corrupt, other}` (io/panic fold into `other`),
+  `decode_failures_forget(paths) → usize` ("Try again" — drops the records so the next scan re-decodes).
+  Every index/watch/import path now records WHY a file was rejected in `decode_failure` (keyed by
+  path — these files have no `images` row) and **skips** re-decoding it while the verdict stands
+  (same `core_raw::DECODER_VERSION` **and** same `(file_size, mtime)`); a decoder bump or a changed
+  file retries automatically. `IndexStats`/`ImportStats` gain `unsupported` (⊆ `failed`). An import
+  refuses an undecodable body BEFORE the copy, and removes the orphan copy if processing fails
+  after one, so the library never holds a file the catalog does not know about. UI: LeftNav
+  "Unsupported" row + `UnsupportedModal.tsx` (grouped by camera + reason, per-group Try again).
 - Develop: `develop_get_edit`, `develop_set_edit`, `develop_render` (viewport render → **raw RGBA**
   `[outW u32 LE][outH u32 LE][rgba]`, NOT JPEG), `develop_preview_jpeg` (instant first paint),
   `develop_get_histogram` (pull), `develop_histogram` (whole-crop pass → emits `develop:histogram`),
@@ -489,7 +565,16 @@ replace_all) → DevelopParams` (merged, NOT persisted — FE commits), `presets
   `pano_detect_mark_merged(group_id, merged_image_id)`. Events:
   `pano_detect:{progress {phase,done,total}, done {found}, error {message}}`
 - Import: `import_start`; staged flow — `import_list` → `import_dedup` → `import_thumb` →
-  `import_commit(source, mode, dest, selected, options, pairing)`
+  `import_commit(source, mode, dest, selected, options, pairing)`. **2026-09-09:** `ImportDialog`
+  is mounted only while open (LibraryView) — it used to reset all state in an effect keyed on the
+  parent's inline `onClose`, so any LibraryView re-render (thumb-queue bumps, watcher refresh,
+  toasts) wiped the listing right after picking a folder. Backend: each source file is read+hashed
+  ONCE (`core_library::process_bytes`; copy/move re-read only the written temp for the on-disk
+  verify), `import_files` runs the unlocked per-file work rayon-parallel per 16-file chunk
+  (Reference = all cores, Copy/Move = ≤4 writers) and replays outcomes in input order; identical
+  files inside one chunk are caught at catalog time and their redundant copy deleted; destination
+  names are reserved through a per-run claim set (`claim_unique_dest`); `dedup_scan` hashes 24-file
+  batches on a 4-thread pool, verdicts assigned sequentially (first occurrence wins).
 - RAW+JPEG pairing (**NEW**, schema 21): `import_commit`'s `pairing` ∈ {`"pair"`,`"standalone"`}
   (default standalone) links each camera companion (a `.jpg`/`.jpeg`/`.hif` sharing a RAW's folder +
   stem) to that RAW in `image_pairs`; `image_pair(image_id) → PairInfo|null`,

@@ -187,7 +187,9 @@ fn main() {
                         res.height as u32,
                         image::ColorType::Rgb8,
                     ) {
-                        Ok(()) => println!("group {gi}: wrote {out} ({}x{})", res.width, res.height),
+                        Ok(()) => {
+                            println!("group {gi}: wrote {out} ({}x{})", res.width, res.height)
+                        }
                         Err(e) => eprintln!("group {gi}: failed to write {out}: {e}"),
                     }
                 }

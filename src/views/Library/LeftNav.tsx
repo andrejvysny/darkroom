@@ -43,6 +43,10 @@ interface LeftNavProps {
   onOpenPanoSuggestions: () => void;
   /** Opens the "Run AI scan…" modal — the single entry point for every detection pass. */
   onOpenScan: () => void;
+  /** Files the catalog could not take, by class — the row is hidden entirely when there are none. */
+  unsupportedCount: number;
+  /** Opens the "Unsupported files" list. */
+  onOpenUnsupported: () => void;
 }
 
 function SectionHeading({
@@ -91,6 +95,8 @@ export default function LeftNav({
   panoSuggested,
   onOpenPanoSuggestions,
   onOpenScan,
+  unsupportedCount,
+  onOpenUnsupported,
 }: LeftNavProps) {
   const noFilters = !hasActiveFilters(params);
   const picksActive = params.flag === "pick";
@@ -189,6 +195,15 @@ export default function LeftNav({
             setSort(recentActive ? "capture_desc" : "imported_desc")
           }
         />
+        {unsupportedCount > 0 && (
+          <NavRow
+            icon="warning"
+            label="Unsupported"
+            count={unsupportedCount.toLocaleString()}
+            active={false}
+            onClick={onOpenUnsupported}
+          />
+        )}
       </div>
 
       {/* Folders section — Lightroom-style Year → Date tree (by capture date) */}

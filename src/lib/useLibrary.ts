@@ -18,6 +18,7 @@ import {
   type DateTreeYear,
   type KeywordRow,
   type CollectionRow,
+  type IndexStats,
 } from "./ipc";
 
 export type IndexingState = { done: number; total: number };
@@ -381,12 +382,7 @@ export function useLibrary(): LibraryState & LibraryActions {
       );
       unlisteners.push(unProgress);
 
-      const unDone = await listen<{
-        scanned: number;
-        added: number;
-        skipped: number;
-        failed: number;
-      }>("import:done", (_ev) => {
+      const unDone = await listen<IndexStats>("import:done", (_ev) => {
         setIndexing(null);
         void refresh();
       });

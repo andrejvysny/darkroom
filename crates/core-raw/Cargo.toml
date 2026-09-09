@@ -5,7 +5,10 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-rawler = "=0.7.2"
+rawler = "=0.8.0"
+# rawler logs through `log`; using the same facade keeps decode diagnostics in one stream
+# (the app installs a `tracing` bridge for it).
+log = "0.4"
 image = "0.25"
 kamadak-exif = "0.6"
 blake3 = "1"
@@ -27,3 +30,6 @@ libheif-rs = { version = "=2.7.0", default-features = false, features = ["v1_17"
 [dev-dependencies]
 anyhow = "1"
 core-pano = { path = "../core-pano" }
+# RAW-corpus manifest/goldens (`tests/corpus/*.toml`), read by `tests/corpus.rs` and the
+# `corpus_probe` recorder example. Test-only — nothing in the product parses TOML.
+toml = "0.8"

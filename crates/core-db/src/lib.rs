@@ -42,6 +42,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/022_image_stage_attempt.sql"),
     include_str!("../migrations/023_clip_embedding.sql"),
     include_str!("../migrations/024_suggestions.sql"),
+    include_str!("../migrations/025_decode_failure.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -140,7 +141,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 24, "expected 24 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 25, "expected 25 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -481,7 +482,7 @@ mod tests {
 
         let img = insert_folder_and_image(&conn, 1);
         let other = insert_folder_and_image(&conn, 2);
-        let mut ar = |image: i64, analyzer: &str, version: &str, ran_at: i64, status: &str| {
+        let ar = |image: i64, analyzer: &str, version: &str, ran_at: i64, status: &str| {
             conn.execute(
                 "INSERT INTO analysis_results
                      (image_id, analyzer_id, model_version, ran_at, status, payload)
@@ -747,6 +748,7 @@ mod tests {
             "app_meta",
             "collection_images",
             "collections",
+            "decode_failure",
             "develop_snapshots",
             "edits",
             "face",

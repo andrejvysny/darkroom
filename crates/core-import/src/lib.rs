@@ -17,14 +17,15 @@ use chrono::DateTime;
 use core_db::rusqlite::{params, Connection};
 use core_db::Db;
 use core_library::{
-    image_by_id, insert_image, now_epoch, process_file, relink_missing_image, ImageRow,
-    ProcessedImage, ThumbCache, THUMB_SIZE,
+    image_by_id, insert_image, now_epoch, process_bytes, relink_missing_image, FailureFacts,
+    ImageRow, ProcessedImage, ThumbCache, THUMB_SIZE,
 };
-use core_raw::{hash_file, read_metadata, source_from_path};
+use core_raw::{content_hash, hash_file, read_metadata, source_from_bytes};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +58,10 @@ pub struct ImportStats {
     pub source_retained: usize,
     /// Camera companions (JPEG/HEIF) linked to their RAW — only non-zero under [`Pairing::Pair`].
     pub paired: usize,
+    /// Files this build can never decode (unknown body, unsupported compression). A strict subset
+    /// of `failed`; each is recorded in `decode_failure` and, crucially, never copied into the
+    /// library — an unreadable body leaves nothing behind.
+    pub unsupported: usize,
 }
 
 /// Content-hash dedup classification of a source file. `Pending` is the listing default; the real
@@ -220,6 +225,10 @@ enum Outcome {
         src_hash: [u8; 32],
         src_to_trash: Option<PathBuf>,
     },
+    /// This build can never decode the file — determined by the pre-copy metadata read, so NOTHING
+    /// was copied. Recorded against the source path; the source is left exactly where it is (a Move
+    /// import never trashes an original we could not read).
+    Unsupported(core_raw::RawError),
 }
 
 /// Run an import. `progress(done, total, added)` fires per file; `added` is the freshly-inserted
@@ -257,9 +266,60 @@ where
     )
 }
 
+/// Number of source files handled by one parallel batch. Small enough that the catalog step (and
+/// with it `seen`, the running duplicate set) advances often — a whole chunk is processed before any
+/// of its hashes are known to the rest of the run — and large enough to keep the pool busy.
+const CHUNK: usize = 16;
+
+/// Worker count for the unlocked per-file phase. Reference mode is pure CPU (decode + thumbnail), so
+/// it takes every core. Copy/Move additionally streams the file through the destination volume;
+/// past ~4 concurrent writers a card reader or spinning disk slows down instead of speeding up, and
+/// the extra threads only inflate peak memory (each holds a whole RAW in a buffer).
+fn worker_count(mode: ImportMode) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    match mode {
+        ImportMode::Reference => cores,
+        ImportMode::Copy | ImportMode::Move => cores.min(4),
+    }
+}
+
+/// Run-constant inputs of the catalog step, so the per-file helpers stay short.
+struct CommitCtx<'a> {
+    db: &'a Mutex<Db>,
+    mode: ImportMode,
+    folder_id: i64,
+    session_id: i64,
+    imported_at: i64,
+    pairing_on: bool,
+    trash: &'a trash::TrashContext,
+}
+
+/// Mutable state threaded through the catalog step, in file order.
+#[derive(Default)]
+struct RunState {
+    stats: ImportStats,
+    /// Content hashes already accounted for. Grows here and ONLY here: the parallel phase reads a
+    /// snapshot, so two identical files inside one chunk both get processed and the second is
+    /// caught by the catalog step.
+    seen: HashSet<[u8; 32]>,
+    /// Source path → catalog row for rows added this run, for the pairing pass.
+    new_ids: HashMap<PathBuf, i64>,
+    /// Source path → content hash for files that were NOT added (already catalogued, or a duplicate
+    /// of an earlier file in this run) — so a companion JPEG still pairs with a RAW that was
+    /// skipped, or that arrived in an earlier import.
+    src_hashes: HashMap<PathBuf, [u8; 32]>,
+}
+
 /// Import an explicit list of source files — the staged-preview commit path. Shares every per-file
 /// catalog rule with [`import`] (which is just the "enumerate the whole source" wrapper). `source`
 /// labels the import session and, in Reference mode, becomes the watched root.
+///
+/// Files are handled a [`CHUNK`] at a time: the unlocked read/copy/verify/decode/thumbnail work runs
+/// in parallel across the chunk, then the catalog step replays the chunk's outcomes **in input
+/// order** under brief locks — so row order, progress order, and every dedup rule are exactly what
+/// the old file-at-a-time loop produced.
 #[allow(clippy::too_many_arguments)]
 pub fn import_files<F>(
     db: &Mutex<Db>,
@@ -275,10 +335,16 @@ where
     F: Fn(usize, usize, Option<&ImageRow>),
 {
     let total = files.len();
+    // Built before anything is written to the catalog: a pool that cannot be created must not leave
+    // a half-open import session behind.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count(mode))
+        .build()
+        .map_err(|e| ImportError::Io(std::io::Error::other(e.to_string())))?;
 
     // Brief lock: destination folder row (copy/move = library root; reference = the source),
     // present-hash snapshot, and the session row.
-    let (folder_id, mut seen, session_id) = {
+    let (folder_id, seen, session_id) = {
         let guard = db.lock().expect("import: db mutex poisoned");
         let conn = &guard.conn;
         let folder_id = match mode {
@@ -291,119 +357,213 @@ where
     };
 
     let trash_ctx = make_trash_ctx();
-    let mut stats = ImportStats {
+    let ctx = CommitCtx {
+        db,
+        mode,
+        folder_id,
         session_id,
-        total,
+        imported_at: now_epoch(),
+        pairing_on: pairing == Pairing::Pair,
+        trash: &trash_ctx,
+    };
+    let mut st = RunState {
+        stats: ImportStats {
+            session_id,
+            total,
+            ..Default::default()
+        },
+        seen,
         ..Default::default()
     };
-    let imported_at = now_epoch();
-    // Source path → catalog row, for the pairing pass below. Rows added this run are known
-    // directly; files that were skipped (already catalogued) are resolved afterwards by hash, so a
-    // JPEG can still be paired to a RAW that arrived in an earlier import.
-    let pairing_on = pairing == Pairing::Pair;
-    let mut new_ids: HashMap<PathBuf, i64> = HashMap::new();
-    let mut src_hashes: HashMap<PathBuf, [u8; 32]> = HashMap::new();
+    // Destination names reserved by this run. Two source folders can hold the same filename, and in
+    // parallel neither copy exists yet when the other picks its name — without a shared claim both
+    // would land on the same path and one would overwrite the other.
+    let claimed: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
 
-    for (i, src_path) in files.iter().enumerate() {
-        // Unlocked: hash, dedup-check, copy, verify, thumbnail/metadata. A per-file error here is
-        // recorded and the import continues (a single bad file must not abort the whole run).
-        let outcome = match process_one_unlocked(thumbs, src_path, mode, library_root, &seen) {
-            Ok(o) => o,
-            Err(_) => {
-                stats.failed += 1;
-                progress(i + 1, total, None);
-                continue;
-            }
-        };
-
-        let row = match outcome {
-            Outcome::Skip(h) => {
-                if pairing_on {
-                    src_hashes.insert(src_path.clone(), h);
-                }
-                stats.skipped += 1;
-                None
-            }
-            Outcome::SkipSeen(h) => {
-                seen.insert(h);
-                if pairing_on {
-                    src_hashes.insert(src_path.clone(), h);
-                }
-                stats.skipped += 1;
-                None
-            }
-            Outcome::Ready {
-                processed,
-                src_hash,
-                src_to_trash,
-            } => {
-                // Brief lock: recover a deleted-then-re-imported file by relinking its `missing`
-                // row (keeps id + edits/keywords), else insert fresh; stamp the session; read the
-                // row back for the live grid update.
-                let inserted: Result<Option<(i64, Option<ImageRow>)>, ImportError> = (|| {
-                    let guard = db.lock().expect("import: db mutex poisoned");
-                    let conn = &guard.conn;
-                    let id = match relink_missing_image(conn, folder_id, imported_at, &processed)? {
-                        Some(id) => Some(id),
-                        None => insert_image(conn, folder_id, imported_at, &processed)?,
-                    };
-                    match id {
-                        Some(id) => {
-                            conn.execute(
-                                "UPDATE images SET import_session_id=?1 WHERE id=?2",
-                                params![session_id, id],
-                            )?;
-                            // Restore edits/rating/keywords from a sidecar that travelled with the
-                            // RAW (copied in `process_one_unlocked`, or in place for reference mode).
-                            let _ =
-                                core_library::sidecar::hydrate_if_blank(conn, id, &processed.path);
-                            // Read-back is best-effort: a failure only costs the live update.
-                            Ok(Some((id, image_by_id(conn, id).ok().flatten())))
-                        }
-                        None => Ok(None),
-                    }
-                })(
-                );
-
-                match inserted {
-                    Ok(Some((id, row))) => {
-                        stats.added += 1;
-                        seen.insert(src_hash);
-                        if pairing_on {
-                            new_ids.insert(src_path.clone(), id);
-                        }
-                        // Move: send the original to Trash ONLY now that its copy is durably
-                        // catalogued. A trash failure leaves the source in place (counted, not lost).
-                        if let Some(src) = src_to_trash {
-                            if trash_ctx.delete(&src).is_err() {
-                                stats.source_retained += 1;
-                            }
-                        }
-                        row
-                    }
-                    Ok(None) => {
-                        stats.skipped += 1;
-                        None
-                    }
-                    Err(_) => {
-                        stats.failed += 1;
-                        None
-                    }
-                }
-            }
-        };
-        progress(i + 1, total, row.as_ref());
+    let mut done = 0usize;
+    for chunk in files.chunks(CHUNK) {
+        // Unlocked + parallel: hash, dedup-check, copy, verify, thumbnail/metadata. A per-file error
+        // is recorded below and the import continues (a single bad file must not abort the run).
+        let outcomes: Vec<Result<Outcome, ImportError>> = pool.install(|| {
+            chunk
+                .par_iter()
+                .map(|p| process_one_unlocked(thumbs, p, mode, library_root, &st.seen, &claimed))
+                .collect()
+        });
+        for (src_path, outcome) in chunk.iter().zip(outcomes) {
+            let row = commit_one(&ctx, &mut st, src_path, outcome);
+            done += 1;
+            progress(done, total, row.as_ref());
+        }
     }
 
-    if pairing_on {
-        stats.paired = link_detected_pairs(db, files, &new_ids, &src_hashes);
+    if ctx.pairing_on {
+        st.stats.paired = link_detected_pairs(db, files, &st.new_ids, &st.src_hashes);
     }
 
     {
         let guard = db.lock().expect("import: db mutex poisoned");
-        finish_session(&guard.conn, &stats)?;
+        finish_session(&guard.conn, &st.stats)?;
     }
-    Ok(stats)
+    Ok(st.stats)
+}
+
+/// Catalog one file's outcome (brief locks only), advancing `st` in input order. Returns the freshly
+/// inserted row for the live grid update, or `None` for a skip/failure.
+fn commit_one(
+    ctx: &CommitCtx<'_>,
+    st: &mut RunState,
+    src_path: &Path,
+    outcome: Result<Outcome, ImportError>,
+) -> Option<ImageRow> {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            st.stats.failed += 1;
+            if record_source_failure(ctx.db, src_path, &failure_facts(&e), ctx.imported_at) {
+                st.stats.unsupported += 1;
+            }
+            return None;
+        }
+    };
+
+    match outcome {
+        Outcome::Skip(h) => {
+            if ctx.pairing_on {
+                st.src_hashes.insert(src_path.to_path_buf(), h);
+            }
+            st.stats.skipped += 1;
+            None
+        }
+        Outcome::SkipSeen(h) => {
+            st.seen.insert(h);
+            if ctx.pairing_on {
+                st.src_hashes.insert(src_path.to_path_buf(), h);
+            }
+            st.stats.skipped += 1;
+            None
+        }
+        Outcome::Unsupported(err) => {
+            // No copy was made and the source is untouched — only the record is written.
+            st.stats.failed += 1;
+            st.stats.unsupported += 1;
+            record_source_failure(
+                ctx.db,
+                src_path,
+                &FailureFacts::from_raw(&err),
+                ctx.imported_at,
+            );
+            None
+        }
+        Outcome::Ready {
+            processed,
+            src_hash,
+            src_to_trash,
+        } => commit_ready(ctx, st, src_path, *processed, src_hash, src_to_trash),
+    }
+}
+
+/// Catalog a processed file: relink-or-insert, stamp the session, then (Move only) trash the source.
+fn commit_ready(
+    ctx: &CommitCtx<'_>,
+    st: &mut RunState,
+    src_path: &Path,
+    processed: ProcessedImage,
+    src_hash: [u8; 32],
+    src_to_trash: Option<PathBuf>,
+) -> Option<ImageRow> {
+    // An earlier file of the SAME chunk carried identical bytes. The parallel phase saw `seen`
+    // before that hash was recorded, so this file was copied+processed anyway; treat it exactly like
+    // the pre-copy `Skip` it would have been, and delete the redundant copy. The source is never
+    // trashed here — the file that "won" is a different original.
+    if st.seen.contains(&src_hash) {
+        if !matches!(ctx.mode, ImportMode::Reference) {
+            remove_orphan_copy(Path::new(&processed.path));
+        }
+        if ctx.pairing_on {
+            st.src_hashes.insert(src_path.to_path_buf(), src_hash);
+        }
+        st.stats.skipped += 1;
+        return None;
+    }
+
+    match insert_catalog_row(ctx, src_path, &processed) {
+        Ok(Some((id, row))) => {
+            st.stats.added += 1;
+            st.seen.insert(src_hash);
+            if ctx.pairing_on {
+                st.new_ids.insert(src_path.to_path_buf(), id);
+            }
+            // Move: send the original to Trash ONLY now that its copy is durably catalogued. A
+            // trash failure leaves the source in place (counted, not lost).
+            if let Some(src) = src_to_trash {
+                if ctx.trash.delete(&src).is_err() {
+                    st.stats.source_retained += 1;
+                }
+            }
+            row
+        }
+        Ok(None) => {
+            // The hash turned out to be in the catalog after all (it was absent from the `present`
+            // snapshot this run started from). The copy is an orphan no rescan can adopt.
+            if !matches!(ctx.mode, ImportMode::Reference) {
+                remove_orphan_copy(Path::new(&processed.path));
+            }
+            st.stats.skipped += 1;
+            None
+        }
+        Err(_) => {
+            st.stats.failed += 1;
+            None
+        }
+    }
+}
+
+/// Brief lock: recover a deleted-then-re-imported file by relinking its `missing` row (keeps id +
+/// edits/keywords), else insert fresh; stamp the session; read the row back for the live grid
+/// update. `Ok(None)` = a byte-identical row is already `present`.
+fn insert_catalog_row(
+    ctx: &CommitCtx<'_>,
+    src_path: &Path,
+    processed: &ProcessedImage,
+) -> Result<Option<(i64, Option<ImageRow>)>, ImportError> {
+    let guard = ctx.db.lock().expect("import: db mutex poisoned");
+    let conn = &guard.conn;
+    let id = match relink_missing_image(conn, ctx.folder_id, ctx.imported_at, processed)? {
+        Some(id) => Some(id),
+        None => insert_image(conn, ctx.folder_id, ctx.imported_at, processed)?,
+    };
+    let Some(id) = id else { return Ok(None) };
+    conn.execute(
+        "UPDATE images SET import_session_id=?1 WHERE id=?2",
+        params![ctx.session_id, id],
+    )?;
+    // Restore edits/rating/keywords from a sidecar that travelled with the RAW (copied in
+    // `process_one_unlocked`, or in place for reference mode).
+    let _ = core_library::sidecar::hydrate_if_blank(conn, id, &processed.path);
+    // The file indexed after all — drop any record of it failing, under both the source key (where
+    // imports record) and the library copy's.
+    let _ = core_library::clear_decode_failure(conn, &src_path.display().to_string());
+    let _ = core_library::clear_decode_failure(conn, &processed.path);
+    // Read-back is best-effort: a failure only costs the live update.
+    Ok(Some((id, image_by_id(conn, id).ok().flatten())))
+}
+
+/// Delete a library copy that will never be catalogued, together with the sidecar copied beside it.
+/// Leaving it behind puts a file in the library that no catalog row points at and that no rescan can
+/// adopt. Reference mode owns nothing — callers must never invoke this on the user's own file.
+fn remove_orphan_copy(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "import: failed to remove an orphan library copy"
+        );
+    }
+    // The sidecar copied alongside it is just as orphaned.
+    let _ = std::fs::remove_file(core_library::sidecar::sidecar_path(
+        &path.display().to_string(),
+    ));
 }
 
 /// Link each detected RAW+JPEG/HEIF group in `files` (one brief lock for the whole batch). Members
@@ -484,11 +644,23 @@ pub fn list_source(source: &Path, recursive: bool) -> Vec<SourceFile> {
         .collect()
 }
 
+/// Files hashed per [`dedup_scan`] batch — also the progress-callback granularity (unchanged).
+const DEDUP_CHUNK: usize = 24;
+
+/// Hashing workers for [`dedup_scan`]. Deliberately small: the scan runs in the background while the
+/// user browses the staged card, and it is bound by reads from one (often slow) card reader.
+const DEDUP_THREADS: usize = 4;
+
 /// Hash-verify each path's dedup status against the catalog (`present_hashes`) and the rest of the
 /// batch. **Size prefilter:** a file is only read+hashed when its size collides with a catalog file
 /// or another batch file — a size unique everywhere can't be a byte-duplicate, so it's `New` with no
 /// I/O. This keeps a full-card check to reading only the genuine candidates. `progress(done, total,
 /// &newly_resolved)` fires periodically so the UI updates live.
+///
+/// Hashing is a pure read + BLAKE3 with no shared state, so a batch is hashed in parallel; the
+/// verdicts are then assigned **sequentially in input order**, because "first occurrence wins /
+/// later ones are `DuplicateBatch`" is order-dependent. Output order and verdicts are identical to
+/// the fully sequential version.
 pub fn dedup_scan<F>(
     paths: &[PathBuf],
     present_hashes: &HashSet<[u8; 32]>,
@@ -509,21 +681,48 @@ where
         *batch_size_count.entry(sz).or_insert(0) += 1;
         size_of.push(sz);
     }
+    let needs_hash = |i: usize| -> bool {
+        let size = size_of[i];
+        present_sizes.contains(&size) || batch_size_count.get(&size).copied().unwrap_or(0) > 1
+    };
+
+    // A private pool keeps a background scan off every core. If one cannot be built we simply hash
+    // on the global pool — a thread-pool shortage must not fail a dedup preview.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(DEDUP_THREADS)
+        .build()
+        .ok();
 
     let mut seen_batch: HashSet<[u8; 32]> = HashSet::new();
     let mut out: Vec<DedupResult> = Vec::with_capacity(total);
-    let mut pending_batch: Vec<DedupResult> = Vec::new();
+    let mut done = 0usize;
 
-    for (i, path) in paths.iter().enumerate() {
-        let size = size_of[i];
-        let needs_hash =
-            present_sizes.contains(&size) || batch_size_count.get(&size).copied().unwrap_or(0) > 1;
+    for chunk in paths.chunks(DEDUP_CHUNK) {
+        let base = done;
+        // `None` = "not a hash candidate" (unique size) or "unreadable"; both classify as New.
+        let hash_chunk = || -> Vec<Option<[u8; 32]>> {
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(k, p)| {
+                    if !needs_hash(base + k) {
+                        return None;
+                    }
+                    // Unreadable here → New; the commit re-verifies and counts any real failure.
+                    hash_file(p).ok().map(|(h, _)| h)
+                })
+                .collect()
+        };
+        let hashes = match &pool {
+            Some(p) => p.install(hash_chunk),
+            None => hash_chunk(),
+        };
 
-        let status = if !needs_hash {
-            SourceStatus::New
-        } else {
-            match hash_file(path) {
-                Ok((h, _)) => {
+        let mut batch: Vec<DedupResult> = Vec::with_capacity(chunk.len());
+        for (k, path) in chunk.iter().enumerate() {
+            let status = match hashes[k] {
+                None => SourceStatus::New,
+                Some(h) => {
                     if present_hashes.contains(&h) {
                         SourceStatus::DuplicateLibrary
                     } else if !seen_batch.insert(h) {
@@ -532,36 +731,82 @@ where
                         SourceStatus::New
                     }
                 }
-                // Unreadable here → treat as New; the commit re-verifies and counts any real failure.
-                Err(_) => SourceStatus::New,
-            }
-        };
-
-        let result = DedupResult {
-            path: path.display().to_string(),
-            status,
-        };
-        out.push(result.clone());
-        pending_batch.push(result);
-
-        if i + 1 == total || pending_batch.len() >= 24 {
-            progress(i + 1, total, &pending_batch);
-            pending_batch.clear();
+            };
+            batch.push(DedupResult {
+                path: path.display().to_string(),
+                status,
+            });
         }
+        done += chunk.len();
+        progress(done, total, &batch);
+        out.extend(batch);
     }
     out
 }
 
-/// Unlocked per-file work: hash → dedup-check → (copy + hash-verify) → thumbnail/metadata. Touches
-/// only the filesystem + CPU; never the DB. Returns what the caller should catalog (or skip).
+/// Catalog facts for an import failure. `core-import`'s errors wrap a RAW decode failure one level
+/// deeper than `core-library`'s, and an I/O failure is worth distinguishing from "something else".
+fn failure_facts(err: &ImportError) -> FailureFacts {
+    let fallback = match err {
+        ImportError::Io(_) => core_raw::FailureKind::Io,
+        _ => core_raw::FailureKind::Other,
+    };
+    FailureFacts::new(err.as_raw(), fallback, err.to_string())
+}
+
+/// Record a per-file import failure against the SOURCE path (`folder_id` is NULL — a card is not a
+/// watched library folder). Returns `true` when the file is permanently unsupported. Best-effort:
+/// neither the lock nor the write may fail an import that is otherwise fine.
+fn record_source_failure(db: &Mutex<Db>, src_path: &Path, facts: &FailureFacts, at: i64) -> bool {
+    let Ok(guard) = db.lock() else { return false };
+    core_library::record_failure_facts(&guard.conn, None, src_path, facts, at).unwrap_or(false)
+}
+
+/// Reserve a destination path for `filename` inside `dir`, for this import run only.
+///
+/// Walks the same candidate sequence as [`unique_dest`] (`name`, `stem_1.ext`, `stem_2.ext`, …) but
+/// additionally skips names another file of the same run already claimed. Files are copied in
+/// parallel, so when two source folders hold the same filename NEITHER copy exists on disk yet when
+/// the other picks its name — `!exists()` alone would hand both threads the same destination and one
+/// copy would silently overwrite the other. The whole search runs under one lock so a name cannot be
+/// claimed between the existence check and the insert.
+fn claim_unique_dest(dir: &Path, filename: &str, claimed: &Mutex<HashSet<PathBuf>>) -> PathBuf {
+    let mut taken = claimed.lock().expect("import: claimed-dest mutex poisoned");
+    let path = Path::new(filename);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    for n in 0.. {
+        let cand = match n {
+            0 => dir.join(filename),
+            _ if ext.is_empty() => dir.join(format!("{stem}_{n}")),
+            _ => dir.join(format!("{stem}_{n}.{ext}")),
+        };
+        if !cand.exists() && taken.insert(cand.clone()) {
+            return cand;
+        }
+    }
+    unreachable!()
+}
+
+/// Unlocked per-file work: read → hash → dedup-check → (write + hash-verify) → thumbnail/metadata.
+/// Touches only the filesystem + CPU; never the DB. Runs in parallel across a chunk, so `seen` is a
+/// read-only snapshot (duplicates *within* a chunk are resolved by the catalog step) and every
+/// destination name is reserved through `claimed`. Returns what the caller should catalog (or skip).
+///
+/// The source is read exactly ONCE and the buffer then serves the hash, the "can we open this?"
+/// metadata probe, the bytes written to the destination, and the final metadata/thumbnail pass. The
+/// only other full read is `hash_file` over the freshly written temp file — the on-disk verification
+/// that the copy is byte-identical, which by definition cannot be done from memory.
 fn process_one_unlocked(
     thumbs: &ThumbCache,
     src_path: &Path,
     mode: ImportMode,
     library_root: &Path,
     seen: &HashSet<[u8; 32]>,
+    claimed: &Mutex<HashSet<PathBuf>>,
 ) -> Result<Outcome, ImportError> {
-    let (src_hash, _size) = hash_file(src_path)?;
+    let bytes = Arc::new(std::fs::read(src_path)?);
+    let src_hash = content_hash(&bytes);
     if seen.contains(&src_hash) {
         return Ok(Outcome::Skip(src_hash)); // already in library (or imported this run)
     }
@@ -569,12 +814,19 @@ fn process_one_unlocked(
     let (dest_path, src_to_trash) = match mode {
         ImportMode::Reference => (src_path.to_path_buf(), None),
         ImportMode::Copy | ImportMode::Move => {
-            // Resolve date folder.
-            let src = source_from_path(src_path)?;
-            let capture = read_metadata(&src)
-                .ok()
-                .and_then(|m| m.capture_date)
-                .unwrap_or_else(|| file_mtime_epoch(src_path));
+            // Resolve date folder, from the bytes we already hold.
+            let src = source_from_bytes(bytes.clone(), src_path);
+            // The metadata read doubles as the "can this build open the file at all?" probe. An
+            // unknown body bails out HERE, before the copy — otherwise every unsupported RAW left an
+            // orphan in `library/YYYY/YYYY-MM-DD/` that no catalog row ever pointed at. Any other
+            // metadata failure keeps the old behaviour (fall back to mtime for date routing).
+            let capture = match read_metadata(&src) {
+                Ok(m) => m.capture_date.unwrap_or_else(|| file_mtime_epoch(src_path)),
+                Err(e) if e.kind() == core_raw::FailureKind::Unsupported => {
+                    return Ok(Outcome::Unsupported(e))
+                }
+                Err(_) => file_mtime_epoch(src_path),
+            };
             let dest_dir = library_root.join(date_subpath(capture));
             std::fs::create_dir_all(&dest_dir)?;
             let filename = src_path
@@ -590,17 +842,18 @@ fn process_one_unlocked(
                     return Ok(Outcome::SkipSeen(src_hash));
                 }
             }
-            let dest = unique_dest(&dest_dir, filename);
+            let dest = claim_unique_dest(&dest_dir, filename, claimed);
 
-            // Copy to a temp sibling, hash-verify, then ATOMIC rename into place. A crash mid-copy
+            // Write to a temp sibling, hash-verify, then ATOMIC rename into place. A crash mid-copy
             // leaves an inert `*.part` file (not a supported RAW ext, so never enumerated/catalogued)
-            // rather than a truncated file sitting at the real destination name.
+            // rather than a truncated file sitting at the real destination name. The temp name is
+            // unique within the run because `dest` is.
             let tmp = {
                 let mut t = dest.clone().into_os_string();
                 t.push(".part");
                 PathBuf::from(t)
             };
-            std::fs::copy(src_path, &tmp)?;
+            std::fs::write(&tmp, bytes.as_slice())?;
             let (vh, _) = hash_file(&tmp)?;
             if vh != src_hash {
                 // Verification failed — remove the bad temp copy, preserve the source, fail.
@@ -625,10 +878,68 @@ fn process_one_unlocked(
         }
     };
 
-    let processed = process_file(&dest_path, thumbs, THUMB_SIZE)?;
+    // The destination is byte-identical to the source (verified above), so the buffer we already
+    // hold IS the destination's content — no second read, and `src_hash` stays its content hash.
+    let processed = match process_bytes(&dest_path, bytes, src_hash, thumbs, THUMB_SIZE) {
+        Ok(p) => p,
+        Err(e) => {
+            // The copy exists but will never be catalogued. Reference mode owns nothing: never
+            // touch the user's own file.
+            if !matches!(mode, ImportMode::Reference) {
+                remove_orphan_copy(&dest_path);
+            }
+            return Err(e.into());
+        }
+    };
     Ok(Outcome::Ready {
         processed: Box::new(processed),
         src_hash,
         src_to_trash,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body this build cannot decode must be recognised BEFORE the copy — otherwise every
+    /// unsupported RAW leaves an orphan in `library/YYYY/YYYY-MM-DD/` that no catalog row points at
+    /// and no rescan can adopt.
+    ///
+    /// Junk bytes under a RAW extension are enough: rawler reports "No decoder found", which
+    /// `core-raw` classifies as `FailureKind::Unsupported` (verified, not assumed) — the same class
+    /// a real unknown body produces.
+    #[test]
+    fn an_undecodable_source_is_refused_before_anything_is_copied() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let thumbdir = tempfile::tempdir().unwrap();
+        let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+
+        let src = src_dir.path().join("DSC_0001.NEF");
+        std::fs::write(&src, vec![0x37u8; 4096]).unwrap();
+
+        let outcome = process_one_unlocked(
+            &thumbs,
+            &src,
+            ImportMode::Copy,
+            library.path(),
+            &HashSet::new(),
+            &Mutex::new(HashSet::new()),
+        )
+        .expect("an undecodable file is an outcome, not an error");
+
+        match outcome {
+            Outcome::Unsupported(e) => {
+                assert_eq!(e.kind(), core_raw::FailureKind::Unsupported);
+            }
+            _ => panic!("expected Outcome::Unsupported"),
+        }
+        assert!(src.exists(), "the source must be left exactly where it was");
+        assert_eq!(
+            std::fs::read_dir(library.path()).unwrap().count(),
+            0,
+            "nothing may be written into the library for a file we cannot open"
+        );
+    }
 }

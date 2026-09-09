@@ -27,6 +27,7 @@ No-GUI validation harnesses (fast feedback without launching the app):
 
 ```bash
 cargo run -p core-raw      --example decode_gate    # rawler decodes R7 CR3
+cargo run --release -p core-raw --example corpus_probe [FILE..]  # decode stats (dims/WB/patch mean/highlight chroma); --record for corpus goldens
 cargo run -p core-library  --example scan_library   # index all 240 + thumbs (~2s)
 cargo run -p core-pipeline --example render_one     # decode → GPU develop → PNG in /tmp
 cargo run -p core-pipeline --example export_full    # full-res export → /tmp
@@ -75,7 +76,19 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 
 - **Do NOT add padding to the `vec3 wb_gain` uniform** (`params.rs` ↔ `develop.wgsl`). A scalar packs into the vec3 tail per std140/WGSL; it is correct. A past review false-flagged it. Guarded by golden test `param_effects.rs`.
 - **All new GPU data must use new bindings**, never alter `ParamsUniform`. Bindings 0–15 are all in use; **next free = `@binding(16)`**. Map: 0 `input_tex`, 1 `input_smp`, 2 `ParamsUniform` (guarded), 3 tone-curve LUT, 4 HSL `FxUniform`, 5–7 masks (array + sampler + storage), 8 white-balance CAT mat3, 9 Detail+vignette+Presence `ExtraUniform`, **10 `ToneOpUniform` (scene-referred base tone operator), 11 `base_lut` (base-curve texture), 12 `GeomUniform` (crop/straighten + lens), 13 `ViewUniform` (viewport + mask overlay), 14 `CbRgbUniform` (Color-balance-RGB grading), 15 `ChanMix` (channel mixer)**. (Global WB rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
-- **rawler `=0.7.2`** pinned (non-SemVer; CR3/EOS R7 validated, no LibRaw). Keep every rawler call inside `core-raw`.
+- **rawler `=0.8.0`** pinned (non-SemVer; bumped from 0.7.2 on 2026-09-08 — `Demosaic` trait moved to
+  `imgop::sensor`, `CFAConfig.sensor: SensorType`, per-format embedded previews are now `preview_image`). No
+  LibRaw. Keep every rawler call inside `core-raw`; every public core-raw entry runs under
+  `panic::catch_decode_panic` (release profile must stay `panic = unwind` — CI greps for `abort`). Update
+  `core_raw::DECODER_VERSION` with the pin.
+- **RAW colour path** (`core-raw/src/develop.rs::map_3ch_to_rgb`): as-shot WB → clipped-highlight
+  reconstruction (dcraw `blend_highlights`-style chroma shrink for raw channels ≥ ~0.92) → dual-illuminant
+  camera matrix (`color.rs::select_cam_matrix`, DNG-spec 1/CCT interpolation) → row-normalised
+  cam→ProPhoto → `clip_negative`. Any change here = `PROCESS_VERSION` bump (`src-tauri/src/commands.rs`).
+- **Formats**: `core_library::SUPPORTED_EXT` is the only gate (`cr3 cr2 crw nef nrw arw sr2 srf dng` + jpg/png/hif/exr);
+  unsupported bodies/modes (Nikon HE/HE*, Sony ARW6, bodies missing from rawler's DB, X-Trans) surface as typed
+  `RawError::Unsupported`, are recorded in `decode_failure` and skipped on rescans until the decoder version changes.
+  Multi-maker corpus: `tests/corpus/manifest.toml` + `scripts/fetch_raw_corpus.sh` (see AGENTS.md).
 - **libheif-rs `=2.7.0`** pinned, `default-features=false, features=["v1_17"]` (oldest supported system libheif — Ubuntu noble; Homebrew's newer releases are API-compatible). Keep every libheif call inside `core-raw/src/heif.rs`; not built on Windows (stub returns a clean error). `exr = "1.74"` (same version image 0.25 already pulls) for merged-HDR files.
 - **wgpu `=29`** — API differs substantially from older majors (Instance/device/pipeline-descriptor changes catalogued in CURRENT_STATE.md).
 - **rusqlite `0.39` + rusqlite_migration `=2.5.0`** pinned for rustc 1.91 (newer needs ≥1.95). Don't bump without checking MSRV.

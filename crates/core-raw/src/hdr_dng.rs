@@ -39,6 +39,10 @@ fn de(e: impl std::fmt::Display) -> RawError {
 /// export-only, not an import path). Durability mirrors `hdr_file::write_hdr_exr`: the bytes go to
 /// `<dest>.part` first, then an atomic rename.
 pub fn write_hdr_dng(dest: &Path, img: &LinearImage, meta: &RawMeta) -> Result<(), RawError> {
+    crate::panic::catch_decode_panic("write_hdr_dng", || write_hdr_dng_inner(dest, img, meta))
+}
+
+fn write_hdr_dng_inner(dest: &Path, img: &LinearImage, meta: &RawMeta) -> Result<(), RawError> {
     let (w, h) = (img.width as usize, img.height as usize);
     if img.data.len() != w * h * 3 || w == 0 || h == 0 {
         return Err(de(format!(

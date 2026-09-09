@@ -63,6 +63,12 @@ pub fn run() {
                 eprintln!("darkroom: file logging unavailable: {e}");
             }
             install_panic_hook();
+            // Decoder-panic containment (`core_raw::panic`) only works when panics unwind. If a
+            // profile ever sets `panic = "abort"`, one odd RAW takes the whole app down again —
+            // say so in the log rather than discovering it from a crash report.
+            if !core_raw::ISOLATION_ACTIVE {
+                tracing::warn!("decode panic isolation DISABLED (panic=abort profile)");
+            }
             // Grant the playwright permission at runtime (debug-only `dynamic-acl`), so the
             // capability never lives in capabilities/ and feature-off builds stay clean.
             #[cfg(feature = "e2e-testing")]
@@ -141,6 +147,9 @@ pub fn run() {
             commands::image_meta,
             commands::gpu_status,
             commands::library_index_root,
+            commands::decode_failures_list,
+            commands::decode_failures_counts,
+            commands::decode_failures_forget,
             commands::database_reset,
             commands::app_default_library,
             commands::develop_get_edit,
@@ -334,6 +343,17 @@ fn install_panic_hook() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "<unknown location>".to_string());
+        // A panic raised on a thread that is inside `core_raw`'s `catch_decode_panic` is already
+        // handled: it comes back to the caller as a typed error and that one file is skipped. Log
+        // it as a warning and stop here — capturing a backtrace and running the default hook's
+        // crash message for a *recovered* condition is expensive (a full unwind capture per bad
+        // file during an index) and reads like a crash in the log when nothing crashed. The check
+        // is thread-local, so an unrelated panic elsewhere during an index still gets the full
+        // error path below.
+        if core_raw::decode_in_flight() {
+            tracing::warn!(%location, %payload, "decoder panic contained — file skipped");
+            return;
+        }
         let backtrace = std::backtrace::Backtrace::force_capture();
         tracing::error!(%location, %payload, %backtrace, "panic");
         previous(info);

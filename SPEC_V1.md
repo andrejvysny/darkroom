@@ -216,7 +216,7 @@ graph TD
 | Shell      | **Tauri v2**                                      | Native heavy compute in Rust; least-privilege capabilities enforce read-only; small footprint. Chosen over Electron because the bottleneck (decode/demosaic/pipeline) is native, not webview. |
 | GPU        | **wgpu** (Metal now; Vulkan/DX12 later)           | Consistent native GPU compute across OSes; avoids webview-WebGPU fragmentation (WKWebView WebGPU only on recent macOS; WebKitGTK spotty).                                                     |
 | Frontend   | **React 19 + Vite + Tailwind**                    | Fast iteration; familiar; webview only does chrome + canvas blit.                                                                                                                             |
-| RAW decode | **rawler** primary, **LibRaw** (`rsraw`) fallback | rawler is pure-Rust, actively maintained, covers Bayer + metadata; LibRaw covers 400+ bodies for gaps (gated behind a Cargo feature; C++ toolchain).                                          |
+| RAW decode | **rawler** only (`=0.8.0`) | rawler is pure-Rust, actively maintained, covers Bayer + metadata. The LibRaw (`rsraw`) fallback originally spec'd was **never built** (decision 2026-09-08: bodies/modes rawler lacks — Nikon HE/HE*, Sony ARW6, unlisted bodies — surface as typed `Unsupported` with a user-facing reason instead). |
 | Hashing    | **BLAKE3**                                        | Cryptographic-strength, very fast; safe to gate deletions on.                                                                                                                                 |
 | Catalog    | **SQLite** via `sqlx`/`rusqlite`, WAL             | Handles millions of rows; single-file; Rust-owned, queried over IPC.                                                                                                                          |
 | FS watch   | **notify**                                        | Cross-platform; FSEvents on macOS.                                                                                                                                                            |
@@ -422,7 +422,7 @@ _(Future tier — perceptual/pixel hash of the decoded preview for "visually ide
 ### Decode & demosaic
 
 - **rawler** decodes Bayer + metadata; **Malvar-He-Cutler** as the quality baseline, **bilinear** for fast preview/thumbnails, **RCD/AMaZE-class** as a later upgrade.
-- LibRaw fallback (feature-gated) for unsupported bodies.
+- ~~LibRaw fallback (feature-gated) for unsupported bodies.~~ Not built; unsupported bodies are recorded (`decode_failure`) and shown in the UI (2026-09-08).
 
 ### GPU implementation (wgpu)
 
@@ -662,10 +662,10 @@ erDiagram
 ## 21. Build, tooling & packaging
 
 - **Workspace:** Cargo workspace — crates: `core-db`, `core-library`, `core-import`, `core-dedup`, `core-decode`, `core-pipeline` (wgpu), `core-export`, `app` (Tauri). Frontend in `/ui` (Vite).
-- **Feature flags:** `libraw-fallback` (C++ toolchain) off by default; enable per build as needed.
+- **Feature flags:** none for decode (the `libraw-fallback` feature was never implemented).
 - **Release builds:** `--release` with LTO; shader precompilation where possible.
 - **Packaging:** Tauri bundler → signed, notarized `.dmg`; Tauri updater for releases.
-- **CI:** build + unit/integration tests + golden-image pipeline tests; validate LibRaw build path; lint (clippy) + format.
+- **CI:** build + unit/integration tests + golden-image pipeline tests; multi-maker RAW corpus job (`raw-corpus`, CC0 samples from raw.pixls.us, cached); lint (clippy) + format.
 
 ---
 
@@ -674,7 +674,7 @@ erDiagram
 - **Unit:** hashing, fingerprint canonicalization, path/date routing, collision logic, move-mode verify-before-delete.
 - **Integration:** import idempotency (re-import same card → no dupes), watcher move reconciliation, dedup grouping correctness on synthetic sets.
 - **Golden-image pipeline tests:** fixed RAW inputs → expected output compared by PSNR/hash within tolerance; guards against accidental pipeline math changes (paired with `process_version`).
-- **Decode coverage:** sample RAWs per supported body (Sony/Canon/Nikon); LibRaw fallback path.
+- **Decode coverage:** sample RAWs per supported maker via `tests/corpus/manifest.toml` (Canon CR2/sRAW/CR3, Nikon 12/14-bit NEF + HE* negative, Sony ARW2/uncompressed/lossless, DNG, mono DNG).
 - **Performance regression:** measure render latency and query times against budgets.
 - **Safety tests:** simulated copy corruption → move must abort, source preserved.
 
@@ -757,5 +757,7 @@ Concatenate normalized fields with a separator, lowercase, trim:
 
 ### C. Supported inputs (v1)
 
-- Bayer RAW from Sony (.ARW), Canon (.CR2/.CR3), Nikon (.NEF), plus DNG (Bayer).
-- Out: X-Trans, monochrome sensors, video.
+- Bayer RAW from Sony (.ARW/.SR2/.SRF), Canon (.CR2/.CR3/.CRW), Nikon (.NEF/.NRW), plus DNG (Bayer,
+  linear, float). Monochrome sensors develop as gray (own rescale path).
+- Out: X-Trans (typed `Unsupported` until a validated demosaic), Nikon HE/HE* (TicoRAW), Sony ARW6,
+  video.

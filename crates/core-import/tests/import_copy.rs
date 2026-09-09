@@ -5,7 +5,7 @@ use core_db::Db;
 use core_import::{dedup_scan, import, list_source, ImportMode, Pairing, SourceStatus};
 use core_library::ThumbCache;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 fn library_files(n: usize) -> Vec<PathBuf> {
@@ -252,7 +252,12 @@ fn dedup_scan_classifies_by_content_hash() {
     let c_hash = core_raw::content_hash(b"UNIQUE-CONTENT");
     let present_hashes: HashSet<[u8; 32]> = [c_hash].into_iter().collect();
     let present_sizes: HashSet<i64> = ["UNIQUE-CONTENT".len() as i64].into_iter().collect();
-    let r2 = dedup_scan(&[c.clone()], &present_hashes, &present_sizes, |_, _, _| {});
+    let r2 = dedup_scan(
+        std::slice::from_ref(&c),
+        &present_hashes,
+        &present_sizes,
+        |_, _, _| {},
+    );
     assert_eq!(r2[0].status, SourceStatus::DuplicateLibrary);
 }
 
@@ -314,4 +319,324 @@ fn move_import_trashes_sources_after_catalog() {
     for p in &routed {
         assert!(std::path::Path::new(p).exists(), "library copy exists: {p}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parallel commit path. These run on the committed `docs/sample-poppies.jpg` (a supported, real,
+// decodable format) rather than a camera RAW, so they need no uncommitted fixture and still drive
+// the FULL pipeline: metadata probe, hash-verified copy, decode, thumbnail, catalog insert.
+// ---------------------------------------------------------------------------------------------
+
+fn poppies() -> Vec<u8> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/sample-poppies.jpg");
+    std::fs::read(&p).expect("committed fixture docs/sample-poppies.jpg")
+}
+
+/// The same JPEG with `tag` appended. A JPEG decoder stops at the EOI marker, so the image still
+/// decodes identically while the file is byte- (and therefore hash-) distinct.
+fn variant(base: &[u8], tag: &str) -> Vec<u8> {
+    let mut v = base.to_vec();
+    v.extend_from_slice(tag.as_bytes());
+    v
+}
+
+/// Stage a synthetic card that exercises every rule the parallel commit has to preserve:
+/// 30 unique files, 5 byte-identical pairs (10 files, distinct filenames — so the duplicate is
+/// caught by content, not by a destination collision), and 2 same-FILENAME different-content files
+/// in separate subfolders (so both race for `SAME.jpg` in the same date folder).
+/// 42 files, 37 distinct contents. Returns the staged paths.
+fn stage_card(dir: &Path) -> Vec<PathBuf> {
+    let base = poppies();
+    let mut staged: Vec<PathBuf> = Vec::new();
+    let mut write = |rel: &str, bytes: &[u8]| {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+        staged.push(p);
+    };
+    for i in 0..30 {
+        write(
+            &format!("uniq{i:02}.jpg"),
+            &variant(&base, &format!("u{i:02}")),
+        );
+    }
+    for i in 0..5 {
+        let dup = variant(&base, &format!("dup{i}"));
+        write(&format!("dup{i}_a.jpg"), &dup);
+        write(&format!("dup{i}_b.jpg"), &dup);
+    }
+    write("a/SAME.jpg", &variant(&base, "same-a"));
+    write("b/SAME.jpg", &variant(&base, "same-b"));
+    staged
+}
+
+/// Every regular file under `root`, recursively.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn catalog_paths(db: &Mutex<Db>) -> Vec<String> {
+    let g = db.lock().unwrap();
+    let mut stmt = g
+        .conn
+        .prepare("SELECT path FROM images ORDER BY id")
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// The chunked/parallel commit must produce exactly what the old file-at-a-time loop did: identical
+/// content is catalogued once, the redundant copy it made is deleted (no orphans, no `*.part`), and
+/// two files sharing a filename get distinct destinations instead of overwriting each other.
+#[test]
+fn parallel_copy_import_keeps_catalog_rules() {
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_card(card.path());
+    assert_eq!(staged.len(), 42);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    let stats = import(
+        &db,
+        &thumbs,
+        card.path(),
+        ImportMode::Copy,
+        libdir.path(),
+        true,
+        Pairing::Standalone,
+        |_, _, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(stats.total, 42);
+    assert_eq!(stats.added, 37, "one row per distinct content");
+    assert_eq!(stats.skipped, 5, "the second file of each identical pair");
+    assert_eq!(stats.failed, 0);
+
+    let count: i64 = db
+        .lock()
+        .unwrap()
+        .conn
+        .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 37);
+
+    let routed = catalog_paths(&db);
+    assert_eq!(routed.len(), 37);
+    for p in &routed {
+        assert!(Path::new(p).exists(), "catalogued file exists: {p}");
+    }
+
+    // No orphan copy of an in-chunk duplicate, and no temp file left behind.
+    let on_disk = walk_files(libdir.path());
+    assert!(
+        on_disk
+            .iter()
+            .all(|p| !p.to_string_lossy().ends_with(".part")),
+        "no `*.part` temp files survive the import"
+    );
+    assert_eq!(
+        on_disk.len(),
+        37,
+        "the library holds exactly the catalogued files: {on_disk:#?}"
+    );
+
+    // `a/SAME.jpg` and `b/SAME.jpg` differ in content, so both are imported and the second is
+    // renamed — neither may overwrite the other even though they are copied concurrently.
+    let names: Vec<String> = on_disk
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert!(names.contains(&"SAME.jpg".to_string()), "{names:#?}");
+    assert!(names.contains(&"SAME_1.jpg".to_string()), "{names:#?}");
+    let same_dirs: HashSet<PathBuf> = on_disk
+        .iter()
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            n == "SAME.jpg" || n == "SAME_1.jpg"
+        })
+        .map(|p| p.parent().unwrap().to_path_buf())
+        .collect();
+    assert_eq!(same_dirs.len(), 1, "both land in the same date folder");
+}
+
+/// The in-chunk duplicate rule, forced deterministically: two identical files with DIFFERENT names
+/// (so no destination collision short-circuits them) and a card small enough that both are certain
+/// to be in the same parallel chunk. Both get copied — the second cannot see the first's hash reach
+/// `seen` — so the catalog step has to count it skipped AND delete the redundant copy.
+#[test]
+fn in_chunk_duplicate_is_skipped_and_its_copy_removed() {
+    let card = tempfile::tempdir().unwrap();
+    let content = variant(&poppies(), "twin");
+    std::fs::write(card.path().join("A.jpg"), &content).unwrap();
+    std::fs::write(card.path().join("B.jpg"), &content).unwrap();
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    let stats = import(
+        &db,
+        &thumbs,
+        card.path(),
+        ImportMode::Copy,
+        libdir.path(),
+        true,
+        Pairing::Standalone,
+        |_, _, _| {},
+    )
+    .unwrap();
+    assert_eq!((stats.added, stats.skipped, stats.failed), (1, 1, 0));
+
+    let on_disk = walk_files(libdir.path());
+    assert_eq!(on_disk.len(), 1, "the redundant copy is gone: {on_disk:#?}");
+    assert_eq!(catalog_paths(&db), vec![on_disk[0].display().to_string()]);
+    // Neither original was touched (Copy mode never trashes, and a duplicate never trashes at all).
+    assert_eq!(walk_files(card.path()).len(), 2);
+}
+
+/// Reference mode catalogs the files where they already are: nothing is copied, the parallel phase
+/// must not fabricate library paths, and identical content is still deduped.
+#[test]
+fn reference_import_reads_in_place() {
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_card(card.path());
+    assert_eq!(staged.len(), 42);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    let stats = import(
+        &db,
+        &thumbs,
+        card.path(),
+        ImportMode::Reference,
+        libdir.path(),
+        true,
+        Pairing::Standalone,
+        |_, _, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(stats.added, 37);
+    assert_eq!(stats.skipped, 5);
+    assert_eq!(stats.failed, 0);
+
+    let card_prefix = card.path().display().to_string();
+    for p in catalog_paths(&db) {
+        assert!(p.starts_with(&card_prefix), "referenced in place: {p}");
+        assert!(Path::new(&p).exists());
+    }
+    // Nothing was written into the library, and the user's own files are all still there.
+    assert!(walk_files(libdir.path()).is_empty());
+    assert_eq!(walk_files(card.path()).len(), 42);
+}
+
+/// Hashing a batch in parallel must not disturb the verdicts, which are order-dependent: the FIRST
+/// occurrence of a content is `New` and every later one `DuplicateBatch`. Progress must also stay
+/// monotonic and finish on the total.
+#[test]
+fn dedup_scan_preserves_first_occurrence_order() {
+    let dir = tempfile::tempdir().unwrap();
+    // Same length everywhere, so the size prefilter hashes all of them (no free `New`s).
+    for name in ["dupA.CR3", "dupA2.CR3", "dupA3.CR3"] {
+        std::fs::write(dir.path().join(name), b"IDENTICAL-BYTES").unwrap();
+    }
+    std::fs::write(dir.path().join("uniq.CR3"), b"DIFFERENT-BYTES").unwrap();
+    let paths: Vec<PathBuf> = ["dupA.CR3", "dupA2.CR3", "dupA3.CR3", "uniq.CR3"]
+        .iter()
+        .map(|n| dir.path().join(n))
+        .collect();
+
+    let seen = Mutex::new(Vec::<(usize, usize)>::new());
+    let r = dedup_scan(
+        &paths,
+        &HashSet::new(),
+        &HashSet::new(),
+        |done, total, _| {
+            seen.lock().unwrap().push((done, total));
+        },
+    );
+
+    let statuses: Vec<SourceStatus> = r.iter().map(|d| d.status).collect();
+    assert_eq!(
+        statuses,
+        vec![
+            SourceStatus::New,
+            SourceStatus::DuplicateBatch,
+            SourceStatus::DuplicateBatch,
+            SourceStatus::New
+        ]
+    );
+    let out_paths: Vec<String> = r.iter().map(|d| d.path.clone()).collect();
+    let in_paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    assert_eq!(out_paths, in_paths, "results stay in input order");
+
+    // A batch bigger than one chunk: progress fires per chunk, strictly increasing, ending on total.
+    let big_dir = tempfile::tempdir().unwrap();
+    let big: Vec<PathBuf> = (0..50)
+        .map(|i| {
+            let p = big_dir.path().join(format!("f{i:02}.CR3"));
+            std::fs::write(&p, b"ALL-THE-SAME").unwrap();
+            p
+        })
+        .collect();
+    let ticks = Mutex::new(Vec::<usize>::new());
+    let r2 = dedup_scan(&big, &HashSet::new(), &HashSet::new(), |done, total, _| {
+        assert_eq!(total, 50);
+        ticks.lock().unwrap().push(done);
+    });
+    assert_eq!(r2[0].status, SourceStatus::New);
+    assert!(r2[1..]
+        .iter()
+        .all(|d| d.status == SourceStatus::DuplicateBatch));
+    let ticks = ticks.into_inner().unwrap();
+    assert!(ticks.len() > 1, "more than one chunk: {ticks:?}");
+    assert!(ticks.windows(2).all(|w| w[1] > w[0]), "{ticks:?}");
+    assert_eq!(*ticks.last().unwrap(), 50);
+}
+
+/// `process_bytes` is `process_file` minus the read+hash — the split the importer relies on to read
+/// each source once. Both must describe the file identically.
+#[test]
+fn process_bytes_matches_process_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("poppies.jpg");
+    std::fs::write(&src, poppies()).unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+
+    let via_file = core_library::process_file(&src, &thumbs, core_library::THUMB_SIZE).unwrap();
+
+    let bytes = std::sync::Arc::new(std::fs::read(&src).unwrap());
+    let digest = core_raw::content_hash(&bytes);
+    let via_bytes =
+        core_library::process_bytes(&src, bytes, digest, &thumbs, core_library::THUMB_SIZE)
+            .unwrap();
+
+    assert_eq!(via_file.content_hash_hex, via_bytes.content_hash_hex);
+    assert_eq!(via_file.file_size, via_bytes.file_size);
+    assert_eq!(
+        (via_file.width, via_file.height),
+        (via_bytes.width, via_bytes.height)
+    );
+    assert_eq!(via_file.meta.capture_date, via_bytes.meta.capture_date);
 }

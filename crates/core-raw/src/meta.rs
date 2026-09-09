@@ -25,10 +25,6 @@ pub struct RawMeta {
     pub orientation: Option<i64>,
 }
 
-fn de(e: impl std::fmt::Display) -> RawError {
-    RawError::Decode(e.to_string())
-}
-
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
@@ -85,6 +81,10 @@ impl RawMeta {
 
 /// Read metadata from an open [`RawSource`] WITHOUT decoding pixels (fast indexing path).
 pub fn read_metadata(src: &RawSource) -> Result<RawMeta, RawError> {
+    crate::panic::catch_decode_panic("read_metadata", || read_metadata_inner(src))
+}
+
+fn read_metadata_inner(src: &RawSource) -> Result<RawMeta, RawError> {
     use crate::display::ImageKind;
     match crate::display::classify(src.path()) {
         ImageKind::Jpeg | ImageKind::Png => {
@@ -94,10 +94,8 @@ pub fn read_metadata(src: &RawSource) -> Result<RawMeta, RawError> {
         ImageKind::Hdr => return Ok(crate::hdr_file::read_hdr_meta(&src.as_vec()?)),
         ImageKind::Raw => {}
     }
-    let decoder = rawler::get_decoder(src).map_err(de)?;
-    let md = decoder
-        .raw_metadata(src, &RawDecodeParams::default())
-        .map_err(de)?;
+    let decoder = rawler::get_decoder(src)?;
+    let md = decoder.raw_metadata(src, &RawDecodeParams::default())?;
     Ok(RawMeta::from_metadata(&md))
 }
 
@@ -105,13 +103,15 @@ pub fn read_metadata(src: &RawSource) -> Result<RawMeta, RawError> {
 /// from rawler's EXIF rationals — never parsed from the formatted display strings. `Ok(None)` when
 /// the source is not a rawler-decoded RAW or any component is missing/zero.
 pub fn read_exposure_numeric(src: &RawSource) -> Result<Option<(f64, f64, f64)>, RawError> {
+    crate::panic::catch_decode_panic("read_exposure_numeric", || read_exposure_numeric_inner(src))
+}
+
+fn read_exposure_numeric_inner(src: &RawSource) -> Result<Option<(f64, f64, f64)>, RawError> {
     if crate::display::classify(src.path()) != crate::display::ImageKind::Raw {
         return Ok(None);
     }
-    let decoder = rawler::get_decoder(src).map_err(de)?;
-    let md = decoder
-        .raw_metadata(src, &RawDecodeParams::default())
-        .map_err(de)?;
+    let decoder = rawler::get_decoder(src)?;
+    let md = decoder.raw_metadata(src, &RawDecodeParams::default())?;
     let exif = &md.exif;
     let t = exif
         .exposure_time

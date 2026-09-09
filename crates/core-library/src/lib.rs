@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod collections;
 pub mod cull;
+pub mod decode_failure;
 pub mod edits;
 pub mod error;
 pub mod events;
@@ -40,6 +41,11 @@ pub use collections::{
     list_collections, remove_images_from_collection, rename_collection, CollectionRow,
 };
 pub use cull::{set_flag, set_flag_many, set_label, set_label_many, set_rating, set_rating_many};
+pub use decode_failure::{
+    clear_decode_failure, decode_failure_counts, forget_decode_failures, list_decode_failures,
+    record_decode_failure, record_failure_facts, skippable_failures, DecodeFailureCounts,
+    DecodeFailureRow, FailureFacts,
+};
 pub use edits::{get_edit, get_edit_with_version, set_edit};
 pub use error::LibError;
 pub use events::{append_event, context_with_suggested, event_count, ids_json, Event};
@@ -57,8 +63,9 @@ pub use features::{
     compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
 };
 pub use index::{
-    add_root, enumerate_raws, existing_paths, image_kind, insert_image, now_epoch, process_file,
-    relink_missing_image, scan_root, IndexStats, ProcessedImage, SUPPORTED_EXT, THUMB_SIZE,
+    add_root, enumerate_raws, existing_paths, image_kind, insert_image, now_epoch, process_bytes,
+    process_file, relink_missing_image, scan_root, IndexStats, ProcessedImage, SUPPORTED_EXT,
+    THUMB_SIZE,
 };
 pub use keywords::{
     add_keyword_to_image, add_keyword_to_images, create_or_get_keyword, delete_keyword,

@@ -1,4 +1,5 @@
 import { useEffect, useCallback, useMemo, useState, useRef } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useAppStore } from "../../store/app";
 import { useLibrary } from "../../lib/useLibrary";
 import {
@@ -26,6 +27,7 @@ import {
   hasActiveFilters,
   hdrCancel,
   suggestionCtx,
+  decodeFailuresCounts,
 } from "../../lib/ipc";
 import type { ImageRow, KeywordRow, CollectionRow } from "../../lib/ipc";
 import { useCulling } from "../../hooks/useCulling";
@@ -46,6 +48,7 @@ import ImportDialog from "./ImportDialog";
 import SettingsModal from "./SettingsModal";
 import DeleteRejectedModal from "./DeleteRejectedModal";
 import ScanModal from "./ScanModal";
+import UnsupportedModal from "./UnsupportedModal";
 
 // Map color label name to CSS var for the dot color in ThumbGrid
 const LABEL_COLOR_MAP: Record<string, string> = {
@@ -98,15 +101,19 @@ export default function LibraryView() {
   const setOnOpenScan = useAppStore((s) => s.setOnOpenScan);
   const setOnSearch = useAppStore((s) => s.setOnSearch);
   const [importOpen, setImportOpen] = useState(false);
+  const closeImport = useCallback(() => setImportOpen(false), []);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deleteRejectedOpen, setDeleteRejectedOpen] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
+  const [unsupportedOpen, setUnsupportedOpen] = useState(false);
+  const [unsupportedCount, setUnsupportedCount] = useState(0);
   const [selectedKeywords, setSelectedKeywords] = useState<KeywordRow[]>([]);
   const [selectedCollections, setSelectedCollections] = useState<
     CollectionRow[]
   >([]);
 
   const lib = useLibrary();
+  const completeImport = useCallback(() => void lib.refresh(), [lib.refresh]);
   const analysis = useAnalysis();
   const hdr = useHdrMerge();
   const panoDetect = usePanoDetect();
@@ -123,6 +130,26 @@ export default function LibraryView() {
   );
   const [stoppingScan, setStoppingScan] = useState(false);
   const [stoppingHdr, setStoppingHdr] = useState(false);
+
+  // Files the catalog could not take. Re-priced whenever indexing finishes (`import:done`) or the
+  // watcher records a newly-seen bad file (`library:changed`) — a failure changes no image count,
+  // so the ordinary sidebar refresh would never notice it.
+  const refreshUnsupportedCount = useCallback(() => {
+    void decodeFailuresCounts()
+      .then((c) => setUnsupportedCount(c.unsupported + c.corrupt + c.other))
+      .catch(() => setUnsupportedCount(0));
+  }, []);
+
+  useEffect(() => {
+    refreshUnsupportedCount();
+    const subs: Promise<UnlistenFn>[] = [
+      listen("import:done", refreshUnsupportedCount),
+      listen("library:changed", refreshUnsupportedCount),
+    ];
+    return () => {
+      subs.forEach((s) => void s.then((un) => un()));
+    };
+  }, [refreshUnsupportedCount]);
 
   // While analysis runs (doneVersion bumps as batches commit), keep the filtered grid in sync so
   // partial detection results appear without re-clicking the category.
@@ -609,6 +636,8 @@ export default function LibraryView() {
           panoSuggested={panoDetect.suggested}
           onOpenPanoSuggestions={() => setPanoSuggestOpen(true)}
           onOpenScan={() => setScanOpen(true)}
+          unsupportedCount={unsupportedCount}
+          onOpenUnsupported={() => setUnsupportedOpen(true)}
         />
       </div>
 
@@ -888,12 +917,15 @@ export default function LibraryView() {
         />
       </div>
 
-      <ImportDialog
-        open={importOpen}
-        collections={lib.collections}
-        onClose={() => setImportOpen(false)}
-        onComplete={() => void lib.refresh()}
-      />
+      {/* Mounted only while open: the dialog's state must never be at the mercy of a parent
+          re-render (see ImportDialog). */}
+      {importOpen && (
+        <ImportDialog
+          collections={lib.collections}
+          onClose={closeImport}
+          onComplete={completeImport}
+        />
+      )}
 
       <SettingsModal
         open={settingsOpen}
@@ -917,6 +949,13 @@ export default function LibraryView() {
         onClose={() => setScanOpen(false)}
         scanScope={scanScope}
         onRefreshCounts={() => void lib.refresh()}
+      />
+
+      <UnsupportedModal
+        open={unsupportedOpen}
+        onClose={() => setUnsupportedOpen(false)}
+        onRetry={() => void lib.reindex()}
+        onRefreshCounts={refreshUnsupportedCount}
       />
     </div>
   );

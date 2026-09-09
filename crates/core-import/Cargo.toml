@@ -12,6 +12,12 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 trash = "5"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Already in the workspace (core-pipeline, src-tauri) and wired into the app's log filter as
+# `core_import` — used only for the orphan-cleanup warning.
+tracing = "0.1"
+# Already in the workspace (core-library, src-tauri). The commit path runs the unlocked per-file
+# work (read/copy/hash/decode/thumbnail) over a chunk at a time on a small dedicated pool.
+rayon = "1"
 
 [dev-dependencies]
 tempfile = "3"

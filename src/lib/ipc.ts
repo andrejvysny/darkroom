@@ -272,6 +272,37 @@ export type IndexStats = {
   added: number;
   skipped: number;
   failed: number;
+  /** Files this build can never decode. A strict subset of `failed`. */
+  unsupported: number;
+};
+
+// ── Decode failures ("Unsupported") ────────────────────────────────────────
+
+/** Why a file is NOT in the catalog (matches Rust `DecodeFailureRow`). Keyed by path — these
+ *  files have no image row. */
+export type DecodeFailureRow = {
+  path: string;
+  filename: string;
+  /** Failure class (matches Rust `core_raw::FailureKind`). */
+  kind: "unsupported" | "corrupt" | "io" | "panic" | "other";
+  /** Camera as the RAW decoder identified it; null when the failure carried no identification. */
+  make: string | null;
+  model: string | null;
+  /** One sentence the user can act on. */
+  detail: string;
+  fileSize: number;
+  firstSeen: number;
+  lastSeen: number;
+  attempts: number;
+  /** Decoder build that produced this verdict — a newer build retries the file automatically. */
+  decoderVersion: string;
+};
+
+/** Failure tallies by class (matches Rust `DecodeFailureCounts`); `io`/`panic` fold into `other`. */
+export type DecodeFailureCounts = {
+  unsupported: number;
+  corrupt: number;
+  other: number;
 };
 
 // ── IPC Wrappers ───────────────────────────────────────────────────────────
@@ -286,6 +317,21 @@ export function libraryCount(params: QueryParams): Promise<number> {
 
 export function libraryFolders(): Promise<FolderRow[]> {
   return invoke<FolderRow[]>("library_folders", {});
+}
+
+/** Files the catalog could not take, most recently seen first. */
+export function decodeFailuresList(limit?: number): Promise<DecodeFailureRow[]> {
+  return invoke<DecodeFailureRow[]>("decode_failures_list", { limit });
+}
+
+export function decodeFailuresCounts(): Promise<DecodeFailureCounts> {
+  return invoke<DecodeFailureCounts>("decode_failures_counts", {});
+}
+
+/** Forget these recorded failures ("Try again") so the next scan decodes them again. Returns how
+ *  many rows were removed; touches bookkeeping only, never a file. */
+export function decodeFailuresForget(paths: string[]): Promise<number> {
+  return invoke<number>("decode_failures_forget", { paths });
 }
 
 /** Year → Date capture-date tree for the left-nav Folders section. */
@@ -344,6 +390,9 @@ export type ImportStats = {
   sourceRetained: number;
   /** Camera companions (JPEG/HEIF) linked to their RAW — only non-zero when pairing was chosen. */
   paired: number;
+  /** Source files this build can never decode. A strict subset of `failed`; each was recorded and
+   *  left on the card — an unreadable body is never copied into the library. */
+  unsupported: number;
 };
 
 /** Content-hash dedup status of a source file (matches Rust `SourceStatus`). "pending" = not yet

@@ -5,6 +5,53 @@
 > Memory index: `~/.claude/.../memory/MEMORY.md` (latest: **darkroom-presets-history**,
 > **darkroom-unified-ai-pipeline**, **darkroom-acr-curve-colorbalance**, **darkroom-tone-crop**).
 
+## Session 2 · 2026-09-09 — RAW multi-maker correctness (Canon/Nikon/Sony) — UNCOMMITTED on `main`
+
+> Plan (approved): `~/.claude/plans/act-as-senior-rust-cozy-sutton.md`. Tracker: top section of
+> `TODO.md`. Facts: `CURRENT_STATE.md` → "RAW multi-maker correctness pass". Memory:
+> `darkroom-raw-multimaker`.
+
+**Goal.** Make RAW support correct for general Canon (CR2/CR3/CRW), Nikon (NEF/NRW), Sony (ARW/SR2/SRF)
+files — not just the one R7 CR3 — and keep it that way with a real multi-maker corpus.
+
+**What was done and why (all gates green 2026-09-09: `cargo fmt --check`, `cargo clippy --workspace
+--examples -D warnings`, `cargo test --workspace` with `DARKROOM_REQUIRE_FIXTURES=1
+DARKROOM_REQUIRE_CORPUS=1`, `npm run build`).**
+- rawler `=0.7.2` → `=0.8.0` (MSRV 1.89 ≤ toolchain 1.91): more bodies, many panic→Result fixes,
+  X-Trans demosaic. API deltas are in `CLAUDE.md`. R7 fixture develops identically to 5 decimals.
+- Typed errors + panic containment: `RawError::{Unsupported, DecoderPanic}` (rawler's
+  `DecoderFailed("… not supported")` promoted to `Unsupported` — that is how Nikon HE/HE* arrives),
+  `core-raw/src/panic.rs` wraps every public entry (thread-local in-flight flag; the app hook logs a
+  contained panic at warn). Release profile no longer `panic = "abort"` (CI greps). Pre-screens turn
+  known rawler `todo!()`s into `Unsupported`; monochrome sensors get their own gray develop path.
+- Colour (PROCESS_VERSION 4→5): clipped highlights were magenta on every maker — dcraw
+  `blend_highlights`-style reconstruction added in `map_3ch_to_rgb`; camera matrix now interpolated
+  DNG-spec style between A and D65 by as-shot-neutral CCT (`color.rs::select_cam_matrix`; R7 daylight
+  4970 K, +0.3 % patch shift); pixel loop rayon-parallel.
+- Catalog dims from a dummy rawler decode (Sony previews are 1616×1080; sRAW needs the full-decode
+  fallback because rawler's dummy path asserts on cpp=3). R7 fingerprints unchanged.
+- `decode_failure` table (schema 25) + skip-until-changed + import refuses unsupported bodies before
+  copying and removes orphan copies; IPC `decode_failures_{list,counts,forget}`; LeftNav "Unsupported"
+  row + `UnsupportedModal.tsx`; toasts count `unsupported`.
+- Corpus: 19 CC0 samples / 7 makers (`tests/corpus/manifest.toml`, `scripts/fetch_raw_corpus.sh`,
+  goldens in `expected.toml`, zero xfails), `raw-corpus` CI job (ubuntu, cached), plus corpus-free
+  synthetic Bayer/mono DNG tests (`core-raw/src/synth.rs`) on every CI run.
+
+**Dead ends / decisions.** No LibRaw fallback (spec'd, never built; dropped for HE/HE*/ARW6 — typed
+unsupported instead). RAF/ORF/RW2/PEF NOT allowlisted (X-Trans needs its own validated demosaic).
+Global in-flight counter for the panic hook rejected (mislabels unrelated panics). Simple
+clip-to-white rejected in favour of luma-preserving reconstruction. My brief's dcraw inverse basis
+was wrong; the implementer used the correct `itrans` and unit-tested `itrans·T = 3I`.
+
+**How to resume.** `/handoff resume`, then: `bash scripts/fetch_raw_corpus.sh --tier 1` (cached in
+`target/raw-corpus`, 650 MB incl. Tier 2), `DARKROOM_REQUIRE_CORPUS=1 cargo test -p core-raw --test
+corpus -- --nocapture`, `cargo run --release -p core-raw --example corpus_probe -- --diff` after any
+decode change (then `--record > tests/corpus/expected.toml` deliberately). Disk was full mid-session
+(`cargo clean` freed 8 GB) — build per crate when tight.
+
+**Open questions.** Commit now or after the live GUI QA? Should `decode_failure` rows be GC'd by
+`maintenance.rs`? Release binary size after the unwind flip is unmeasured (needs `tauri build`).
+
 ## Repo state sync (2026-06-26)
 
 `main` = **`f7445df`**, `origin/main` = **`1cbb3e3` (v0.1.1)**, **2 unpushed** (`e880fda` GPU hardening,
@@ -224,7 +271,8 @@ while disabled in fusion), gate the wasted compute. Add an F1-0.905 regression g
 ### E. Pre-distribution (only if shipping beyond this Mac)
 
 CSP hardening, Rust path-allowlist for export/import/index, Developer-ID codesign + notarize,
-multi-format (ARW/NEF/DNG/Fuji) validation. All deferred while personal/macOS-only.
+multi-format validation (Canon/Nikon/Sony now covered by the `raw-corpus` CI job, 2026-09-08; Fuji RAF is
+not allowlisted — X-Trans needs its own demosaic). CSP/allowlist/codesign still deferred while personal/macOS-only.
 
 ## Open items / gotchas
 

@@ -15,3 +15,14 @@ pub enum LibError {
     #[error("{0}")]
     Other(String),
 }
+
+impl LibError {
+    /// The underlying RAW-decode failure, when this error is one. Lets the catalog classify a
+    /// per-file indexing failure (`unsupported` vs `corrupt` vs `io`) without matching on strings.
+    pub fn as_raw(&self) -> Option<&core_raw::RawError> {
+        match self {
+            LibError::Raw(e) => Some(e),
+            _ => None,
+        }
+    }
+}

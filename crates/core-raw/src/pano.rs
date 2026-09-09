@@ -74,19 +74,26 @@ pub struct CameraNativeImage {
 /// color pipeline to preserve), sensors without a usable color matrix (the merged DNG could not
 /// carry one, and the read-back would fall to the calibrated path), and non-3-channel sensors.
 pub fn develop_camera_native(src: &RawSource) -> Result<CameraNativeImage, RawError> {
+    crate::panic::catch_decode_panic("develop_camera_native", || develop_camera_native_inner(src))
+}
+
+fn develop_camera_native_inner(src: &RawSource) -> Result<CameraNativeImage, RawError> {
     if crate::display::is_display(src.path()) {
         return Err(RawError::Decode(
             "panorama merge requires RAW sources (JPEG/PNG have no raw color pipeline)".into(),
         ));
     }
-    let decoder = rawler::get_decoder(src).map_err(de)?;
+    let decoder = rawler::get_decoder(src)?;
     let params = RawDecodeParams::default();
-    let metadata = decoder.raw_metadata(src, &params).map_err(de)?;
-    // `RawImage.orientation` is hardcoded Normal in rawler 0.7.2 — take it from EXIF (as elsewhere).
+    let metadata = decoder.raw_metadata(src, &params)?;
+    // `RawImage.orientation` is only populated by rawler's DNG decoder — take it from EXIF (as elsewhere).
     let orientation = metadata.exif.orientation;
-    let raw = decoder.raw_image(src, &params, false).map_err(de)?;
+    let raw = decoder.raw_image(src, &params, false)?;
 
-    if cam_xyz2cam(&raw).is_none() {
+    // Same shared (DNG dual-illuminant) selection the develop path uses, keyed on the same as-shot
+    // balance — so "this file has a usable matrix" means the same thing on both sides.
+    let wb_coeffs = wb_or_neutral(&raw);
+    if cam_xyz2cam(&raw, &wb_coeffs).is_none() {
         return Err(RawError::Decode(
             "panorama merge requires a camera color matrix (none found in this file)".into(),
         ));
@@ -118,7 +125,7 @@ pub fn develop_camera_native(src: &RawSource) -> Result<CameraNativeImage, RawEr
         data: native.data,
         meta: PanoColorMeta {
             color_matrix: raw.color_matrix.clone(),
-            wb_coeffs: wb_or_neutral(&raw),
+            wb_coeffs,
             metadata,
             make: raw.make.clone(),
             model: raw.model.clone(),
@@ -138,6 +145,18 @@ pub fn develop_camera_native(src: &RawSource) -> Result<CameraNativeImage, RawEr
 /// sRGB preview + thumbnail (fast library thumbnails without a full develop), the source's EXIF
 /// via rawler's metadata pass-through, and `Orientation=1` (pixels are already upright).
 pub fn write_pano_dng(
+    dest: &Path,
+    width: u32,
+    height: u32,
+    rgb_native: &[f32],
+    meta: &PanoColorMeta,
+) -> Result<(), RawError> {
+    crate::panic::catch_decode_panic("write_pano_dng", || {
+        write_pano_dng_inner(dest, width, height, rgb_native, meta)
+    })
+}
+
+fn write_pano_dng_inner(
     dest: &Path,
     width: u32,
     height: u32,
@@ -302,7 +321,12 @@ fn preview_srgb_edge(
     image::DynamicImage::ImageRgb8(out)
 }
 
-/// Deterministic matrix pick + padding, mirroring `develop::cam_xyz2cam` but over a bare map.
+/// Deterministic matrix pick + padding for the WRITE side (the merged DNG's embedded sRGB preview).
+///
+/// Deliberately NOT `develop::cam_xyz2cam`: that one interpolates between calibration illuminants
+/// for a specific as-shot neutral, which is a *decode-time* decision. The DNG carries the source's
+/// whole `color_matrix` map, so the re-decode redoes that interpolation itself; this preview only
+/// needs one plausible matrix, and D65-else-lowest-illuminant is stable and cheap.
 fn padded_xyz2cam(matrices: &HashMap<Illuminant, FlatColorMatrix>) -> [[f32; 3]; 4] {
     let flat = matrices
         .get(&Illuminant::D65)
@@ -410,7 +434,7 @@ mod tests {
             );
         }
         assert!(
-            cam_xyz2cam(&raw).is_some(),
+            cam_xyz2cam(&raw, &meta.wb_coeffs).is_some(),
             "color matrix missing after round-trip — decode would fall to the calibrated path"
         );
         assert_eq!(raw.whitelevel.0[0], 65535, "whitelevel must be full 16-bit");

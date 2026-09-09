@@ -11,3 +11,14 @@ pub enum ImportError {
     #[error("trash: {0}")]
     Trash(#[from] trash::Error),
 }
+
+impl ImportError {
+    /// The underlying RAW-decode failure, when this error is one (an import failure reaches us
+    /// wrapped one level deeper than in `core-library`: `Lib(LibError::Raw(_))`).
+    pub fn as_raw(&self) -> Option<&core_raw::RawError> {
+        match self {
+            ImportError::Lib(e) => e.as_raw(),
+            _ => None,
+        }
+    }
+}

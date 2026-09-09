@@ -519,7 +519,12 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     failed: 0,
     sourceRetained: 0,
     paired: String(p.pairing) === "pair" ? 1 : 0,
+    unsupported: 0,
   }),
+  // Nothing undecodable in the mock library; keeps the sidebar badge + modal drivable and quiet.
+  decode_failures_counts: () => ({ unsupported: 0, corrupt: 0, other: 0 }),
+  decode_failures_list: () => [],
+  decode_failures_forget: () => 0,
   image_pair: (p) =>
     Number(p.imageId) % 7 === 1
       ? {

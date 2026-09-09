@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly so a raw.pixls.us change (a re-uploaded sample, a moved path) is caught on its own
+  # schedule rather than in someone's PR.
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -52,6 +57,12 @@ jobs:
       - name: Frontend type-check + build
         run: npm run build
 
+      # `core-raw` contains rawler's decoder panics with `catch_unwind` so one odd RAW is skipped
+      # instead of aborting the app. `panic = "abort"` in the release profile would silently turn
+      # every such file into a crash, and nothing else would notice.
+      - name: Release profile must unwind (decoder panic isolation)
+        run: grep -q 'panic = "abort"' Cargo.toml && exit 1 || true
+
       - name: Clippy (warnings = errors)
         run: cargo clippy --workspace --examples -- -D warnings
 
@@ -91,3 +102,48 @@ jobs:
 
       - name: Build (release)
         run: cargo build --workspace --release
+
+  # Multi-maker RAW decode regression (tests/corpus/). ~370 MB of CC0 samples from raw.pixls.us,
+  # cached on the manifest hash so a normal run downloads nothing. Ubuntu because this job needs no
+  # GPU and no Metal: it is pure CPU decode + colour math, and Linux runners are cheaper and larger.
+  #
+  # Not on every PR — it is the slowest job and the download is a third-party dependency. It runs on
+  # main, nightly, on demand, and on any PR carrying the `raw-corpus` label. `pull_request` keeps its
+  # default event types (adding `labeled` would re-run the whole workflow, and cancel the in-flight
+  # run, every time any label is touched), so labelling an OPEN pr takes effect on its next push —
+  # or use "Run workflow" on the Actions tab.
+  raw-corpus:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'raw-corpus')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # core-raw dynamic-links system libheif (HEIF decode); the corpus itself is RAW-only, but the
+      # crate does not build without it.
+      - name: Install libheif (HEIF decode system dep)
+        run: sudo apt-get update && sudo apt-get install -y libheif-dev libde265-dev
+
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Keyed on the manifest: the corpus only changes when the SET of files changes, so goldens can
+      # move freely without paying for a re-download.
+      - name: Cache RAW corpus
+        uses: actions/cache@v4
+        with:
+          path: target/raw-corpus
+          key: raw-corpus-v1-${{ hashFiles('tests/corpus/manifest.toml') }}
+          restore-keys: raw-corpus-v1-
+
+      - name: Fetch RAW corpus (tier 1)
+        run: bash scripts/fetch_raw_corpus.sh --tier 1
+
+      # DARKROOM_REQUIRE_CORPUS=1 turns a missing/incomplete corpus into a failure instead of a
+      # silently-skipped test — the same contract DARKROOM_REQUIRE_FIXTURES has in the macOS job.
+      - name: Corpus tests
+        run: DARKROOM_REQUIRE_CORPUS=1 cargo test -p core-raw -p core-library --test corpus --test corpus_index -- --nocapture

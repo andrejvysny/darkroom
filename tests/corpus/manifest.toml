@@ -1,0 +1,298 @@
+# Multi-maker RAW test corpus — IDENTITY AND ACQUISITION ONLY.
+#
+# Every sample here comes from the raw.pixls.us CC0 pool (https://raw.pixls.us/), which only
+# accepts files their contributors released under CC0. Nothing is redistributed by this repo: the
+# manifest records *where* each file lives and *what bytes* it must hash to, and
+# `scripts/fetch_raw_corpus.sh` downloads it into `target/raw-corpus/` (git-ignored).
+#
+# This file is the CI cache key (`hashFiles('tests/corpus/manifest.toml')`), so it must change only
+# when the *set of files* changes — never when a golden moves. Measured values live in
+# `expected.toml`; the only judgement calls stored here are `support` (does this build decode it at
+# all) and `xfail` (which assertions are known-red today).
+#
+# FORMAT IS LOAD-BEARING: `scripts/fetch_raw_corpus.sh` parses this with awk, one `key = value` per
+# line, so every `[[file]]` key must stay on a single line. `corpus.rs::manifest_shape_is_parsable`
+# enforces that (and the 800 MB total budget) on every test run.
+#
+# Directory casing upstream is inconsistent (`Sony/ILCE-7M3` but `SONY/ILCE-6400A`); `path` is the
+# exact upstream string and must not be normalised.
+#
+# Tier 1 (~367 MB) is what CI fetches on every run. Tier 2 (~311 MB more) is the extended set:
+# `scripts/fetch_raw_corpus.sh --tier 2` + `DARKROOM_CORPUS_TIER=2`.
+
+source_base = "https://raw.pixls.us/download/data"
+filelist = "https://raw.pixls.us/data/filelist.sha256"
+# Dataset stamp (https://raw.pixls.us/data/timestamp.txt) at the time these hashes were recorded.
+upstream_timestamp = 1788897901
+
+# Canon's workhorse CR2: plain lossless-JPEG mosaic, the reference for the whole Canon path.
+[[file]]
+id = "canon-5d3-cr2"
+path = "Canon/EOS 5D Mark III/5G4A9394.CR2"
+sha256 = "ec069b178b9383d80c72f8cdc1b79bd54ca451e7c20793b109d8ad73bef6bdf6"
+bytes = 25965009
+make = "Canon"
+model = "EOS 5D Mark III"
+tier = 1
+tags = ["cr2", "bayer", "landscape"]
+support = "ok"
+deep = true
+xfail = []
+
+# sRAW1: Canon's YCbCr half-size 'raw' — three components per pixel, no CFA. Exercises the non-Bayer branch.
+#
+# History: first recorded as XFAIL (2026-09-08) — the embedded preview is the FULL sensor readout
+# (5616x3744) while the sRAW planes develop to 3861x2574, and rawler's dummy (geometry-only) decode
+# asserts on cpp=3, so `thumbnail_jpeg` fell back to the preview's dims. Fixed the same day:
+# `thumb.rs` now pays for one real decode when the dummy one fails, so the catalog stores the
+# developed 3861x2574. The contained panic on the dummy path is expected and logged at warn.
+[[file]]
+id = "canon-5d2-sraw1"
+path = "Canon/EOS 5D Mark II/09.canon.sraw1.cr2"
+sha256 = "acadf73d760b1f311f18f473b859e262ef3ba1513b3360f02675c38dcadba80b"
+bytes = 15445115
+make = "Canon"
+model = "EOS 5D Mark II"
+tier = 1
+tags = ["cr2", "sraw"]
+support = "ok"
+deep = false
+xfail = []
+
+# CR3 C-RAW (lossy): the modern Canon container plus Canon's lossy codec.
+[[file]]
+id = "canon-r5-craw"
+path = "Canon/EOS R5/Canon_EOS_R5_CRAW_ISO_100_nocrop_nodual.CR3"
+sha256 = "2deae46b816e56ba91ae7a3892ca121290e12d5b22afb11f5b05a3d8f09f759f"
+bytes = 16815190
+make = "Canon"
+model = "EOS R5"
+tier = 1
+tags = ["cr3", "craw", "lossy"]
+support = "ok"
+deep = true
+xfail = []
+
+# The NEF everyone shoots: 14-bit lossless compressed.
+[[file]]
+id = "nikon-d850-lossless"
+path = "Nikon/D850/Nikon-D850-14bit-lossless-compressed.NEF"
+sha256 = "0c9438258ddae5260b9f5a1aace6658a723f1cb1acace3a6cb507116dc6da4f2"
+bytes = 55196715
+make = "Nikon"
+model = "D850"
+tier = 1
+tags = ["nef", "14bit", "lossless"]
+support = "ok"
+deep = true
+xfail = []
+
+# 12-bit *lossy* compressed NEF — a different bit depth AND a different Huffman table to the D850.
+[[file]]
+id = "nikon-d7500-12bit"
+path = "Nikon/D7500/RAW_NIKON_D7500_12BIT_COMPRESSED.NEF"
+sha256 = "ad53ee232836ba707d3d6820b5f9c015f129599aef7737adcec4a07b803b8891"
+bytes = 18601899
+make = "Nikon"
+model = "D7500"
+tier = 1
+tags = ["nef", "12bit", "lossy"]
+support = "ok"
+deep = false
+xfail = []
+
+# Nikon High Efficiency (TicoRAW). rawler cannot decode it; this entry pins the *typed* refusal.
+[[file]]
+id = "nikon-z8-he"
+path = "Nikon/Z 8/Nikon_Z8_high_efficiency_low.NEF"
+sha256 = "82df041542b8d328738443bb5ff3373b396e406ecc8cbe7dc3b35252790c53e7"
+bytes = 24384512
+make = "Nikon"
+model = "Z 8"
+tier = 1
+tags = ["nef", "high-efficiency"]
+support = "unsupported"
+deep = false
+xfail = []
+
+# Sony's lossy 11+7 delta compression — the default every A7 III ships with.
+[[file]]
+id = "sony-a7m3-compressed"
+path = "Sony/ILCE-7M3/_DSC0009.ARW"
+sha256 = "250784580ea527442c09004417bb0eead484f2bf3ee8f9121a776ac65bb50d0f"
+bytes = 25639680
+make = "Sony"
+model = "ILCE-7M3"
+tier = 1
+tags = ["arw", "compressed"]
+support = "ok"
+deep = true
+xfail = []
+
+# Same body, uncompressed 14-bit: the A/B pair that isolates the compression from the colour.
+[[file]]
+id = "sony-a7m3-uncompressed"
+path = "Sony/ILCE-7M3/UNCOMPRESSED_14bit.ARW"
+sha256 = "ece80551abf64949dbe826985a80f1d9b265401ee4ea6b989e1829549616fdcd"
+bytes = 50009600
+make = "Sony"
+model = "ILCE-7M3"
+tier = 1
+tags = ["arw", "uncompressed", "14bit"]
+support = "ok"
+deep = false
+xfail = []
+
+# Sony's newer lossless-compressed ARW (a different codec to the 11+7 above).
+[[file]]
+id = "sony-a1-lossless"
+path = "Sony/ILCE-1/A1_full_lossless_compressed.ARW"
+sha256 = "4012536ee0f938d8c5c5e932bb7953a03134abbd9f3f4c664cb2526c1903d492"
+bytes = 81575280
+make = "Sony"
+model = "ILCE-1"
+tier = 1
+tags = ["arw", "lossless"]
+support = "ok"
+deep = false
+xfail = []
+
+# A phone DNG: tiny sensor, EXIF orientation 3 (180 deg — dims NOT transposed, unlike 5..8).
+[[file]]
+id = "google-pixel7pro-dng"
+path = "Google/Pixel 7 Pro/PXL_20221204_063131635.dng"
+sha256 = "6b921558944db5fdb4f1c63dc64919b6666ef700857a187e18500099c6e7c6c6"
+bytes = 12243982
+make = "Google"
+model = "Pixel 7 Pro"
+tier = 1
+tags = ["dng", "phone", "orientation-3"]
+support = "ok"
+deep = true
+xfail = []
+
+# A true monochrome sensor (BlackIsZero, no CFA, no white balance) — the path rawler itself cannot develop.
+[[file]]
+id = "leica-m246-mono"
+path = "Leica/M Monochrom (Typ 246)/M2462362.DNG"
+sha256 = "3fb74d1fc402daaa48a9c3f1d6279d7e85fb58dfdaf816f036927d49ab228977"
+bytes = 21700096
+make = "Leica"
+model = "M Monochrom"
+tier = 1
+tags = ["dng", "monochrome"]
+support = "ok"
+deep = false
+xfail = []
+
+# Shot in portrait (EXIF orientation 8): the develop output must come back transposed.
+[[file]]
+id = "nikon-z30-portrait"
+path = "Nikon/Z 30/_DSC0028.NEF"
+sha256 = "75249c11a3a845367c7a322a1c4e7076f33c785ec2518fc6594c34c185b41161"
+bytes = 19789738
+make = "Nikon"
+model = "Z 30"
+tier = 1
+tags = ["nef", "portrait", "orientation-8"]
+support = "ok"
+deep = true
+xfail = []
+
+# 61 MP uncompressed — the biggest single decode in the corpus (memory/throughput canary).
+[[file]]
+id = "sony-a7r4a-uncompressed"
+path = "Sony/ILCE-7RM4A/uncompressed_14_bit.ARW"
+sha256 = "f0f597b984e3c307715d4b40937f47f0657fa3abcd629826da67a7421a226935"
+bytes = 123119616
+make = "Sony"
+model = "ILCE-7RM4A"
+tier = 2
+tags = ["arw", "uncompressed", "61mp"]
+support = "ok"
+deep = false
+xfail = []
+
+# The same R5 frame as canon-r5-craw but in full RAW — an exact codec A/B on one sensor.
+[[file]]
+id = "canon-r5-raw"
+path = "Canon/EOS R5/Canon_EOS_R5_RAW_ISO_100_nocrop_nodual.CR3"
+sha256 = "21430c36387efe65bd09ac0fcd724bfd959d93dd391ec811a1b741c8663becb5"
+bytes = 40632406
+make = "Canon"
+model = "EOS R5"
+tier = 2
+tags = ["cr3", "raw", "lossless"]
+support = "ok"
+deep = false
+xfail = []
+
+# Second High Efficiency body, and the only path with parentheses in it (URL-encoding regression).
+[[file]]
+id = "nikon-z9-he"
+path = "Nikon/Z 9/Nikon_-_NIKON_Z_9_-_14bit_compressed_(Lossy_High_Efficiency).NEF"
+sha256 = "be91bac25573adf7ec6320a542105d87b4fb9c956d7b620ec90d57ac2ae6c3f0"
+bytes = 24839168
+make = "Nikon"
+model = "Z 9"
+tier = 2
+tags = ["nef", "high-efficiency", "parens-in-name"]
+support = "unsupported"
+deep = false
+xfail = []
+
+# iPhone DNG shot in portrait (orientation 6).
+[[file]]
+id = "apple-iphone12pro-dng"
+path = "Apple/iPhone 12 Pro/IMG_1361.DNG"
+sha256 = "e91e77a4533ed7cce551d83330676ea5c47dd5e55fb38adda7819366afdbdfc2"
+bytes = 29195592
+make = "Apple"
+model = "iPhone 12 Pro"
+tier = 2
+tags = ["dng", "phone", "portrait", "orientation-6"]
+support = "ok"
+deep = false
+xfail = []
+
+# Second monochrome body, and the only Pentax in the corpus.
+[[file]]
+id = "pentax-k3iii-mono"
+path = "Pentax/K-3 Mark III Monochrome/K3III.DNG"
+sha256 = "1afc1071451a3a3737c29ae319e1411551b6893d0e6a34db29903318266b0066"
+bytes = 37669430
+make = "Pentax"
+model = "K-3 Mark III Monochrome"
+tier = 2
+tags = ["dng", "monochrome"]
+support = "ok"
+deep = false
+xfail = []
+
+# Portrait-orientation CR3 — the orientation check on the Canon container.
+[[file]]
+id = "canon-r10-portrait"
+path = "Canon/EOS R10/IMG_4361.CR3"
+sha256 = "15d017f0770b3da17180077617ffe07b786a1ec2cb36297f81a82a27a54756db"
+bytes = 30161242
+make = "Canon"
+model = "EOS R10"
+tier = 2
+tags = ["cr3", "portrait", "orientation-8"]
+support = "ok"
+deep = false
+xfail = []
+
+# Portrait ARW, and the one entry under an UPPERCASE maker directory (raw.pixls.us casing is inconsistent).
+[[file]]
+id = "sony-a6400-portrait"
+path = "SONY/ILCE-6400A/KTB00899.ARW"
+sha256 = "a8a45e9b6c437eba6724fcda24c3efd084c05389711b955d84b2af67635e241b"
+bytes = 25287424
+make = "Sony"
+model = "ILCE-6400"
+tier = 2
+tags = ["arw", "portrait", "orientation-8", "uppercase-dir"]
+support = "ok"
+deep = false
+xfail = []

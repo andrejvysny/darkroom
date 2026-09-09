@@ -47,8 +47,17 @@ impl ImageKind {
     }
 }
 
+/// RAW container extensions this build expects to hand to rawler: every Canon (`cr3 cr2 crw`),
+/// Nikon (`nef nrw`) and Sony (`arw sr2 srf`) format plus DNG. `core_library::SUPPORTED_EXT` (the
+/// indexing allowlist) must stay a superset of this list plus the display/HDR kinds below — a test
+/// there guards the drift. Other makers (raf/orf/rw2/pef) are deliberately absent until validated.
+pub const RAW_EXT: &[&str] = &[
+    "cr3", "cr2", "crw", "nef", "nrw", "arw", "sr2", "srf", "dng",
+];
+
 /// Classify a path by extension (case-insensitive). Unknown extensions are treated as `Raw` so the
-/// existing rawler path handles them (and reports its own decode error), preserving prior behavior.
+/// existing rawler path handles them (rawler sniffs the container bytes itself and reports a typed
+/// `Unsupported`/`Decode` error), preserving prior behavior.
 pub fn classify(path: &Path) -> ImageKind {
     match path
         .extension()

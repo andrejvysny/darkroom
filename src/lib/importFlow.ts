@@ -44,13 +44,17 @@ export async function commitImport(
   const unDone = await listen<ImportStats>("import:done", (ev) => {
     unProgress();
     unDone();
-    const { added, skipped, sourceRetained, paired } = ev.payload;
+    const { added, skipped, sourceRetained, paired, unsupported } = ev.payload;
     const retained =
       sourceRetained > 0
         ? `, ${sourceRetained} original(s) kept (trash failed)`
         : "";
     const pairs = paired > 0 ? `, ${paired} paired` : "";
-    setToast(`Imported: added ${added}, skipped ${skipped}${pairs}${retained}`);
+    // Unsupported files were never copied — say so rather than leaving them silently absent.
+    const bad = unsupported > 0 ? `, ${unsupported} unsupported` : "";
+    setToast(
+      `Imported: added ${added}, skipped ${skipped}${pairs}${bad}${retained}`,
+    );
     onComplete?.();
   });
 
