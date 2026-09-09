@@ -58,6 +58,44 @@
 > Branch `feat/lens-corrections` (in progress) adds lens distortion/CA + pre-release signing scaffolding.
 > Everything below dated 2026-06-26 predates those merges.
 
+## Stability/performance hardening patch (2026-09-09, `main`) — CURRENT
+
+> Plan: `~/.claude/plans/act-as-senior-rust-lively-storm.md`. Tracking + remaining commits: `TODO.md`.
+> Scope P0+P1, committed on `main` (unpushed). **`PROCESS_VERSION` stays 5 — no pixel changes.**
+
+**P0 landed (c6ca2af, 58d0bf4, 228b4e0, 8abc842, 38e20ba, 3aa18d7):**
+
+- **CI was red and silent.** `ci.yml`'s "Release profile must unwind" step ran
+  `grep -q 'panic = "abort"' Cargo.toml && exit 1 || true`; `Cargo.toml`'s own guard comment
+  contains that literal, so the step failed every run and the macOS Clippy + `cargo test --workspace`
+  steps after it never executed. Replaced by `#[cfg(all(not(test), panic = "abort"))] compile_error!`
+  in `core-raw/src/panic.rs` — a runtime test CANNOT work here, cargo forces unwind for test
+  binaries. Also cfg-gated the 13 HEIF-only PQ/BT.2020 items in `color.rs` (Windows `-D warnings`),
+  added the missing `heif_exif_bytes` Windows stub, dropped the stale `packageManager: yarn`.
+- **Develop edits were lost when switching photos.** One shared debounce timer meant persisting B
+  cancelled A's pending save. New `src/lib/developPersistence.ts`: per-image entries with
+  dirty/saved generations, latest-wins, serialized saves, 250 ms idle / 1000 ms max-wait, flush on
+  navigate / Develop exit / blur / tab hide, retry with backoff + a non-modal banner.
+  `develop_regen_thumb` (a full RAW decode) moved off the save path onto a 1200 ms idle timer.
+- **Sidecars no longer write under the DB lock.** `core_library::sidecar_snapshot` (needs the
+  connection) + `write_snapshot` (does not); `src-tauri/src/sidecar_queue.rs` coalesces marks over a
+  10 s window into one write per image, gathering under a brief lock and writing outside it.
+- **Quit is held until edits land.** `src-tauri/src/quit.rs` — `ExitRequested{code:None}` prevents
+  the exit, emits `app:flush-edits`, waits ≤1500 ms for `develop_flush_ack`, then `exit(0)`. Tauri's
+  own `code: Some(..)` for programmatic exits is the re-entry guard. A failed flush cancels the quit
+  once; a retry within 30 s exits regardless.
+- **An unreadable stored edit is announced** (`develop_edit_status`) and suspends auto-save instead
+  of showing defaults the backend will refuse to overwrite.
+
+**New test surface:** a third Playwright project, `mock` (`npm run e2e:mock`) — the plugin's own
+`browser` mode injects `__TAURI_INTERNALS__`, so `src/dev/tauriMock.ts` never installs there and it
+only ever rendered the error boundary. The `mock` project uses plain Chromium against the dev server.
+Five specs in `e2e/tests/mock/`. The mock records invocations on `window.__darkroomIpcLog` and
+exposes `__darkroomEmit` / `__darkroomEditUnreadable` as dev-only test hooks.
+
+**Still pending live QA on the dev Mac:** ⌘Q with a dirty edit → relaunch; sidecar file updates
+within ~10 s and on quit; the save-error banner against a real failure.
+
 ## RAW multi-maker correctness pass (2026-09-08, UNCOMMITTED on `main`) — CURRENT
 
 > Plan: `~/.claude/plans/act-as-senior-rust-cozy-sutton.md`; tracker: top of `TODO.md`. Review of
