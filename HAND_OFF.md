@@ -2,10 +2,107 @@
 
 > Read order when resuming: this file → `CURRENT_STATE.md` (architecture, gotchas, IPC surface) →
 > `TODO.md` (granular leftovers) → `SPEC_V1.md` (full spec) → `CLAUDE.md` (hard constraints).
-> Memory index: `~/.claude/.../memory/MEMORY.md` (latest: **darkroom-presets-history**,
-> **darkroom-unified-ai-pipeline**, **darkroom-acr-curve-colorbalance**, **darkroom-tone-crop**).
+> Memory index: `~/.claude/.../memory/MEMORY.md` (latest: **darkroom-hardening-patch**,
+> **darkroom-import-fix-parallel**, **darkroom-raw-multimaker**, **darkroom-presets-history**).
 
-## Session 2 · 2026-09-09 — RAW multi-maker correctness (Canon/Nikon/Sony) — UNCOMMITTED on `main`
+## Session 3 · 2026-09-09 — Stability/performance hardening patch — COMMITTED on `main`, UNPUSHED
+
+> Plan (approved): `~/.claude/plans/act-as-senior-rust-lively-storm.md`. Tracker: "IN PROGRESS:
+> Stability/performance hardening patch" at the top of `TODO.md`. Facts: `CURRENT_STATE.md` →
+> "Stability/performance hardening patch". Memory: `darkroom-hardening-patch`. Live QA checklist:
+> `QA_CAMPAIGN.md` §G.
+
+**Goal.** Treat the next release as a stability/performance patch against an external hardening
+report: edits feel continuously saved, foreground beats background, one bad photo cannot destabilise
+the app, a 100k catalog stays responsive, and a release cannot publish past red validation. Scope was
+P0 + P1, on `main`, benchmarks on the dev Mac only, stable-release gating enforced now.
+**`PROCESS_VERSION` stayed 5 — no commit here changes developed pixels.**
+
+**14 commits, `c6ca2af`..`a0f3b0a`.** All gates green at the end: `cargo fmt --all --check`,
+`cargo clippy --workspace --examples -- -D warnings`, `cargo test --workspace` (62 test binaries,
+0 failures), `npm run build`, `npm run e2e:mock` (5 specs).
+
+**What was done and why**
+
+- **`c6ca2af` — CI had been dead, not merely wrong.** `ci.yml`'s "Release profile must unwind" ran
+  `grep -q 'panic = "abort"' Cargo.toml && exit 1 || true`, and `Cargo.toml`'s own guard comment
+  contains that literal — so the step failed every run and the macOS Clippy + `cargo test
+  --workspace` steps *after* it never executed. The report's proposed replacement (a release-profile
+  test asserting `ISOLATION_ACTIVE`) **cannot work**: cargo forces `panic = "unwind"` for
+  test-harness binaries regardless of profile, so such a test passes even under abort. Replaced with
+  `#[cfg(all(not(test), panic = "abort"))] compile_error!` in `core-raw/src/panic.rs`, verified by
+  temporarily adding a `panic = "abort"` probe profile. Also cfg-gated the 13 HEIF-only PQ/BT.2020
+  items in `color.rs` (verified by simulating the Windows cfg locally — `cfg(not(windows))` rewritten
+  to `cfg(not(target_os = "macos"))`), added the missing `heif_exif_bytes` Windows stub, dropped the
+  stale `packageManager: yarn`.
+- **`58d0bf4` / `228b4e0` — the lost-edit bug.** `useDevelop.ts` debounced persistence through ONE
+  shared timer, so persisting B cancelled A's pending save. Test first (it fails on the old code with
+  `develop_set_edit image ids: [47]` — only B saved), then `src/lib/developPersistence.ts`: per-image
+  entries with dirty/saved generations, latest-wins, serialized saves, 250 ms idle / 1000 ms
+  max-wait, flush on navigate / Develop exit / blur / tab hide, retry with backoff + banner.
+  `develop_regen_thumb` (a full RAW decode) moved OFF the save path onto a 1200 ms idle timer —
+  max-wait would otherwise have put a decode per second behind a live drag.
+- **`8abc842` — sidecars off the DB lock**, because of that same max-wait: `sidecar_snapshot`
+  (needs the connection) + `write_snapshot` (does not), with `src-tauri/src/sidecar_queue.rs`
+  coalescing marks over 10 s into one write per image. Done BEFORE the quit barrier for that reason.
+- **`38e20ba` — quit barrier.** `ExitRequested{code:None}` holds the exit, emits `app:flush-edits`,
+  waits ≤1500 ms for `develop_flush_ack`. Tauri's own `code: Some(..)` for programmatic exits is the
+  re-entry guard (verified in tauri 2.11.5's source). A failed flush cancels the quit once; a retry
+  within 30 s exits regardless — a save barrier that can trap the user is worse than the bug.
+- **`3aa18d7`** unreadable stored edit announced + auto-save suspended. **`88c9db9`** one speculative
+  decode at a time + preview LRU 768→384 MiB (env-tunable). **`1db9042`** poison policy per lock
+  class + one-query thumb pre-check. **`07ae4c1`** release gated on the exact tagged commit; stable
+  `v*` refuses to publish unsigned or un-notarized. **`f3078a3`** atomic generated outputs.
+  **`2ff943a`** 100k benchmark + the one query it justified. **`45ddddf`** import benchmark harness.
+
+**Dead ends and rejected options — do not redo these**
+
+- *Runtime test for the unwind guard* — impossible (see above).
+- *Changing `develop_get_edit` to return an error for an unparseable blob* (the report's fix) — it
+  has four call sites that treat the result as the params object. Added a separate
+  `develop_edit_status` probe instead.
+- *Sourcing edited thumbnails from the warm half-res preview LRU* — would change thumbnail pixels for
+  newly written cache entries only, leaving one library with mixed provenance under the same
+  `PROCESS_VERSION`. Revisit only with a PV bump.
+- *Converting the `strftime(...,'unixepoch')` date filters to epoch ranges* — the report called this
+  the first likely SQL fix; measured at 100k it is **9 ms**. Not touched. The real offender was
+  `list_keywords` at 504 ms (correlated `COUNT(*)` per keyword over a table indexed only by its PK)
+  → one grouped pass, **28 ms**. Search is 54 ms, so no FTS either.
+- *Batching the 100k thumbnail backlog's scheduling* — the report assumed 100k decodes; `render_one`
+  already pre-checks, so the cost was DB round-trips. Fixed the query, not the scheduler.
+
+**Gotchas discovered (cost real time — keep)**
+
+- The `browser` Playwright project never reached `src/dev/tauriMock.ts`: the tauri-playwright fixture
+  injects `__TAURI_INTERNALS__` in BOTH of its modes and `installTauriMock()` gates on its absence,
+  so that project only ever rendered the error boundary. Tier-1 UI tests need plain Chromium against
+  the dev server — that is the new **`mock`** project, `npm run e2e:mock`.
+- `images.content_hash` is 32 raw bytes, hex-encoded on read (`query::map_row`). A new query reading
+  it as TEXT compiles and then fails on every row — its test caught exactly that.
+- `cargo clippy --workspace --all-targets` fails on 3 pre-existing `needless_range_loop` lints in
+  core-pipeline TEST code (`base_curve_ref.rs:154`, `params.rs:802,803`). CI only runs `--examples`,
+  so it is green today. Widening the lint scope means fixing those first.
+
+**How to resume**
+
+1. Run the `handoff` skill with "resume".
+2. `TODO.md` → the hardening section's remaining unchecked boxes. The next actions need the dev Mac
+   or a real card, not more code:
+   - live ⌘Q-with-a-dirty-edit → relaunch; sidecar catch-up; save-error banner (`QA_CAMPAIGN.md` §G);
+   - `cargo run --release -p core-import --example bench_import -- /path/to/card`, THEN change the
+     caps in a separate commit (`worker_count`, `crates/core-import/src/lib.rs`);
+   - the C10 tail: cancellation tests per stage, fault injection at each boundary, and the
+     conservative startup sweep for stale app-owned temps.
+3. Nothing is pushed. `git log origin/main..main` is the full set.
+
+**Open questions for the user**
+
+- Push these 14 commits, or hold for live QA first?
+- The stale-temp startup sweep deletes files. Confirm the scope before it is written: Darkroom-owned
+  directories only, known suffixes only (`.part`, `.exr.part`, `.dng.part`, `.db.part`,
+  `.part.<pid>.<seq>`, `.tmp`, `<hash>_*.<pid>.<seq>.tmp`), age threshold, never a Reference original.
+
+## Session 2 · 2026-09-09 — RAW multi-maker correctness (Canon/Nikon/Sony) — committed `5978ace`
 
 > Plan (approved): `~/.claude/plans/act-as-senior-rust-cozy-sutton.md`. Tracker: top section of
 > `TODO.md`. Facts: `CURRENT_STATE.md` → "RAW multi-maker correctness pass". Memory:

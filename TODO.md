@@ -9,6 +9,10 @@
 > responsive, a release cannot publish past red validation. Scope P0+P1, committed on `main`.
 > **`PROCESS_VERSION` stays 5 — nothing here changes developed pixels.**
 >
+> **NOW (needs the dev Mac / a real card, not more code):** live ⌘Q-with-a-dirty-edit → relaunch,
+> then `bench_import` on a real card before touching the import caps. Everything code-only that the
+> plan called for is committed. Nothing is pushed.
+>
 > Headline finding: `ci.yml` step "Release profile must unwind" runs
 > `grep -q 'panic = "abort"' Cargo.toml && exit 1 || true`, and `Cargo.toml:31`'s own guard comment
 > contains that literal, so the step fails every run and the macOS Clippy + `cargo test --workspace`

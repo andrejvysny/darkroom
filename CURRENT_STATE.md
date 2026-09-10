@@ -60,6 +60,11 @@
 
 ## Stability/performance hardening patch (2026-09-09, `main`) — CURRENT
 
+> Last verified 2026-09-09 17:12 — `main`, clean tree, 14 commits ahead of `origin/main`, UNPUSHED.
+> Gates green: `cargo fmt --all --check`, `cargo clippy --workspace --examples -- -D warnings`,
+> `cargo test --workspace` (62 test binaries, 0 failures), `npm run build`, `npm run e2e:mock` (5).
+> Narrative + dead-ends: `HAND_OFF.md` → Session 3.
+>
 > Plan: `~/.claude/plans/act-as-senior-rust-lively-storm.md`. Tracking + remaining commits: `TODO.md`.
 > Scope P0+P1, committed on `main` (unpushed). **`PROCESS_VERSION` stays 5 — no pixel changes.**
 
