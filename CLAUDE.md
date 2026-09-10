@@ -95,6 +95,26 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 - All SQL filters use bound named params (injection-safe) — keep new queries that way.
 - CSP is `null` (permissive) in `tauri.conf.json` — required for `thumb://` + inline styles today; harden before any public distribution.
 
+## Delegating numerics to GPT-6-Astra
+
+`/codex-darkroom` (`.claude/skills/codex-darkroom/`) — **opt-in, explicit invocation only.** Sends a
+sealed evidence packet to GPT-6-Astra via the Codex CLI for the parts of Darkroom where a wrong
+algorithm ships a wrong photograph: RAW colour science (`core-raw/{color,develop,heif}.rs`), develop
+shader math (`core-pipeline/src/develop.wgsl`, `curve.rs`, `base_curve_ref.rs`), HDR merge
+(`core-hdr`), panorama geometry (`core-pano`), denoise DSP (`core-analyze/denoise.rs`), colour
+management, and `core-suggest` statistics. Refuses and redirects for UI, IPC, SQLite, import, CI, or
+wgpu resource plumbing — those go to `codex-plan-review` / `codex-implementation-review`.
+
+Astra runs **read-only with no repository access** and never writes code: it derives, diagnoses, and
+attacks; Claude packs the evidence, verifies the answer against source, runs the spec's synthetic
+test vectors, and implements. It is on a limited ChatGPT Plus allowance, so calls are gated, one-shot,
+and logged. Modes: `derive` · `diagnose` · `verify`.
+
+Supporting agents: `astra-packer` (builds the packet, runs the harnesses), `astra-spec-implementer`
+(implements an accepted spec, never redesigns), `gpu-visual-qa` (renders before/after, reports
+differences as numbers). Register: `docs/astra/{FINDINGS.md,LOG.md}` — check `FINDINGS.md` before
+packing a question so it is never paid for twice.
+
 ## Status shorthand
 
 V1 complete (validated on 240 real Canon R7 CR3 **on the dev machine** — only 1 CR3 is committed;
