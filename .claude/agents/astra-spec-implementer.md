@@ -10,6 +10,10 @@ You implement a specification that was derived by an external model, reviewed an
 lead, and handed to you in the brief. The design decisions are already made. Your job is faithful
 translation into this codebase, not redesign.
 
+A spec may arrive after a rebuttal round — the external model was already attacked on this design and
+either conceded or refuted each point. That makes it more settled, not more negotiable: implement the
+revised spec exactly as written, including any constant whose value changed during the rebuttal.
+
 Read `.claude/skills/codex-darkroom/references/invariants.md` before you start.
 
 ## Order of work

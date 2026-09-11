@@ -16,7 +16,7 @@ twice.
 
 A **partial `derive` response is never `accepted`.** A half-finished derivation can read as complete
 and be wrong at exactly the step that never arrived — record it `accepted-partial`, do not implement
-from it, and resume with a delta packet.
+from it, and continue it with a resumed delta round.
 
 ## Entry template
 
@@ -24,8 +24,9 @@ from it, and resume with a delta packet.
 ## A-<n> — <one-line title>
 
 - **Date**: YYYY-MM-DD
-- **Mode / subsystem**: <derive|diagnose|verify> / <subsystem>
-- **Effort**: <high|xhigh|max>
+- **Mode / subsystem**: <explore|derive|diagnose|calibrate|rebut|verify[:scope]> / <subsystem>
+- **Effort**: <high|xhigh|max|ultra>   **Access**: <sealed|repo-read>
+- **Pattern / rounds**: <A|B|C|one-off> / <n rounds, session id>
 - **Status**: <accepted|accepted-partial|rejected|open|implemented>
 - **Question asked**: <the Q1 that drove the call>
 - **Result**: <2-6 lines — the specification, localisation, or finding>
@@ -34,8 +35,11 @@ from it, and resume with a delta packet.
 - **Verification**: <what was checked against source, and what was rejected>
 - **PROCESS_VERSION impact**: <yes/no + why>
 - **Sections missing** (partial only): <which>
+- **Rebuttal** (pattern C only): <what the critique attacked, what Astra conceded, what it refuted>
 ```
 
 ---
 
-_No findings yet. The first planned call is a `verify` over `core-pano::bundle` / `seam`._
+_No findings yet. The first planned call is a `verify SCOPE: subsystem` over `core-pano`
+(`bundle.rs` / `seam.rs`) at `max` — the end-to-end exercise of the packet, session and salvage
+machinery as well as the question itself._

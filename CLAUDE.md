@@ -97,23 +97,38 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 
 ## Delegating numerics to GPT-6-Astra
 
-`/codex-darkroom` (`.claude/skills/codex-darkroom/`) — **opt-in, explicit invocation only.** Sends a
-sealed evidence packet to GPT-6-Astra via the Codex CLI for the parts of Darkroom where a wrong
-algorithm ships a wrong photograph: RAW colour science (`core-raw/{color,develop,heif}.rs`), develop
-shader math (`core-pipeline/src/develop.wgsl`, `curve.rs`, `base_curve_ref.rs`), HDR merge
-(`core-hdr`), panorama geometry (`core-pano`), denoise DSP (`core-analyze/denoise.rs`), colour
-management, and `core-suggest` statistics. Refuses and redirects for UI, IPC, SQLite, import, CI, or
-wgpu resource plumbing — those go to `codex-plan-review` / `codex-implementation-review`.
+`/codex-darkroom` (`.claude/skills/codex-darkroom/`) — **opt-in, explicit invocation only.** Sends an
+evidence packet to GPT-6-Astra via the Codex CLI for the parts of Darkroom where a wrong algorithm
+ships a wrong photograph. Routing rule: **if a mistake produces the wrong pixel, involve Astra; if it
+produces broken software, involve Fable.** In scope: RAW colour science
+(`core-raw/{color,develop,heif,display}.rs`), develop shader math (`develop.wgsl`, `curve.rs`,
+`base_curve_ref.rs`, the mask shaders, and `params.rs:603–1139` — WB/CAT/tone/geometry math, *not*
+the std140 packing below it), HDR merge and deghosting (`core-hdr`), panorama geometry (`core-pano`,
+all files), denoise and analysis DSP (`core-analyze/{denoise,metrics,presence,face_aligner}.rs`),
+colour management, `core-suggest` statistics, `core-dedup` similarity math, and the numerics in
+`core-library/{face_cluster,features}.rs`. Refuses and redirects for UI, IPC, SQLite, import, CI, ORT
+plumbing or wgpu resource lifecycle — those go to `codex-plan-review` / `codex-implementation-review`.
 
-Astra runs **read-only with no repository access** and never writes code: it derives, diagnoses, and
-attacks; Claude packs the evidence, verifies the answer against source, runs the spec's synthetic
-test vectors, and implements. It is on a limited ChatGPT Plus allowance, so calls are gated, one-shot,
-and logged. Modes: `derive` · `diagnose` · `verify`.
+Astra never writes code: it explores, derives, diagnoses, calibrates, rebuts and attacks; Claude
+packs the evidence, verifies the answer against source, runs the spec's synthetic test vectors, and
+implements. Six modes: `explore` · `derive` · `diagnose` · `calibrate` · `rebut` · `verify`
+(`SCOPE: diff|function|subsystem`). Default effort `xhigh`; `max` free; `ultra` (real multi-agent
+delegation) on explicit approval. Access is a **sealed packet by default** — a gated `repo-read` mode
+exists for questions that provably span three or more crates. Runs are session-backed (no
+`--ephemeral`), so `rebut` and follow-up rounds resume via `codex exec resume`. Three approved call
+patterns: **A** derive→verify, **B** diagnose→experiment→diagnose→verify, **C** (RAW colour, pano
+bundle/seam, HDR merge, base tone operator) explore→derive→critique→rebut→verify.
+
+The skill never invokes itself, but Claude **must offer the exact call** — mode, effort, Q1 — when a
+diff about to be committed touches a scope path, a `PROCESS_VERSION` bump is proposed, a new
+pixel-path algorithm appears in a plan, a golden moves unexpectedly, a constant would land without
+provenance, or the CPU and GPU paths disagree. Offer, never run.
 
 Supporting agents: `astra-packer` (builds the packet, runs the harnesses), `astra-spec-implementer`
 (implements an accepted spec, never redesigns), `gpu-visual-qa` (renders before/after, reports
-differences as numbers). Register: `docs/astra/{FINDINGS.md,LOG.md}` — check `FINDINGS.md` before
-packing a question so it is never paid for twice.
+differences as numbers and writes the crops Astra can be shown), `reviewer-critical` (plays the
+critique side of pattern C). Register: `docs/astra/{FINDINGS.md,LOG.md}` — check `FINDINGS.md` before
+packing a question so it is never asked twice.
 
 ## Status shorthand
 
