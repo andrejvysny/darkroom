@@ -81,6 +81,6 @@ cargo test --workspace                  # run tests
 cargo clippy --workspace                # lint
 ```
 
-Architecture, status, and the full spec live in `CLAUDE.md`, `CURRENT_STATE.md`, and `SPEC_V1.md`.
+Architecture, status, and the full spec live in `CLAUDE.md` and the Plane project DARKROOM (Pages + work items).
 
 </details>

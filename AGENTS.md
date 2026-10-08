@@ -1,5 +1,15 @@
 # Repository Guidelines
 
+## Tracking & Documentation: Plane Only
+
+Task tracking and durable knowledge live in Plane project **DARKROOM**, not in the repo. Never create or update local `TODO.md`, `PLAN.md`, `HANDOFF.md`/`HAND_OFF.md`, `CURRENT_STATE.md`, status/notes/QA-checklist files, or temp trackers.
+
+- **Tasks:** future work, bugs, QA items and follow-ups are Plane work items (children of the `[Area]` parents; labels `qa`, `needs-dev-mac`, `needs-decision`, `idea` plus area). Check Plane before assuming a feature is done or starting new work, and update item state as you go.
+- **Knowledge:** specs, architecture, decisions, dead ends and research are Plane Pages under "Darkroom — Documentation Index" (e.g. "Architecture & Hard Constraints", "Implementation Status & History", "Product Spec v1"). Update the existing page; do not create v2/final/dated duplicates.
+- **Ask before saving** to Plane: propose what to record unless the user explicitly asks you to.
+- **Stays in Git (code-coupled only):** `CLAUDE.md`, `AGENTS.md`, `README.md`, `docs/macos-signing.md`, `tests/corpus/README.md`, `crates/core-analyze/SPIKE.md`, `docs/astra/*`, `.claude/*`, migrations, and IPC/schema definitions in code. Link to them from Plane instead of duplicating.
+- Chat sessions, plans, agent memory and generated temp files are not authoritative.
+
 ## Project Structure & Module Organization
 
 Darkroom is a macOS Tauri v2 application. The React 19/TypeScript frontend lives in `src/`; views are grouped under `src/views/`, shared UI under `src/components/`, Zustand stores under `src/store/`, and IPC helpers under `src/lib/`. Native commands and application state live in `src-tauri/src/`. Rust domain code is split into focused workspace crates under `crates/core-*`, including database, RAW decoding, library, pipeline, import, deduplication, and analysis. Rust integration tests sit beside each crate in `crates/*/tests/`; Playwright scenarios live in `e2e/tests/`. Treat `DATA/` and most of `library/` as local, large photo data, not source assets.

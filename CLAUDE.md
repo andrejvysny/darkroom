@@ -5,9 +5,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Darkroom — local non-destructive RAW photo library + develop editor for macOS. Tauri v2 · Rust
 Cargo workspace · React 19 + Tailwind v4 · SQLite (rusqlite) · wgpu/Metal develop pipeline.
 
-> **Read first when resuming:** `CURRENT_STATE.md` (handoff: done/partial/not-done, gotchas),
-> `TODO.md` (prioritized next work), `SPEC_V1.md` (full spec). This file is the orientation; those
-> are the source of truth for status.
+> **Read first when resuming:** Plane project DARKROOM (identifier `DARKROOM`) — work items (open
+> tasks) and Pages ("Architecture & Hard Constraints", "Implementation Status & History",
+> "Product Spec v1"). This file is the orientation; Plane is the source of truth for status.
+
+## Tracking & documentation: Plane only
+
+- **Always use Plane** (project DARKROOM) for task tracking and durable knowledge. Never create or
+  update local files for this: no `TODO.md`, `PLAN.md`, `HANDOFF.md`/`HAND_OFF.md`,
+  `CURRENT_STATE.md`, status/notes/QA-checklist `.md` files, or temp trackers in the repo.
+- **Tasks:** future work, bugs, QA items, follow-ups = Plane work items (children of the `[Area]`
+  parents; labels `qa`, `needs-dev-mac`, `needs-decision`, `idea` + area). Update state as work
+  progresses; check Plane before assuming a feature is done or planning new work.
+- **Knowledge:** specs, architecture, decisions, dead ends, research, session outcomes = Plane
+  Pages under "Darkroom — Documentation Index". Update the existing canonical page; no
+  v2/final/dated duplicates.
+- **Ask before saving** to Plane (suggest what to record), except when the user explicitly asks.
+- **Stays in Git (code-coupled only):** this file, `AGENTS.md`, `README.md`, `docs/macos-signing.md`,
+  `tests/corpus/README.md`, `crates/core-analyze/SPIKE.md`, `docs/astra/*`, `.claude/*`, migrations,
+  and IPC/schema definitions in code. Link to them from Plane rather than duplicating.
+- Chat sessions, plans (`~/.claude/plans`), agent memory and generated temp files are not
+  authoritative.
 
 ## Commands
 
@@ -48,7 +66,7 @@ App data (catalog + thumb cache): `~/Library/Application Support/com.andrejvysny
 Workspace = `src-tauri` + `crates/*`; frontend at repo root `src/` (deviates from spec's `/ui`
 intentionally, reusing the Tauri scaffold). **The frontend never touches the DB or filesystem
 directly — all access is typed Rust IPC commands.** The IPC command surface is the contract; it is
-enumerated in `CURRENT_STATE.md` ("IPC command surface").
+defined in `src-tauri/src/lib.rs` + `src/lib/ipc.ts` (summary: Plane page "Architecture & Hard Constraints").
 
 | Crate           | Role                                                                                                                                    |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -72,7 +90,7 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 - **Develop preview:** `core-raw::develop_linear` (rawler demosaic + our camera→**linear wide-gamut ProPhoto** map via `clip_negative`, >1.0 headroom kept; ProPhoto→sRGB happens in-shader at the display transition) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG bytes → `tauri::ipc::Response` → JS `invoke<ArrayBuffer>` → `URL.createObjectURL`. **Never base64 over IPC.**
 - **Export:** re-decode full-res → full-res GPU render → PNG/JPEG → save dialog dest (not cached).
 
-## Hard constraints (do not violate — see CURRENT_STATE.md for detail)
+## Hard constraints (do not violate — see Plane page "Architecture & Hard Constraints")
 
 - **Do NOT add padding to the `vec3 wb_gain` uniform** (`params.rs` ↔ `develop.wgsl`). A scalar packs into the vec3 tail per std140/WGSL; it is correct. A past review false-flagged it. Guarded by golden test `param_effects.rs`.
 - **All new GPU data must use new bindings**, never alter `ParamsUniform`. Bindings 0–15 are all in use; **next free = `@binding(16)`**. Map: 0 `input_tex`, 1 `input_smp`, 2 `ParamsUniform` (guarded), 3 tone-curve LUT, 4 HSL `FxUniform`, 5–7 masks (array + sampler + storage), 8 white-balance CAT mat3, 9 Detail+vignette+Presence `ExtraUniform`, **10 `ToneOpUniform` (scene-referred base tone operator), 11 `base_lut` (base-curve texture), 12 `GeomUniform` (crop/straighten + lens), 13 `ViewUniform` (viewport + mask overlay), 14 `CbRgbUniform` (Color-balance-RGB grading), 15 `ChanMix` (channel mixer)**. (Global WB rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
@@ -90,7 +108,7 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
   `RawError::Unsupported`, are recorded in `decode_failure` and skipped on rescans until the decoder version changes.
   Multi-maker corpus: `tests/corpus/manifest.toml` + `scripts/fetch_raw_corpus.sh` (see AGENTS.md).
 - **libheif-rs `=2.7.0`** pinned, `default-features=false, features=["v1_17"]` (oldest supported system libheif — Ubuntu noble; Homebrew's newer releases are API-compatible). Keep every libheif call inside `core-raw/src/heif.rs`; not built on Windows (stub returns a clean error). `exr = "1.74"` (same version image 0.25 already pulls) for merged-HDR files.
-- **wgpu `=29`** — API differs substantially from older majors (Instance/device/pipeline-descriptor changes catalogued in CURRENT_STATE.md).
+- **wgpu `=29`** — API differs substantially from older majors (Instance/device/pipeline-descriptor changes catalogued on the Plane Architecture page).
 - **rusqlite `0.39` + rusqlite_migration `=2.5.0`** pinned for rustc 1.91 (newer needs ≥1.95). Don't bump without checking MSRV.
 - All SQL filters use bound named params (injection-safe) — keep new queries that way.
 - CSP is `null` (permissive) in `tauri.conf.json` — required for `thumb://` + inline styles today; harden before any public distribution.
@@ -140,7 +158,7 @@ working space, scene-referred **ACR base tone operator** (`@binding(10/11)`), Ke
 freeze (whole-import DB lock) is **resolved** (ea0d66a); the AI scan pipeline (D-FINE-M + MegaDetector
 
 - MobileCLIP verifier + Florence-2) is production-wired (F1 0.905). Crop is wired (visual-QA
-  pending). Check `TODO.md` before assuming a develop module is functional.
+  pending). Check Plane work items before assuming a develop module is functional.
 
 **HDR (2026-07-19, branch `claude/hdr-heif-support-5r5ztx`):** Canon **HDR PQ HEIF (`.hif`)** decodes
 to scene-linear ProPhoto via libheif (PQ EOTF, **300-nit diffuse-white anchor** → 1.0 — calibrated
