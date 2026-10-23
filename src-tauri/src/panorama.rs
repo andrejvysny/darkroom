@@ -118,6 +118,10 @@ fn validate_ids(ids: &[i64]) -> Result<(), String> {
             ids.len()
         ));
     }
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    if unique.len() != ids.len() {
+        return Err("select distinct source images for a panorama".into());
+    }
     Ok(())
 }
 
@@ -377,6 +381,9 @@ pub fn merge<R: Runtime>(
         cancel: &st.panorama_cancel,
     };
     st.panorama_cancel.store(false, Ordering::SeqCst);
+    // Publication and catalog insertion belong to this job. Defer watcher indexing until both
+    // complete, otherwise the watcher can win the insert and make cleanup remove a catalogued DNG.
+    let _watch_guard = crate::watch::ImportGuard::new(app.clone());
 
     // Borrow the flag itself (not the `State` wrapper) so the closure is `Sync` — core-pano polls it
     // from inside its rayon-parallel phases.
@@ -439,11 +446,7 @@ pub fn merge<R: Runtime>(
         &result.rgb,
         ref_meta,
     )
-    .map_err(|e| {
-        // write_pano_dng creates the file up front, so a failed write can leave a truncated DNG.
-        let _ = std::fs::remove_file(&dest);
-        e.to_string()
-    })?;
+    .map_err(|e| e.to_string())?;
     if cancelled() {
         let _ = std::fs::remove_file(&dest);
         return Err("cancelled".into());

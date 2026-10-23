@@ -22,6 +22,7 @@ pub fn is_identity(points: &[CurvePoint]) -> bool {
 fn clean(points: &[CurvePoint]) -> Vec<(f32, f32)> {
     let mut p: Vec<(f32, f32)> = points
         .iter()
+        .filter(|c| c.x.is_finite() && c.y.is_finite())
         .map(|c| (c.x.clamp(0.0, 1.0), c.y.clamp(0.0, 1.0)))
         .collect();
     p.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -33,11 +34,8 @@ fn clean(points: &[CurvePoint]) -> Vec<(f32, f32)> {
 /// Flat extrapolation outside the control-point range. Returns a value clamped to [0,1].
 fn eval(pts: &[(f32, f32)], x: f32) -> f32 {
     let n = pts.len();
-    if n == 0 {
+    if n < 2 {
         return x.clamp(0.0, 1.0);
-    }
-    if n == 1 {
-        return pts[0].1;
     }
     if x <= pts[0].0 {
         return pts[0].1;
@@ -56,7 +54,14 @@ fn eval(pts: &[(f32, f32)], x: f32) -> f32 {
     m[0] = d[0];
     m[n - 1] = d[n - 2];
     for i in 1..n - 1 {
-        m[i] = (d[i - 1] + d[i]) * 0.5;
+        // A local extremum must have a horizontal tangent. The magnitude limiter below alone
+        // does not enforce this: a negative tangent relative to either secant overshoots that
+        // segment even when a²+b² <= 9 (e.g. a creative curve that rises, falls, then rises).
+        m[i] = if d[i - 1] * d[i] <= 0.0 {
+            0.0
+        } else {
+            (d[i - 1] + d[i]) * 0.5
+        };
     }
 
     // Fritsch–Carlson monotonicity clamp.
@@ -169,6 +174,44 @@ mod tests {
             );
             prev = v;
         }
+    }
+
+    #[test]
+    fn local_extrema_stay_within_each_segments_control_points() {
+        let points: [(f32, f32); 4] = [(0.0, 0.0), (0.2, 0.8), (0.8, 0.7), (1.0, 1.0)];
+        for pair in points.windows(2) {
+            let (lo, hi) = (pair[0].1.min(pair[1].1), pair[0].1.max(pair[1].1));
+            for step in 0..=100 {
+                let x = pair[0].0 + (pair[1].0 - pair[0].0) * step as f32 / 100.0;
+                let y = eval(&points, x);
+                assert!(
+                    y >= lo - 1e-6 && y <= hi + 1e-6,
+                    "x={x}, y={y} outside [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_and_nonfinite_points_do_not_destroy_the_image() {
+        for rgb in [
+            vec![pt(0.5, 0.1)],
+            vec![pt(0.5, 0.1), pt(0.5, 0.9)],
+            vec![pt(f32::NAN, 0.0), pt(0.0, f32::INFINITY)],
+        ] {
+            assert_eq!(
+                build_lut(&ToneCurve {
+                    rgb,
+                    ..Default::default()
+                }),
+                identity_lut()
+            );
+        }
+        let tc = ToneCurve {
+            rgb: vec![pt(0.0, 0.0), pt(f32::NAN, 0.9), pt(1.0, 1.0)],
+            ..Default::default()
+        };
+        assert_eq!(build_lut(&tc), identity_lut());
     }
 
     #[test]

@@ -41,7 +41,7 @@ fn read_thumb(
             // Edited image: only its OWN preview is valid. If it isn't rendered yet, fall through to
             // the edited thumb tier below — NOT the canonical preview (that's the unedited look).
             Some(version) => {
-                if let Ok(bytes) = thumbs.read_edited_preview(hash, version, edge) {
+                if let Ok(bytes) = thumbs.read_edited_preview(hash, pv, version, edge) {
                     return Some(bytes);
                 }
             }
@@ -54,7 +54,7 @@ fn read_thumb(
         // Preview not rendered yet — fall through to the (smaller) thumb tier as a placeholder.
     }
     if let Some(version) = edit {
-        if let Ok(bytes) = thumbs.read_edited(hash, version) {
+        if let Ok(bytes) = thumbs.read_edited(hash, pv, version) {
             return Some(bytes);
         }
     }

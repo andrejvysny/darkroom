@@ -5,12 +5,30 @@
 //! so slider changes re-render in single-digit milliseconds. Output resolution == input resolution.
 
 use crate::error::PipelineError;
-use crate::params::DevelopParams;
+use crate::params::{AiCoverage, DevelopParams};
 use core_raw::LinearImage;
 use wgpu::util::DeviceExt;
 
 #[cfg(target_os = "windows")]
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+
+/// Coverage availability and pixels are part of the baked layer, even when the persisted mask
+/// geometry/hash is unchanged (for example when SAM finishes rebuilding after a reload).
+fn mask_render_hash(mask: &crate::params::Mask, coverages: &[AiCoverage]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    crate::mask::mask_geometry_hash(mask).hash(&mut hash);
+    if let Some(key) = crate::mask::mask_ai_hash(mask) {
+        let coverage = coverages.iter().find(|c| c.hash == key);
+        coverage.is_some().hash(&mut hash);
+        if let Some(coverage) = coverage {
+            coverage.width.hash(&mut hash);
+            coverage.height.hash(&mut hash);
+            coverage.alpha.hash(&mut hash);
+        }
+    }
+    hash.finish()
+}
 
 /// Long-lived GPU device + queue.
 pub struct GpuContext {
@@ -203,12 +221,6 @@ fn candidate_adapters(
     }
 }
 
-const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-
-fn padded_bpr(width: u32) -> u32 {
-    (width * 4).div_ceil(ALIGN) * ALIGN
-}
-
 /// Upload a 256x1 RGBA8 tone-curve LUT (`LUT_SIZE*4` bytes) to `tex`.
 fn write_lut(ctx: &GpuContext, tex: &wgpu::Texture, lut: &[u8]) {
     let w = crate::curve::LUT_SIZE as u32;
@@ -349,24 +361,58 @@ mod write_slot {
 }
 const WRITE_SLOTS: usize = 12;
 
-/// 2×2 box-average one RGBA f32 mip level into the next (odd trailing row/col clamp to the edge).
+/// Area-average one RGBA f32 mip level into the next. GPU mip dimensions are floor-halved, so an
+/// odd source edge must be distributed over the smaller level rather than dropping its last texel.
 fn downsample_rgba_f32(src: &[f32], w: u32, h: u32) -> Vec<f32> {
     let (nw, nh) = ((w / 2).max(1) as usize, (h / 2).max(1) as usize);
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![0f32; nw * nh * 4];
+    let exact_halving = (w == 1 || w.is_multiple_of(2)) && (h == 1 || h.is_multiple_of(2));
     for y in 0..nh {
-        let y0 = (y * 2).min(h - 1);
-        let y1 = (y * 2 + 1).min(h - 1);
         for x in 0..nw {
-            let x0 = (x * 2).min(w - 1);
-            let x1 = (x * 2 + 1).min(w - 1);
             let o = (y * nw + x) * 4;
-            for c in 0..4 {
-                out[o + c] = 0.25
-                    * (src[(y0 * w + x0) * 4 + c]
-                        + src[(y0 * w + x1) * 4 + c]
-                        + src[(y1 * w + x0) * 4 + c]
-                        + src[(y1 * w + x1) * 4 + c]);
+            if exact_halving {
+                // Preserve the existing fast 2×2 box arithmetic for even dimensions (including
+                // the duplicated sample on a 1-pixel axis). Accumulate in f64 only if a sum of
+                // finite HDR values overflows f32; their average is still representable.
+                let y0 = (y * 2).min(h - 1);
+                let y1 = (y * 2 + 1).min(h - 1);
+                let x0 = (x * 2).min(w - 1);
+                let x1 = (x * 2 + 1).min(w - 1);
+                for c in 0..4 {
+                    let samples = [
+                        src[(y0 * w + x0) * 4 + c],
+                        src[(y0 * w + x1) * 4 + c],
+                        src[(y1 * w + x0) * 4 + c],
+                        src[(y1 * w + x1) * 4 + c],
+                    ];
+                    let sum = samples[0] + samples[1] + samples[2] + samples[3];
+                    out[o + c] = if sum.is_finite() {
+                        0.25 * sum
+                    } else {
+                        (0.25 * samples.into_iter().map(f64::from).sum::<f64>()) as f32
+                    };
+                }
+            } else {
+                // Use integer overlap lengths in units of 1/nw and 1/nh source pixels. Each
+                // destination footprint has total weight w*h, with at most 3×3 source texels.
+                // This covers [0,w]×[0,h] exactly, with no dropped border or shifted footprint.
+                let (left, right) = (x * w, (x + 1) * w);
+                let (top, bottom) = (y * h, (y + 1) * h);
+                let mut sum = [0.0f64; 4];
+                for sy in top / nh..bottom.div_ceil(nh) {
+                    let wy = bottom.min((sy + 1) * nh) - top.max(sy * nh);
+                    for sx in left / nw..right.div_ceil(nw) {
+                        let wx = right.min((sx + 1) * nw) - left.max(sx * nw);
+                        let weight = (wx * wy) as f64;
+                        for (c, value) in sum.iter_mut().enumerate() {
+                            *value += f64::from(src[(sy * w + sx) * 4 + c]) * weight;
+                        }
+                    }
+                }
+                for (c, value) in sum.iter().enumerate() {
+                    out[o + c] = (value / (w * h) as f64) as f32;
+                }
             }
         }
     }
@@ -404,7 +450,15 @@ struct ViewTarget {
 }
 
 impl ViewTarget {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self, PipelineError> {
+        let limits = device.limits();
+        let (bpr, readback_size) = crate::validation::output_layout(
+            width,
+            height,
+            limits.max_texture_dimension_2d,
+            limits.max_buffer_size,
+        )?;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("develop-view-output"),
             size: wgpu::Extent3d {
@@ -419,20 +473,22 @@ impl ViewTarget {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let bpr = padded_bpr(width);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("develop-view-readback"),
-            size: (bpr * height) as u64,
+            size: readback_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        Self {
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(PipelineError::Allocation(format!("GPU viewport: {err}")));
+        }
+        Ok(Self {
             width,
             height,
             bpr,
             texture,
             readback,
-        }
+        })
     }
 }
 
@@ -710,22 +766,24 @@ impl DevelopPipeline {
     ) -> Result<PreparedImage, PipelineError> {
         let device = &ctx.device;
         let (w, h) = (img.width, img.height);
-
-        // Reject images larger than the device can hold *before* touching the GPU. Exceeding
-        // `max_texture_dimension_2d` is a validation error, which the OutOfMemory scope below would
-        // NOT capture — it would surface as an uncaptured device error rather than a clean Result.
-        if w > ctx.max_texture_dim || h > ctx.max_texture_dim {
-            return Err(PipelineError::ImageTooLarge {
-                w,
-                h,
-                max: ctx.max_texture_dim,
-            });
-        }
-
-        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let limits = device.limits();
+        let rgba_len = crate::validation::linear_image(
+            img,
+            limits.max_texture_dimension_2d,
+            limits.max_buffer_size,
+        )?;
+        let (bpr, readback_size) = crate::validation::output_layout(
+            w,
+            h,
+            limits.max_texture_dimension_2d,
+            limits.max_buffer_size,
+        )?;
 
         // RGB f32 -> RGBA f32 (alpha = 1).
-        let mut rgba = vec![0f32; (w * h * 4) as usize];
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(rgba_len)
+            .map_err(|e| PipelineError::Allocation(format!("CPU upload: {e}")))?;
+        rgba.resize(rgba_len, 0.0f32);
         for (i, px) in img.data.chunks_exact(3).enumerate() {
             let o = i * 4;
             rgba[o] = px[0];
@@ -733,6 +791,8 @@ impl DevelopPipeline {
             rgba[o + 2] = px[2];
             rgba[o + 3] = 1.0;
         }
+
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
         let size = wgpu::Extent3d {
             width: w,
@@ -1112,10 +1172,9 @@ impl DevelopPipeline {
             ],
         });
 
-        let bpr = padded_bpr(w);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("develop-readback"),
-            size: (bpr * h) as u64,
+            size: readback_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1174,6 +1233,7 @@ impl DevelopPipeline {
         prepared: &PreparedImage,
         params: &DevelopParams,
         view: &crate::params::ViewParams,
+        ai_coverages: Option<&[AiCoverage]>,
         out_tex: &wgpu::Texture,
         readback: &wgpu::Buffer,
         out_bpr: u32,
@@ -1190,6 +1250,12 @@ impl DevelopPipeline {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let device = &ctx.device;
         let (w, h) = (prepared.width, prepared.height);
+        // The source/viewport layout was validated before allocation. Reserve the host output
+        // before mapping the readback so an allocation error cannot leave that GPU buffer mapped.
+        let output_len = ow as usize * oh as usize * 4;
+        let mut out = Vec::new();
+        out.try_reserve_exact(output_len)
+            .map_err(|e| PipelineError::Allocation(format!("CPU readback: {e}")))?;
 
         // Every write below is diffed against its last payload (write_hashes): a pan/zoom frame
         // rewrites ONLY the view uniform; a slider move rewrites only what it feeds.
@@ -1314,10 +1380,22 @@ impl DevelopPipeline {
         // Poison policy: RECOVER ONLY — read-only here, and this holds baked SAM coverage that costs
         // a full segmentation run to rebuild, so it is never cleared. Worst case a stale coverage is
         // used for one render; the next `develop_render` re-resolves it from the backend SAM cache.
-        let ai_covs = prepared
-            .ai_coverages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Application callers pass an immutable snapshot with the render request. Legacy callers
+        // can still use the stored coverages; never replace that shared slot before taking the
+        // render lock, since another request could otherwise render with the wrong snapshot.
+        let stored_coverages = ai_coverages.is_none().then(|| {
+            prepared
+                .ai_coverages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let ai_covs = ai_coverages.unwrap_or_else(|| {
+            stored_coverages
+                .as_ref()
+                .expect("stored coverages")
+                .as_slice()
+        });
+        crate::validation::ai_coverages(ai_covs)?;
         let mut enabled_count = 0usize;
         for (layer, mask) in params
             .masks
@@ -1327,7 +1405,7 @@ impl DevelopPipeline {
             .enumerate()
         {
             enabled_count = layer + 1;
-            let geom_hash = crate::mask::mask_geometry_hash(mask);
+            let geom_hash = mask_render_hash(mask, ai_covs);
             if layer_hashes[layer] == Some(geom_hash) {
                 continue; // coverage unchanged ⇒ this mask_tex layer is already valid
             }
@@ -1524,8 +1602,8 @@ impl DevelopPipeline {
             .map_err(|e| PipelineError::Map(e.to_string()))?;
 
         let data = readback.slice(..).get_mapped_range();
-        let mut out = vec![0u8; (ow * oh * 4) as usize];
-        let row = (ow * 4) as usize;
+        out.resize(output_len, 0u8);
+        let row = ow as usize * 4;
         if out_bpr as usize == row {
             // Rows already tightly packed (width divisible by the 256-byte alignment) — one copy.
             let len = out.len();
@@ -1557,6 +1635,7 @@ impl DevelopPipeline {
             prepared,
             params,
             &view,
+            None,
             &prepared.output,
             &prepared.readback,
             prepared.bpr,
@@ -1578,18 +1657,49 @@ impl DevelopPipeline {
         params: &DevelopParams,
         view: &crate::params::ViewParams,
     ) -> Result<Vec<u8>, PipelineError> {
-        // Clamp the output to the device's real max texture edge. This also bounds `ow * oh * 4`
-        // within u32 (16384² × 4 ≈ 1 GiB), so the readback allocation can't silently overflow on a
-        // bad request from the IPC layer; the OutOfMemory error scope guards the allocation itself.
-        let max_edge = ctx.max_texture_dim;
-        let ow = view.out_w.clamp(1, max_edge);
-        let oh = view.out_h.clamp(1, max_edge);
+        self.render_view_inner(ctx, prepared, params, view, None)
+    }
+
+    /// Render with the AI coverage snapshot belonging to this request. Coverage is consumed under
+    /// the same render lock as the uniforms and mask pre-pass, so concurrent viewport/histogram
+    /// requests cannot replace one another's masks.
+    pub fn render_view_with_ai_coverages(
+        &self,
+        ctx: &GpuContext,
+        prepared: &PreparedImage,
+        params: &DevelopParams,
+        view: &crate::params::ViewParams,
+        ai_coverages: &[AiCoverage],
+    ) -> Result<Vec<u8>, PipelineError> {
+        self.render_view_inner(ctx, prepared, params, view, Some(ai_coverages))
+    }
+
+    fn render_view_inner(
+        &self,
+        ctx: &GpuContext,
+        prepared: &PreparedImage,
+        params: &DevelopParams,
+        view: &crate::params::ViewParams,
+        ai_coverages: Option<&[AiCoverage]>,
+    ) -> Result<Vec<u8>, PipelineError> {
+        // Keep the existing clamped viewport contract; IPC callers clamp identically when framing
+        // the returned buffer. Validate the padded byte size against the separate buffer limit.
+        let limits = ctx.device.limits();
+        let ow = view.out_w.clamp(1, limits.max_texture_dimension_2d);
+        let oh = view.out_h.clamp(1, limits.max_texture_dimension_2d);
+        crate::validation::output_layout(
+            ow,
+            oh,
+            limits.max_texture_dimension_2d,
+            limits.max_buffer_size,
+        )?;
         if !view.active && view.overlay_layer < 0 && ow == prepared.width && oh == prepared.height {
             return self.render_to(
                 ctx,
                 prepared,
                 params,
                 view,
+                ai_coverages,
                 &prepared.output,
                 &prepared.readback,
                 prepared.bpr,
@@ -1605,15 +1715,19 @@ impl DevelopPipeline {
             *g = None;
             g
         });
-        let target = target.get_or_insert_with(|| ViewTarget::new(&ctx.device, ow, oh));
-        if target.width != ow || target.height != oh {
-            *target = ViewTarget::new(&ctx.device, ow, oh);
+        if target
+            .as_ref()
+            .is_none_or(|t| t.width != ow || t.height != oh)
+        {
+            *target = Some(ViewTarget::new(&ctx.device, ow, oh)?);
         }
+        let target = target.as_ref().expect("viewport target initialized");
         self.render_to(
             ctx,
             prepared,
             params,
             view,
+            ai_coverages,
             &target.texture,
             &target.readback,
             target.bpr,
@@ -1785,5 +1899,108 @@ impl DevelopPipeline {
     ) -> Result<Vec<u8>, PipelineError> {
         let prepared = self.prepare(ctx, img)?;
         self.render(ctx, &prepared, params)
+    }
+
+    /// Render the complete selected crop at native pixel dimensions. Unlike a source-sized
+    /// letterbox followed by a pixel cut, this preserves both crop area and quarter-turn axes.
+    pub fn render_cropped_with_ai_coverages(
+        &self,
+        ctx: &GpuContext,
+        image: &LinearImage,
+        params: &DevelopParams,
+        coverages: &[AiCoverage],
+    ) -> Result<(Vec<u8>, u32, u32), PipelineError> {
+        let prepared = self.prepare(ctx, image)?;
+        let (width, height) = params.crop.output_size(image.width, image.height);
+        let view = crate::params::ViewParams {
+            active: true,
+            ..crate::params::ViewParams::full(width, height)
+        };
+        let rgba = self.render_view_with_ai_coverages(ctx, &prepared, params, &view, coverages)?;
+        Ok((rgba, width, height))
+    }
+}
+
+#[cfg(test)]
+mod mip_tests {
+    use super::downsample_rgba_f32;
+
+    fn gray(values: &[f32]) -> Vec<f32> {
+        values.iter().flat_map(|&v| [v, v, v, 1.0]).collect()
+    }
+
+    #[test]
+    fn odd_axes_include_the_last_texel() {
+        for (w, h) in [(3, 1), (1, 3)] {
+            assert_eq!(
+                downsample_rgba_f32(&gray(&[0.0, 0.0, 1.0]), w, h),
+                gray(&[1.0 / 3.0])
+            );
+        }
+        // 5 -> 2 footprints have width 2.5: weights (2,2,1)/5 and (1,2,2)/5.
+        assert_eq!(
+            downsample_rgba_f32(&gray(&[0.0, 0.0, 1.0, 0.0, 1.0]), 5, 1),
+            gray(&[0.2, 0.6])
+        );
+    }
+
+    #[test]
+    fn odd_2d_mips_preserve_mean_including_bottom_right_corner() {
+        let mut values = [0.0; 15];
+        values[14] = 1.0;
+        let next = downsample_rgba_f32(&gray(&values), 5, 3);
+        assert_eq!(next, gray(&[0.0, 2.0 / 15.0]));
+        let last = downsample_rgba_f32(&next, 2, 1);
+        assert_eq!(last, gray(&[1.0 / 15.0]));
+    }
+
+    #[test]
+    fn constant_hdr_and_negative_channels_are_preserved() {
+        let color = [-0.125, 3.0, 32.0, 1.0];
+        for (w, h) in [(1, 1), (5, 3), (3, 4), (4, 4)] {
+            let source = color.repeat((w * h) as usize);
+            let result = downsample_rgba_f32(&source, w, h);
+            assert_eq!(
+                result,
+                color.repeat(((w / 2).max(1) * (h / 2).max(1)) as usize)
+            );
+        }
+        // An average of finite values must not overflow just because the sum did.
+        for (w, h) in [(3, 3), (2, 2)] {
+            let source = [f32::MAX, f32::MAX, f32::MAX, 1.0].repeat((w * h) as usize);
+            assert_eq!(
+                downsample_rgba_f32(&source, w, h),
+                [f32::MAX, f32::MAX, f32::MAX, 1.0]
+            );
+        }
+    }
+
+    #[test]
+    fn even_dimensions_keep_the_existing_two_by_two_box_filter() {
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        assert_eq!(
+            downsample_rgba_f32(&gray(&values), 4, 4),
+            gray(&[2.5, 4.5, 10.5, 12.5])
+        );
+    }
+
+    #[test]
+    fn mip_mean_matches_source_for_varied_odd_and_even_sizes() {
+        for w in 1..=9 {
+            for h in 1..=9 {
+                let values: Vec<f32> = (0..w * h)
+                    .map(|i| (i * 17 % 31) as f32 / 7.0 - 2.0)
+                    .collect();
+                let expected =
+                    values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len() as f64;
+                let mip = downsample_rgba_f32(&gray(&values), w, h);
+                let actual = mip.chunks_exact(4).map(|p| f64::from(p[0])).sum::<f64>()
+                    / (mip.len() / 4) as f64;
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "{w}x{h}: {actual} vs {expected}"
+                );
+            }
+        }
     }
 }

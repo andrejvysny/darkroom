@@ -24,6 +24,8 @@ jobs:
     env:
       # Turn a missing committed fixture into a hard failure instead of a silently-skipped test.
       DARKROOM_REQUIRE_FIXTURES: "1"
+      # GPU assertions must execute on the Metal runner; missing adapters cannot turn them green.
+      DARKROOM_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@v4
 

@@ -17,6 +17,7 @@ pub mod hdr_dng;
 pub mod hdr_file;
 pub mod heif;
 pub mod meta;
+mod output;
 pub mod panic;
 pub mod pano;
 pub mod thumb;

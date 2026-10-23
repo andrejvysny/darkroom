@@ -14,7 +14,10 @@
 //! `prioritize`) before the bulk backfill (back). Uses a transient `PreparedImage` via
 //! `render_develop_jpeg`, never the interactive `full_render_cache`.
 
-use crate::commands::{decode_develop, enforce_thumb_cap, render_linear_cropped, PROCESS_VERSION};
+use crate::commands::{
+    decode_develop, enforce_thumb_cap, render_linear_preview, required_ai_coverages,
+    PROCESS_VERSION,
+};
 use crate::state::AppState;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,10 +30,21 @@ const CANONICAL_EDGE: u32 = 1024;
 const CANONICAL_QUALITY: u8 = 85;
 /// Display-sharp preview JPEG quality (slightly higher than the thumb — it's viewed full-screen).
 const PREVIEW_QUALITY: u8 = 88;
-/// Run the LRU cap-enforcement every N tier-writes during backfill (read_dir is not free; this bounds
-/// the evictable-preview disk without statting the cache on every single write).
+/// Run LRU cap enforcement periodically across background and Develop render writes. Directory
+/// scans are not free, so allow a small batch of writes between passes.
 const EVICT_EVERY: u64 = 24;
 static WRITES_SINCE_EVICT: AtomicU64 = AtomicU64::new(0);
+
+/// Account for a successful render-cache write, including foreground edits while backfill is
+/// paused. Call without the catalog lock: cap enforcement briefly acquires it to read settings.
+pub(crate) fn enforce_thumb_cap_after_write(st: &AppState) {
+    if WRITES_SINCE_EVICT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(EVICT_EVERY)
+    {
+        enforce_thumb_cap(st);
+    }
+}
 
 #[derive(Default)]
 struct QueueState {
@@ -219,12 +233,14 @@ fn render_one(app: &AppHandle, image_id: i64) {
         };
         let pedge = core_library::preview_edge(&db.conn).unwrap_or(0);
         let need_thumb = match edit_version {
-            Some(v) => st.thumbs.read_edited(&hash, v).is_err(),
+            Some(v) => st.thumbs.read_edited(&hash, PROCESS_VERSION, v).is_err(),
             None => !st.thumbs.has_canonical(&hash, PROCESS_VERSION),
         };
         let need_preview = pedge > 0
             && match edit_version {
-                Some(v) => !st.thumbs.has_edited_preview(&hash, v, pedge),
+                Some(v) => !st
+                    .thumbs
+                    .has_edited_preview(&hash, PROCESS_VERSION, v, pedge),
                 None => !st.thumbs.has_preview(&hash, PROCESS_VERSION, pedge),
             };
         (pedge, need_thumb, need_preview)
@@ -242,9 +258,19 @@ fn render_one(app: &AppHandle, image_id: i64) {
             return;
         }
     };
+    let coverages = match required_ai_coverages(st.inner(), image_id, &params) {
+        Ok(coverages) => coverages,
+        Err(_) => {
+            tracing::warn!(image_id, "thumbnail AI mask restoration failed");
+            return;
+        }
+    };
     let write_thumb = |jpeg: &[u8]| -> bool {
         match edit_version {
-            Some(v) => st.thumbs.write_edited(&hash, v, jpeg).is_ok(),
+            Some(v) => st
+                .thumbs
+                .write_edited(&hash, PROCESS_VERSION, v, jpeg)
+                .is_ok(),
             None => st
                 .thumbs
                 .write_canonical(&hash, PROCESS_VERSION, jpeg)
@@ -255,7 +281,7 @@ fn render_one(app: &AppHandle, image_id: i64) {
         match edit_version {
             Some(v) => st
                 .thumbs
-                .write_edited_preview(&hash, v, pedge, jpeg)
+                .write_edited_preview(&hash, PROCESS_VERSION, v, pedge, jpeg)
                 .is_ok(),
             None => st
                 .thumbs
@@ -268,8 +294,7 @@ fn render_one(app: &AppHandle, image_id: i64) {
     if need_preview {
         // Render the preview at the configured edge; derive the thumb by downscaling its RGBA (one
         // GPU render total — exact for default params; imperceptible for edited thumbs at grid size).
-        let plin = lin.downscale_into_hq(pedge);
-        match render_linear_cropped(gpu, &plin, &params) {
+        match render_linear_preview(gpu, lin, &params, &coverages, pedge) {
             Ok((rgba, w, h)) => {
                 if let Ok(jpeg) = core_pipeline::rgba8_to_jpeg(&rgba, w, h, PREVIEW_QUALITY) {
                     wrote |= write_preview(&jpeg);
@@ -287,8 +312,7 @@ fn render_one(app: &AppHandle, image_id: i64) {
         }
     } else if need_thumb {
         // Preview not wanted yet (edge unset) or already present: render just the thumb.
-        let tlin = lin.downscale_into_hq(CANONICAL_EDGE);
-        match render_linear_cropped(gpu, &tlin, &params) {
+        match render_linear_preview(gpu, lin, &params, &coverages, CANONICAL_EDGE) {
             Ok((rgba, w, h)) => {
                 if let Ok(jpeg) = core_pipeline::rgba8_to_jpeg(&rgba, w, h, CANONICAL_QUALITY) {
                     wrote |= write_thumb(&jpeg);
@@ -300,13 +324,6 @@ fn render_one(app: &AppHandle, image_id: i64) {
 
     if wrote {
         let _ = app.emit("thumb:rendered", ThumbRendered { image_id, hash });
-        // Bound the evictable (preview) cache off the write path — `enforce_thumb_cap` only ran on
-        // import before, so without this the cap would never apply during loupe/backfill rendering.
-        if WRITES_SINCE_EVICT
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(EVICT_EVERY)
-        {
-            enforce_thumb_cap(&st);
-        }
+        enforce_thumb_cap_after_write(&st);
     }
 }

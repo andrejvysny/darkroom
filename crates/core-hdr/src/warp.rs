@@ -19,7 +19,8 @@ use rayon::prelude::*;
 /// - `mask`: `ref_w·ref_h` u8; `1` = the back-projected sample landed inside `mov` (contributes to
 ///   the merge), `0` = outside → the accumulator skips this pixel for this frame.
 ///
-/// A singular `m` (or one whose inverse maps everything out of bounds) yields an all-zero mask.
+/// A malformed/empty source, a non-finite or singular `m`, or an inverse mapping entirely out of
+/// bounds yields an all-zero mask. An empty target yields empty buffers.
 pub fn warp_into_reference(
     mov: &LinearImage,
     ref_w: u32,
@@ -31,11 +32,20 @@ pub fn warp_into_reference(
     let mut rgb = vec![0.0f32; rw * rh * 3];
     let mut mask = vec![0u8; rw * rh];
 
+    let mw = mov.width as usize;
+    let mh = mov.height as usize;
+    if rw == 0
+        || rh == 0
+        || mw == 0
+        || mh == 0
+        || mw.checked_mul(mh).and_then(|n| n.checked_mul(3)) != Some(mov.data.len())
+    {
+        return (rgb, mask);
+    }
+
     let Some(inv) = invert3(m) else {
         return (rgb, mask); // singular transform → nothing valid
     };
-    let mw = mov.width as usize;
-    let mh = mov.height as usize;
 
     // Row-parallel: each output row is independent. par_chunks_mut splits the interleaved RGB into
     // `rw*3`-float rows, zipped with the matching `rw`-byte mask rows.
@@ -48,7 +58,7 @@ pub fn warp_into_reference(
                 let xf = x as f64;
                 // p = inv · (x, y, 1), then homogeneous divide.
                 let w = inv[2][0] * xf + inv[2][1] * yf + inv[2][2];
-                if w.abs() < 1e-12 {
+                if !w.is_finite() || w.abs() < 1e-12 {
                     continue;
                 }
                 let sx = (inv[0][0] * xf + inv[0][1] * yf + inv[0][2]) / w;
@@ -70,7 +80,13 @@ pub fn warp_into_reference(
 /// `core-pano`'s `project::bilinear_rgb` does, so a sample on the last row/column stays valid.
 #[inline]
 fn sample_bilinear(data: &[f32], w: usize, h: usize, sx: f64, sy: f64) -> Option<[f32; 3]> {
-    if sx < 0.0 || sy < 0.0 || sx > (w - 1) as f64 || sy > (h - 1) as f64 {
+    if !sx.is_finite()
+        || !sy.is_finite()
+        || sx < 0.0
+        || sy < 0.0
+        || sx > (w - 1) as f64
+        || sy > (h - 1) as f64
+    {
         return None;
     }
     let x0 = sx.floor() as usize;
@@ -89,21 +105,24 @@ fn sample_bilinear(data: &[f32], w: usize, h: usize, sx: f64, sy: f64) -> Option
         let bot = p01 + (p11 - p01) * fx;
         *o = top + (bot - top) * fy;
     }
-    Some(out)
+    out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
 /// Invert a 3×3 row-major matrix via the classical adjugate/determinant; `None` if (near-)singular.
 fn invert3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    if m.iter().flatten().any(|v| !v.is_finite()) {
+        return None;
+    }
     let (a, b, c) = (m[0][0], m[0][1], m[0][2]);
     let (d, e, f) = (m[1][0], m[1][1], m[1][2]);
     let (g, h, i) = (m[2][0], m[2][1], m[2][2]);
 
     let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    if det.abs() < 1e-15 {
+    if !det.is_finite() || det.abs() < 1e-15 {
         return None;
     }
     let inv_det = 1.0 / det;
-    Some([
+    let inv = [
         [
             (e * i - f * h) * inv_det,
             (c * h - b * i) * inv_det,
@@ -119,5 +138,6 @@ fn invert3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
             (b * g - a * h) * inv_det,
             (a * e - b * d) * inv_det,
         ],
-    ])
+    ];
+    inv.iter().flatten().all(|v| v.is_finite()).then_some(inv)
 }

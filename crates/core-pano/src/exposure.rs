@@ -129,8 +129,12 @@ pub(crate) fn solve_gains(warps: &[Option<Warped>]) -> Vec<[f32; 3]> {
             a[(jj, ii)] -= s.n * ai * aj;
         }
         for k in 0..n_cam {
-            a[(k, k)] += LAMBDA * n_i[k];
-            b[k] += LAMBDA * n_i[k];
+            // An unobserved frame has no data term. Pin its gain to 1 explicitly;
+            // leaving a zero row makes the entire system singular and silently
+            // disables compensation for every other, well-connected frame too.
+            let prior = if n_i[k] > 0.0 { LAMBDA * n_i[k] } else { 1.0 };
+            a[(k, k)] += prior;
+            b[k] += prior;
         }
         if let Some(chol) = Cholesky::new(a) {
             let g = chol.solve(&b);
@@ -202,5 +206,30 @@ mod tests {
         for g in &gains {
             assert!((g[0] - g[1]).abs() < 1e-4 && g[1] - g[2] < 1e-4);
         }
+    }
+
+    #[test]
+    fn isolated_frames_do_not_disable_overlap_compensation() {
+        let pair = || {
+            vec![
+                Some(flat_warp((0, 0, 100, 100), 0.2)),
+                Some(flat_warp((50, 0, 100, 100), 0.4)),
+            ]
+        };
+        let expected = solve_gains(&pair());
+        let mut warps = pair();
+        warps.push(None);
+        warps.push(Some(flat_warp((500, 0, 100, 100), 0.3)));
+        let actual = solve_gains(&warps);
+        for i in 0..2 {
+            for channel in 0..3 {
+                assert!(
+                    (actual[i][channel] - expected[i][channel]).abs() < 1e-6,
+                    "isolated frame changed gain for overlapping frame {i}: {actual:?} vs {expected:?}"
+                );
+            }
+        }
+        assert_eq!(actual[2], [1.0; 3]);
+        assert_eq!(actual[3], [1.0; 3]);
     }
 }
