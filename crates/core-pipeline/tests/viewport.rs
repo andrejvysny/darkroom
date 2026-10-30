@@ -5,21 +5,13 @@
 //! matching sub-region of the SAME develop rendered over the whole (crop-local) frame — both go
 //! through identical develop math, so they differ only by the view rect they select.
 
+mod common;
+
 use core_pipeline::{
-    ComponentKind, Crop, DevelopParams, DevelopPipeline, GpuContext, LocalAdjust, Mask,
-    MaskComponent, MaskOp, ViewParams,
+    ComponentKind, Crop, DevelopParams, DevelopPipeline, LocalAdjust, Mask, MaskComponent, MaskOp,
+    ViewParams,
 };
 use core_raw::LinearImage;
-
-fn gpu() -> Option<GpuContext> {
-    match GpuContext::new() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            None
-        }
-    }
-}
 
 /// Smooth gradient with all channels varying so the develop output is non-flat and comparable.
 fn ramp(w: u32, h: u32) -> LinearImage {
@@ -70,7 +62,7 @@ fn max_diff(a: &[u8], b: &[u8]) -> i32 {
 // 1. Identity: an active full-window view at source size is byte-identical to the legacy `render()`.
 #[test]
 fn identity_view_matches_legacy_render() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(64, 48);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -91,11 +83,42 @@ fn identity_view_matches_legacy_render() {
     );
 }
 
+#[test]
+fn minified_odd_edges_preserve_source_area_mean() {
+    let Some(ctx) = common::gpu() else { return };
+    let pipe = DevelopPipeline::new(&ctx);
+    for (w, h) in [(3, 1), (1, 3), (5, 3)] {
+        let mut img = LinearImage {
+            width: w,
+            height: h,
+            data: vec![0.0; (w * h * 3) as usize],
+        };
+        let last = img.data.len() - 3;
+        img.data[last..].fill(1.0);
+        let prepared = pipe.prepare(&ctx, &img).unwrap();
+        let minified = pipe
+            .render_view(&ctx, &prepared, &DevelopParams::default(), &view_full(1, 1))
+            .unwrap();
+        let mean = LinearImage {
+            width: 1,
+            height: 1,
+            data: vec![1.0 / (w * h) as f32; 3],
+        };
+        let expected = pipe
+            .render_once(&ctx, &mean, &DevelopParams::default())
+            .unwrap();
+        assert!(
+            max_diff(&minified, &expected) <= 1,
+            "{w}x{h} minified {minified:?}, expected {expected:?}"
+        );
+    }
+}
+
 // 2. Zoom (no crop): the center-half view at 320×240 (1:1 with the source there) must match the
 //    center 320×240 region of the full 640×480 render within rounding.
 #[test]
 fn zoom_window_matches_full_region() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(640, 480);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -124,7 +147,7 @@ fn zoom_window_matches_full_region() {
 // 3. Fit/letterbox: a square crop shown in a 300×200 (1.5:1) frame letterboxes to ~50px side bars.
 #[test]
 fn fit_letterbox_side_bars() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(400, 300); // src aspect 4:3
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -163,7 +186,7 @@ fn fit_letterbox_side_bars() {
 //    crop-local render (same crop+rotation params), proving view composition is correct.
 #[test]
 fn crop_straighten_zoom_window_consistent() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(640, 480);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -208,7 +231,7 @@ fn crop_straighten_zoom_window_consistent() {
 //     ~constant across a row. Locks the shader `rot90_uv` direction against params.rs.
 #[test]
 fn rot90_rotates_content_cw() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(64, 64); // square ⇒ no letterbox, a clean permutation
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -243,7 +266,7 @@ fn rot90_rotates_content_cw() {
 //    disabled mask's), and leave uncovered pixels untouched. Odd output dims exercise row padding.
 #[test]
 fn overlay_tints_packed_selected_layer() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(256, 256);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -329,7 +352,7 @@ fn overlay_tints_packed_selected_layer() {
 //    buffer sized to the CLAMPED dims (callers must clamp identically before framing headers).
 #[test]
 fn oversized_view_clamps_to_device_max() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(64, 48);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -352,7 +375,7 @@ fn oversized_view_clamps_to_device_max() {
 /// the preview. A large source into a small target forces minification.
 #[test]
 fn spatial_effects_apply_when_minified() {
-    let Some(ctx) = gpu() else { return };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = ramp(512, 512); // 512 → 64 target ⇒ ~8× minification ⇒ mip > 0
     let prep = pipe.prepare(&ctx, &img).unwrap();

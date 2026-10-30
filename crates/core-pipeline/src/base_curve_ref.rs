@@ -151,8 +151,7 @@ mod tests {
         assert!((mg - 0.3874).abs() < 0.002, "f(0.18)={mg}");
         // Monotone increasing.
         let mut prev = -1.0;
-        for k in 0..=1024 {
-            let v = ADOBE_DEFAULT_TONE_CURVE[k];
+        for (k, &v) in ADOBE_DEFAULT_TONE_CURVE.iter().enumerate() {
             assert!(v >= prev, "non-monotone at {k}");
             prev = v;
         }

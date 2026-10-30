@@ -32,7 +32,9 @@ pub fn frontend_log(
 // v5 changes the decode itself (core-raw): clipped-highlight reconstruction (no more magenta blown
 // skies), dual-illuminant camera-matrix interpolation, rawler 0.8.0 demosaic. Canonical thumbnails
 // and previews re-render; stored edit params are untouched.
-pub const PROCESS_VERSION: i64 = 5;
+// v6 fixes sequential local-mask composition and bounded tone-curve extrema. Saved parameters
+// remain intact; both canonical and edited caches now include this renderer version.
+pub const PROCESS_VERSION: i64 = 6;
 
 /// Default cap on the Unsupported list — enough to see every camera the library trips over without
 /// shipping a 50k-row table to the frontend.
@@ -504,9 +506,6 @@ pub struct DevelopRender {
     pub edit_version: Option<i64>,
 }
 
-/// Decode an image to its full-resolution linear working buffer plus the develop params to apply —
-/// the image's stored edit, or `DevelopParams::default()` when unedited (the SAME default the Develop
-/// canvas uses, so every surface matches by construction). This is the expensive half (full
 /// Whether `image_id`'s source is a display-referred image (JPEG/PNG) → the develop pipeline must
 /// bypass the scene-referred base tone operator. Memoized per image so the hot `develop_render` path
 /// (one call per slider move) reads the DB only when the open image changes.
@@ -531,7 +530,8 @@ pub(crate) fn image_display_referred(st: &AppState, image_id: i64) -> Result<boo
     Ok(v)
 }
 
-/// `develop_linear` demosaic, already `.oriented()`); callers render it to one or more sizes.
+/// Decode the full-resolution, oriented source using the stored edits. Canonical thumbnails and
+/// previews use the same denoise source selection as export before deriving their smaller tiers.
 pub(crate) fn decode_develop(
     st: &AppState,
     image_id: i64,
@@ -558,34 +558,146 @@ pub(crate) fn decode_develop(
     // image renders as itself. Intrinsic to the file, so derive it here (never trust persisted edits).
     params.display_referred = core_raw::is_display(Path::new(&path));
     let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-    let lin = core_raw::develop_linear(&src).map_err(|e| e.to_string())?;
+    let lin = decode_develop_source(st, &src, &params)?;
     Ok((hash, params, edit_version, lin))
 }
 
-/// Render an already-decoded linear buffer through the pipeline and **apply the crop**, returning the
-/// crop-applied RGBA8 + its dims. `render_once` letterbox-fits the crop centered into the full frame
-/// (legacy `geom_resolve`); a plain pixel-copy of that centered rect (`export_rect` + `crop_rgba8`,
-/// same as export) yields the FILLED cropped frame — matching the loupe/develop viewport geometry, so
-/// the cached preview lines up with `develop_render` on zoom. Uses a transient `PreparedImage`; never
-/// touches `full_render_cache`. (No mask overlay — `render_once` is always `ViewParams::full`.)
+fn decode_develop_source(
+    st: &AppState,
+    src: &core_raw::RawSource,
+    params: &DevelopParams,
+) -> Result<core_raw::LinearImage, String> {
+    if params.denoise.is_off() {
+        core_raw::develop_linear(src).map_err(|e| e.to_string())
+    } else {
+        crate::denoise::denoised_full(st, src, params.denoise.amount)
+    }
+}
+
+/// A failed SAM rebuild must not produce a successful export/cached preview with missing edits.
+/// Validate only layers the GPU consumes; disabled masks and layers beyond MASK_CAP have no effect.
+fn validate_ai_coverages(
+    params: &DevelopParams,
+    coverages: &[core_pipeline::AiCoverage],
+) -> Result<(), String> {
+    for mask in params
+        .masks
+        .iter()
+        .filter(|m| m.enabled)
+        .take(core_pipeline::MASK_CAP)
+    {
+        if let Some(key) = core_pipeline::mask::mask_ai_hash(mask) {
+            let valid = coverages.iter().any(|c| {
+                c.hash == key
+                    && c.width > 0
+                    && c.height > 0
+                    && c.width <= core_pipeline::AI_TEX_EDGE
+                    && c.height <= core_pipeline::AI_TEX_EDGE
+                    && (c.width as usize).checked_mul(c.height as usize) == Some(c.alpha.len())
+            });
+            if !valid {
+                return Err(format!(
+                    "AI mask '{}' could not be restored; open Develop and rebuild the mask before rendering",
+                    mask.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn required_ai_coverages(
+    st: &AppState,
+    image_id: i64,
+    params: &DevelopParams,
+) -> Result<Vec<core_pipeline::AiCoverage>, String> {
+    let coverages = crate::segment::coverages_for(st, image_id, params);
+    validate_ai_coverages(params, &coverages)?;
+    Ok(coverages)
+}
+
+#[cfg(test)]
+mod render_coverage_tests {
+    use super::validate_ai_coverages;
+    use core_pipeline::{AiCoverage, ComponentKind, DevelopParams, Mask, MaskComponent};
+
+    fn masked_params() -> DevelopParams {
+        DevelopParams {
+            masks: vec![Mask {
+                name: "subject".into(),
+                components: vec![MaskComponent {
+                    kind: ComponentKind::Ai {
+                        model: "test".into(),
+                        points: vec![],
+                        hash: "subject".into(),
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn saved_active_ai_masks_cannot_silently_disappear_from_output() {
+        let mut params = masked_params();
+        assert!(validate_ai_coverages(&params, &[]).is_err());
+        let mut coverage = AiCoverage {
+            hash: "subject".into(),
+            width: 2,
+            height: 2,
+            alpha: vec![0; 4],
+        };
+        assert!(
+            validate_ai_coverages(&params, std::slice::from_ref(&coverage)).is_ok(),
+            "legitimate all-zero coverage is still a restored mask"
+        );
+        coverage.alpha.pop();
+        assert!(validate_ai_coverages(&params, &[coverage]).is_err());
+        params.masks[0].enabled = false;
+        assert!(validate_ai_coverages(&params, &[]).is_ok());
+    }
+}
+
+/// Render the whole crop directly at its native dimensions, including quarter-turn axis swaps.
+/// A source-sized letterbox followed by a pixel cut would upscale small crops and lose resolution
+/// on 90-degree rotation. This uses the same crop-local geometry as Develop, with a transient
+/// prepared source and the request's AI coverage; it never touches the interactive render cache.
 pub(crate) fn render_linear_cropped(
     gpu: &crate::state::GpuRender,
     lin: &core_raw::LinearImage,
     params: &DevelopParams,
+    ai_coverages: &[core_pipeline::AiCoverage],
 ) -> Result<(Vec<u8>, u32, u32), String> {
-    let rgba = gpu
-        .pipeline
-        .render_once(&gpu.ctx, lin, params)
-        .map_err(|e| e.to_string())?;
-    let (cx, cy, cw, ch) = params.crop.export_rect(lin.width, lin.height);
-    if (cw, ch) == (lin.width, lin.height) {
-        Ok((rgba, lin.width, lin.height))
+    validate_ai_coverages(params, ai_coverages)?;
+    gpu.pipeline
+        .render_cropped_with_ai_coverages(&gpu.ctx, lin, params, ai_coverages)
+        .map_err(|e| e.to_string())
+}
+
+/// Preserve the requested crop's detail when budgeting the source upload, then cap the rendered
+/// output edge. Resizing only the uncropped source to the requested edge makes tight crops blurry.
+pub(crate) fn render_linear_preview(
+    gpu: &crate::state::GpuRender,
+    lin: core_raw::LinearImage,
+    params: &DevelopParams,
+    ai_coverages: &[core_pipeline::AiCoverage],
+    max_edge: u32,
+) -> Result<(Vec<u8>, u32, u32), String> {
+    let max_edge = max_edge.max(1);
+    let source_edge =
+        params
+            .crop
+            .preview_source_edge(lin.width, lin.height, max_edge, gpu.ctx.max_texture_dim);
+    let lin = lin.downscale_into_hq(source_edge);
+    let (rgba, w, h) = render_linear_cropped(gpu, &lin, params, ai_coverages)?;
+    // Integer source dimensions and crop rounding can overshoot by a pixel; never upscale when
+    // the native crop or the device cap limits how many pixels are available.
+    if w.max(h) > max_edge {
+        Ok(core_pipeline::resize_rgba8(&rgba, w, h, max_edge))
     } else {
-        Ok((
-            core_pipeline::crop_rgba8(&rgba, lin.width, cx, cy, cw, ch),
-            cw,
-            ch,
-        ))
+        Ok((rgba, w, h))
     }
 }
 
@@ -600,8 +712,8 @@ pub fn render_develop_jpeg(
     quality: u8,
 ) -> Result<DevelopRender, String> {
     let (hash, params, edit_version, lin) = decode_develop(st, image_id)?;
-    let lin = lin.downscale_into_hq(max_edge);
-    let (rgba, w, h) = render_linear_cropped(gpu, &lin, &params)?;
+    let coverages = required_ai_coverages(st, image_id, &params)?;
+    let (rgba, w, h) = render_linear_preview(gpu, lin, &params, &coverages, max_edge)?;
     let jpeg = core_pipeline::rgba8_to_jpeg(&rgba, w, h, quality).map_err(|e| e.to_string())?;
     Ok(DevelopRender {
         hash,
@@ -619,8 +731,8 @@ struct EditChanged {
 }
 
 /// Regenerate the edited thumbnail for an image and notify the frontend so the grid/filmstrip swap
-/// to the new versioned `thumb://` URL. Called on edit-settle (after persist). Returns the new edit
-/// version, or null when the image has no edit (its edited variants are then cleared).
+/// to the new versioned `thumb://` URL. Called on edit-settle (after persist). Returns the current
+/// edit version, or null when the image has no edit; a superseded render never publishes old state.
 #[tauri::command]
 pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option<i64>, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -639,15 +751,32 @@ pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option
         let edited_at = match render.edit_version {
             Some(version) => {
                 st.thumbs
-                    .write_edited(&render.hash, version, &render.jpeg)
+                    .write_edited(&render.hash, PROCESS_VERSION, version, &render.jpeg)
                     .map_err(|e| e.to_string())?;
                 Some(version)
             }
             None => {
-                let _ = st.thumbs.clear_edited(&render.hash);
+                // A late default render must not remove a newer edited variant written while it
+                // was rendering. Cache keys coexist; the catalog selects the current revision.
+                st.thumbs
+                    .write_canonical(&render.hash, PROCESS_VERSION, &render.jpeg)
+                    .map_err(|e| e.to_string())?;
                 None
             }
         };
+        // Edited revisions coexist for out-of-order render safety; keep their storage bounded
+        // even while the background worker is paused for this Develop session.
+        crate::thumb_queue::enforce_thumb_cap_after_write(st.inner());
+        // The render ran without the DB lock and may have been overtaken by a new save/render.
+        // Serialize this final revision check + event enqueue with saves so completion order
+        // cannot roll the frontend's editedAt backwards. The expensive render/write is finished.
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let current_version = core_library::get_edit_with_version(&db.conn, image_id)
+            .map_err(|e| e.to_string())?
+            .map(|(_, version)| version);
+        if current_version != edited_at {
+            return Ok(current_version);
+        }
         let _ = app.emit(
             "develop:edit-changed",
             EditChanged {
@@ -1055,16 +1184,12 @@ pub async fn develop_render(
                 .map(|(_, p)| p.clone())
                 .ok_or_else(|| "full-res image evicted before render".to_string())?
         };
-        // Resolve any AI (SAM) mask coverages referenced by `params` and stash them on the prepared
-        // image so the GPU mask pre-pass can sample kind==5. Empty on the Intel build and when the
-        // params carry no AI masks (no decode cost in that case).
-        let ai_covs = crate::segment::coverages_for(st.inner(), image_id, &params);
-        if let Ok(mut slot) = prepared.ai_coverages.lock() {
-            *slot = ai_covs;
-        }
+        // Resolve AI (SAM) coverage for this request so another viewport/histogram cannot replace
+        // it before the GPU mask pre-pass. Missing saved coverage is an error, never an empty mask.
+        let ai_covs = required_ai_coverages(st.inner(), image_id, &params)?;
         let rgba = gpu
             .pipeline
-            .render_view(&gpu.ctx, &prepared, &params, &view)
+            .render_view_with_ai_coverages(&gpu.ctx, &prepared, &params, &view, &ai_covs)
             .map_err(|e| e.to_string())?;
         if prof {
             tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "gpu render profile");
@@ -1158,10 +1283,12 @@ pub async fn develop_histogram(
                 }
             }
         };
+        // Resolve coverage for THIS histogram's params, not whichever viewport rendered last.
+        let ai_covs = required_ai_coverages(st.inner(), image_id, &params)?;
         // Cache locks dropped — the render serializes only on the per-image render_lock.
         let rgba = gpu
             .pipeline
-            .render_view(&gpu.ctx, &prepared, &params, &view)
+            .render_view_with_ai_coverages(&gpu.ctx, &prepared, &params, &view, &ai_covs)
             .map_err(|e| e.to_string())?;
 
         if st.hist_seq.load(Ordering::SeqCst) != seq {
@@ -1185,20 +1312,82 @@ pub async fn develop_histogram(
 /// A half-written export is indistinguishable from a finished one — to the user browsing the
 /// folder, and to any tool that opens it (a truncated JPEG still decodes to a partial image). The
 /// rename is atomic within a filesystem, so the destination either does not exist or is complete.
-/// Matches `core_raw::hdr_file` / `core_library::sidecar`.
+/// A unique temporary file isolates concurrent exports; flushing and syncing must succeed before
+/// replacement. An explicit export may replace a previous export, but never a catalog source.
 fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
-    let part = dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.part"),
-        None => "part".to_string(),
-    });
-    std::fs::write(&part, bytes).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        e.to_string()
-    })?;
-    std::fs::rename(&part, dest).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        e.to_string()
+    write_atomic_with_policy(dest, bytes, true)
+}
+
+/// Batch photo export has no per-file overwrite confirmation; collisions must preserve both the
+/// existing photograph and any concurrent writer's output. Preset save uses explicit replacement.
+fn write_new_export(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_with_policy(dest, bytes, false)
+}
+
+fn write_atomic_with_policy(dest: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
+    use std::io::Write;
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut part = tempfile::Builder::new()
+        .prefix(".darkroom-export-")
+        .suffix(".part")
+        .tempfile_in(parent)
+        .map_err(|e| e.to_string())?;
+    part.write_all(bytes).map_err(|e| e.to_string())?;
+    part.as_file().sync_all().map_err(|e| e.to_string())?;
+    (if replace {
+        part.persist(dest)
+    } else {
+        part.persist_noclobber(dest)
     })
+    .map(|_| ())
+    .map_err(|e| e.error.to_string())
+}
+
+/// Protect every catalog source, including another image or a symlink alias, before publishing an
+/// export. The DB lock covers only path lookup; filesystem resolution happens after it is released.
+fn ensure_export_destination(st: &AppState, dest: &Path) -> Result<(), String> {
+    let sources: Vec<String> = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = db
+            .conn
+            .prepare("SELECT path FROM images")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+    };
+    ensure_not_source(dest, &sources)
+}
+
+fn ensure_not_source(dest: &Path, sources: &[String]) -> Result<(), String> {
+    // A missing original still owns its catalog path. Resolve its parent so aliases and `..`
+    // cannot publish unrelated pixels under a missing row's old content identity.
+    let resolve = |path: &Path| {
+        path.canonicalize().ok().or_else(|| {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            Some(parent.canonicalize().ok()?.join(path.file_name()?))
+        })
+    };
+    let resolved = resolve(dest);
+    if sources.iter().any(|source| {
+        let source = Path::new(source);
+        source == dest
+            || resolved
+                .as_ref()
+                .is_some_and(|dest| resolve(source).as_ref() == Some(dest))
+    }) {
+        return Err(
+            "export destination is a catalog source image; choose a different filename".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Export a single image at full resolution through the develop pipeline to `dest`.
@@ -1216,6 +1405,7 @@ pub async fn export_image(
     let quality = quality.unwrap_or(92).clamp(1, 100);
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
+        ensure_export_destination(st.inner(), Path::new(&dest))?;
         let gpu = st
             .gpu
             .as_ref()
@@ -1233,11 +1423,7 @@ pub async fn export_image(
         let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
         // When denoise is enabled for this image, export from the full-res denoised source (raw-domain
         // denoise + amount blend) instead of the plain develop.
-        let lin = if params.denoise.is_off() {
-            core_raw::develop_linear(&src).map_err(|e| e.to_string())?
-        } else {
-            crate::denoise::denoised_full(st.inner(), &src, params.denoise.amount)?
-        };
+        let lin = decode_develop_source(st.inner(), &src, &params)?;
         // Full-res export needs a source-sized GPU texture — fail with a clear message instead of
         // an opaque pipeline error. (Tiled/downscaled export for oversized sources is a follow-up.)
         let max_edge = gpu.ctx.max_texture_dim;
@@ -1247,19 +1433,8 @@ pub async fn export_image(
                 lin.width, lin.height
             ));
         }
-        let rgba = gpu
-            .pipeline
-            .render_once(&gpu.ctx, &lin, &params)
-            .map_err(|e| e.to_string())?;
-
-        // Crop to true dimensions: the render letterbox-fits the crop centered into the full frame,
-        // so a plain pixel copy of that rect is the exact cropped export (no extra resample).
-        let (cx, cy, cw, ch) = params.crop.export_rect(lin.width, lin.height);
-        let rgba = if (cw, ch) == (lin.width, lin.height) {
-            rgba
-        } else {
-            core_pipeline::crop_rgba8(&rgba, lin.width, cx, cy, cw, ch)
-        };
+        let ai_covs = required_ai_coverages(st.inner(), image_id, &params)?;
+        let (rgba, cw, ch) = render_linear_cropped(gpu, &lin, &params, &ai_covs)?;
 
         // Border / frame composite (solid color + optional pad-to-aspect). A CPU post-step outside
         // the GPU pipeline; no-op unless the border is active.
@@ -1283,7 +1458,8 @@ pub async fn export_image(
         }
         .map_err(|e| e.to_string())?;
 
-        write_atomic(Path::new(&dest), &bytes)?;
+        ensure_export_destination(st.inner(), Path::new(&dest))?;
+        write_new_export(Path::new(&dest), &bytes)?;
         // Export is the strongest edit-quality endorsement — log it (best-effort, separate lock).
         crate::events::log_event(
             st.inner(),
@@ -3171,7 +3347,7 @@ pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<His
             (hash, version)
         };
         let jpeg = edit_version
-            .and_then(|v| st.thumbs.read_edited(&hash, v).ok())
+            .and_then(|v| st.thumbs.read_edited(&hash, PROCESS_VERSION, v).ok())
             .or_else(|| st.thumbs.read_canonical(&hash, PROCESS_VERSION).ok())
             .or_else(|| st.thumbs.read(&hash, core_library::THUMB_SIZE).ok());
         let Some(jpeg) = jpeg else {
@@ -4188,12 +4364,13 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                 relative_ev: (evs[i] - evs[ref_idx]) as f32,
             })
             .collect();
-        core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx).map_err(|e| {
-            // The writer stages through `.part` + rename; a failure can still leave the part file.
-            let _ = std::fs::remove_file(dest.with_extension("exr.part"));
-            e.to_string()
-        })?;
+        core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx)
+            .map_err(|e| e.to_string())?;
         drop(merged);
+        if st.hdr_cancel.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&dest);
+            return Err("cancelled".into());
+        }
         done += 1;
         progress(done, "writing");
 
@@ -4209,7 +4386,7 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
         // Any catalog failure after a successful write would leave the EXR orphaned on disk —
         // remove it on every error path out of this block (the collision branch's own remove
         // stays; a second remove is a no-op).
-        let row = (|| -> Result<ImageRow, String> {
+        let id = (|| -> Result<i64, String> {
             let db = st.db.lock().map_err(|e| e.to_string())?;
             let conn = &db.conn;
             let folder_id = match &library_root {
@@ -4219,35 +4396,31 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                 None if frames[ref_idx].folder_id >= 0 => frames[ref_idx].folder_id,
                 None => core_library::add_root(conn, &ref_parent).map_err(|e| e.to_string())?,
             };
-            let id = core_library::insert_image(
+            let id = core_library::insert_hdr_image(
                 conn,
                 folder_id,
                 core_library::index::now_epoch(),
                 &processed,
+                &sources,
             )
             .map_err(|e| e.to_string())?
             .ok_or_else(|| {
                 // Byte-identical EXR already catalogued (same bracket merged before).
                 "an identical merge of these frames is already in the library".to_string()
             })?;
-            // Link the bracket frames for the "Source frames" panel — mirrors the `sources` vec
-            // already embedded in the EXR's `darkroom:sources` attribute, just queryable without a
-            // file decode. `OR IGNORE` mirrors panorama.rs's insert (idempotent on a retry).
-            for (pos, s) in sources.iter().enumerate() {
-                conn.execute(
-                    "INSERT OR IGNORE INTO hdr_sources (hdr_image_id, source_image_id, position, relative_ev)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    core_db::rusqlite::params![id, s.image_id, pos as i64, s.relative_ev],
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            core_library::image_by_id(conn, id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "merged image row vanished after insert".to_string())
+            Ok(id)
         })()
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&dest);
         })?;
+        // The image and its provenance are committed now. A response-query failure must not
+        // remove the successfully published file and leave a dangling catalog row.
+        let row = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::image_by_id(&db.conn, id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "merged image row vanished after insert".to_string())?
+        };
         done += 1;
         progress(done, "done");
         let _ = app.emit(
@@ -4279,6 +4452,9 @@ pub fn hdr_cancel(app: AppHandle) {
 pub async fn hdr_export_dng(app: AppHandle, image_id: i64, dest: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
+        // Keep the watcher from cataloguing an existing export between the source-path check and
+        // atomic replacement. A newly catalogued file would otherwise become a protected source.
+        let _watch_guard = crate::watch::ImportGuard::new(app.clone());
         let (path, format) = {
             let db = st.db.lock().map_err(|e| e.to_string())?;
             db.conn
@@ -4298,11 +4474,8 @@ pub async fn hdr_export_dng(app: AppHandle, image_id: i64, dest: String) -> Resu
         let lin = core_raw::hdr_file::read_hdr_linear(&bytes).map_err(|e| e.to_string())?;
         let meta = core_raw::hdr_file::read_hdr_meta(&bytes);
         let dest_path = Path::new(&dest);
-        core_raw::write_hdr_dng(dest_path, &lin, &meta).map_err(|e| {
-            // The writer stages through `.part` + rename; a failure can still leave the part file.
-            let _ = std::fs::remove_file(dest_path.with_extension("dng.part"));
-            e.to_string()
-        })
+        ensure_export_destination(st.inner(), dest_path)?;
+        core_raw::write_hdr_dng(dest_path, &lin, &meta).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -4433,7 +4606,7 @@ mod develop_edit_tests {
 
 #[cfg(test)]
 mod export_tests {
-    use super::write_atomic;
+    use super::{ensure_not_source, write_atomic, write_new_export};
     use std::path::PathBuf;
 
     fn tempdir(tag: &str) -> PathBuf {
@@ -4473,5 +4646,65 @@ mod export_tests {
         assert!(write_atomic(&dest, b"x").is_err());
         assert!(!dest.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_protects_catalog_sources_and_allows_other_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("original.png");
+        std::fs::write(&source, b"original").unwrap();
+        let sources = vec![source.to_string_lossy().into_owned()];
+        assert!(ensure_not_source(&source, &sources).is_err());
+        assert!(ensure_not_source(&dir.path().join("./original.png"), &sources).is_err());
+        assert!(ensure_not_source(&dir.path().join("export.png"), &sources).is_ok());
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_protects_symlink_aliases_of_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("original.png");
+        let alias = dir.path().join("alias.png");
+        std::fs::write(&source, b"original").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert!(ensure_not_source(&alias, &[source.to_string_lossy().into_owned()]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_protects_missing_sources_through_parent_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_dir = dir.path().join("originals");
+        let alias_dir = dir.path().join("alias");
+        std::fs::create_dir(&original_dir).unwrap();
+        std::os::unix::fs::symlink(&original_dir, &alias_dir).unwrap();
+        let source = original_dir.join("missing.dng");
+        let sources = [source.to_string_lossy().into_owned()];
+        assert!(ensure_not_source(&alias_dir.join("missing.dng"), &sources).is_err());
+        assert!(
+            ensure_not_source(&original_dir.join("../originals/missing.dng"), &sources).is_err()
+        );
+    }
+
+    #[test]
+    fn export_does_not_touch_an_unrelated_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("photo.jpg");
+        let other = dir.path().join("photo.jpg.part");
+        std::fs::write(&other, b"another operation").unwrap();
+        write_atomic(&dest, b"complete").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"complete");
+        assert_eq!(std::fs::read(&other).unwrap(), b"another operation");
+    }
+
+    #[test]
+    fn batch_export_never_replaces_an_existing_deliverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("photo.jpg");
+        std::fs::write(&dest, b"previous export").unwrap();
+        assert!(write_new_export(&dest, b"new pixels").is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous export");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

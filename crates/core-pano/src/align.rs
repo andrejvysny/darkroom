@@ -49,6 +49,8 @@ pub fn estimate_alignment_rgb(
     mov_h: usize,
     model: AlignModel,
 ) -> Option<[[f64; 3]; 3]> {
+    crate::validate_rgb(ref_rgb, ref_w, ref_h).ok()?;
+    crate::validate_rgb(mov_rgb, mov_w, mov_h).ok()?;
     let pattern = fixed_test_pairs();
     let ref_f = features::extract_at(ref_rgb, ref_w, ref_h, ref_w, ref_h, &pattern);
     let mov_f = features::extract_at(mov_rgb, mov_w, mov_h, mov_w, mov_h, &pattern);

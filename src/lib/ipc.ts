@@ -700,6 +700,11 @@ const THUMB_BASE =
     ? "http://thumb.localhost"
     : "thumb://localhost";
 
+// A WebView can retain immutable custom-protocol responses across app upgrades. Disk render keys
+// include the backend process version; a new session must also bypass old HTTP responses (including
+// camera placeholders that were served while the generated render was still pending).
+const THUMB_SESSION = Date.now().toString(36);
+
 export function thumbUrl(
   hash: string,
   size = 512,
@@ -711,7 +716,7 @@ export function thumbUrl(
    *  first-paint) instead of the small thumb tier (grid / filmstrip). */
   previewEdge?: number | null,
 ): string {
-  const base = `${THUMB_BASE}/${hash}?size=${size}`;
+  const base = `${THUMB_BASE}/${hash}?size=${size}&session=${THUMB_SESSION}`;
   // `edit=<version>` makes the protocol serve the edited render and changes the URL on each edit.
   // `pv=1&edge=<n>` requests the larger preview tier. `&t=<token>` busts the cache when a fresh
   // render lands for an UNEDITED image (placeholder → canonical swap), where `editedAt` doesn't change.

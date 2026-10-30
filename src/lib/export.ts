@@ -108,6 +108,7 @@ export async function runExportBatch(
   const used = new Set<string>();
   let done = 0;
   let failed = 0;
+  let firstError = "";
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
     try {
@@ -119,15 +120,16 @@ export async function runExportBatch(
       const dest = `${opts.dir}/${unique}.${ext}`;
       await exportImage(t.id, params, opts.format, dest, opts.quality);
       done += 1;
-    } catch {
+    } catch (error) {
       failed += 1;
+      if (!firstError) firstError = String(error);
     }
     setToast(`Exporting ${done + failed} / ${targets.length}…`);
   }
   const where = opts.dir.split("/").pop();
   setToast(
     failed > 0
-      ? `Exported ${done}, ${failed} failed → ${where}`
+      ? `Exported ${done}, ${failed} failed → ${where}: ${firstError}`
       : `Exported ${done} → ${where}`,
   );
 }

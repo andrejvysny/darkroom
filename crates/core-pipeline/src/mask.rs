@@ -476,11 +476,15 @@ pub fn mask_has_brush(mask: &Mask) -> bool {
 
 /// The first AI component's baked-coverage `hash` for this mask (empty string filtered out), if any.
 /// Used by the bake loop to locate the mask's [`crate::params::AiCoverage`] on the prepared image.
+/// Components beyond the pre-pass cap are not rendered and must not require coverage restoration.
 pub fn mask_ai_hash(mask: &Mask) -> Option<&str> {
-    mask.components.iter().find_map(|c| match &c.kind {
-        ComponentKind::Ai { hash, .. } if !hash.is_empty() => Some(hash.as_str()),
-        _ => None,
-    })
+    mask.components
+        .iter()
+        .take(MAX_PREPASS_COMPONENTS)
+        .find_map(|c| match &c.kind {
+            ComponentKind::Ai { hash, .. } if !hash.is_empty() => Some(hash.as_str()),
+            _ => None,
+        })
 }
 
 /// Collect all brush strokes across a mask's brush components (in order).
@@ -525,4 +529,39 @@ pub fn mask_geometry_hash(mask: &Mask) -> u64 {
         s.is_erase.hash(&mut h);
     }
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::MaskComponent;
+
+    fn ai_component(hash: &str) -> MaskComponent {
+        MaskComponent {
+            kind: ComponentKind::Ai {
+                model: "test".into(),
+                points: Vec::new(),
+                hash: hash.into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ai_coverage_requirement_matches_consumed_component_limit() {
+        let mut mask = Mask {
+            components: vec![MaskComponent::default(); MAX_PREPASS_COMPONENTS],
+            ..Default::default()
+        };
+        mask.components.push(ai_component("ignored"));
+        assert_eq!(mask_ai_hash(&mask), None, "ninth component is not rendered");
+
+        mask.components[MAX_PREPASS_COMPONENTS - 1] = ai_component("last");
+        assert_eq!(mask_ai_hash(&mask), Some("last"));
+
+        mask.components[0] = ai_component("");
+        assert_eq!(mask_ai_hash(&mask), Some("last"), "empty keys remain inert");
+        mask.components[MAX_PREPASS_COMPONENTS - 1] = ai_component("");
+        assert_eq!(mask_ai_hash(&mask), None);
+    }
 }

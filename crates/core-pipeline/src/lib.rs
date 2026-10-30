@@ -12,6 +12,7 @@ pub mod error;
 pub mod histogram;
 pub mod mask;
 pub mod params;
+mod validation;
 
 pub use backend::AI_TEX_EDGE;
 pub use backend::{DevelopPipeline, GpuAdapterInfo, GpuContext};

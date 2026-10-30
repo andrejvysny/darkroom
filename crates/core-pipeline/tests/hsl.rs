@@ -1,7 +1,9 @@
 //! Golden checks for the per-hue HSL mixer: a red-band adjustment affects a red patch, and a
 //! distant (blue) band does not. Skips without a GPU adapter.
 
-use core_pipeline::{DevelopParams, DevelopPipeline, GpuContext, HslBand};
+mod common;
+
+use core_pipeline::{DevelopParams, DevelopPipeline, HslBand};
 use core_raw::LinearImage;
 
 const RED_BAND: usize = 0; // center 0°
@@ -40,13 +42,7 @@ fn with_band(idx: usize, band: HslBand) -> DevelopParams {
 
 #[test]
 fn hsl_mixer_is_hue_selective() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     let red = solid(16, 16, [0.45, 0.12, 0.12]);

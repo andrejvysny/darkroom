@@ -20,6 +20,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Merged-HDR storage (fp16 linear-ProPhoto OpenEXR). Same version image 0.25 already pulls in
 # transitively, so this adds no new build cost.
 exr = "1.74"
+tempfile = "3"
 
 # HEIF (.hif) decode. Pinned exact (C-API surface); `v1_17` matches the oldest system libheif we
 # support (Ubuntu noble's 1.17); Homebrew's newer libheif is backward-compatible with that subset.

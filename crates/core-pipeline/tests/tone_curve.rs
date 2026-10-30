@@ -1,7 +1,9 @@
 //! Golden checks that the tone-curve LUT stage is wired into the GPU pipeline correctly:
 //! an identity curve is a no-op, and a brightening curve lifts mid-gray. Skips without a GPU.
 
-use core_pipeline::{CurvePoint, DevelopParams, DevelopPipeline, GpuContext, ToneCurve};
+mod common;
+
+use core_pipeline::{CurvePoint, DevelopParams, DevelopPipeline, ToneCurve};
 use core_raw::LinearImage;
 
 fn solid(w: u32, h: u32, rgb: [f32; 3]) -> LinearImage {
@@ -31,13 +33,7 @@ fn pt(x: f32, y: f32) -> CurvePoint {
 
 #[test]
 fn tone_curve_applies_in_pipeline() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     // ~0.18 linear ≈ mid-gray after sRGB OETF — lands near the middle of the curve.

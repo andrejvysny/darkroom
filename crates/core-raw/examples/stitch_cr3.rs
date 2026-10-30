@@ -6,6 +6,7 @@
 //!
 //! The full app path (`src-tauri/src/panorama.rs`) does exactly this plus catalog registration;
 //! this example is the fast feedback loop for stitch quality on real captures.
+//! Existing outputs are never overwritten; omit `out.dng` for a per-process temporary filename.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,10 +17,10 @@ fn main() -> anyhow::Result<()> {
         args.next()
             .expect("usage: stitch_cr3 <dir-of-raws> [out.dng]"),
     );
-    let out = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("pano_out.dng"));
+    let out = args.next().map(PathBuf::from).unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("pano_out-{}.dng", std::process::id()))
+    });
+    anyhow::ensure!(!out.exists(), "output already exists: {}", out.display());
 
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))

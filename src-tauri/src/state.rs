@@ -11,7 +11,7 @@ use core_raw::LinearImage;
 use std::collections::HashSet;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -108,13 +108,9 @@ pub struct AppState {
     pub last_histogram: Mutex<Option<Histogram>>,
     /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
-    /// Number of imports currently in flight. While > 0 the FS watcher defers its reconcile/index
-    /// pass so it can't race an import's unlocked copy/process phase (double-decode / duplicate
-    /// insert). A counter, not a bool, so overlapping imports compose. See `watch::ImportGuard`.
-    pub import_active: AtomicUsize,
-    /// Set by the watcher when it skipped a sync because an import was in flight; the import's
-    /// completion guard then runs exactly one deferred sync to catch any real external change.
-    pub watch_pending: AtomicBool,
+    /// Coordinates import/merge publication with watcher snapshots, including jobs that start and
+    /// finish while the watcher decodes. See `watch::ImportGuard`.
+    pub(crate) publication: crate::watch::PublicationFence,
     /// Directory holding downloaded ML model files (`<app-data>/models`).
     #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub models_dir: PathBuf,
@@ -277,8 +273,7 @@ impl AppState {
             hdr_cancel: AtomicBool::new(false),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
-            import_active: AtomicUsize::new(0),
-            watch_pending: AtomicBool::new(false),
+            publication: crate::watch::PublicationFence::default(),
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             models_dir,
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]

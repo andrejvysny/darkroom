@@ -14,7 +14,6 @@ pub fn get_edit(conn: &Connection, image_id: i64) -> Result<Option<String>, LibE
         .optional()?)
 }
 
-/// Saved develop params JSON + its `updated_at` version, if any. The version cache-busts previews.
 /// One-query pre-check for the thumbnail backfill: an image's content hash plus its edit version
 /// (`None` when unedited). The worker asks this for EVERY present image at startup, so two separate
 /// round-trips per id meant two catalog-lock acquisitions per id — 200k of them on a 100k library,
@@ -43,6 +42,8 @@ pub fn thumb_precheck(
         .optional()?)
 }
 
+/// Saved develop params JSON + its monotonic `updated_at` revision, if any. The revision cache-busts
+/// previews; it is not the renderer's process version. Render caches must include that separately.
 pub fn get_edit_with_version(
     conn: &Connection,
     image_id: i64,
@@ -56,7 +57,9 @@ pub fn get_edit_with_version(
         .optional()?)
 }
 
-/// Upsert develop params JSON for an image.
+/// Upsert develop params JSON for an image. `updated_at` is also the cache revision, so ensure it
+/// strictly increases even for saves in the same clock tick or after a wall-clock adjustment.
+/// Readers must use the stored revision rather than assuming it equals the supplied timestamp.
 pub fn set_edit(
     conn: &Connection,
     image_id: i64,
@@ -69,7 +72,7 @@ pub fn set_edit(
          ON CONFLICT(image_id) DO UPDATE SET
             process_version = excluded.process_version,
             params = excluded.params,
-            updated_at = excluded.updated_at",
+            updated_at = MAX(excluded.updated_at, edits.updated_at + 1)",
         params![image_id, process_version, params_json, updated_at],
     )?;
     Ok(())
