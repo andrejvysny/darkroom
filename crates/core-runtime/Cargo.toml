@@ -1,0 +1,15 @@
+[package]
+name = "core-runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-app = { path = "../core-app" }
+core-model = { path = "../core-model" }
+core-db = { path = "../core-db" }
+core-library = { path = "../core-library" }
+
+[dev-dependencies]
+serde_json = "1"
+image = "0.25"

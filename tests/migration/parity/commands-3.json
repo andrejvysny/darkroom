@@ -1,0 +1,284 @@
+{
+  "commands": [
+    {
+      "name": "import_commit",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Commit a staged import: copy/move/reference only the `selected` source files, then apply `options` to the freshly-added rows. Emits `import:progress` (live rows) + `import:done`.  `pairing` decides what happens to a JPEG/HEIF the camera wrote beside a RAW: `\"pair\"` links it to that RAW (one grid cell), anything else (the default) catalogs every file standalone.",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "hdr_merge",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Single-flight merge 2\u20139 unique bracket frames into HDR EXR; publish via synced unique temporary file without overwrite, remove output on cancellation or catalog failure, emit progress and completion.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "hdr_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request the running HDR merge to stop (honored between frames). No-op if idle.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "hdr_export_dng",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Export a merged-HDR image (`format='hdr'`) as an uncompressed FLOAT LinearRaw DNG for Lightroom/ACR interop \u2014 the full >1.0 scene-referred headroom Merge-to-HDR produced survives untouched (no bit-depth quantization). Export-only: the written DNG is never re-imported into the catalog (Darkroom itself always reads the source `.exr`).",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_sources",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Source frames behind `image_id` (an HDR bracket or a panorama stitch) for the metadata panel's \"Source frames\" section. `None` when `image_id` is an ordinary, un-merged image.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_pair",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "The RAW+JPEG/HEIF pair `image_id` belongs to, from either member, for the metadata panel. `None` when the image is not paired.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_pair_unlink",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Break a pair: `secondary_id` (the camera companion) returns to the grid as a standalone image. Files on disk are untouched \u2014 this only drops the catalog link.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "thumb_cache_cap",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Configured thumbnail-cache cap in bytes (default when unset).",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "thumb_cache_size",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Current on-disk size of the thumbnail cache in bytes.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_thumb_cache_cap",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Persist a new thumbnail-cache cap and immediately evict down to it. Returns bytes freed.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "preview_edge",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Configured display-sharp preview longest edge in px, or `0` when unset (frontend picks a default from the display on first launch).",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_preview_edge",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Persist the preview longest edge (clamped). Re-enqueues the whole library so images that were deferred (no preview because the edge was unset) \u2014 and any whose preview edge changed \u2014 render at the new size; already-current tiers are cheaply skipped by the worker's pre-check.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "analysis_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Total / analyzed / pending image counts + models-ready + running flags (for the Detected panel).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "analysis_models_ensure",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Download any missing model files (first run only). Emits `analysis:models` progress.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "analysis_run",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Run the background analysis pass. `force` re-analyzes everything. Emits `analysis:progress`/`:done`.  `scope` narrows the pass to the container the grid is showing. The frontend may post its whole filter \u2014 `ScanScope` deserializes only the container dimensions, so rating/flag/search and the scan-derived `detectedCategory`/`personId` are dropped by the type. Omitted \u21d2 whole library.  Legacy entry point: it runs every AI stage. The Run-AI-scan modal calls `scan_run` instead, which owns stage selection and sequences panorama detection in the same job.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "analysis_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request the running analysis pass to stop after the current batch commits. Results already persisted are kept; the pass then emits `analysis:done` with its partial stats. No-op if idle.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "scan_scope_counts",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "How much work the AI scans have inside `scope` \u2014 sizes the \"Analyze \u00b7 N\" / \"Find People \u00b7 N\" buttons. Read-only and model-free, so it is safe to call on every filter change.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "scan_run",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Run the unified AI scan: the selected stages, in one job, with one cancel.  This is what the \"Run AI scan\u2026\" modal calls. Unlike `analysis_run` it also sequences panorama detection, and its cancel works during the model download \u2014 the window in which `analysis_cancel` is still a no-op.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "scan_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request current scan stop across phases; keep already committed results; no-op when idle.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "scan_running",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Whether a unified scan is in flight. Lets the UI re-attach after a reload rather than showing an idle button while a scan is still running.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "scan_prefs_get",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "The scan modal's remembered stage ticks. Typed + validated in Rust rather than letting the frontend write `app_meta` directly \u2014 the IPC boundary is the contract, and an unrecognised stage id must never reach a run.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "scan_prefs_set",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Scan prefs set; inputs: app: AppHandle, stages: Vec<core_library::StageId>,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_scan_state",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "The per-photo scan record for the info panel: which stages ran, when, and which failed.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "denoise_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Denoise availability + running state (drives the Develop \"Denoise\" panel).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "denoise_apply",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Apply raw-domain denoise to `image_id` at `amount` (0..100), swapping the denoised source into the render cache. Re-blends cached buffers on an amount change (no re-inference). Emits `denoise:progress` / `denoise:done`; the frontend re-renders on `denoise:done`.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "denoise_clear",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Turn denoise off for `image_id`: drops cached buffers + evicts the denoised render caches so the next render re-decodes the clean image.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "denoise_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request the running denoise compute to stop. No-op if idle.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "panorama_preview",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Fast low-res panorama stitch of `image_ids` for the merge dialog \u2192 JPEG bytes. First call for an id list decodes + caches downscaled frames; projection/crop changes restitch from cache.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "panorama_merge",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Full-resolution merge \u2192 LinearRaw DNG next to the first source, registered in the catalog and linked to its sources. Resolves with the new image id when the whole job finishes; progress streams via `panorama:progress` / `panorama:done`, failures also emit `panorama:error` so the progress pill clears even if the caller dropped the promise.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "panorama_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request cancellation of the running merge (honored between sources/phases).",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "panorama_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Panorama status; inputs: app: AppHandle; returns: Result<crate::panorama::PanoStatus, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "panorama_preview_release",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Drop the merge dialog's cached preview frames (modal closed \u2014 they are only useful while the dialog is re-stitching the same source set on option toggles).",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "pano_detect_run",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Run (or resume) a whole-library panorama-detection scan. Resolves with the accumulated count of freshly-`suggested` groups when the scan finishes; progress streams via `pano_detect:progress` / `pano_detect:done`, failures also emit `pano_detect:error` so the UI clears even if the caller dropped the promise.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "pano_detect_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request cancellation of the running scan (honored between clusters).",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "pano_detect_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Pano detect status; inputs: app: AppHandle,; returns: Result<crate::pano_detect::PanoDetectStatus, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    }
+  ]
+}

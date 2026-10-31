@@ -72,10 +72,10 @@ fn faces_files() -> Vec<core_analyze::models::RemoteFile> {
 pub fn ensure_face_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let st = app.state::<AppState>();
     let _guard = st.faces_download_lock.lock().map_err(|e| e.to_string())?;
-    st.faces_dl_cancel.store(false, Ordering::SeqCst);
+    st.workers.reset_cancel(&st.faces_dl_cancel)?;
     let store = ModelStore::new(st.models_dir.clone());
     let files = faces_files();
-    let cancel = || st.faces_dl_cancel.load(Ordering::SeqCst);
+    let cancel = || st.workers.is_stopping() || st.faces_dl_cancel.load(Ordering::SeqCst);
     store
         .ensure_with(
             &files,

@@ -49,11 +49,12 @@ pub fn cancel(st: &AppState) {
 struct RunGuard<'a> {
     running: &'a AtomicBool,
     cancel: &'a AtomicBool,
+    workers: &'a core_runtime::workers::ManagedWorkers,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.cancel.store(false, Ordering::SeqCst);
+        let _ = self.workers.reset_cancel(self.cancel);
     }
 }
 
@@ -97,12 +98,13 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, force: bool) -> Result<usize, String>
     if st.pano_detect_running.swap(true, Ordering::SeqCst) {
         return Err("a panorama detection scan is already running".into());
     }
-    st.pano_detect_cancel.store(false, Ordering::SeqCst);
     let _guard = RunGuard {
         running: &st.pano_detect_running,
         cancel: &st.pano_detect_cancel,
+        workers: &st.workers,
     };
-    let cancelled = || st.pano_detect_cancel.load(Ordering::SeqCst);
+    st.workers.reset_cancel(&st.pano_detect_cancel)?;
+    let cancelled = || st.workers.is_stopping() || st.pano_detect_cancel.load(Ordering::SeqCst);
 
     // Brief lock: prune zombie suggestions (members gone missing, or a group whose member rows
     // fully cascaded away) before scanning — keeps the review queue honest even for a cluster this

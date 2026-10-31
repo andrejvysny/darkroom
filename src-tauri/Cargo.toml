@@ -24,6 +24,9 @@ tauri-build = { version = "2", features = [] }
 e2e-testing = ["dep:tauri-plugin-playwright", "tauri/dynamic-acl"]
 
 [dependencies]
+core-model = { path = "../crates/core-model" }
+core-app = { path = "../crates/core-app" }
+core-runtime = { path = "../crates/core-runtime" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 # Fatal-startup dialog (lib.rs `fatal_startup_error`): a SYNC native modal shown from the setup
@@ -51,6 +54,7 @@ core-preset = { path = "../crates/core-preset" }
 image = "0.25"
 rayon = "1"
 notify = "8"
+walkdir = "2"
 tempfile = "3"
 
 [target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]

@@ -122,7 +122,8 @@ pub fn on_exit_requested(app: &AppHandle, code: Option<i32>) -> bool {
     }
     let app = app.clone();
     // Off the main thread: the webview needs the run loop to deliver the ack back to us.
-    std::thread::spawn(move || {
+    let host = app.clone();
+    if let Err(error) = crate::jobs::worker(&host, "quit-flush", move || {
         let ok = match rx.recv_timeout(ACK_TIMEOUT) {
             Ok(ok) => ok,
             Err(_) => {
@@ -140,7 +141,11 @@ pub fn on_exit_requested(app: &AppHandle, code: Option<i32>) -> bool {
             tracing::warn!("quit cancelled: Develop edits could not be saved");
             app.state::<AppState>().quit.finish_failed();
         }
-    });
+        Ok(())
+    }) {
+        tracing::error!(%error, "quit coordinator failed to start");
+        host.state::<AppState>().quit.finish_failed();
+    }
     true
 }
 

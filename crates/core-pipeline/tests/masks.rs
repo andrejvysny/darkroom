@@ -8,6 +8,7 @@
 
 mod common;
 
+use core_pipeline::params::GpuParamsExt;
 use core_pipeline::params::MaskBufferUniform;
 use core_pipeline::{
     ComponentKind, DevelopParams, DevelopPipeline, LocalAdjust, Mask, MaskComponent, MaskOp,

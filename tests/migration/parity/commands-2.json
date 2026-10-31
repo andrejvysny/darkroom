@@ -1,0 +1,284 @@
+{
+  "commands": [
+    {
+      "name": "snapshot_create",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Create a named snapshot of `params` for an image; returns the new id.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "snapshot_restore",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Restore a snapshot's params (validated through the current schema). NOT persisted \u2014 the frontend commits the returned params so the restore becomes an undoable step.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "snapshot_rename",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Rename a snapshot.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "snapshot_delete",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Delete a snapshot.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "export_image",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Render full-resolution PNG or JPEG; refuse existing destination or source overwrite; default JPEG quality 92; originals remain unchanged.",
+      "target": "core-app",
+      "task": "DARKROOM-149",
+      "test": "src-tauri/src/commands.rs"
+    },
+    {
+      "name": "cull_set_rating",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Cull set rating; inputs: app: AppHandle, image_id: i64, stars: i64, latency_ms: Option<i64>, group_id: Option<String>, candidate_ids: Option<Vec<i64>>, suggestion: Option<SuggestionCtx>,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "e2e/tests/native/migration-baseline.spec.ts"
+    },
+    {
+      "name": "cull_set_flag",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Cull set flag; inputs: app: AppHandle, image_id: i64, flag: String, latency_ms: Option<i64>, group_id: Option<String>, candidate_ids: Option<Vec<i64>>, suggestion: Option<SuggestionCtx>,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "cull_set_label",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Cull set label; inputs: app: AppHandle, image_id: i64, label: Option<String>, latency_ms: Option<i64>, group_id: Option<String>, suggestion: Option<SuggestionCtx>,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "cull_set_rating_many",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Cull set rating many; inputs: app: AppHandle, image_ids: Vec<i64>, stars: i64, group_id: Option<String>,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "cull_set_flag_many",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Cull set flag many; inputs: app: AppHandle, image_ids: Vec<i64>, flag: String, group_id: Option<String>,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "cull_set_label_many",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Cull set label many; inputs: app: AppHandle, image_ids: Vec<i64>, label: Option<String>, group_id: Option<String>,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "cull_rejected_summary",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Count + on-disk size of the rejected photos matching `params` \u2014 what `cull_delete_rejected` would remove. Read-only; drives the confirmation dialog so the user sees the real number rather than the grid's (possibly paged) one.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "cull_delete_rejected",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Send every rejected photo matching `params` (plus the camera companions of a rejected RAW) to the OS Trash and drop its catalog rows.  The frontend passes only the *filter*, never image ids: the target set is re-derived here with the `reject` flag forced on (`core_library::rejected_ids`), so a stale or malformed request can never reach a picked or unflagged photo. Files remain recoverable from the Trash; the catalog removal is not undoable in-app.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "keywords_list",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Keywords list; inputs: app: AppHandle; returns: Result<Vec<KeywordRow>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "keywords_for_image",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Keywords for image; inputs: app: AppHandle, image_id: i64; returns: Result<Vec<KeywordRow>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "keyword_add_to_image",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Keyword add to image; inputs: app: AppHandle, image_id: i64, name: String,; returns: Result<KeywordRow, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "keyword_add_to_images",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Keyword add to images; inputs: app: AppHandle, image_ids: Vec<i64>, name: String,; returns: Result<KeywordRow, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "keyword_remove_from_image",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Keyword remove from image; inputs: app: AppHandle, image_id: i64, keyword_id: i64,; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "keyword_delete",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Keyword delete; inputs: app: AppHandle, keyword_id: i64; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "collections_list",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Collections list; inputs: app: AppHandle; returns: Result<Vec<CollectionRow>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "collections_for_image",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Collections for image; inputs: app: AppHandle, image_id: i64,; returns: Result<Vec<CollectionRow>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "collection_create",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Collection create; inputs: app: AppHandle, name: String, is_smart: bool, query: Option<String>,; returns: Result<i64, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "collection_rename",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Collection rename; inputs: app: AppHandle, id: i64, name: String; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "collection_delete",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Collection delete; inputs: app: AppHandle, id: i64; returns: Result<(), String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "collection_add_images",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Collection add images; inputs: app: AppHandle, collection_id: i64, image_ids: Vec<i64>,; returns: Result<usize, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "collection_remove_images",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Collection remove images; inputs: app: AppHandle, collection_id: i64, image_ids: Vec<i64>,; returns: Result<usize, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "app_library_root",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "The copy/move import destination. Prefers the user-configured library root (Settings); falls back to the parent of the first watched folder (the root under which dated `YYYY/YYYY-MM-DD` folders live) for catalogs created before the setting existed; `None` if neither is available.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_library_root",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Persist the library root (the copy/move import destination), creating the directory if needed. Existing photos are NOT moved \u2014 only future copy/move imports file into the new location.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "dedup_scan",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Dedup scan; inputs: app: AppHandle, category: String,; returns: Result<Vec<core_dedup::DupGroup>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "dedup_scan_perceptual",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Perceptual same-scene scan. Lazily computes versioned visual features for any present image that lacks them (parallel decode of cached thumbnails, emitting `dedup:progress`), then groups only capture-time-gated, visually verified candidates. Never auto-trashes.",
+      "target": "core-app",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "dedup_resolve",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Keep selected image, move selected duplicate files to Trash, return count and clean orphan thumbnails.",
+      "target": "core-app",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "dedup_resolve_bulk",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Move byte-identical duplicates to Trash; never auto-resolve same-capture or perceptual matches.",
+      "target": "core-app",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "import_list",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Fast import listing: enumerate the RAW files under `source` from filesystem metadata only \u2014 NO catalog access, hashing, decode, or thumbnail work \u2014 so a full card lists in milliseconds. Every file comes back `pending`; hash-verified dedup runs separately via `import_dedup`. Thumbnails are fetched lazily, per file, via `import_thumb`. AppHandle is host-injected for bounded executor admission; IPC payload unchanged.",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "import_dedup",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Hash-verified dedup for the listed source files: classify each path as new / library-duplicate / batch-duplicate by BLAKE3 (size-prefiltered, so only genuine candidates are read). Runs in the background while the list is already visible; emits `import:dedup:progress {done,total,results}` as it resolves files, and returns the full verdict set.",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "import_thumb",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Lazy single-file preview for the import list: decode just this one file's embedded preview and return JPEG bytes. Called on demand (when the user clicks a row), never up front \u2014 keeps listing instant. No catalog access. AppHandle is host-injected for bounded executor admission; IPC payload unchanged.",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    }
+  ]
+}

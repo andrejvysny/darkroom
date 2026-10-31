@@ -9,10 +9,9 @@ use crate::state::AppState;
 use core_library::THUMB_SIZE;
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -28,6 +27,7 @@ pub(crate) struct PublicationFence {
     active: AtomicUsize,
     generation: AtomicU64,
     pending: AtomicBool,
+    wake: Mutex<Option<SyncSender<()>>>,
 }
 
 impl PublicationFence {
@@ -65,16 +65,18 @@ impl PublicationFence {
 }
 
 fn schedule_pending<R: Runtime>(app: &AppHandle<R>) {
-    if app.state::<AppState>().publication.take_retry_if_idle() {
-        let app = app.clone();
-        std::thread::spawn(move || sync(&app));
+    let fence = &app.state::<AppState>().publication;
+    if !fence.is_active() && fence.pending.load(Ordering::SeqCst) {
+        if let Ok(wake) = fence.wake.lock() {
+            if let Some(wake) = wake.as_ref() {
+                let _ = wake.try_send(());
+            }
+        }
     }
 }
 
 fn request_resync<R: Runtime>(app: &AppHandle<R>) {
     app.state::<AppState>().publication.request_retry();
-    // The last guard may have dropped before this request was recorded. In that case this caller
-    // schedules the retry itself; otherwise the guard's drop schedules it when publication ends.
     schedule_pending(app);
 }
 
@@ -82,11 +84,13 @@ fn request_resync<R: Runtime>(app: &AppHandle<R>) {
 /// (store in `AppState`) — dropping it stops watching. `None` if there are no roots or setup fails.
 pub fn spawn_watcher(app: AppHandle) -> Option<RecommendedWatcher> {
     let roots = watched_roots(&app);
-    if roots.is_empty() {
-        return None;
-    }
 
-    let (tx, rx) = channel::<()>();
+    let (tx, rx) = sync_channel::<()>(1);
+    *app.state::<AppState>()
+        .publication
+        .wake
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
             // Structural changes only — ignore pure metadata/access noise.
@@ -97,7 +101,7 @@ pub fn spawn_watcher(app: AppHandle) -> Option<RecommendedWatcher> {
                     | EventKind::Modify(ModifyKind::Name(_))
             );
             if relevant {
-                let _ = tx.send(());
+                let _ = tx.try_send(());
             }
         }
     })
@@ -109,29 +113,78 @@ pub fn spawn_watcher(app: AppHandle) -> Option<RecommendedWatcher> {
 
     // Coalescing worker: wake on the first event, drain the quiet window, then sync once.
     let app2 = app.clone();
-    std::thread::spawn(move || loop {
-        if rx.recv().is_err() {
-            break; // sender dropped — watcher gone
-        }
+    let worker = app.clone();
+    if let Err(error) = crate::jobs::worker(&worker, "catalog-watcher", move || {
         loop {
-            match rx.recv_timeout(DEBOUNCE) {
-                Ok(()) => continue,
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return,
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    if app2.state::<AppState>().workers.is_stopping() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            loop {
+                match rx.recv_timeout(DEBOUNCE) {
+                    Ok(()) if app2.state::<AppState>().workers.is_stopping() => return Ok(()),
+                    Ok(()) => continue,
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+            }
+            let st = app2.state::<AppState>();
+            if st.workers.is_stopping() {
+                break;
+            }
+            st.publication.take_retry_if_idle();
+            loop {
+                let work = app2.clone();
+                match st.jobs.submit(
+                    crate::jobs::spec(st.inner(), core_app::jobs::JobClass::Maintenance, false),
+                    move |ctx| {
+                        ctx.checkpoint()?;
+                        sync(&work);
+                        Ok(())
+                    },
+                ) {
+                    Ok(job) => {
+                        if matches!(
+                            job.wait(),
+                            Err(core_app::jobs::JobFailure::Cancelled
+                                | core_app::jobs::JobFailure::Superseded)
+                        ) && !st.workers.is_stopping()
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    Err(core_app::jobs::SubmitError::Capacity) => {
+                        if !st.jobs.wait_capacity(64 * 1024) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "watcher request rejected");
+                        break;
+                    }
+                }
             }
         }
-        sync(&app2);
-    });
+        Ok(())
+    }) {
+        tracing::error!(%error, "watcher worker failed to start");
+        return None;
+    }
 
+    schedule_pending(&app);
     Some(watcher)
 }
 
 /// Run a startup reconcile (catch changes made while the app was closed) and notify the UI.
 pub fn reconcile_on_launch(app: &AppHandle) {
-    let st = app.state::<AppState>();
-    if let Ok(db) = st.db.lock() {
-        let _ = core_library::reconcile(&db.conn);
-    }
+    reconcile_status(app);
     let _ = app.emit("library:changed", ());
 }
 
@@ -159,22 +212,119 @@ pub(crate) fn sync<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
 
-    let mut changed = false;
-    if let Ok(db) = st.db.lock() {
-        if st.publication.is_active() {
-            request_resync(app);
-            return;
-        }
-        if let Ok(rs) = core_library::reconcile(&db.conn) {
-            changed |= rs.now_missing > 0 || rs.restored > 0;
-        }
-    }
+    let mut changed = reconcile_status(app);
     for root in watched_roots(app) {
+        if st.workers.is_stopping() {
+            break;
+        }
         changed |= index_new(app, &root);
     }
     if changed {
         let _ = app.emit("library:changed", ());
     }
+}
+
+fn reconcile_status<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let st = app.state::<AppState>();
+    let (generation, rows): (u64, Vec<(i64, String, String)>) = {
+        let Ok(db) = st.db.lock() else { return false };
+        let Some(generation) = st.publication.snapshot(&db) else {
+            drop(db);
+            request_resync(app);
+            return false;
+        };
+        let Ok(mut stmt) = db.conn.prepare("SELECT id, path, status FROM images") else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) else {
+            return false;
+        };
+        let mut snapshot = Vec::new();
+        for row in rows {
+            if st.workers.is_stopping() {
+                return false;
+            }
+            if let Ok(row) = row {
+                snapshot.push(row);
+            }
+        }
+        (generation, snapshot)
+    };
+    let mut changes = Vec::new();
+    for (id, path, status) in rows {
+        if st.workers.is_stopping() {
+            return false;
+        }
+        let exists = Path::new(&path).exists();
+        match (status.as_str(), exists) {
+            ("present", false) => changes.push((id, path, status, "missing")),
+            ("missing", true) => changes.push((id, path, status, "present")),
+            _ => {}
+        }
+    }
+    if changes.is_empty() {
+        return false;
+    }
+    if st.workers.is_stopping() {
+        return false;
+    }
+    let mut gate = st.publications.source_guard();
+    let Ok(db) = st.db.lock() else { return false };
+    if st.workers.is_stopping() {
+        return false;
+    }
+    if !st.publication.is_current(&db, generation) {
+        drop(db);
+        drop(gate);
+        request_resync(app);
+        return false;
+    }
+    let Ok(tx) = db.conn.unchecked_transaction() else {
+        return false;
+    };
+    let mut changed = false;
+    for (id, path, old, new) in changes {
+        if st.workers.is_stopping() {
+            return false;
+        }
+        if tx
+            .execute(
+                "UPDATE images SET status=?1 WHERE id=?2 AND path=?3 AND status=?4",
+                core_db::rusqlite::params![new, id, path, old],
+            )
+            .unwrap_or(0)
+            > 0
+        {
+            changed = true;
+        }
+    }
+    if st.workers.is_stopping() {
+        return false;
+    }
+    if tx.commit().is_ok() && changed {
+        drop(db);
+        gate.invalidate_all();
+        st.clear_source_caches();
+        true
+    } else {
+        false
+    }
+}
+
+fn supported_path(path: &Path) -> bool {
+    let visible = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| !name.starts_with('.'));
+    visible
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                core_library::SUPPORTED_EXT
+                    .iter()
+                    .any(|supported| extension.eq_ignore_ascii_case(supported))
+            })
 }
 
 /// Index RAW files under `root` that aren't already in the catalog (idempotent). No progress events.
@@ -184,10 +334,15 @@ fn index_new<R: Runtime>(app: &AppHandle<R>, root: &Path) -> bool {
     let (generation, folder_id, known, known_bad) = {
         let Ok(db) = st.db.lock() else { return false };
         let Some(generation) = st.publication.snapshot(&db) else {
+            drop(db);
             request_resync(app);
             return false;
         };
-        let Ok(fid) = core_library::add_root(&db.conn, root) else {
+        let Ok(fid) = db.conn.query_row(
+            "SELECT id FROM folders WHERE path=?1",
+            [root.to_string_lossy().as_ref()],
+            |row| row.get::<_, i64>(0),
+        ) else {
             return false;
         };
         (
@@ -198,61 +353,77 @@ fn index_new<R: Runtime>(app: &AppHandle<R>, root: &Path) -> bool {
         )
     };
 
-    // Files whose recorded failure still stands are not re-opened: the watcher wakes on every card
-    // mount and folder touch, so without this an undecodable file is re-decoded indefinitely.
-    let todo: Vec<PathBuf> = core_library::enumerate_raws(root, true)
-        .into_iter()
-        .filter(|p| !known.contains(&p.display().to_string()))
-        .filter(|p| !known_bad.contains(&p.display().to_string()))
-        .collect();
-    if todo.is_empty() {
-        return false;
-    }
-
-    // The path rides along with its result: a `LibError` carries no path, and failures used to be
-    // dropped here entirely (`results.iter().flatten()`), so a watcher-seen bad file went unrecorded.
-    let results: Vec<_> = todo
-        .par_iter()
-        .map(|p| (p, core_library::process_file(p, &st.thumbs, THUMB_SIZE)))
-        .collect();
-
     let imported_at = core_library::now_epoch();
     let mut inserted_any = false;
     let mut recorded = 0usize;
-    if let Ok(mut db) = st.db.lock() {
-        // Discard bytes decoded across any publication, even when the entire job has already
-        // finished. Its replacement/cancellation may have changed or removed these paths.
-        if !st.publication.is_current(&db, generation) {
-            request_resync(app);
-            return false;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        if st.workers.is_stopping() {
+            break;
         }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() || !supported_path(entry.path()) {
+            continue;
+        }
+        let path = entry.path();
+        let key = path.display().to_string();
+        if known.contains(&key) || known_bad.contains(&key) {
+            continue;
+        }
+        if st.workers.is_stopping() {
+            break;
+        }
+        let result = core_library::process_file(path, &st.thumbs, THUMB_SIZE);
+        if st.workers.is_stopping() {
+            break;
+        }
+        let mut gate = st.publications.source_guard();
+        let Ok(mut db) = st.db.lock() else { break };
+        if st.workers.is_stopping() {
+            break;
+        }
+        if !st.publication.is_current(&db, generation) {
+            drop(db);
+            drop(gate);
+            request_resync(app);
+            return inserted_any || recorded > 0;
+        }
+        let mut published = false;
         if let Ok(tx) = db.conn.transaction() {
-            for (path, r) in &results {
-                match r {
-                    Ok(p) => {
-                        if let Ok(Some(_)) =
-                            core_library::insert_image(&tx, folder_id, imported_at, p)
-                        {
-                            inserted_any = true;
-                        }
-                        let _ = core_library::clear_decode_failure(&tx, &p.path);
+            let mut inserted = false;
+            match &result {
+                Ok(p) => {
+                    if let Ok(Some(_)) = core_library::insert_image(&tx, folder_id, imported_at, p)
+                    {
+                        inserted = true;
                     }
-                    Err(e) => {
-                        if core_library::record_decode_failure(
-                            &tx,
-                            Some(folder_id),
-                            path,
-                            e,
-                            imported_at,
-                        )
-                        .is_ok()
-                        {
-                            recorded += 1;
-                        }
+                    let _ = core_library::clear_decode_failure(&tx, &p.path);
+                }
+                Err(e) => {
+                    if core_library::record_decode_failure(
+                        &tx,
+                        Some(folder_id),
+                        path,
+                        e,
+                        imported_at,
+                    )
+                    .is_ok()
+                    {
+                        recorded += 1;
                     }
                 }
             }
-            let _ = tx.commit();
+            if st.workers.is_stopping() {
+                break;
+            }
+            if tx.commit().is_ok() && inserted {
+                gate.invalidate_all();
+                published = true;
+                inserted_any = true;
+            }
+        };
+        drop(db);
+        if published {
+            st.clear_source_caches();
         }
     }
     // A newly-recorded failure changes the sidebar's Unsupported count, so it counts as a change.
@@ -286,67 +457,4 @@ impl<R: Runtime> Drop for ImportGuard<R> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::PublicationFence;
-    use std::sync::{mpsc, Arc, Mutex};
-
-    #[test]
-    fn publication_completed_during_decode_invalidates_snapshot_and_retries() {
-        let fence = PublicationFence::default();
-        let db = Mutex::new(());
-        let generation = fence.snapshot(&db.lock().unwrap()).unwrap();
-        // The watcher owns decoded bytes from before a whole import/export guard lifetime.
-        fence.begin(&db);
-        fence.end(&db);
-        assert!(!fence.is_active());
-        assert!(!fence.is_current(&db.lock().unwrap(), generation));
-        // No guard remains to drain this late request, so the watcher must schedule it itself.
-        fence.request_retry();
-        assert!(fence.take_retry_if_idle());
-        assert!(!fence.take_retry_if_idle());
-    }
-
-    #[test]
-    fn overlapping_publications_defer_retry_until_the_last_finishes() {
-        let fence = PublicationFence::default();
-        let db = Mutex::new(());
-        let generation = fence.snapshot(&db.lock().unwrap()).unwrap();
-        fence.begin(&db);
-        fence.begin(&db);
-        fence.request_retry();
-        fence.end(&db);
-        assert!(fence.snapshot(&db.lock().unwrap()).is_none());
-        assert!(!fence.take_retry_if_idle());
-        fence.end(&db);
-        assert!(!fence.is_current(&db.lock().unwrap(), generation));
-        assert!(fence.take_retry_if_idle());
-    }
-
-    #[test]
-    fn publication_start_waits_for_watcher_check_and_commit_lock() {
-        let fence = Arc::new(PublicationFence::default());
-        let db = Arc::new(Mutex::new(()));
-        let insertion = db.lock().unwrap();
-        let generation = fence.snapshot(&insertion).unwrap();
-        let (attempt_tx, attempt_rx) = mpsc::channel();
-        let (started_tx, started_rx) = mpsc::channel();
-        let writer = {
-            let fence = Arc::clone(&fence);
-            let db = Arc::clone(&db);
-            std::thread::spawn(move || {
-                attempt_tx.send(()).unwrap();
-                fence.begin(&db);
-                started_tx.send(()).unwrap();
-            })
-        };
-        attempt_rx.recv().unwrap();
-        // The real begin helper shares the insertion mutex: it cannot cross this check/commit.
-        assert!(started_rx.try_recv().is_err());
-        assert!(fence.is_current(&insertion, generation));
-        drop(insertion);
-        started_rx.recv().unwrap();
-        writer.join().unwrap();
-        assert!(!fence.is_current(&db.lock().unwrap(), generation));
-        fence.end(&db);
-    }
-}
+mod tests;

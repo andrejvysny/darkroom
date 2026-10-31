@@ -90,7 +90,7 @@ export default function Loupe({ image }: LoupeProps) {
   } = useViewport<HTMLDivElement>({
     natural,
     resetKey: image.id,
-    render: async (d, canvas) => {
+    render: async (d, canvas, isCurrent) => {
       // Size + draw + publish the matching CSS box as ONE atomic "painted state"; never resize the
       // canvas when nothing will be drawn (that clears it → blink).
       const sizeAndPublish = () => {
@@ -138,7 +138,7 @@ export default function Loupe({ image }: LoupeProps) {
         d.outH,
         -1,
       );
-      if (frame) {
+      if (frame && isCurrent()) {
         lastFrameRef.current = frame;
         // The async frame belongs to THIS d — repaint + republish the same box (no-op unless a
         // newer sync paint happened meanwhile; the trailing scheduler then repaints anyway).

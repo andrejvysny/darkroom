@@ -1,7 +1,9 @@
 mod backup;
+mod catalog_adapter;
 mod commands;
 mod events;
 mod features;
+mod jobs;
 mod logging;
 mod model_mgmt;
 mod pano_detect;
@@ -127,20 +129,42 @@ pub fn run() {
             // Reconcile against disk, then start the FS watcher — off the setup thread so a slow
             // stat sweep can't delay window creation. The watcher is parked in AppState to stay alive.
             let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                watch::reconcile_on_launch(&handle);
+            let worker_host = handle.clone();
+            if let Err(error) = crate::jobs::worker(&worker_host, "startup-reconcile", move || {
+                let st = handle.state::<AppState>();
+                let work = handle.clone();
+                let job = st
+                    .jobs
+                    .submit(
+                        crate::jobs::spec(st.inner(), core_app::jobs::JobClass::Maintenance, false),
+                        move |ctx| {
+                            ctx.checkpoint()?;
+                            watch::reconcile_on_launch(&work);
+                            Ok(())
+                        },
+                    )
+                    .map_err(|e| format!("startup reconcile: {e:?}"))?;
+                job.wait().map_err(crate::jobs::cancelled)?;
+                if st.workers.is_stopping() {
+                    return Ok(());
+                }
                 if let Some(w) = watch::spawn_watcher(handle.clone()) {
                     let st = handle.state::<AppState>();
                     let lock = st.watcher.lock();
                     if let Ok(mut slot) = lock {
-                        *slot = Some(w);
+                        if !st.workers.is_stopping() {
+                            *slot = Some(w);
+                        }
                     }
                 }
                 // Backfill canonical thumbnails for the whole library at low priority (visible /
                 // just-opened images are promoted to the front via `thumb_prioritize`). After
                 // reconcile so freshly re-added rows are included.
                 thumb_queue::enqueue_all(&handle);
-            });
+                Ok(())
+            }) {
+                return Err(error.into());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -324,8 +348,7 @@ pub fn run() {
                 {
                     tracing::warn!("sidecar queue did not drain before exit");
                 }
-                st.sidecar_queue.shutdown();
-                st.prefetch_queue.shutdown();
+                crate::jobs::shutdown(app_handle);
                 let lock = st.db.lock();
                 if let Ok(db) = lock {
                     let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");

@@ -77,19 +77,15 @@ mod imp {
                 }
                 let body = &b[pos + header..pos + size];
                 match typ {
-                    b"colr" => {
-                        // colour_type (4 bytes) then, for 'nclx', three u16 code points.
-                        if body.len() >= 10 && &body[0..4] == b"nclx" {
-                            let primaries = u16::from_be_bytes([body[4], body[5]]);
-                            let transfer = u16::from_be_bytes([body[6], body[7]]);
-                            out.push((primaries, transfer));
-                        }
+                    // colour_type (4 bytes) then, for 'nclx', three u16 code points.
+                    b"colr" if body.len() >= 10 && &body[0..4] == b"nclx" => {
+                        let primaries = u16::from_be_bytes([body[4], body[5]]);
+                        let transfer = u16::from_be_bytes([body[6], body[7]]);
+                        out.push((primaries, transfer));
                     }
-                    b"meta" | b"moov" => {
-                        // FullBox: skip version+flags before the children.
-                        if body.len() > 4 {
-                            walk(&body[4..], out, depth + 1);
-                        }
+                    // FullBox: skip version+flags before the children.
+                    b"meta" | b"moov" if body.len() > 4 => {
+                        walk(&body[4..], out, depth + 1);
                     }
                     b"iprp" | b"ipco" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
                         walk(body, out, depth + 1)

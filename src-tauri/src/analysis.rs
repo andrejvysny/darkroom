@@ -1,4 +1,4 @@
-//! Background AI analysis pass: decode → run analyzers (rayon, no DB lock) → bulk-insert results.
+//! Background AI analysis pass: decode → run analyzers (sequential photos, no DB lock) → bulk-insert results.
 //!
 //! Lives here (not in `core-library`) because it bridges the ML crate (`core-analyze`) and the
 //! catalog (`core-library`), keeping `core-library` free of any ONNX/ort dependency. Mirrors the
@@ -20,10 +20,9 @@ use core_library::{
     plan_clusters, present_image_count, present_images, present_targets_after, present_targets_in,
     reconcile_faces, record_attempts, scope_image_ids, stale_count, stale_count_in, stale_targets,
     stale_targets_in, AnalysisInput, ClusterParams, FaceInput, ScanScope, ScopeCounts,
-    StageAttempt, StageId, StageSpec, StaleTarget, SCOPE_CHUNK,
+    StageAttempt, StageId, StageSpec, StaleTarget,
 };
 use image::imageops::FilterType;
-use rayon::prelude::*;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
@@ -126,10 +125,10 @@ pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .analysis_download_lock
         .lock()
         .map_err(|e| e.to_string())?;
-    st.analysis_dl_cancel.store(false, Ordering::SeqCst);
+    st.workers.reset_cancel(&st.analysis_dl_cancel)?;
     let store = ModelStore::new(st.models_dir.clone());
     let files = analysis_files();
-    let cancel = || st.analysis_dl_cancel.load(Ordering::SeqCst);
+    let cancel = || st.workers.is_stopping() || st.analysis_dl_cancel.load(Ordering::SeqCst);
     store
         .ensure_with(
             &files,
@@ -355,19 +354,13 @@ enum TargetSource<'a> {
         ids: &'a [i64],
         /// Index of the next id to pull into `buf`.
         next: usize,
-        /// Rows fetched by the last `SCOPE_CHUNK` query, not yet handed to the caller.
-        buf: std::collections::VecDeque<StaleTarget>,
     },
 }
 
 impl<'a> TargetSource<'a> {
     fn new(scope_ids: Option<&'a [i64]>) -> Self {
         match scope_ids {
-            Some(ids) => TargetSource::Scope {
-                ids,
-                next: 0,
-                buf: std::collections::VecDeque::new(),
-            },
+            Some(ids) => TargetSource::Scope { ids, next: 0 },
             None => TargetSource::Library { cursor: 0 },
         }
     }
@@ -376,60 +369,90 @@ impl<'a> TargetSource<'a> {
 /// One page of work for `specs`. `force` re-scans every image in the source (all stages stale);
 /// otherwise only images with ≥1 stale stage. An empty return means the source is exhausted.
 ///
-/// The two sources differ in what "empty" means, and that difference is the whole reason the scoped
-/// branch loops: `stale_targets` filters staleness *inside* the keyset window, so an empty keyset
-/// page really is the end. `stale_targets_in` is handed a fixed slice of ids, so an all-clean slice
-/// yields nothing while later ids may still be dirty — it must keep pulling chunks. Chunks are
-/// `SCOPE_CHUNK`-sized (not `limit`-sized) so an already-analyzed scope costs one query per 400
-/// images instead of one per batch; the surplus rows wait in `buf`.
 fn page_targets(
     st: &AppState,
     specs: &[StageSpec],
     src: &mut TargetSource<'_>,
     limit: usize,
     force: bool,
-) -> Result<Vec<StaleTarget>, String> {
-    let n = specs.len();
-    let all_stale = |t: core_library::AnalyzeTarget| StaleTarget {
-        id: t.id,
-        path: t.path,
-        content_hash_hex: t.content_hash_hex,
-        stale: vec![true; n],
-    };
-    let db = st.db.lock().map_err(|e| e.to_string())?;
-    match src {
-        TargetSource::Library { cursor } => {
-            let page: Vec<StaleTarget> = if force {
-                present_targets_after(&db.conn, *cursor, limit as i64)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .map(all_stale)
-                    .collect()
-            } else {
-                stale_targets(&db.conn, specs, *cursor, limit as i64).map_err(|e| e.to_string())?
-            };
-            if let Some(last) = page.last() {
-                *cursor = last.id;
-            }
-            Ok(page)
+    epoch: core_model::identity::CatalogEpoch,
+) -> Result<
+    (
+        Vec<StaleTarget>,
+        Vec<core_runtime::publication::PublicationToken>,
+    ),
+    String,
+> {
+    loop {
+        if st.workers.is_stopping() {
+            return Err("analysis stopped: shutdown".into());
         }
-        TargetSource::Scope { ids, next, buf } => {
-            while buf.is_empty() && *next < ids.len() {
-                let end = (*next + SCOPE_CHUNK).min(ids.len());
-                let chunk = &ids[*next..end];
-                *next = end;
-                let rows: Vec<StaleTarget> = if force {
-                    present_targets_in(&db.conn, chunk)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(all_stale)
-                        .collect()
-                } else {
-                    stale_targets_in(&db.conn, specs, chunk).map_err(|e| e.to_string())?
-                };
-                buf.extend(rows);
+        if st.publications.epoch() != epoch {
+            return Err("analysis stale: catalog reset".into());
+        }
+        let sequence = st.publications.sequence();
+        let all_stale = |t: core_library::AnalyzeTarget| StaleTarget {
+            id: t.id,
+            path: t.path,
+            content_hash_hex: t.content_hash_hex,
+            stale: vec![true; specs.len()],
+        };
+        let (page, exhausted) = {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            match src {
+                TargetSource::Library { cursor } => {
+                    let page: Vec<StaleTarget> = if force {
+                        present_targets_after(&db.conn, *cursor, limit as i64)
+                            .map_err(|e| e.to_string())?
+                            .into_iter()
+                            .map(all_stale)
+                            .collect()
+                    } else {
+                        stale_targets(&db.conn, specs, *cursor, limit as i64)
+                            .map_err(|e| e.to_string())?
+                    };
+                    if let Some(last) = page.last() {
+                        *cursor = last.id;
+                    }
+                    (page, true)
+                }
+                TargetSource::Scope { ids, next } => {
+                    let end = (*next + limit).min(ids.len());
+                    let chunk = &ids[*next..end];
+                    *next = end;
+                    let page = if force {
+                        present_targets_in(&db.conn, chunk)
+                            .map_err(|e| e.to_string())?
+                            .into_iter()
+                            .map(all_stale)
+                            .collect()
+                    } else {
+                        stale_targets_in(&db.conn, specs, chunk).map_err(|e| e.to_string())?
+                    };
+                    (page, end == ids.len())
+                }
             }
-            Ok(buf.drain(..limit.min(buf.len())).collect())
+        };
+        if st.publications.epoch() != epoch {
+            return Err("analysis stale: catalog reset".into());
+        }
+        let tokens = page
+            .iter()
+            .map(|t| {
+                st.publications
+                    .capture_at(
+                        core_model::identity::ImageId(t.id),
+                        core_runtime::publication::SourceKey {
+                            path: t.path.clone(),
+                            hash: t.content_hash_hex.clone(),
+                        },
+                        sequence,
+                    )
+                    .map_err(|_| "analysis stale: source changed".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !page.is_empty() || exhausted {
+            return Ok((page, tokens));
         }
     }
 }
@@ -438,7 +461,7 @@ fn page_targets(
 /// swallowed zero-face success). `None` = the face stage was not needed/disabled for this image.
 type FaceOut = Option<Result<Vec<FaceInput>, String>>;
 
-/// One stage's outcome for one photo, owned so it can cross the rayon boundary.
+/// One stage's outcome for one photo, owned so it can cross the compute/publication boundary.
 struct OwnedAttempt {
     stage_id: String,
     model_version: String,
@@ -494,11 +517,12 @@ fn pass_total(
 struct RunGuard<'a> {
     running: &'a AtomicBool,
     cancel: &'a AtomicBool,
+    workers: &'a core_runtime::workers::ManagedWorkers,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.cancel.store(false, Ordering::SeqCst);
+        let _ = self.workers.reset_cancel(self.cancel);
     }
 }
 
@@ -526,11 +550,14 @@ pub fn run_pass<R: Runtime>(
     if st.analysis_running.swap(true, Ordering::SeqCst) {
         return Err("analysis already running".into());
     }
-    st.analysis_cancel.store(false, Ordering::SeqCst);
     let _guard = RunGuard {
         running: &st.analysis_running,
         cancel: &st.analysis_cancel,
+        workers: &st.workers,
     };
+    st.workers.reset_cancel(&st.analysis_cancel)?;
+
+    let epoch = st.publications.epoch();
 
     // Resolve the scope before building anything expensive: an empty scope must not load ~280 MB of
     // models just to discover it has no work.
@@ -607,10 +634,13 @@ pub fn run_pass<R: Runtime>(
     let mut faces_added = false;
     let mut a_src = TargetSource::new(scope_ids);
     while !a_specs.is_empty() {
+        if st.workers.is_stopping() {
+            return Err("analysis stopped: shutdown".into());
+        }
         if st.analysis_cancel.load(Ordering::SeqCst) {
             break;
         }
-        let page = page_targets(&st, &a_specs, &mut a_src, ANALYSIS_BATCH, force)?;
+        let (page, tokens) = page_targets(&st, &a_specs, &mut a_src, ANALYSIS_BATCH, force, epoch)?;
         if page.is_empty() {
             break;
         }
@@ -620,7 +650,7 @@ pub fn run_pass<R: Runtime>(
         // scanned", and silently re-failing on every future run. It now reaches the transaction
         // carrying an error attempt per stale stage.
         let results: Vec<PhotoOutcome> = page
-            .par_iter()
+            .iter()
             .map(|t| {
                 let need_face = face_idx.map(|fi| t.stale[fi]).unwrap_or(false) && fa.is_some();
                 // Stages this photo owes work for — the only ones an attempt may be recorded for.
@@ -735,30 +765,43 @@ pub fn run_pass<R: Runtime>(
             .collect();
 
         if !results.is_empty() {
-            let mut db = st.db.lock().map_err(|e| e.to_string())?;
-            let now = core_library::now_epoch();
-            let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-            for o in &results {
-                if !o.inputs.is_empty() {
-                    insert_analysis(&tx, o.id, now, &o.inputs).map_err(|e| e.to_string())?;
-                }
-                if let Some(Ok(faces)) = &o.face {
-                    reconcile_faces(&tx, o.id, FACE_MODEL_VERSION, FACE_MODEL_TAG, now, faces)
-                        .map_err(|e| e.to_string())?;
-                    let marker = [AnalysisInput {
-                        analyzer_id: FACE_ANALYZER_ID.to_string(),
-                        model_version: FACE_MODEL_VERSION.to_string(),
-                        payload: serde_json::json!({ "faces": faces.len() }),
-                    }];
-                    insert_analysis(&tx, o.id, now, &marker).map_err(|e| e.to_string())?;
-                    if !faces.is_empty() {
-                        faces_added = true;
+            st.publications
+                .with_tokens(&tokens, || -> Result<(), String> {
+                    let mut db = st.db.lock().map_err(|e| e.to_string())?;
+                    let now = core_library::now_epoch();
+                    let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+                    for o in &results {
+                        if !o.inputs.is_empty() {
+                            insert_analysis(&tx, o.id, now, &o.inputs)
+                                .map_err(|e| e.to_string())?;
+                        }
+                        if let Some(Ok(faces)) = &o.face {
+                            reconcile_faces(
+                                &tx,
+                                o.id,
+                                FACE_MODEL_VERSION,
+                                FACE_MODEL_TAG,
+                                now,
+                                faces,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            let marker = [AnalysisInput {
+                                analyzer_id: FACE_ANALYZER_ID.to_string(),
+                                model_version: FACE_MODEL_VERSION.to_string(),
+                                payload: serde_json::json!({ "faces": faces.len() }),
+                            }];
+                            insert_analysis(&tx, o.id, now, &marker).map_err(|e| e.to_string())?;
+                            if !faces.is_empty() {
+                                faces_added = true;
+                            }
+                        }
+                        record_attempts(&tx, o.id, now, &o.borrowed_attempts())
+                            .map_err(|e| e.to_string())?;
                     }
-                }
-                record_attempts(&tx, o.id, now, &o.borrowed_attempts())
-                    .map_err(|e| e.to_string())?;
-            }
-            tx.commit().map_err(|e| e.to_string())?;
+                    tx.commit().map_err(|e| e.to_string())?;
+                    Ok(())
+                })
+                .map_err(|_| "analysis stale: source changed".to_string())??;
             // Count photos that produced at least one successful stage — decode failures are in
             // `results` now, and must not inflate "analyzed".
             analyzed += results.iter().filter(|o| o.produced_work()).count();
@@ -768,7 +811,7 @@ pub fn run_pass<R: Runtime>(
 
     // Place the faces this run found — deliberately also on the cancel path, see `run_clustering`.
     if face_on {
-        run_clustering(app, &st, faces_added)?;
+        run_clustering(app, &st, faces_added, epoch)?;
     }
 
     // ---- Phase B: captions (deferred, non-blocking) ----
@@ -790,10 +833,14 @@ pub fn run_pass<R: Runtime>(
         let bdone = AtomicUsize::new(0);
         let mut b_src = TargetSource::new(scope_ids);
         loop {
+            if st.workers.is_stopping() {
+                return Err("analysis stopped: shutdown".into());
+            }
             if st.analysis_cancel.load(Ordering::SeqCst) {
                 break;
             }
-            let page = page_targets(&st, &b_specs, &mut b_src, ANALYSIS_BATCH, force)?;
+            let (page, tokens) =
+                page_targets(&st, &b_specs, &mut b_src, ANALYSIS_BATCH, force, epoch)?;
             if page.is_empty() {
                 break;
             }
@@ -801,7 +848,7 @@ pub fn run_pass<R: Runtime>(
             // silently dropped. The caption stage is the only one in flight here, so an outcome
             // carries at most one attempt.
             let results: Vec<PhotoOutcome> = page
-                .par_iter()
+                .iter()
                 .map(|t| {
                     let decoded = decode_shared(&t.path, false);
                     let outcome = match decoded {
@@ -847,17 +894,23 @@ pub fn run_pass<R: Runtime>(
                 })
                 .collect();
             if !results.is_empty() {
-                let mut db = st.db.lock().map_err(|e| e.to_string())?;
-                let now = core_library::now_epoch();
-                let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-                for o in &results {
-                    if !o.inputs.is_empty() {
-                        insert_analysis(&tx, o.id, now, &o.inputs).map_err(|e| e.to_string())?;
-                    }
-                    record_attempts(&tx, o.id, now, &o.borrowed_attempts())
-                        .map_err(|e| e.to_string())?;
-                }
-                tx.commit().map_err(|e| e.to_string())?;
+                st.publications
+                    .with_tokens(&tokens, || -> Result<(), String> {
+                        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+                        let now = core_library::now_epoch();
+                        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+                        for o in &results {
+                            if !o.inputs.is_empty() {
+                                insert_analysis(&tx, o.id, now, &o.inputs)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            record_attempts(&tx, o.id, now, &o.borrowed_attempts())
+                                .map_err(|e| e.to_string())?;
+                        }
+                        tx.commit().map_err(|e| e.to_string())?;
+                        Ok(())
+                    })
+                    .map_err(|_| "analysis stale: source changed".to_string())??;
                 analyzed += results.iter().filter(|o| o.produced_work()).count();
             }
             emit_progress(app, "caption", bdone.load(Ordering::Relaxed), total_b);
@@ -892,7 +945,14 @@ fn run_clustering<R: Runtime>(
     app: &AppHandle<R>,
     st: &AppState,
     faces_added: bool,
+    epoch: core_model::identity::CatalogEpoch,
 ) -> Result<(), String> {
+    if st.workers.is_stopping() {
+        return Err("analysis stopped: shutdown".into());
+    }
+    if st.publications.epoch() != epoch {
+        return Err("analysis stale: catalog reset".into());
+    }
     let cancelled = st.analysis_cancel.load(Ordering::SeqCst);
     // On the cancel path only finish what THIS run started; a full sweep of pre-existing dirty faces
     // is the next scan's job and would make Stop arbitrarily long for no user-visible gain.
@@ -904,8 +964,12 @@ fn run_clustering<R: Runtime>(
     };
 
     if should_run {
-        st.cluster_cancel.store(false, Ordering::SeqCst);
+        st.workers.reset_cancel(&st.cluster_cancel)?;
         // 1. Snapshot — short lock.
+        let sequence = st.publications.sequence();
+        if st.publications.epoch() != epoch {
+            return Err("analysis stale: catalog reset".into());
+        }
         let snap = {
             let db = st.db.lock().map_err(|e| e.to_string())?;
             cluster_snapshot(&db.conn, FACE_MODEL_TAG).map_err(|e| e.to_string())?
@@ -918,12 +982,18 @@ fn run_clustering<R: Runtime>(
             &st.cluster_cancel,
             &mut |done, total| emit_progress(app, "finalize", done, total as i64),
         );
-        // 3. Apply — short lock, flat keyed UPDATEs.
-        {
-            let mut db = st.db.lock().map_err(|e| e.to_string())?;
-            let now = core_library::now_epoch();
-            apply_cluster_plan(&mut db.conn, now, &plan).map_err(|e| e.to_string())?;
+        if st.workers.is_stopping() {
+            return Err("analysis stopped: shutdown".into());
         }
+        // 3. Apply — short lock, flat keyed UPDATEs.
+        st.publications
+            .with_sequence(sequence, || -> Result<(), String> {
+                let mut db = st.db.lock().map_err(|e| e.to_string())?;
+                let now = core_library::now_epoch();
+                apply_cluster_plan(&mut db.conn, now, &plan).map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .map_err(|_| "analysis stale: catalog changed".to_string())??;
     }
 
     // Checkpoint on every path, cancelled included — previously this sat after an early return, so

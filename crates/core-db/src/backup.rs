@@ -67,7 +67,7 @@ pub fn backups(backups_dir: &Path) -> Vec<(PathBuf, SystemTime)> {
             Some((p, mtime))
         })
         .collect();
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|file| std::cmp::Reverse(file.1));
     files
 }
 
@@ -127,6 +127,29 @@ mod tests {
         assert_eq!(count, 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn independent_read_only_connection_can_back_up_a_live_wal_catalog() {
+        let root = std::env::temp_dir().join(format!("dr_read_backup_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("catalog.db");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE test(value INTEGER); INSERT INTO test VALUES(7);").unwrap();
+        let reader =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let backup = backup_now(&reader, &root.join("backups"), 1).unwrap();
+        let check = Connection::open(backup).unwrap();
+        assert_eq!(
+            check
+                .query_row("SELECT value FROM test", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        drop(check);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

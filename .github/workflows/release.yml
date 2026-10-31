@@ -33,16 +33,19 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Install libheif
-        run: brew install libheif
+      - name: Build macOS 12 codec closure
+        uses: ./.github/actions/macos-codecs
 
-      - name: Install Rust 1.91
-        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      - name: Stage qualified macOS dylibs
+        run: bash scripts/macos-bundle-dylibs.sh stage
 
       - name: Install frontend deps
         run: npm ci
@@ -164,14 +167,13 @@ jobs:
           }
           NODE
 
-      # HEIF decode dynamic-links system libheif; the beforeBundleCommand hook
-      # (scripts/macos-bundle-dylibs.sh) stages its dylib closure into the .app.
-      - name: Install libheif (macOS only)
+      # Preserve the deployment target through every bundled native dependency.
+      - name: Build macOS 12 codec closure
         if: runner.os == 'macOS'
-        run: brew install libheif
+        uses: ./.github/actions/macos-codecs
 
-      - name: Install Rust 1.91
-        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.rustTargets }}
 

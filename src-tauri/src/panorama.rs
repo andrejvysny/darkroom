@@ -64,11 +64,12 @@ pub fn status(st: &AppState) -> PanoStatus {
 struct RunGuard<'a> {
     running: &'a AtomicBool,
     cancel: &'a AtomicBool,
+    workers: &'a core_runtime::workers::ManagedWorkers,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.cancel.store(false, Ordering::SeqCst);
+        let _ = self.workers.reset_cancel(self.cancel);
     }
 }
 
@@ -215,13 +216,15 @@ pub fn preview<R: Runtime>(
     }
     let projection = parse_projection(&projection)?;
 
-    // Serialize preview work (and cache access) on one mutex — a second preview waits rather than
-    // duplicating a multi-second decode burst.
-    let mut cache = st
-        .panorama_preview_cache
-        .lock()
-        .map_err(|e| e.to_string())?;
-    if cache.as_ref().map(|c| &c.ids) != Some(&ids) {
+    let sequence = st.publications.sequence();
+    let cached = {
+        let cache = st
+            .panorama_preview_cache
+            .lock()
+            .map_err(|e| e.to_string())?;
+        cache.as_ref().is_some_and(|c| c.ids == ids)
+    };
+    if !cached {
         let paths = resolve_paths(&st, &ids)?;
         let mut frames = Vec::with_capacity(paths.len());
         let mut metas = Vec::with_capacity(paths.len());
@@ -233,13 +236,27 @@ pub fn preview<R: Runtime>(
             metas.push(meta);
         }
         check_same_camera(&metas)?;
-        *cache = Some(PreviewCache {
-            ids: ids.clone(),
-            frames,
-            metas,
-        });
+        st.publications
+            .with_sequence(sequence, || -> Result<(), String> {
+                *st.panorama_preview_cache
+                    .lock()
+                    .map_err(|e| e.to_string())? = Some(PreviewCache {
+                    ids: ids.clone(),
+                    frames,
+                    metas,
+                });
+                Ok(())
+            })
+            .map_err(|_| "panorama preview stale: catalog source changed".to_string())??;
     }
-    let c = cache.as_ref().expect("cache filled above");
+    let cache = st
+        .panorama_preview_cache
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let c = cache
+        .as_ref()
+        .filter(|c| c.ids == ids)
+        .ok_or_else(|| "panorama preview stale: cache changed".to_string())?;
 
     let opt = StitchOptions {
         projection,
@@ -379,8 +396,9 @@ pub fn merge<R: Runtime>(
     let _guard = RunGuard {
         running: &st.panorama_running,
         cancel: &st.panorama_cancel,
+        workers: &st.workers,
     };
-    st.panorama_cancel.store(false, Ordering::SeqCst);
+    st.workers.reset_cancel(&st.panorama_cancel)?;
     // Publication and catalog insertion belong to this job. Defer watcher indexing until both
     // complete, otherwise the watcher can win the insert and make cleanup remove a catalogued DNG.
     let _watch_guard = crate::watch::ImportGuard::new(app.clone());
@@ -388,7 +406,8 @@ pub fn merge<R: Runtime>(
     // Borrow the flag itself (not the `State` wrapper) so the closure is `Sync` — core-pano polls it
     // from inside its rayon-parallel phases.
     let cancel_flag = &st.panorama_cancel;
-    let cancelled = move || cancel_flag.load(Ordering::SeqCst);
+    let workers = &st.workers;
+    let cancelled = move || workers.is_stopping() || cancel_flag.load(Ordering::SeqCst);
 
     // Brief lock: resolve paths + the first source's folder (the pano lands in the same folder).
     let paths = resolve_paths(&st, &ids)?;

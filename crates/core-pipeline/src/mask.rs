@@ -317,7 +317,7 @@ impl BrushBake {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs"),
-                    buffers: std::slice::from_ref(&instance_layout),
+                    buffers: &[Some(instance_layout.clone())],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {

@@ -6,6 +6,7 @@
 
 use crate::error::PipelineError;
 use crate::params::{AiCoverage, DevelopParams};
+use crate::params::{GpuParamsExt, GpuViewParamsExt};
 use core_raw::LinearImage;
 use wgpu::util::DeviceExt;
 
@@ -71,7 +72,8 @@ impl From<wgpu::AdapterInfo> for GpuAdapterInfo {
             device_pci_bus_id: info.device_pci_bus_id,
             subgroup_min_size: info.subgroup_min_size,
             subgroup_max_size: info.subgroup_max_size,
-            transient_saves_memory: info.transient_saves_memory,
+            // Unknown backend support must not advertise a memory saving.
+            transient_saves_memory: info.transient_saves_memory.unwrap_or(false),
             // Not available from AdapterInfo; set from the granted device limits in `GpuContext::new`.
             max_texture_dim: 0,
         }
@@ -79,6 +81,23 @@ impl From<wgpu::AdapterInfo> for GpuAdapterInfo {
 }
 
 impl GpuContext {
+    /// Share the host's surface-compatible device and queue with image processing.
+    pub fn from_device_queue(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        adapter_info: wgpu::AdapterInfo,
+    ) -> Self {
+        let max_texture_dim = device.limits().max_texture_dimension_2d;
+        let mut info = GpuAdapterInfo::from(adapter_info);
+        info.max_texture_dim = max_texture_dim;
+        Self {
+            device,
+            queue,
+            info,
+            max_texture_dim,
+        }
+    }
+
     pub fn new() -> Result<Self, PipelineError> {
         let desc = instance_descriptor();
         let enabled_backends = desc.backends;
@@ -1601,7 +1620,13 @@ impl DevelopPipeline {
             .map_err(|e| PipelineError::Map(e.to_string()))?
             .map_err(|e| PipelineError::Map(e.to_string()))?;
 
-        let data = readback.slice(..).get_mapped_range();
+        let data = match readback.slice(..).get_mapped_range() {
+            Ok(data) => data,
+            Err(error) => {
+                readback.unmap();
+                return Err(PipelineError::Map(error.to_string()));
+            }
+        };
         out.resize(output_len, 0u8);
         let row = ow as usize * 4;
         if out_bpr as usize == row {

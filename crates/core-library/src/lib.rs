@@ -61,7 +61,8 @@ pub use face_cluster::{
     ungrouped_face_count, ClusterParams, ClusterPlan, ClusterSnapshot, ClusterStats,
 };
 pub use features::{
-    compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
+    compute_features, count_images_missing_features, has_features, images_missing_features,
+    images_missing_features_after, set_image_features, ImageFeatures,
 };
 pub use index::{
     add_root, enumerate_raws, existing_paths, image_kind, insert_image, now_epoch, process_bytes,

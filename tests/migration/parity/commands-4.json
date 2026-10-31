@@ -1,0 +1,284 @@
+{
+  "commands": [
+    {
+      "name": "pano_detect_groups",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Suggestion groups for the review panel.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "pano_detect_dismiss",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Dismiss (or undo a dismissal of) a suggestion group.",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "pano_detect_mark_merged",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Record that a suggestion group was merged into `merged_image_id` (the merge-flow handoff).",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "mask_ai_models_ensure",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Download the interactive-segmentation (AI masking) model weights. Emits `mask_ai:models` progress.",
+      "target": "core-app",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "mask_ai_ready",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Whether the AI-masking models are downloaded and ready.",
+      "target": "core-app",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "mask_ai_encode",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Warm the SAM image embedding for `image_id` in the background (downloads the tier's model on first use, then runs the heavy encode) so the first click segments instantly. Fire-and-forget from the UI.",
+      "target": "core-app",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "mask_ai_prompt",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Compute an AI (SAM) mask from prompt points on `image_id`. Returns the component key (`hash`) to store in the mask's `ai` component plus the mask dims + predicted IoU. The heavy image encode runs once per image and is cached, so repeated clicks are fast.",
+      "target": "core-app",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "mask_ai_tier_get",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Configured AI-masking quality tier (`\"realtime\"` | `\"balanced\"` | `\"max\"`).",
+      "target": "core-app",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "mask_ai_tier_set",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set the AI-masking tier. Clears the cached SAM embedding so the next prompt re-encodes (a tier change swaps the encoder); the segmenter itself rebuilds lazily when the tier differs.",
+      "target": "core-app",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "analysis_facets",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Detected-object category counts (distinct images) for the LeftNav facet.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_detections",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Detected objects for one image (metadata panel).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_caption",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Generated caption + keywords for one image (metadata panel).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_presence",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "MobileCLIP presence-probe scores for one image (advisory AI readout; `None` until the probe ran).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_user_labels",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Manual ground-truth labels for one image (the \"Contains person/animal\" checkboxes).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_image_user_label",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set one manual label field (`field` = \"person\" | \"animal\"; `value` = Some(bool) or None to clear).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_image_user_label_many",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set one manual label field on many images at once (multi-select labeling). Logs one behavioral event per image so the labels feed the AI training layer with their full candidate context.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "analysis_detector_size",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Configured MegaDetector input size (640 or 1280).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_analysis_detector_size",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set the MegaDetector input size; invalidates the cached analyzer registry so the next pass rebuilds at the new resolution.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "models_overview",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Manager overview of every AI model capability (Detection & Scene / People / AI Masking): install state, on-disk size, and per-file + per-tier detail. Drives the AI Models manager UI.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "models_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request an in-flight model download for `group` (`\"analysis\"`|`\"faces\"`|`\"mask_ai\"`) to stop. The partially-written temp file is discarded; already-completed files stay. No-op if idle.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "models_remove",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Delete a capability's downloaded model files to reclaim disk. For `\"mask_ai\"`, `tier` selects the SAM tier (`\"realtime\"`|`\"balanced\"`|`\"max\"`; empty = active). Refuses while a scan is running so it can't race a pass that's loading those weights.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "faces_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "People status: present-image total, how many are face-processed, total faces/people, model state.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "faces_models_ensure",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Download any missing face models (~190 MB, first run only). Emits `faces:models` progress.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "faces_run",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Run the \"Find People\" pass (detect \u2192 align \u2192 embed \u2192 cluster). `force` re-processes everything. Emits `faces:progress`/`faces:done`.  `scope` narrows *detection + embedding* to the container the grid is showing (see [`analysis_run`]). Clustering stays library-wide by design: a face found in one folder must still be matchable against people discovered anywhere else.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "faces_cancel",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Request the running scan to stop after the current batch commits. No-op if idle. Faces run inside the unified scan, so this shares the analysis cancel flag.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "face_stage_enabled",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Whether the face stage participates in the unified AI scan (Settings toggle; default on).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_face_stage_enabled",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Enable/disable the face stage in the unified scan.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "people_list",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "People for the sidebar (named first, then unnamed \"Suggested\" clusters); each with a cover crop.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "person_faces",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Faces of one person, optionally restricted to a status (e.g. `\"unconfirmed\"` for the Review flow).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_faces",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Faces detected in one image (+ their person names) \u2014 the RightInfo \"People\" chips.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "person_set_name",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set (or clear with `null`) a person's name.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "person_set_hidden",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Hide/unhide a person (excluded from the sidebar + library filter when hidden).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "person_set_cover",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set a person's cover (key) face. The face must belong to the person.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "person_merge",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Merge person `src` into `dst` (move all faces + rejections, delete `src`). Atomic; not reversible.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "face_confirm",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Confirm a face belongs to its person (\"yes\" in the Review flow).",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    }
+  ]
+}

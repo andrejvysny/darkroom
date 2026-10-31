@@ -62,11 +62,12 @@ pub struct ScanResult {
 struct RunGuard<'a> {
     running: &'a AtomicBool,
     cancel: &'a AtomicBool,
+    workers: &'a core_runtime::workers::ManagedWorkers,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.cancel.store(false, Ordering::SeqCst);
+        let _ = self.workers.reset_cancel(self.cancel);
     }
 }
 
@@ -95,11 +96,12 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, sel: &ScanSelection) -> Result<ScanRe
     if st.scan_running.swap(true, Ordering::SeqCst) {
         return Err("a scan is already running".into());
     }
-    st.scan_cancel.store(false, Ordering::SeqCst);
     let _guard = RunGuard {
         running: &st.scan_running,
         cancel: &st.scan_cancel,
+        workers: &st.workers,
     };
+    st.workers.reset_cancel(&st.scan_cancel)?;
 
     if sel.stages.is_empty() {
         return Err("no scan stages selected".into());
@@ -113,7 +115,7 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, sel: &ScanSelection) -> Result<ScanRe
         }
     }
 
-    let cancelled = || st.scan_cancel.load(Ordering::SeqCst);
+    let cancelled = || st.workers.is_stopping() || st.scan_cancel.load(Ordering::SeqCst);
     let ai: Vec<StageId> = sel
         .stages
         .iter()
@@ -141,7 +143,7 @@ pub fn run<R: Runtime>(app: &AppHandle<R>, sel: &ScanSelection) -> Result<ScanRe
         }
         // `run_pass`'s RunGuard cleared `analysis_cancel` on the way out; clear the panorama flag
         // too so a cancel from the *previous* phase can't abort this one before it starts.
-        st.pano_detect_cancel.store(false, Ordering::SeqCst);
+        st.workers.reset_cancel(&st.pano_detect_cancel)?;
         out.panoramas_found = crate::pano_detect::run(app, sel.force)?;
     }
 

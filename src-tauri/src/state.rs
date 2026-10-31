@@ -26,7 +26,11 @@ pub struct GpuRender {
 
 /// Managed application state.
 pub struct AppState {
-    pub db: Mutex<Db>,
+    pub workers: core_runtime::workers::ManagedWorkers,
+    pub jobs: core_runtime::jobs::Supervisor,
+    pub publications: core_runtime::publication::PublicationGate,
+    pub db: Arc<Mutex<Db>>,
+    pub catalog: core_runtime::catalog::CatalogAdapter,
     pub thumbs: ThumbCache,
     pub gpu: Option<GpuRender>,
     /// Background queue that renders canonical develop thumbnails so the grid/filmstrip/loupe match
@@ -71,8 +75,8 @@ pub struct AppState {
     pub pano_detect_running: AtomicBool,
     /// Set by `pano_detect_cancel` to abort the running scan (checked between clusters).
     pub pano_detect_cancel: AtomicBool,
-    /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
-    /// newer request has already superseded it.
+    /// Supervisor job ID of the latest claimed viewport owner. Host admission order survives
+    /// client counter restarts and lets older workers skip obsolete decode/publication.
     pub latest_render: AtomicU64,
     /// Monotonic id of the latest whole-crop histogram request; a stale (out-of-order) histogram
     /// result must not overwrite / emit over a newer one.
@@ -129,6 +133,7 @@ pub struct AppState {
     /// Guards the `image_features` backfill, which now runs automatically after imports and scans as
     /// well as from Settings — without this the triggers would overlap and decode everything twice.
     pub features_running: AtomicBool,
+    pub features_queue: crate::features::BackfillQueue,
     /// Guards the pick/reject suggestion fit + scoring pass. Both the manual command and the
     /// post-scan trigger go through it, so a scan finishing mid-training queues nothing.
     pub suggest_running: AtomicBool,
@@ -189,6 +194,40 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Caller holds the publication gate so reused row IDs cannot retain another source's caches.
+    pub fn clear_source_caches(&self) {
+        if let Ok(mut cache) = self.full_render_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.preview_render_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.preview_linear_lru.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.denoise_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.panorama_preview_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.display_referred_memo.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.last_histogram.lock() {
+            *cache = None;
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        {
+            if let Ok(mut cache) = self.sam_embedding.lock() {
+                *cache = None;
+            }
+            if let Ok(mut cache) = self.sam_masks.lock() {
+                cache.clear();
+            }
+        }
+    }
+
     pub fn new<R: Runtime>(app: &AppHandle<R>) -> Result<Self, String> {
         let data_dir = app
             .path()
@@ -196,26 +235,17 @@ impl AppState {
             .map_err(|e| format!("app_data_dir: {e}"))?;
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
 
-        // Map catalog-open failures to actionable, user-facing text — this string ends up in the
-        // fatal startup dialog (`fatal_startup_error`), not just a log line.
-        let db = Db::open(&data_dir.join("catalog.db")).map_err(|e| match e {
-            core_db::DbError::SchemaTooNew { found, supported } => format!(
-                "Your photo catalog was last opened by a newer version of Darkroom \
-                 (catalog format v{found}; this version supports up to v{supported}).\n\n\
-                 Install the latest Darkroom release to keep using this catalog. \
-                 Your photos and edits are safe and untouched."
-            ),
-            core_db::DbError::Corrupt(detail) => format!(
-                "The photo catalog failed its integrity check ({detail}).\n\n\
-                 You can restore a recent copy from the \"backups\" folder next to the catalog \
-                 in Application Support, or rebuild the catalog from your library's sidecar files."
-            ),
-            other => format!("The photo catalog could not be opened: {other}"),
-        })?;
+        let db = core_runtime::catalog::open_database(&data_dir.join("catalog.db"))
+            .map_err(crate::catalog_adapter::startup_error)?;
+        let catalog = core_runtime::catalog::CatalogAdapter::from_shared(db.clone());
         let thumbs =
             ThumbCache::new(data_dir.join("thumbs")).map_err(|e| format!("thumb cache: {e}"))?;
         // Bound the cache to the configured cap on startup (best-effort).
-        if let Ok(cap) = core_library::thumb_cache_cap(&db.conn) {
+        let cap = db
+            .lock()
+            .ok()
+            .and_then(|db| core_library::thumb_cache_cap(&db.conn).ok());
+        if let Some(cap) = cap {
             let _ = thumbs.evict_to(cap);
         }
 
@@ -242,7 +272,20 @@ impl AppState {
         let session_id = format!("{start_ms:x}-{}", std::process::id());
 
         Ok(Self {
-            db: Mutex::new(db),
+            workers: core_runtime::workers::ManagedWorkers::new(16),
+            jobs: core_runtime::jobs::Supervisor::new(
+                core_runtime::jobs::Config {
+                    workers: 3,
+                    max_jobs: 64,
+                    max_bytes: 2 * 1024 * 1024 * 1024,
+                    max_terminal_records: 256,
+                },
+                Arc::new(|| {}),
+            )
+            .map_err(|e| format!("background executor: {e:?}"))?,
+            publications: core_runtime::publication::PublicationGate::default(),
+            db,
+            catalog,
             thumbs,
             gpu,
             thumb_queue: ThumbQueue::new(),
@@ -279,6 +322,7 @@ impl AppState {
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             analyzers: Mutex::new(None),
             features_running: AtomicBool::new(false),
+            features_queue: crate::features::BackfillQueue::default(),
             suggest_running: AtomicBool::new(false),
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),

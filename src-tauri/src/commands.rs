@@ -2,13 +2,13 @@
 //! `AppHandle` inside the blocking closure (never held across `.await`).
 
 use crate::state::{AppState, GpuRender};
+use core_app::ports::CatalogPort;
 use core_library::{
     CaptionRow, CollectionRow, DateTreeYear, DetectionRow, FacetRow, FolderRow, ImageFaceRow,
     ImageRow, IndexStats, KeywordRow, MergeSources, PersonFaceRow, PersonRow, PresenceRow,
     QueryParams, UserLabels,
 };
 use core_pipeline::{DevelopParams, Histogram};
-use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -75,55 +75,80 @@ pub(crate) fn enforce_thumb_cap(st: &AppState) {
 
 #[tauri::command]
 pub async fn library_query(app: AppHandle, params: QueryParams) -> Result<Vec<ImageRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::query_images(&db.conn, &params).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "library_query",
+        move || {
+            let st = app.state::<AppState>();
+            st.catalog.query(&params).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn library_count(app: AppHandle, params: QueryParams) -> Result<i64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::count_images(&db.conn, &params).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "library_count",
+        move || {
+            let st = app.state::<AppState>();
+            st.catalog.count(&params).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn library_folders(app: AppHandle) -> Result<Vec<FolderRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::list_folders(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "library_folders",
+        move || {
+            let st = app.state::<AppState>();
+            st.catalog.folders().map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn library_date_tree(app: AppHandle) -> Result<Vec<DateTreeYear>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::date_tree(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "library_date_tree",
+        move || {
+            let st = app.state::<AppState>();
+            st.catalog.dates().map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn image_meta(app: AppHandle, id: i64) -> Result<Option<ImageRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::image_by_id(&db.conn, id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "image_meta",
+        move || {
+            let st = app.state::<AppState>();
+            st.catalog.image(id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -144,10 +169,16 @@ pub fn gpu_status(app: AppHandle) -> Option<core_pipeline::GpuAdapterInfo> {
 #[tauri::command]
 pub async fn library_index_root(app: AppHandle, path: String) -> Result<IndexStats, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app2.state::<AppState>();
-        index_root_blocking(&app2, &st, &PathBuf::from(&path), true)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Import,
+        true,
+        "library_index_root",
+        move || {
+            let st = app2.state::<AppState>();
+            index_root_blocking(&app2, &st, &PathBuf::from(&path), true)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -159,12 +190,18 @@ pub async fn decode_failures_list(
     app: AppHandle,
     limit: Option<i64>,
 ) -> Result<Vec<core_library::DecodeFailureRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::list_decode_failures(&db.conn, limit.unwrap_or(DECODE_FAILURE_LIMIT))
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "decode_failures_list",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::list_decode_failures(&db.conn, limit.unwrap_or(DECODE_FAILURE_LIMIT))
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -174,11 +211,17 @@ pub async fn decode_failures_list(
 pub async fn decode_failures_counts(
     app: AppHandle,
 ) -> Result<core_library::DecodeFailureCounts, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::decode_failure_counts(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "decode_failures_counts",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::decode_failure_counts(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -187,17 +230,23 @@ pub async fn decode_failures_counts(
 /// Returns how many rows were removed. Touches only bookkeeping — no file is read or moved.
 #[tauri::command]
 pub async fn decode_failures_forget(app: AppHandle, paths: Vec<String>) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::forget_decode_failures(&db.conn, &paths).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "decode_failures_forget",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::forget_decode_failures(&db.conn, &paths).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
 
 /// Index every supported RAW under `root` into the catalog: upsert the folder, enumerate
-/// (recursively), parallel hash+meta+thumbnail, then a single transactional insert. Emits
+/// (recursively), sequential hash+meta+thumbnail, then a single transactional insert. Emits
 /// `import:progress` / `import:done`. When `analyze`, kicks off background AI analysis of the
 /// newly-added images (only if models are already downloaded). Runs synchronously on the caller's
 /// (blocking) thread.
@@ -216,7 +265,7 @@ fn index_root_blocking(
         (fid, known, known_bad)
     };
 
-    // --- unlocked: enumerate + parallel process (hash + meta + thumbnail) ---
+    // --- unlocked: enumerate + sequential process (hash + meta + thumbnail) ---
     // Files whose recorded failure still stands (same decoder build, same bytes) are not re-opened.
     let mut skipped_bad = 0usize;
     let todo: Vec<PathBuf> = core_library::enumerate_raws(root, true)
@@ -233,7 +282,7 @@ fn index_root_blocking(
     // The path rides along with its result: a `LibError` carries no path, and every failure has to
     // be recorded against the file that produced it.
     let results: Vec<_> = todo
-        .par_iter()
+        .iter()
         .map(|p| {
             let r = core_library::process_file(p, &st.thumbs, core_library::THUMB_SIZE);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -308,31 +357,39 @@ fn index_root_blocking(
 #[tauri::command]
 pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app2.state::<AppState>();
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "database_reset",
+        move || {
+            let st = app2.state::<AppState>();
+            let _sources = st.publications.invalidate_all_guard();
+            st.clear_source_caches();
 
-        // Wipe all catalog rows (folders included → no watched roots remain).
-        {
-            let mut db = st.db.lock().map_err(|e| e.to_string())?;
-            db.wipe().map_err(|e| e.to_string())?;
-        }
-        // Clear derived caches (thumbnails on disk + warm GPU resources + last histogram).
-        let _ = st.thumbs.evict_to(0);
-        if let Ok(mut slot) = st.full_render_cache.lock() {
-            *slot = None;
-        }
-        if let Ok(mut slot) = st.preview_render_cache.lock() {
-            *slot = None;
-        }
-        if let Ok(mut lru) = st.preview_linear_lru.lock() {
-            lru.clear();
-        }
-        if let Ok(mut h) = st.last_histogram.lock() {
-            *h = None;
-        }
+            // Wipe all catalog rows (folders included → no watched roots remain).
+            {
+                let mut db = st.db.lock().map_err(|e| e.to_string())?;
+                db.wipe().map_err(|e| e.to_string())?;
+            }
+            // Clear derived caches (thumbnails on disk + warm GPU resources + last histogram).
+            let _ = st.thumbs.evict_to(0);
+            if let Ok(mut slot) = st.full_render_cache.lock() {
+                *slot = None;
+            }
+            if let Ok(mut slot) = st.preview_render_cache.lock() {
+                *slot = None;
+            }
+            if let Ok(mut lru) = st.preview_linear_lru.lock() {
+                lru.clear();
+            }
+            if let Ok(mut h) = st.last_histogram.lock() {
+                *h = None;
+            }
 
-        Ok::<_, String>(IndexStats::default())
-    })
+            Ok::<_, String>(IndexStats::default())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -360,7 +417,8 @@ pub(crate) fn stored_edit_is_unreadable(stored: Option<&str>) -> bool {
 /// Saved develop params for an image (defaults if none).
 #[tauri::command]
 pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopParams, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::jobs::spawn_blocking(app.clone(), core_app::jobs::JobClass::UserCommand, true, "develop_get_edit",
+        move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
         let params = match core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())? {
@@ -384,12 +442,18 @@ pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopPa
 /// silently invite edits that `develop_set_edit` then refuses. Cheap — one row read.
 #[tauri::command]
 pub async fn develop_edit_status(app: AppHandle, image_id: i64) -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let stored = core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())?;
-        Ok::<_, String>(stored_edit_is_unreadable(stored.as_deref()))
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "develop_edit_status",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let stored = core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())?;
+            Ok::<_, String>(stored_edit_is_unreadable(stored.as_deref()))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -404,48 +468,55 @@ pub async fn develop_set_edit(
     // `true` to overwrite even an unreadable stored blob (explicit Reset). Defaults to `false`.
     force: Option<bool>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        // Snapshot the prior params for the event before overwriting.
-        let before = core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())?;
-        // Refuse to clobber a stored edit that exists but no longer parses into the current schema
-        // (corruption / breaking change). Overwriting it would permanently destroy the user's real
-        // adjustments — the non-destructive guarantee. An explicit Reset passes `force=true` to
-        // discard it deliberately; a stray slider commit (no force) cannot.
-        if !force.unwrap_or(false) && stored_edit_is_unreadable(before.as_deref()) {
-            return Err(format!(
-                "stored edit for image {image_id} is unreadable (schema mismatch or \
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "develop_set_edit",
+        move || {
+            let json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            // Snapshot the prior params for the event before overwriting.
+            let before = core_library::get_edit(&db.conn, image_id).map_err(|e| e.to_string())?;
+            // Refuse to clobber a stored edit that exists but no longer parses into the current schema
+            // (corruption / breaking change). Overwriting it would permanently destroy the user's real
+            // adjustments — the non-destructive guarantee. An explicit Reset passes `force=true` to
+            // discard it deliberately; a stray slider commit (no force) cannot.
+            if !force.unwrap_or(false) && stored_edit_is_unreadable(before.as_deref()) {
+                return Err(format!(
+                    "stored edit for image {image_id} is unreadable (schema mismatch or \
                  corruption); Reset to discard it"
-            ));
-        }
-        core_library::set_edit(
-            &db.conn,
-            image_id,
-            PROCESS_VERSION,
-            &json,
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())?;
-        sync_sidecar(st.inner(), image_id);
-        let _ = core_library::append_event(
-            &db.conn,
-            &crate::events::stamp(
-                st.inner(),
-                core_library::Event {
-                    event_type: "develop.params_commit".into(),
-                    image_id: Some(image_id),
-                    process_version: Some(PROCESS_VERSION),
-                    params_before: before,
-                    params_after: Some(json),
-                    touch_count,
-                    ..Default::default()
-                },
-            ),
-        );
-        Ok(())
-    })
+                ));
+            }
+            core_library::set_edit(
+                &db.conn,
+                image_id,
+                PROCESS_VERSION,
+                &json,
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())?;
+            sync_sidecar(st.inner(), image_id);
+            let _ = core_library::append_event(
+                &db.conn,
+                &crate::events::stamp(
+                    st.inner(),
+                    core_library::Event {
+                        event_type: "develop.params_commit".into(),
+                        image_id: Some(image_id),
+                        process_version: Some(PROCESS_VERSION),
+                        params_before: before,
+                        params_after: Some(json),
+                        touch_count,
+                        ..Default::default()
+                    },
+                ),
+            );
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -477,19 +548,25 @@ pub async fn develop_preview_jpeg(
     app: AppHandle,
     image_id: i64,
 ) -> Result<tauri::ipc::Response, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let path = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::image_by_id(&db.conn, image_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "image not found".to_string())?
-                .path
-        };
-        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-        let thumb = core_raw::thumbnail_jpeg(&src, 2560, 85).map_err(|e| e.to_string())?;
-        Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Viewport,
+        false,
+        "develop_preview_jpeg",
+        move || {
+            let st = app.state::<AppState>();
+            let path = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::image_by_id(&db.conn, image_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "image not found".to_string())?
+                    .path
+            };
+            let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+            let thumb = core_raw::thumbnail_jpeg(&src, 2560, 85).map_err(|e| e.to_string())?;
+            Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -510,6 +587,7 @@ pub struct DevelopRender {
 /// bypass the scene-referred base tone operator. Memoized per image so the hot `develop_render` path
 /// (one call per slider move) reads the DB only when the open image changes.
 pub(crate) fn image_display_referred(st: &AppState, image_id: i64) -> Result<bool, String> {
+    let _source = st.publications.mutation_guard();
     {
         let memo = st.display_referred_memo.lock().map_err(|e| e.to_string())?;
         if let Some((id, v)) = *memo {
@@ -735,57 +813,81 @@ struct EditChanged {
 /// edit version, or null when the image has no edit; a superseded render never publishes old state.
 #[tauri::command]
 pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option<i64>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let gpu = st
-            .gpu
-            .as_ref()
-            .ok_or_else(|| "GPU develop unavailable".to_string())?;
-        let render = render_develop_jpeg(
-            st.inner(),
-            gpu,
-            image_id,
-            THUMB_EDIT_EDGE,
-            THUMB_EDIT_QUALITY,
-        )?;
-        let edited_at = match render.edit_version {
-            Some(version) => {
-                st.thumbs
-                    .write_edited(&render.hash, PROCESS_VERSION, version, &render.jpeg)
-                    .map_err(|e| e.to_string())?;
-                Some(version)
-            }
-            None => {
-                // A late default render must not remove a newer edited variant written while it
-                // was rendering. Cache keys coexist; the catalog selects the current revision.
-                st.thumbs
-                    .write_canonical(&render.hash, PROCESS_VERSION, &render.jpeg)
-                    .map_err(|e| e.to_string())?;
-                None
-            }
-        };
-        // Edited revisions coexist for out-of-order render safety; keep their storage bounded
-        // even while the background worker is paused for this Develop session.
-        crate::thumb_queue::enforce_thumb_cap_after_write(st.inner());
-        // The render ran without the DB lock and may have been overtaken by a new save/render.
-        // Serialize this final revision check + event enqueue with saves so completion order
-        // cannot roll the frontend's editedAt backwards. The expensive render/write is finished.
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let current_version = core_library::get_edit_with_version(&db.conn, image_id)
-            .map_err(|e| e.to_string())?
-            .map(|(_, version)| version);
-        if current_version != edited_at {
-            return Ok(current_version);
-        }
-        let _ = app.emit(
-            "develop:edit-changed",
-            EditChanged {
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Thumbnail,
+        false,
+        "develop_regen_thumb",
+        move || {
+            let st = app.state::<AppState>();
+            let gpu = st
+                .gpu
+                .as_ref()
+                .ok_or_else(|| "GPU develop unavailable".to_string())?;
+            let sequence = st.publications.sequence();
+            let source = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::image_by_id(&db.conn, image_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "image not found".to_string())?
+            };
+            let token = st
+                .publications
+                .capture_at(
+                    core_model::identity::ImageId(image_id),
+                    core_runtime::publication::SourceKey {
+                        path: source.path,
+                        hash: source.content_hash,
+                    },
+                    sequence,
+                )
+                .map_err(|_| "thumbnail source changed".to_string())?;
+            let render = render_develop_jpeg(
+                st.inner(),
+                gpu,
                 image_id,
-                edited_at,
-            },
-        );
-        Ok(edited_at)
-    })
+                THUMB_EDIT_EDGE,
+                THUMB_EDIT_QUALITY,
+            )?;
+            let edited_at = st
+                .publications
+                .with_current(&token, || -> Result<Option<i64>, String> {
+                    let current_version = {
+                        let db = st.db.lock().map_err(|e| e.to_string())?;
+                        core_library::get_edit_with_version(&db.conn, image_id)
+                            .map_err(|e| e.to_string())?
+                            .map(|(_, version)| version)
+                    };
+                    if current_version != render.edit_version {
+                        return Ok(current_version);
+                    }
+                    match render.edit_version {
+                        Some(version) => st.thumbs.write_edited(
+                            &render.hash,
+                            PROCESS_VERSION,
+                            version,
+                            &render.jpeg,
+                        ),
+                        None => {
+                            st.thumbs
+                                .write_canonical(&render.hash, PROCESS_VERSION, &render.jpeg)
+                        }
+                    }
+                    .map_err(|e| e.to_string())?;
+                    let _ = app.emit(
+                        "develop:edit-changed",
+                        EditChanged {
+                            image_id,
+                            edited_at: current_version,
+                        },
+                    );
+                    Ok(current_version)
+                })
+                .map_err(|_| "thumbnail source changed".to_string())??;
+            crate::thumb_queue::enforce_thumb_cap_after_write(st.inner());
+            Ok(edited_at)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -913,6 +1015,24 @@ fn ensure_full_render_cache(
     image_id: i64,
     superseded: impl Fn() -> bool,
 ) -> Result<bool, String> {
+    let sequence = st.publications.sequence();
+    let source = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::image_by_id(&db.conn, image_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "image not found".to_string())?
+    };
+    let token = st
+        .publications
+        .capture_at(
+            core_model::identity::ImageId(image_id),
+            core_runtime::publication::SourceKey {
+                path: source.path.clone(),
+                hash: source.content_hash,
+            },
+            sequence,
+        )
+        .map_err(|_| "source changed before decode".to_string())?;
     // Free the large full-res texture as soon as we render a different image.
     {
         let mut slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
@@ -938,13 +1058,7 @@ fn ensure_full_render_cache(
         ClaimOutcome::Decode(claim) => claim,
     };
     {
-        let path = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::image_by_id(&db.conn, image_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "image not found".to_string())?
-                .path
-        };
+        let path = source.path;
         let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
         let t = Instant::now();
         let lin = core_raw::develop_linear(&src)
@@ -963,10 +1077,17 @@ fn ensure_full_render_cache(
             .pipeline
             .prepare(&gpu.ctx, &lin)
             .map_err(|e| e.to_string())?;
-        *st.full_render_cache.lock().map_err(|e| e.to_string())? =
-            Some((image_id, std::sync::Arc::new(prepared)));
+        st.publications
+            .with_current(&token, || -> Result<bool, String> {
+                if superseded() || st.workers.is_stopping() {
+                    return Ok(false);
+                }
+                *st.full_render_cache.lock().map_err(|e| e.to_string())? =
+                    Some((image_id, std::sync::Arc::new(prepared)));
+                Ok(true)
+            })
+            .unwrap_or(Ok(false))
     }
-    Ok(true)
 }
 
 fn ensure_preview_render_cache(
@@ -975,6 +1096,24 @@ fn ensure_preview_render_cache(
     image_id: i64,
     superseded: impl Fn() -> bool,
 ) -> Result<bool, String> {
+    let sequence = st.publications.sequence();
+    let source = {
+        let db = st.db.lock().map_err(|e| e.to_string())?;
+        core_library::image_by_id(&db.conn, image_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "image not found".to_string())?
+    };
+    let token = st
+        .publications
+        .capture_at(
+            core_model::identity::ImageId(image_id),
+            core_runtime::publication::SourceKey {
+                path: source.path.clone(),
+                hash: source.content_hash,
+            },
+            sequence,
+        )
+        .map_err(|_| "source changed before decode".to_string())?;
     {
         let mut slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
         if slot.as_ref().is_some_and(|(id, _)| *id != image_id) {
@@ -1001,13 +1140,7 @@ fn ensure_preview_render_cache(
         let lin = match cached {
             Some(lin) => lin,
             None => {
-                let path = {
-                    let db = st.db.lock().map_err(|e| e.to_string())?;
-                    core_library::image_by_id(&db.conn, image_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| "image not found".to_string())?
-                        .path
-                };
+                let path = source.path;
                 let src =
                     core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
                 let t = Instant::now();
@@ -1021,10 +1154,13 @@ fn ensure_preview_render_cache(
                     );
                 }
                 // Cache the decode so navigating BACK to this image is instant.
-                st.preview_linear_lru
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .insert(image_id, lin.clone());
+                let _ = st.publications.with_current(&token, || {
+                    st.preview_linear_lru
+                        .lock()
+                        .map_err(|e| e.to_string())?
+                        .insert(image_id, lin.clone());
+                    Ok::<_, String>(())
+                });
                 lin
             }
         };
@@ -1036,10 +1172,17 @@ fn ensure_preview_render_cache(
             .pipeline
             .prepare(&gpu.ctx, &lin)
             .map_err(|e| e.to_string())?;
-        *st.preview_render_cache.lock().map_err(|e| e.to_string())? =
-            Some((image_id, std::sync::Arc::new(prepared)));
+        st.publications
+            .with_current(&token, || -> Result<bool, String> {
+                if superseded() || st.workers.is_stopping() {
+                    return Ok(false);
+                }
+                *st.preview_render_cache.lock().map_err(|e| e.to_string())? =
+                    Some((image_id, std::sync::Arc::new(prepared)));
+                Ok(true)
+            })
+            .unwrap_or(Ok(false))
     }
-    Ok(true)
 }
 
 /// Predictively decode the half-res previews of `image_ids` (the frontend's next/prev neighbors)
@@ -1062,7 +1205,8 @@ struct DevelopFullReady {
 }
 
 fn warm_full_render_cache(app: AppHandle, image_id: i64) {
-    std::thread::spawn(move || {
+    let host = app.clone();
+    crate::jobs::background(&host, core_app::jobs::JobClass::Prefetch, move || {
         let st = app.state::<AppState>();
         let Some(gpu) = st.gpu.as_ref() else { return };
         let already_full = st
@@ -1116,7 +1260,9 @@ pub async fn develop_render(
     crop_preview: bool,
     request_id: u64,
 ) -> Result<tauri::ipc::Response, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    // Client counters restart on view/webview reload; the supervisor assigns ordered host IDs.
+    let _client_request_id = request_id;
+    crate::jobs::viewport_render(app.clone(), image_id, move |request_id| {
         let prof = profiling();
         let st = app.state::<AppState>();
         let gpu = st
@@ -1127,8 +1273,6 @@ pub async fn develop_render(
         // Authoritative (intrinsic to the file): never trust the FE-sent value.
         params.display_referred = image_display_referred(st.inner(), image_id)?;
 
-        st.latest_render.fetch_max(request_id, Ordering::SeqCst);
-        st.current_image.store(image_id, Ordering::SeqCst);
         let superseded = || st.latest_render.load(Ordering::SeqCst) > request_id;
 
         // Clamp to the device limit HERE so the response header always matches the rendered
@@ -1236,71 +1380,80 @@ pub async fn develop_histogram(
     image_id: i64,
     mut params: DevelopParams,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let gpu = st
-            .gpu
-            .as_ref()
-            .ok_or_else(|| "GPU develop unavailable".to_string())?;
-        params.display_referred = image_display_referred(st.inner(), image_id)?;
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Viewport,
+        false,
+        "develop_histogram",
+        move || {
+            let st = app.state::<AppState>();
+            let sequence = st.publications.sequence();
+            let gpu = st
+                .gpu
+                .as_ref()
+                .ok_or_else(|| "GPU develop unavailable".to_string())?;
+            params.display_referred = image_display_referred(st.inner(), image_id)?;
 
-        let view = core_pipeline::ViewParams {
-            origin: [0.0, 0.0],
-            size: [1.0, 1.0],
-            out_w: HIST_RENDER_EDGE,
-            out_h: HIST_RENDER_EDGE,
-            active: true,
-            overlay_layer: -1,
-            overlay_color: [0.0, 0.0, 0.0],
-            overlay_strength: 0.0,
-            crop_preview: false,
-        };
-        // Order guard: two overlapping histogram calls (rapid slider + before/after) can finish out
-        // of order; only the newest may store/emit.
-        let seq = st.hist_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let view = core_pipeline::ViewParams {
+                origin: [0.0, 0.0],
+                size: [1.0, 1.0],
+                out_w: HIST_RENDER_EDGE,
+                out_h: HIST_RENDER_EDGE,
+                active: true,
+                overlay_layer: -1,
+                overlay_color: [0.0, 0.0, 0.0],
+                overlay_strength: 0.0,
+                crop_preview: false,
+            };
+            // Order guard: two overlapping histogram calls (rapid slider + before/after) can finish out
+            // of order; only the newest may store/emit.
+            let seq = st.hist_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Reuse a WARM cache only — never decode here. Prefer the full-res slot; fall back to the
-        // half-res preview slot (at HIST_RENDER_EDGE the tiers are indistinguishable), so the panel
-        // has data while the full decode is still in flight. Skip only when BOTH are cold — the
-        // frontend re-triggers after the first viewport render warms a cache.
-        let prepared = {
-            let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
-            slot.as_ref()
-                .filter(|(id, _)| *id == image_id)
-                .map(|(_, p)| p.clone())
-        };
-        let prepared = match prepared {
-            Some(p) => p,
-            None => {
-                let slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
-                match slot
-                    .as_ref()
+            // Reuse a WARM cache only — never decode here. Prefer the full-res slot; fall back to the
+            // half-res preview slot (at HIST_RENDER_EDGE the tiers are indistinguishable), so the panel
+            // has data while the full decode is still in flight. Skip only when BOTH are cold — the
+            // frontend re-triggers after the first viewport render warms a cache.
+            let prepared = {
+                let slot = st.full_render_cache.lock().map_err(|e| e.to_string())?;
+                slot.as_ref()
                     .filter(|(id, _)| *id == image_id)
                     .map(|(_, p)| p.clone())
-                {
-                    Some(p) => p,
-                    None => return Ok(()),
+            };
+            let prepared = match prepared {
+                Some(p) => p,
+                None => {
+                    let slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
+                    match slot
+                        .as_ref()
+                        .filter(|(id, _)| *id == image_id)
+                        .map(|(_, p)| p.clone())
+                    {
+                        Some(p) => p,
+                        None => return Ok(()),
+                    }
                 }
-            }
-        };
-        // Resolve coverage for THIS histogram's params, not whichever viewport rendered last.
-        let ai_covs = required_ai_coverages(st.inner(), image_id, &params)?;
-        // Cache locks dropped — the render serializes only on the per-image render_lock.
-        let rgba = gpu
-            .pipeline
-            .render_view_with_ai_coverages(&gpu.ctx, &prepared, &params, &view, &ai_covs)
-            .map_err(|e| e.to_string())?;
+            };
+            // Resolve coverage for THIS histogram's params, not whichever viewport rendered last.
+            let ai_covs = required_ai_coverages(st.inner(), image_id, &params)?;
+            // Cache locks dropped — the render serializes only on the per-image render_lock.
+            let rgba = gpu
+                .pipeline
+                .render_view_with_ai_coverages(&gpu.ctx, &prepared, &params, &view, &ai_covs)
+                .map_err(|e| e.to_string())?;
 
-        if st.hist_seq.load(Ordering::SeqCst) != seq {
-            return Ok(()); // superseded by a newer histogram request
-        }
-        let hist = core_pipeline::histogram(&rgba);
-        if let Ok(mut last) = st.last_histogram.lock() {
-            *last = Some(hist.clone());
-        }
-        let _ = app.emit("develop:histogram", hist);
-        Ok::<_, String>(())
-    })
+            if st.hist_seq.load(Ordering::SeqCst) != seq {
+                return Ok(()); // superseded by a newer histogram request
+            }
+            let hist = core_pipeline::histogram(&rgba);
+            let _ = st.publications.with_sequence(sequence, || {
+                if let Ok(mut last) = st.last_histogram.lock() {
+                    *last = Some(hist.clone());
+                }
+                let _ = app.emit("develop:histogram", hist);
+            });
+            Ok::<_, String>(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1403,79 +1556,85 @@ pub async fn export_image(
 ) -> Result<(), String> {
     // JPEG encoder quality (1..=100); default 92 when unset. Ignored for PNG.
     let quality = quality.unwrap_or(92).clamp(1, 100);
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        ensure_export_destination(st.inner(), Path::new(&dest))?;
-        let gpu = st
-            .gpu
-            .as_ref()
-            .ok_or_else(|| "GPU export unavailable".to_string())?;
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Export,
+        true,
+        "export_image",
+        move || {
+            let st = app.state::<AppState>();
+            ensure_export_destination(st.inner(), Path::new(&dest))?;
+            let gpu = st
+                .gpu
+                .as_ref()
+                .ok_or_else(|| "GPU export unavailable".to_string())?;
 
-        let path = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::image_by_id(&db.conn, image_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "image not found".to_string())?
-                .path
-        };
-        params.display_referred = core_raw::is_display(Path::new(&path));
+            let path = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::image_by_id(&db.conn, image_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "image not found".to_string())?
+                    .path
+            };
+            params.display_referred = core_raw::is_display(Path::new(&path));
 
-        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-        // When denoise is enabled for this image, export from the full-res denoised source (raw-domain
-        // denoise + amount blend) instead of the plain develop.
-        let lin = decode_develop_source(st.inner(), &src, &params)?;
-        // Full-res export needs a source-sized GPU texture — fail with a clear message instead of
-        // an opaque pipeline error. (Tiled/downscaled export for oversized sources is a follow-up.)
-        let max_edge = gpu.ctx.max_texture_dim;
-        if lin.width > max_edge || lin.height > max_edge {
-            return Err(format!(
-                "image is {}×{} but this GPU supports at most {max_edge}px per side for export",
-                lin.width, lin.height
-            ));
-        }
-        let ai_covs = required_ai_coverages(st.inner(), image_id, &params)?;
-        let (rgba, cw, ch) = render_linear_cropped(gpu, &lin, &params, &ai_covs)?;
+            let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+            // When denoise is enabled for this image, export from the full-res denoised source (raw-domain
+            // denoise + amount blend) instead of the plain develop.
+            let lin = decode_develop_source(st.inner(), &src, &params)?;
+            // Full-res export needs a source-sized GPU texture — fail with a clear message instead of
+            // an opaque pipeline error. (Tiled/downscaled export for oversized sources is a follow-up.)
+            let max_edge = gpu.ctx.max_texture_dim;
+            if lin.width > max_edge || lin.height > max_edge {
+                return Err(format!(
+                    "image is {}×{} but this GPU supports at most {max_edge}px per side for export",
+                    lin.width, lin.height
+                ));
+            }
+            let ai_covs = required_ai_coverages(st.inner(), image_id, &params)?;
+            let (rgba, cw, ch) = render_linear_cropped(gpu, &lin, &params, &ai_covs)?;
 
-        // Border / frame composite (solid color + optional pad-to-aspect). A CPU post-step outside
-        // the GPU pipeline; no-op unless the border is active.
-        let (rgba, ow, oh) = if params.border.is_active() {
-            core_pipeline::frame_rgba8(
-                &rgba,
-                cw,
-                ch,
-                params.border.color_rgba8(),
-                params.border.size,
-                params.border.aspect(),
-            )
-        } else {
-            (rgba, cw, ch)
-        };
+            // Border / frame composite (solid color + optional pad-to-aspect). A CPU post-step outside
+            // the GPU pipeline; no-op unless the border is active.
+            let (rgba, ow, oh) = if params.border.is_active() {
+                core_pipeline::frame_rgba8(
+                    &rgba,
+                    cw,
+                    ch,
+                    params.border.color_rgba8(),
+                    params.border.size,
+                    params.border.aspect(),
+                )
+            } else {
+                (rgba, cw, ch)
+            };
 
-        let bytes = match format.to_lowercase().as_str() {
-            "png" => core_pipeline::rgba8_to_png(&rgba, ow, oh),
-            "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, ow, oh, quality),
-            other => return Err(format!("unsupported export format: {other}")),
-        }
-        .map_err(|e| e.to_string())?;
+            let bytes = match format.to_lowercase().as_str() {
+                "png" => core_pipeline::rgba8_to_png(&rgba, ow, oh),
+                "jpeg" | "jpg" => core_pipeline::rgba8_to_jpeg(&rgba, ow, oh, quality),
+                other => return Err(format!("unsupported export format: {other}")),
+            }
+            .map_err(|e| e.to_string())?;
 
-        ensure_export_destination(st.inner(), Path::new(&dest))?;
-        write_new_export(Path::new(&dest), &bytes)?;
-        // Export is the strongest edit-quality endorsement — log it (best-effort, separate lock).
-        crate::events::log_event(
-            st.inner(),
-            core_library::Event {
-                event_type: "develop.export".into(),
-                image_id: Some(image_id),
-                process_version: Some(PROCESS_VERSION),
-                params_after: serde_json::to_string(&params).ok(),
-                context: Some(
-                    serde_json::json!({ "format": format, "quality": quality }).to_string(),
-                ),
-                ..Default::default()
-            },
-        );
-        Ok::<_, String>(())
-    })
+            ensure_export_destination(st.inner(), Path::new(&dest))?;
+            write_new_export(Path::new(&dest), &bytes)?;
+            // Export is the strongest edit-quality endorsement — log it (best-effort, separate lock).
+            crate::events::log_event(
+                st.inner(),
+                core_library::Event {
+                    event_type: "develop.export".into(),
+                    image_id: Some(image_id),
+                    process_version: Some(PROCESS_VERSION),
+                    params_after: serde_json::to_string(&params).ok(),
+                    context: Some(
+                        serde_json::json!({ "format": format, "quality": quality }).to_string(),
+                    ),
+                    ..Default::default()
+                },
+            );
+            Ok::<_, String>(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1488,11 +1647,18 @@ where
         + Send
         + 'static,
 {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        f(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "db_write",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            f(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1552,24 +1718,31 @@ pub async fn cull_set_rating(
     candidate_ids: Option<Vec<i64>>,
     suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_rating(&db.conn, image_id, stars).map_err(|e| e.to_string())?;
-        sync_sidecar(st.inner(), image_id);
-        let mut event = core_library::Event {
-            event_type: "culling.rate".into(),
-            image_id: Some(image_id),
-            stars: Some(stars),
-            group_id,
-            candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
-            latency_ms,
-            ..Default::default()
-        };
-        suggestion.unwrap_or_default().apply(&mut event);
-        let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_set_rating",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_rating(&db.conn, image_id, stars).map_err(|e| e.to_string())?;
+            sync_sidecar(st.inner(), image_id);
+            let mut event = core_library::Event {
+                event_type: "culling.rate".into(),
+                image_id: Some(image_id),
+                stars: Some(stars),
+                group_id,
+                candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
+                latency_ms,
+                ..Default::default()
+            };
+            suggestion.unwrap_or_default().apply(&mut event);
+            let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1584,25 +1757,32 @@ pub async fn cull_set_flag(
     candidate_ids: Option<Vec<i64>>,
     suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_flag(&db.conn, image_id, &flag).map_err(|e| e.to_string())?;
-        sync_sidecar(st.inner(), image_id);
-        let mut event = core_library::Event {
-            event_type: flag_event_type(&flag).into(),
-            image_id: Some(image_id),
-            chosen_id: (flag == "pick").then_some(image_id),
-            flag: Some(flag),
-            group_id,
-            candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
-            latency_ms,
-            ..Default::default()
-        };
-        suggestion.unwrap_or_default().apply(&mut event);
-        let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_set_flag",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_flag(&db.conn, image_id, &flag).map_err(|e| e.to_string())?;
+            sync_sidecar(st.inner(), image_id);
+            let mut event = core_library::Event {
+                event_type: flag_event_type(&flag).into(),
+                image_id: Some(image_id),
+                chosen_id: (flag == "pick").then_some(image_id),
+                flag: Some(flag),
+                group_id,
+                candidate_ids: candidate_ids.as_deref().map(core_library::ids_json),
+                latency_ms,
+                ..Default::default()
+            };
+            suggestion.unwrap_or_default().apply(&mut event);
+            let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1616,23 +1796,31 @@ pub async fn cull_set_label(
     group_id: Option<String>,
     suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_label(&db.conn, image_id, label.as_deref()).map_err(|e| e.to_string())?;
-        sync_sidecar(st.inner(), image_id);
-        let mut event = core_library::Event {
-            event_type: "culling.label".into(),
-            image_id: Some(image_id),
-            color_label: label,
-            group_id,
-            latency_ms,
-            ..Default::default()
-        };
-        suggestion.unwrap_or_default().apply(&mut event);
-        let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_set_label",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_label(&db.conn, image_id, label.as_deref())
+                .map_err(|e| e.to_string())?;
+            sync_sidecar(st.inner(), image_id);
+            let mut event = core_library::Event {
+                event_type: "culling.label".into(),
+                image_id: Some(image_id),
+                color_label: label,
+                group_id,
+                latency_ms,
+                ..Default::default()
+            };
+            suggestion.unwrap_or_default().apply(&mut event);
+            let _ = core_library::append_event(&db.conn, &crate::events::stamp(st.inner(), event));
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1665,21 +1853,28 @@ pub async fn cull_set_rating_many(
     stars: i64,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_rating_many(&mut db.conn, &image_ids, stars)
-            .map_err(|e| e.to_string())?;
-        sync_sidecars(st.inner(), &image_ids);
-        log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
-            core_library::Event {
-                event_type: "culling.rate".into(),
-                stars: Some(stars),
-                ..Default::default()
-            }
-        });
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_set_rating_many",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_rating_many(&mut db.conn, &image_ids, stars)
+                .map_err(|e| e.to_string())?;
+            sync_sidecars(st.inner(), &image_ids);
+            log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
+                core_library::Event {
+                    event_type: "culling.rate".into(),
+                    stars: Some(stars),
+                    ..Default::default()
+                }
+            });
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1691,22 +1886,30 @@ pub async fn cull_set_flag_many(
     flag: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_flag_many(&mut db.conn, &image_ids, &flag).map_err(|e| e.to_string())?;
-        sync_sidecars(st.inner(), &image_ids);
-        let et = flag_event_type(&flag);
-        log_batch(st.inner(), &db.conn, &image_ids, &group_id, |id| {
-            core_library::Event {
-                event_type: et.into(),
-                chosen_id: (flag == "pick").then_some(id),
-                flag: Some(flag.clone()),
-                ..Default::default()
-            }
-        });
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_set_flag_many",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_flag_many(&mut db.conn, &image_ids, &flag)
+                .map_err(|e| e.to_string())?;
+            sync_sidecars(st.inner(), &image_ids);
+            let et = flag_event_type(&flag);
+            log_batch(st.inner(), &db.conn, &image_ids, &group_id, |id| {
+                core_library::Event {
+                    event_type: et.into(),
+                    chosen_id: (flag == "pick").then_some(id),
+                    flag: Some(flag.clone()),
+                    ..Default::default()
+                }
+            });
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1718,21 +1921,28 @@ pub async fn cull_set_label_many(
     label: Option<String>,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_label_many(&mut db.conn, &image_ids, label.as_deref())
-            .map_err(|e| e.to_string())?;
-        sync_sidecars(st.inner(), &image_ids);
-        log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
-            core_library::Event {
-                event_type: "culling.label".into(),
-                color_label: label.clone(),
-                ..Default::default()
-            }
-        });
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_set_label_many",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_label_many(&mut db.conn, &image_ids, label.as_deref())
+                .map_err(|e| e.to_string())?;
+            sync_sidecars(st.inner(), &image_ids);
+            log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
+                core_library::Event {
+                    event_type: "culling.label".into(),
+                    color_label: label.clone(),
+                    ..Default::default()
+                }
+            });
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1745,11 +1955,17 @@ pub async fn cull_rejected_summary(
     app: AppHandle,
     params: QueryParams,
 ) -> Result<core_library::RejectSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::summarize_rejected(&db.conn, &params).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_rejected_summary",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::summarize_rejected(&db.conn, &params).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1766,38 +1982,47 @@ pub async fn cull_delete_rejected(
     app: AppHandle,
     params: QueryParams,
 ) -> Result<core_library::RejectDeleteResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let res = core_library::delete_rejected(&db.conn, &params).map_err(|e| e.to_string())?;
-        gc_orphan_thumbs(&db.conn, &st.thumbs, &res.hashes);
-        tracing::info!(
-            trashed = res.trashed,
-            failed = res.failed,
-            companions = res.companions,
-            "deleted rejected photos"
-        );
-        let _ = core_library::append_event(
-            &db.conn,
-            &crate::events::stamp(
-                st.inner(),
-                core_library::Event {
-                    event_type: "culling.delete_rejected".into(),
-                    flag: Some("reject".into()),
-                    touch_count: Some(res.trashed as i64),
-                    context: Some(
-                        serde_json::json!({
-                            "companions": res.companions,
-                            "failed": res.failed,
-                        })
-                        .to_string(),
-                    ),
-                    ..Default::default()
-                },
-            ),
-        );
-        Ok::<_, String>(res)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "cull_delete_rejected",
+        move || {
+            let st = app.state::<AppState>();
+            let _sources = st.publications.invalidate_all_guard();
+            st.clear_source_caches();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let res =
+                core_library::delete_rejected(&db.conn, &params).map_err(|e| e.to_string())?;
+            gc_orphan_thumbs(&db.conn, &st.thumbs, &res.hashes);
+            tracing::info!(
+                trashed = res.trashed,
+                failed = res.failed,
+                companions = res.companions,
+                "deleted rejected photos"
+            );
+            let _ = core_library::append_event(
+                &db.conn,
+                &crate::events::stamp(
+                    st.inner(),
+                    core_library::Event {
+                        event_type: "culling.delete_rejected".into(),
+                        flag: Some("reject".into()),
+                        touch_count: Some(res.trashed as i64),
+                        context: Some(
+                            serde_json::json!({
+                                "companions": res.companions,
+                                "failed": res.failed,
+                            })
+                            .to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                ),
+            );
+            Ok::<_, String>(res)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1806,22 +2031,34 @@ pub async fn cull_delete_rejected(
 
 #[tauri::command]
 pub async fn keywords_list(app: AppHandle) -> Result<Vec<KeywordRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::list_keywords(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "keywords_list",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::list_keywords(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn keywords_for_image(app: AppHandle, image_id: i64) -> Result<Vec<KeywordRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::keywords_for_image(&db.conn, image_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "keywords_for_image",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::keywords_for_image(&db.conn, image_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1832,14 +2069,21 @@ pub async fn keyword_add_to_image(
     image_id: i64,
     name: String,
 ) -> Result<KeywordRow, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let row = core_library::add_keyword_to_image(&db.conn, image_id, &name)
-            .map_err(|e| e.to_string())?;
-        sync_sidecar(st.inner(), image_id);
-        Ok(row)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "keyword_add_to_image",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let row = core_library::add_keyword_to_image(&db.conn, image_id, &name)
+                .map_err(|e| e.to_string())?;
+            sync_sidecar(st.inner(), image_id);
+            Ok(row)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1850,14 +2094,21 @@ pub async fn keyword_add_to_images(
     image_ids: Vec<i64>,
     name: String,
 ) -> Result<KeywordRow, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let row = core_library::add_keyword_to_images(&db.conn, &image_ids, &name)
-            .map_err(|e| e.to_string())?;
-        sync_sidecars(st.inner(), &image_ids);
-        Ok(row)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "keyword_add_to_images",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let row = core_library::add_keyword_to_images(&db.conn, &image_ids, &name)
+                .map_err(|e| e.to_string())?;
+            sync_sidecars(st.inner(), &image_ids);
+            Ok(row)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1868,38 +2119,52 @@ pub async fn keyword_remove_from_image(
     image_id: i64,
     keyword_id: i64,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::remove_keyword_from_image(&db.conn, image_id, keyword_id)
-            .map_err(|e| e.to_string())?;
-        sync_sidecar(st.inner(), image_id);
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "keyword_remove_from_image",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::remove_keyword_from_image(&db.conn, image_id, keyword_id)
+                .map_err(|e| e.to_string())?;
+            sync_sidecar(st.inner(), image_id);
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        // Capture images that carry this keyword BEFORE the cascade delete, to rewrite their sidecars.
-        let affected: Vec<i64> = {
-            let mut stmt = db
-                .conn
-                .prepare("SELECT image_id FROM image_keywords WHERE keyword_id = ?1")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([keyword_id], |r| r.get::<_, i64>(0))
-                .map_err(|e| e.to_string())?;
-            rows.filter_map(Result::ok).collect()
-        };
-        core_library::delete_keyword(&db.conn, keyword_id).map_err(|e| e.to_string())?;
-        sync_sidecars(st.inner(), &affected);
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "keyword_delete",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            // Capture images that carry this keyword BEFORE the cascade delete, to rewrite their sidecars.
+            let affected: Vec<i64> = {
+                let mut stmt = db
+                    .conn
+                    .prepare("SELECT image_id FROM image_keywords WHERE keyword_id = ?1")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([keyword_id], |r| r.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())?;
+                rows.filter_map(Result::ok).collect()
+            };
+            core_library::delete_keyword(&db.conn, keyword_id).map_err(|e| e.to_string())?;
+            sync_sidecars(st.inner(), &affected);
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1908,11 +2173,17 @@ pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), Strin
 
 #[tauri::command]
 pub async fn collections_list(app: AppHandle) -> Result<Vec<CollectionRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::list_collections(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "collections_list",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::list_collections(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1922,11 +2193,17 @@ pub async fn collections_for_image(
     app: AppHandle,
     image_id: i64,
 ) -> Result<Vec<CollectionRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::collections_for_image(&db.conn, image_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "collections_for_image",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::collections_for_image(&db.conn, image_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1938,12 +2215,19 @@ pub async fn collection_create(
     is_smart: bool,
     query: Option<String>,
 ) -> Result<i64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::create_collection(&db.conn, &name, is_smart, query.as_deref())
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "collection_create",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::create_collection(&db.conn, &name, is_smart, query.as_deref())
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1964,12 +2248,19 @@ pub async fn collection_add_images(
     collection_id: i64,
     image_ids: Vec<i64>,
 ) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::add_images_to_collection(&db.conn, collection_id, &image_ids)
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "collection_add_images",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::add_images_to_collection(&db.conn, collection_id, &image_ids)
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1980,12 +2271,19 @@ pub async fn collection_remove_images(
     collection_id: i64,
     image_ids: Vec<i64>,
 ) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::remove_images_from_collection(&db.conn, collection_id, &image_ids)
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "collection_remove_images",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::remove_images_from_collection(&db.conn, collection_id, &image_ids)
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -1995,24 +2293,30 @@ pub async fn collection_remove_images(
 /// live) for catalogs created before the setting existed; `None` if neither is available.
 #[tauri::command]
 pub async fn app_library_root(app: AppHandle) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        if let Some(root) = core_library::library_root(&db.conn).map_err(|e| e.to_string())? {
-            return Ok::<_, String>(Some(root));
-        }
-        let first: Option<String> = db
-            .conn
-            .query_row("SELECT path FROM folders ORDER BY id LIMIT 1", [], |r| {
-                r.get(0)
-            })
-            .ok();
-        Ok::<_, String>(first.and_then(|p| {
-            Path::new(&p)
-                .parent()
-                .map(|parent| parent.display().to_string())
-        }))
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "app_library_root",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            if let Some(root) = core_library::library_root(&db.conn).map_err(|e| e.to_string())? {
+                return Ok::<_, String>(Some(root));
+            }
+            let first: Option<String> = db
+                .conn
+                .query_row("SELECT path FROM folders ORDER BY id LIMIT 1", [], |r| {
+                    r.get(0)
+                })
+                .ok();
+            Ok::<_, String>(first.and_then(|p| {
+                Path::new(&p)
+                    .parent()
+                    .map(|parent| parent.display().to_string())
+            }))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2021,12 +2325,18 @@ pub async fn app_library_root(app: AppHandle) -> Result<Option<String>, String> 
 /// Existing photos are NOT moved — only future copy/move imports file into the new location.
 #[tauri::command]
 pub async fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        std::fs::create_dir_all(&path).map_err(|e| format!("cannot create {path}: {e}"))?;
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_library_root(&db.conn, &path).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "set_library_root",
+        move || {
+            std::fs::create_dir_all(&path).map_err(|e| format!("cannot create {path}: {e}"))?;
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_library_root(&db.conn, &path).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2038,15 +2348,21 @@ pub async fn dedup_scan(
     app: AppHandle,
     category: String,
 ) -> Result<Vec<core_dedup::DupGroup>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        match category.as_str() {
-            "capture" => core_dedup::find_same_capture(&db.conn),
-            _ => core_dedup::find_byte_identical(&db.conn),
-        }
-        .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "dedup_scan",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            match category.as_str() {
+                "capture" => core_dedup::find_same_capture(&db.conn),
+                _ => core_dedup::find_byte_identical(&db.conn),
+            }
+            .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2062,54 +2378,63 @@ pub async fn dedup_resolve(
     auto_keeper_id: Option<i64>,
     group_id: Option<String>,
 ) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let res = core_dedup::resolve(&db.conn, keep_id, &trash_ids).map_err(|e| e.to_string())?;
-        gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "dedup_resolve",
+        move || {
+            let st = app.state::<AppState>();
+            let _sources = st.publications.invalidate_all_guard();
+            st.clear_source_caches();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let res =
+                core_dedup::resolve(&db.conn, keep_id, &trash_ids).map_err(|e| e.to_string())?;
+            gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
 
-        // Behavioral log: the keeper choice + full candidate set + (if known) the auto-suggested
-        // keeper, so we can later learn keeper ranking and detect user overrides.
-        let candidates = candidate_ids.unwrap_or_else(|| {
-            let mut v = trash_ids.clone();
-            v.push(keep_id);
-            v.sort_unstable();
-            v
-        });
-        let gid = group_id.or_else(|| candidates.iter().min().map(|m| format!("dedup-{m}")));
-        let cands_json = core_library::ids_json(&candidates);
-        let ev = |event_type: &str| {
-            crate::events::stamp(
-                st.inner(),
-                core_library::Event {
-                    event_type: event_type.into(),
-                    group_id: gid.clone(),
-                    candidate_ids: Some(cands_json.clone()),
-                    suggestion_id: auto_keeper_id,
-                    ..Default::default()
-                },
-            )
-        };
-        let _ = core_library::append_event(&db.conn, &ev("dedup.group_shown"));
-        let _ = core_library::append_event(
-            &db.conn,
-            &core_library::Event {
-                chosen_id: Some(keep_id),
-                rejected_ids: Some(core_library::ids_json(&trash_ids)),
-                ..ev("dedup.keeper_chosen")
-            },
-        );
-        if auto_keeper_id.is_some_and(|ak| ak != keep_id) {
+            // Behavioral log: the keeper choice + full candidate set + (if known) the auto-suggested
+            // keeper, so we can later learn keeper ranking and detect user overrides.
+            let candidates = candidate_ids.unwrap_or_else(|| {
+                let mut v = trash_ids.clone();
+                v.push(keep_id);
+                v.sort_unstable();
+                v
+            });
+            let gid = group_id.or_else(|| candidates.iter().min().map(|m| format!("dedup-{m}")));
+            let cands_json = core_library::ids_json(&candidates);
+            let ev = |event_type: &str| {
+                crate::events::stamp(
+                    st.inner(),
+                    core_library::Event {
+                        event_type: event_type.into(),
+                        group_id: gid.clone(),
+                        candidate_ids: Some(cands_json.clone()),
+                        suggestion_id: auto_keeper_id,
+                        ..Default::default()
+                    },
+                )
+            };
+            let _ = core_library::append_event(&db.conn, &ev("dedup.group_shown"));
             let _ = core_library::append_event(
                 &db.conn,
                 &core_library::Event {
                     chosen_id: Some(keep_id),
-                    ..ev("dedup.override")
+                    rejected_ids: Some(core_library::ids_json(&trash_ids)),
+                    ..ev("dedup.keeper_chosen")
                 },
             );
-        }
-        Ok::<_, String>(res.trashed)
-    })
+            if auto_keeper_id.is_some_and(|ak| ak != keep_id) {
+                let _ = core_library::append_event(
+                    &db.conn,
+                    &core_library::Event {
+                        chosen_id: Some(keep_id),
+                        ..ev("dedup.override")
+                    },
+                );
+            }
+            Ok::<_, String>(res.trashed)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2118,13 +2443,22 @@ pub async fn dedup_resolve(
 /// the number of files trashed. Same-capture/perceptual matches are never auto-resolved.
 #[tauri::command]
 pub async fn dedup_resolve_bulk(app: AppHandle) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let res = core_dedup::auto_resolve_byte_identical(&db.conn).map_err(|e| e.to_string())?;
-        gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
-        Ok::<_, String>(res.trashed)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "dedup_resolve_bulk",
+        move || {
+            let st = app.state::<AppState>();
+            let _sources = st.publications.invalidate_all_guard();
+            st.clear_source_caches();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let res =
+                core_dedup::auto_resolve_byte_identical(&db.conn).map_err(|e| e.to_string())?;
+            gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
+            Ok::<_, String>(res.trashed)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2138,61 +2472,65 @@ pub async fn dedup_scan_perceptual(
     threshold: u32,
 ) -> Result<Vec<core_dedup::DupGroup>, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app2.state::<AppState>();
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "dedup_scan_perceptual",
+        move || {
+            let st = app2.state::<AppState>();
 
-        // Present rows lacking current similarity features: (id, lowercase-hex content hash).
-        let todo: Vec<(i64, String)> = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let mut stmt = db
-                .conn
-                .prepare(
-                    "SELECT i.id, lower(hex(i.content_hash)) FROM images i \
+            // Present rows lacking current similarity features: (id, lowercase-hex content hash).
+            let todo: Vec<(i64, String)> = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                let mut stmt = db
+                    .conn
+                    .prepare(
+                        "SELECT i.id, lower(hex(i.content_hash)) FROM images i \
                      LEFT JOIN image_similarity_features sf \
                        ON sf.image_id=i.id AND sf.feature_version=?1 \
                      WHERE i.status='present' AND sf.image_id IS NULL",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(
-                    core_db::rusqlite::params![core_dedup::SIMILARITY_FEATURE_VERSION],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(|e| e.to_string())?
-                .collect::<core_db::rusqlite::Result<Vec<(i64, String)>>>()
-                .map_err(|e| e.to_string())?;
-            rows
-        };
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(
+                        core_db::rusqlite::params![core_dedup::SIMILARITY_FEATURE_VERSION],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .collect::<core_db::rusqlite::Result<Vec<(i64, String)>>>()
+                    .map_err(|e| e.to_string())?;
+                rows
+            };
 
-        // Compute visual features in parallel from cached thumbnails, then persist in one tx.
-        if !todo.is_empty() {
-            let total = todo.len();
-            let done = AtomicUsize::new(0);
-            let computed: Vec<(i64, core_dedup::SimilarityFeatures)> = todo
-                .par_iter()
-                .filter_map(|(id, hex)| {
-                    let features = st
-                        .thumbs
-                        .read(hex, core_library::THUMB_SIZE)
-                        .ok()
-                        .and_then(|bytes| core_dedup::similarity_features_from_jpeg(&bytes));
-                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == total || n.is_multiple_of(16) {
-                        let _ = app2.emit(
-                            "dedup:progress",
-                            serde_json::json!({"done": n, "total": total}),
-                        );
-                    }
-                    features.map(|f| (*id, f))
-                })
-                .collect();
+            // Compute visual features sequentially from cached thumbnails, then persist in one tx.
+            if !todo.is_empty() {
+                let total = todo.len();
+                let done = AtomicUsize::new(0);
+                let computed: Vec<(i64, core_dedup::SimilarityFeatures)> =
+                    todo.iter()
+                        .filter_map(|(id, hex)| {
+                            let features =
+                                st.thumbs.read(hex, core_library::THUMB_SIZE).ok().and_then(
+                                    |bytes| core_dedup::similarity_features_from_jpeg(&bytes),
+                                );
+                            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n == total || n.is_multiple_of(16) {
+                                let _ = app2.emit(
+                                    "dedup:progress",
+                                    serde_json::json!({"done": n, "total": total}),
+                                );
+                            }
+                            features.map(|f| (*id, f))
+                        })
+                        .collect();
 
-            let mut db = st.db.lock().map_err(|e| e.to_string())?;
-            let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-            {
-                let mut upsert = tx
-                    .prepare(
-                        "INSERT INTO image_similarity_features(
+                let mut db = st.db.lock().map_err(|e| e.to_string())?;
+                let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+                {
+                    let mut upsert = tx
+                        .prepare(
+                            "INSERT INTO image_similarity_features(
                             image_id, feature_version, dhash64, phash64,
                             tiny_luma32, color_grid4x4, computed_at
                          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'))
@@ -2203,33 +2541,34 @@ pub async fn dedup_scan_perceptual(
                             tiny_luma32=excluded.tiny_luma32,
                             color_grid4x4=excluded.color_grid4x4,
                             computed_at=excluded.computed_at",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let mut legacy = tx
-                    .prepare("UPDATE images SET phash=?1 WHERE id=?2")
-                    .map_err(|e| e.to_string())?;
-                for (id, f) in &computed {
-                    upsert
-                        .execute(core_db::rusqlite::params![
-                            id,
-                            core_dedup::SIMILARITY_FEATURE_VERSION,
-                            f.dhash64 as i64,
-                            f.phash64 as i64,
-                            &f.tiny_luma32,
-                            &f.color_grid4x4,
-                        ])
+                        )
                         .map_err(|e| e.to_string())?;
-                    legacy
-                        .execute(core_db::rusqlite::params![f.dhash64 as i64, id])
+                    let mut legacy = tx
+                        .prepare("UPDATE images SET phash=?1 WHERE id=?2")
                         .map_err(|e| e.to_string())?;
+                    for (id, f) in &computed {
+                        upsert
+                            .execute(core_db::rusqlite::params![
+                                id,
+                                core_dedup::SIMILARITY_FEATURE_VERSION,
+                                f.dhash64 as i64,
+                                f.phash64 as i64,
+                                &f.tiny_luma32,
+                                &f.color_grid4x4,
+                            ])
+                            .map_err(|e| e.to_string())?;
+                        legacy
+                            .execute(core_db::rusqlite::params![f.dhash64 as i64, id])
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
+                tx.commit().map_err(|e| e.to_string())?;
             }
-            tx.commit().map_err(|e| e.to_string())?;
-        }
 
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_dedup::find_perceptual(&db.conn, threshold).map_err(|e| e.to_string())
-    })
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_dedup::find_perceptual(&db.conn, threshold).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2294,15 +2633,22 @@ fn apply_import_options(st: &AppState, ids: &[i64], opts: &ImportOptions) -> Res
 /// fetched lazily, per file, via `import_thumb`.
 #[tauri::command]
 pub async fn import_list(
+    app: AppHandle,
     source: String,
     recursive: Option<bool>,
 ) -> Result<Vec<core_import::SourceFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        Ok::<_, String>(core_import::list_source(
-            Path::new(&source),
-            recursive.unwrap_or(true),
-        ))
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Import,
+        false,
+        "import_list",
+        move || {
+            Ok::<_, String>(core_import::list_source(
+                Path::new(&source),
+                recursive.unwrap_or(true),
+            ))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2317,45 +2663,51 @@ pub async fn import_dedup(
     paths: Vec<String>,
 ) -> Result<Vec<core_import::DedupResult>, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app2.state::<AppState>();
-        // Brief lock: snapshot present content hashes + sizes (the size set drives the prefilter).
-        let (present_hashes, present_sizes) = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let mut stmt = db
-                .conn
-                .prepare("SELECT content_hash, file_size FROM images WHERE status = 'present'")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))
-                .map_err(|e| e.to_string())?;
-            let mut hashes = std::collections::HashSet::new();
-            let mut sizes = std::collections::HashSet::new();
-            for row in rows.filter_map(Result::ok) {
-                if row.0.len() == 32 {
-                    let mut a = [0u8; 32];
-                    a.copy_from_slice(&row.0);
-                    hashes.insert(a);
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Import,
+        true,
+        "import_dedup",
+        move || {
+            let st = app2.state::<AppState>();
+            // Brief lock: snapshot present content hashes + sizes (the size set drives the prefilter).
+            let (present_hashes, present_sizes) = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                let mut stmt = db
+                    .conn
+                    .prepare("SELECT content_hash, file_size FROM images WHERE status = 'present'")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))
+                    .map_err(|e| e.to_string())?;
+                let mut hashes = std::collections::HashSet::new();
+                let mut sizes = std::collections::HashSet::new();
+                for row in rows.filter_map(Result::ok) {
+                    if row.0.len() == 32 {
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&row.0);
+                        hashes.insert(a);
+                    }
+                    sizes.insert(row.1);
                 }
-                sizes.insert(row.1);
-            }
-            (hashes, sizes)
-        };
-        let files: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-        let progress_app = app2.clone();
-        let results = core_import::dedup_scan(
-            &files,
-            &present_hashes,
-            &present_sizes,
-            |done, total, batch| {
-                let _ = progress_app.emit(
-                    "import:dedup:progress",
-                    serde_json::json!({"done": done, "total": total, "results": batch}),
-                );
-            },
-        );
-        Ok::<_, String>(results)
-    })
+                (hashes, sizes)
+            };
+            let files: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+            let progress_app = app2.clone();
+            let results = core_import::dedup_scan(
+                &files,
+                &present_hashes,
+                &present_sizes,
+                |done, total, batch| {
+                    let _ = progress_app.emit(
+                        "import:dedup:progress",
+                        serde_json::json!({"done": done, "total": total, "results": batch}),
+                    );
+                },
+            );
+            Ok::<_, String>(results)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2365,15 +2717,22 @@ pub async fn import_dedup(
 /// instant. No catalog access.
 #[tauri::command]
 pub async fn import_thumb(
+    app: AppHandle,
     path: String,
     max_edge: Option<u32>,
 ) -> Result<tauri::ipc::Response, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let edge = max_edge.unwrap_or(1024);
-        let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-        let thumb = core_raw::thumbnail_jpeg(&src, edge, 85).map_err(|e| e.to_string())?;
-        Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Import,
+        true,
+        "import_thumb",
+        move || {
+            let edge = max_edge.unwrap_or(1024);
+            let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
+            let thumb = core_raw::thumbnail_jpeg(&src, edge, 85).map_err(|e| e.to_string())?;
+            Ok::<_, String>(tauri::ipc::Response::new(thumb.jpeg))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2394,63 +2753,69 @@ pub async fn import_commit(
     pairing: Option<String>,
 ) -> Result<core_import::ImportStats, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app2.state::<AppState>();
-        let import_mode = match mode.as_str() {
-            "move" => core_import::ImportMode::Move,
-            "reference" => core_import::ImportMode::Reference,
-            _ => core_import::ImportMode::Copy,
-        };
-        let pairing = match pairing.as_deref() {
-            Some("pair") => core_import::Pairing::Pair,
-            _ => core_import::Pairing::Standalone,
-        };
-        let files: Vec<PathBuf> = selected.iter().map(PathBuf::from).collect();
-        // Gate the FS watcher for the duration of the import so it can't race the now-unlocked
-        // per-file copy/process phase (double-decode / duplicate insert). Dropped when this closure
-        // returns (success or error), which runs one deferred watcher sync if one was suppressed.
-        let _import_guard = crate::watch::ImportGuard::new(app2.clone());
-        let progress_app = app2.clone();
-        // Buffer freshly-imported rows (flush with progress for live grid append) and collect their
-        // ids for the on-import options pass (single-threaded blocking import → RefCell is enough).
-        let pending = std::cell::RefCell::new(Vec::<core_library::ImageRow>::new());
-        let added_ids = std::cell::RefCell::new(Vec::<i64>::new());
-        let stats = core_import::import_files(
-            &st.db,
-            &st.thumbs,
-            Path::new(&source),
-            &files,
-            import_mode,
-            Path::new(&dest),
-            pairing,
-            |done, total, added| {
-                if let Some(row) = added {
-                    added_ids.borrow_mut().push(row.id);
-                    pending.borrow_mut().push(row.clone());
-                }
-                // Flush on completion, a full batch, or every 4th file (keeps the counter live even
-                // through runs of skipped files that add no rows).
-                if done == total || pending.borrow().len() >= 8 || done.is_multiple_of(4) {
-                    let images: Vec<core_library::ImageRow> =
-                        pending.borrow_mut().drain(..).collect();
-                    let _ = progress_app.emit(
-                        "import:progress",
-                        serde_json::json!({"done": done, "total": total, "images": images}),
-                    );
-                }
-            },
-        )
-        .map_err(|e| e.to_string())?;
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Import,
+        true,
+        "import_commit",
+        move || {
+            let st = app2.state::<AppState>();
+            let import_mode = match mode.as_str() {
+                "move" => core_import::ImportMode::Move,
+                "reference" => core_import::ImportMode::Reference,
+                _ => core_import::ImportMode::Copy,
+            };
+            let pairing = match pairing.as_deref() {
+                Some("pair") => core_import::Pairing::Pair,
+                _ => core_import::Pairing::Standalone,
+            };
+            let files: Vec<PathBuf> = selected.iter().map(PathBuf::from).collect();
+            // Gate the FS watcher for the duration of the import so it can't race the now-unlocked
+            // per-file copy/process phase (double-decode / duplicate insert). Dropped when this closure
+            // returns (success or error), which runs one deferred watcher sync if one was suppressed.
+            let _import_guard = crate::watch::ImportGuard::new(app2.clone());
+            let progress_app = app2.clone();
+            // Buffer freshly-imported rows (flush with progress for live grid append) and collect their
+            // ids for the on-import options pass (single-threaded blocking import → RefCell is enough).
+            let pending = std::cell::RefCell::new(Vec::<core_library::ImageRow>::new());
+            let added_ids = std::cell::RefCell::new(Vec::<i64>::new());
+            let stats = core_import::import_files(
+                &st.db,
+                &st.thumbs,
+                Path::new(&source),
+                &files,
+                import_mode,
+                Path::new(&dest),
+                pairing,
+                |done, total, added| {
+                    if let Some(row) = added {
+                        added_ids.borrow_mut().push(row.id);
+                        pending.borrow_mut().push(row.clone());
+                    }
+                    // Flush on completion, a full batch, or every 4th file (keeps the counter live even
+                    // through runs of skipped files that add no rows).
+                    if done == total || pending.borrow().len() >= 8 || done.is_multiple_of(4) {
+                        let images: Vec<core_library::ImageRow> =
+                            pending.borrow_mut().drain(..).collect();
+                        let _ = progress_app.emit(
+                            "import:progress",
+                            serde_json::json!({"done": done, "total": total, "images": images}),
+                        );
+                    }
+                },
+            )
+            .map_err(|e| e.to_string())?;
 
-        apply_import_options(&st, &added_ids.into_inner(), &options)?;
-        enforce_thumb_cap(&st);
-        let _ = app2.emit("import:done", &stats);
-        crate::thumb_queue::enqueue_all(&app2);
-        // Freshly-imported photos get their feature vectors without the user having to know the
-        // Settings button exists. Background + skips images that already have a row.
-        crate::features::spawn_backfill(&app2);
-        Ok::<_, String>(stats)
-    })
+            apply_import_options(&st, &added_ids.into_inner(), &options)?;
+            enforce_thumb_cap(&st);
+            let _ = app2.emit("import:done", &stats);
+            crate::thumb_queue::enqueue_all(&app2);
+            // Freshly-imported photos get their feature vectors without the user having to know the
+            // Settings button exists. Background + skips images that already have a row.
+            crate::features::spawn_backfill(&app2);
+            Ok::<_, String>(stats)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2463,10 +2828,19 @@ pub fn logs_status() -> Result<crate::logging::LogsStatus, String> {
 }
 
 #[tauri::command]
-pub async fn set_logs_directory(path: String) -> Result<crate::logging::LogsStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::logging::set_directory(Path::new(&path)))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn set_logs_directory(
+    app: AppHandle,
+    path: String,
+) -> Result<crate::logging::LogsStatus, String> {
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "set_logs_directory",
+        move || crate::logging::set_directory(Path::new(&path)),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2475,10 +2849,16 @@ pub fn set_log_level(level: String) -> Result<crate::logging::LogsStatus, String
 }
 
 #[tauri::command]
-pub async fn logs_export_zip(dest: String) -> Result<u64, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::logging::export_zip(Path::new(&dest)))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn logs_export_zip(app: AppHandle, dest: String) -> Result<u64, String> {
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Export,
+        true,
+        "logs_export_zip",
+        move || crate::logging::export_zip(Path::new(&dest)),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2488,9 +2868,15 @@ pub fn logs_delete_all() -> Result<crate::logging::LogsStatus, String> {
 
 #[tauri::command]
 pub async fn catalog_backup_now(app: AppHandle) -> Result<crate::backup::BackupStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::backup::run_now(&app))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Maintenance,
+        true,
+        "catalog_backup_now",
+        move || crate::backup::run_now(&app),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2501,11 +2887,17 @@ pub fn catalog_backup_status(app: AppHandle) -> Result<crate::backup::BackupStat
 /// Configured thumbnail-cache cap in bytes (default when unset).
 #[tauri::command]
 pub async fn thumb_cache_cap(app: AppHandle) -> Result<u64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::thumb_cache_cap(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "thumb_cache_cap",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::thumb_cache_cap(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2513,10 +2905,16 @@ pub async fn thumb_cache_cap(app: AppHandle) -> Result<u64, String> {
 /// Current on-disk size of the thumbnail cache in bytes.
 #[tauri::command]
 pub async fn thumb_cache_size(app: AppHandle) -> Result<u64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        st.thumbs.total_size().map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "thumb_cache_size",
+        move || {
+            let st = app.state::<AppState>();
+            st.thumbs.total_size().map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2524,14 +2922,20 @@ pub async fn thumb_cache_size(app: AppHandle) -> Result<u64, String> {
 /// Persist a new thumbnail-cache cap and immediately evict down to it. Returns bytes freed.
 #[tauri::command]
 pub async fn set_thumb_cache_cap(app: AppHandle, bytes: u64) -> Result<u64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::set_thumb_cache_cap(&db.conn, bytes).map_err(|e| e.to_string())?;
-        }
-        st.thumbs.evict_to(bytes).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "set_thumb_cache_cap",
+        move || {
+            let st = app.state::<AppState>();
+            {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::set_thumb_cache_cap(&db.conn, bytes).map_err(|e| e.to_string())?;
+            }
+            st.thumbs.evict_to(bytes).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2540,11 +2944,17 @@ pub async fn set_thumb_cache_cap(app: AppHandle, bytes: u64) -> Result<u64, Stri
 /// from the display on first launch).
 #[tauri::command]
 pub async fn preview_edge(app: AppHandle) -> Result<u32, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::preview_edge(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "preview_edge",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::preview_edge(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2568,10 +2978,16 @@ pub async fn set_preview_edge(app: AppHandle, edge: u32) -> Result<(), String> {
 /// Total / analyzed / pending image counts + models-ready + running flags (for the Detected panel).
 #[tauri::command]
 pub async fn analysis_status(app: AppHandle) -> Result<crate::analysis::AnalysisStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        crate::analysis::status(&st)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "analysis_status",
+        move || {
+            let st = app.state::<AppState>();
+            crate::analysis::status(&st)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2579,9 +2995,15 @@ pub async fn analysis_status(app: AppHandle) -> Result<crate::analysis::Analysis
 /// Download any missing model files (first run only). Emits `analysis:models` progress.
 #[tauri::command]
 pub async fn analysis_models_ensure(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || crate::analysis::ensure_models(&app))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "analysis_models_ensure",
+        move || crate::analysis::ensure_models(&app),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Run the background analysis pass. `force` re-analyzes everything. Emits `analysis:progress`/`:done`.
@@ -2600,9 +3022,13 @@ pub async fn analysis_run(
 ) -> Result<crate::analysis::RunStats, String> {
     let scope = scope.unwrap_or_default();
     let stages = crate::scan::AI_STAGES.to_vec();
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::analysis::run_pass(&app, force, &scope, &stages)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "analysis_run",
+        move || crate::analysis::run_pass(&app, force, &scope, &stages),
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2617,15 +3043,25 @@ pub async fn scan_run(
     app: AppHandle,
     selection: crate::scan::ScanSelection,
 ) -> Result<crate::scan::ScanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::scan::run(&app, &selection))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "scan_run",
+        move || crate::scan::run(&app, &selection),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Request the running unified scan to stop, whatever phase it is in. Everything already committed
 /// is kept. No-op if idle.
 #[tauri::command]
 pub fn scan_cancel(app: AppHandle) {
+    crate::jobs::cancel_class(
+        app.state::<AppState>().inner(),
+        core_app::jobs::JobClass::Analysis,
+    );
     crate::scan::cancel(&app.state::<AppState>());
 }
 
@@ -2641,11 +3077,17 @@ pub fn scan_running(app: AppHandle) -> bool {
 /// id must never reach a run.
 #[tauri::command]
 pub async fn scan_prefs_get(app: AppHandle) -> Result<Vec<core_library::StageId>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::scan_stages(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "scan_prefs_get",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::scan_stages(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2655,11 +3097,17 @@ pub async fn scan_prefs_set(
     app: AppHandle,
     stages: Vec<core_library::StageId>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_scan_stages(&db.conn, &stages).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "scan_prefs_set",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_scan_stages(&db.conn, &stages).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2670,9 +3118,13 @@ pub async fn image_scan_state(
     app: AppHandle,
     image_id: i64,
 ) -> Result<core_library::ImageScanState, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::analysis::image_scan_state(&app.state::<AppState>(), image_id)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_scan_state",
+        move || crate::analysis::image_scan_state(&app.state::<AppState>(), image_id),
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2685,9 +3137,13 @@ pub async fn scan_scope_counts(
     scope: Option<core_library::ScanScope>,
 ) -> Result<core_library::ScopeCounts, String> {
     let scope = scope.unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::analysis::scope_counts(&app.state::<AppState>(), &scope)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "scan_scope_counts",
+        move || crate::analysis::scope_counts(&app.state::<AppState>(), &scope),
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2707,10 +3163,16 @@ pub fn analysis_cancel(app: AppHandle) {
 /// Denoise availability + running state (drives the Develop "Denoise" panel).
 #[tauri::command]
 pub async fn denoise_status(app: AppHandle) -> Result<crate::denoise::DenoiseStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        Ok(crate::denoise::status(&st))
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "denoise_status",
+        move || {
+            let st = app.state::<AppState>();
+            Ok(crate::denoise::status(&st))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2720,19 +3182,31 @@ pub async fn denoise_status(app: AppHandle) -> Result<crate::denoise::DenoiseSta
 /// `denoise:progress` / `denoise:done`; the frontend re-renders on `denoise:done`.
 #[tauri::command]
 pub async fn denoise_apply(app: AppHandle, image_id: i64, amount: f32) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || crate::denoise::apply(&app, image_id, amount))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "denoise_apply",
+        move || crate::denoise::apply(&app, image_id, amount),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Turn denoise off for `image_id`: drops cached buffers + evicts the denoised render caches so the
 /// next render re-decodes the clean image.
 #[tauri::command]
 pub async fn denoise_clear(app: AppHandle, image_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        crate::denoise::clear(&st, image_id)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "denoise_clear",
+        move || {
+            let st = app.state::<AppState>();
+            crate::denoise::clear(&st, image_id)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2758,10 +3232,16 @@ pub async fn panorama_preview(
     boundary_warp: f32,
     auto_crop: bool,
 ) -> Result<tauri::ipc::Response, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::panorama::preview(&app, image_ids, projection, boundary_warp, auto_crop)
-            .map(tauri::ipc::Response::new)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Viewport,
+        false,
+        "panorama_preview",
+        move || {
+            crate::panorama::preview(&app, image_ids, projection, boundary_warp, auto_crop)
+                .map(tauri::ipc::Response::new)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2780,16 +3260,22 @@ pub async fn panorama_merge(
     detect_group_id: Option<i64>,
 ) -> Result<i64, String> {
     let emitter = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::panorama::merge(
-            &app,
-            image_ids,
-            projection,
-            boundary_warp,
-            auto_crop,
-            detect_group_id,
-        )
-    })
+    let result = crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "panorama_merge",
+        move || {
+            crate::panorama::merge(
+                &app,
+                image_ids,
+                projection,
+                boundary_warp,
+                auto_crop,
+                detect_group_id,
+            )
+        },
+    )
     .await
     .map_err(|e| e.to_string())?;
     if let Err(msg) = &result {
@@ -2811,10 +3297,16 @@ pub fn panorama_cancel(app: AppHandle) {
 
 #[tauri::command]
 pub async fn panorama_status(app: AppHandle) -> Result<crate::panorama::PanoStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        Ok(crate::panorama::status(&st))
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "panorama_status",
+        move || {
+            let st = app.state::<AppState>();
+            Ok(crate::panorama::status(&st))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2836,9 +3328,15 @@ pub fn panorama_preview_release(app: AppHandle) {
 #[tauri::command]
 pub async fn pano_detect_run(app: AppHandle, force: bool) -> Result<usize, String> {
     let emitter = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || crate::pano_detect::run(&app, force))
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "pano_detect_run",
+        move || crate::pano_detect::run(&app, force),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if let Err(msg) = &result {
         let _ = emitter.emit("pano_detect:error", serde_json::json!({ "message": msg }));
     }
@@ -2856,10 +3354,16 @@ pub fn pano_detect_cancel(app: AppHandle) {
 pub async fn pano_detect_status(
     app: AppHandle,
 ) -> Result<crate::pano_detect::PanoDetectStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        crate::pano_detect::status(&st)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "pano_detect_status",
+        move || {
+            let st = app.state::<AppState>();
+            crate::pano_detect::status(&st)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2870,10 +3374,16 @@ pub async fn pano_detect_groups(
     app: AppHandle,
     include_dismissed: bool,
 ) -> Result<Vec<core_library::pano_detect::PanoGroupRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        crate::pano_detect::groups(&st, include_dismissed)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "pano_detect_groups",
+        move || {
+            let st = app.state::<AppState>();
+            crate::pano_detect::groups(&st, include_dismissed)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2885,10 +3395,16 @@ pub async fn pano_detect_dismiss(
     group_id: i64,
     dismissed: bool,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        crate::pano_detect::dismiss(&st, group_id, dismissed)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "pano_detect_dismiss",
+        move || {
+            let st = app.state::<AppState>();
+            crate::pano_detect::dismiss(&st, group_id, dismissed)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2900,10 +3416,16 @@ pub async fn pano_detect_mark_merged(
     group_id: i64,
     merged_image_id: i64,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        crate::pano_detect::mark_merged(&st, group_id, merged_image_id)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "pano_detect_mark_merged",
+        move || {
+            let st = app.state::<AppState>();
+            crate::pano_detect::mark_merged(&st, group_id, merged_image_id)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2912,14 +3434,20 @@ pub async fn pano_detect_mark_merged(
 /// state, on-disk size, and per-file + per-tier detail. Drives the AI Models manager UI.
 #[tauri::command]
 pub async fn models_overview(app: AppHandle) -> Result<Vec<crate::model_mgmt::ModelGroup>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        Ok(vec![
-            crate::analysis::overview(&st),
-            crate::faces::overview(&st),
-            crate::segment::overview(&st),
-        ])
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "models_overview",
+        move || {
+            let st = app.state::<AppState>();
+            Ok(vec![
+                crate::analysis::overview(&st),
+                crate::faces::overview(&st),
+                crate::segment::overview(&st),
+            ])
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2946,18 +3474,24 @@ pub async fn models_remove(
     group: String,
     tier: Option<String>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        if st.analysis_running.load(Ordering::SeqCst) {
-            return Err("an AI scan is running — stop it before removing models".into());
-        }
-        match group.as_str() {
-            "analysis" => crate::analysis::remove(&st),
-            "faces" => crate::faces::remove(&st),
-            "mask_ai" => crate::segment::remove(&st, tier.as_deref().unwrap_or("")),
-            other => Err(format!("unknown model group: {other}")),
-        }
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "models_remove",
+        move || {
+            let st = app.state::<AppState>();
+            if st.analysis_running.load(Ordering::SeqCst) {
+                return Err("an AI scan is running — stop it before removing models".into());
+            }
+            match group.as_str() {
+                "analysis" => crate::analysis::remove(&st),
+                "faces" => crate::faces::remove(&st),
+                "mask_ai" => crate::segment::remove(&st, tier.as_deref().unwrap_or("")),
+                other => Err(format!("unknown model group: {other}")),
+            }
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2965,9 +3499,15 @@ pub async fn models_remove(
 /// Download the interactive-segmentation (AI masking) model weights. Emits `mask_ai:models` progress.
 #[tauri::command]
 pub async fn mask_ai_models_ensure(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || crate::segment::ensure_models(&app))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "mask_ai_models_ensure",
+        move || crate::segment::ensure_models(&app),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Whether the AI-masking models are downloaded and ready.
@@ -2981,11 +3521,17 @@ pub fn mask_ai_ready(app: AppHandle) -> bool {
 /// use, then runs the heavy encode) so the first click segments instantly. Fire-and-forget from the UI.
 #[tauri::command]
 pub async fn mask_ai_encode(app: AppHandle, image_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::segment::ensure_models(&app)?;
-        let st = app.state::<AppState>();
-        crate::segment::warm(&st, image_id)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "mask_ai_encode",
+        move || {
+            crate::segment::ensure_models(&app)?;
+            let st = app.state::<AppState>();
+            crate::segment::warm(&st, image_id)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -2999,13 +3545,19 @@ pub async fn mask_ai_prompt(
     image_id: i64,
     points: Vec<core_pipeline::AiPoint>,
 ) -> Result<crate::segment::PromptResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        // Fetch the (selected-tier) SAM weights on first use — idempotent, skips present files, emits
-        // `mask_ai:models` progress. Without this the first prompt errors "models not downloaded".
-        crate::segment::ensure_models(&app)?;
-        let st = app.state::<AppState>();
-        crate::segment::prompt(&st, image_id, points)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "mask_ai_prompt",
+        move || {
+            // Fetch the (selected-tier) SAM weights on first use — idempotent, skips present files, emits
+            // `mask_ai:models` progress. Without this the first prompt errors "models not downloaded".
+            crate::segment::ensure_models(&app)?;
+            let st = app.state::<AppState>();
+            crate::segment::prompt(&st, image_id, points)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3013,11 +3565,17 @@ pub async fn mask_ai_prompt(
 /// Detected-object category counts (distinct images) for the LeftNav facet.
 #[tauri::command]
 pub async fn analysis_facets(app: AppHandle) -> Result<Vec<FacetRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::analysis_facets(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "analysis_facets",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::analysis_facets(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3025,11 +3583,17 @@ pub async fn analysis_facets(app: AppHandle) -> Result<Vec<FacetRow>, String> {
 /// Detected objects for one image (metadata panel).
 #[tauri::command]
 pub async fn image_detections(app: AppHandle, id: i64) -> Result<Vec<DetectionRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::detections_for_image(&db.conn, id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_detections",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::detections_for_image(&db.conn, id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3037,11 +3601,17 @@ pub async fn image_detections(app: AppHandle, id: i64) -> Result<Vec<DetectionRo
 /// Generated caption + keywords for one image (metadata panel).
 #[tauri::command]
 pub async fn image_caption(app: AppHandle, id: i64) -> Result<Option<CaptionRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::caption_for_image(&db.conn, id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_caption",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::caption_for_image(&db.conn, id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3049,11 +3619,17 @@ pub async fn image_caption(app: AppHandle, id: i64) -> Result<Option<CaptionRow>
 /// MobileCLIP presence-probe scores for one image (advisory AI readout; `None` until the probe ran).
 #[tauri::command]
 pub async fn image_presence(app: AppHandle, id: i64) -> Result<Option<PresenceRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::presence_for_image(&db.conn, id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_presence",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::presence_for_image(&db.conn, id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3063,10 +3639,16 @@ pub async fn image_presence(app: AppHandle, id: i64) -> Result<Option<PresenceRo
 /// People status: present-image total, how many are face-processed, total faces/people, model state.
 #[tauri::command]
 pub async fn faces_status(app: AppHandle) -> Result<crate::faces::FacesStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        crate::faces::status(&st)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "faces_status",
+        move || {
+            let st = app.state::<AppState>();
+            crate::faces::status(&st)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3074,9 +3656,15 @@ pub async fn faces_status(app: AppHandle) -> Result<crate::faces::FacesStatus, S
 /// Download any missing face models (~190 MB, first run only). Emits `faces:models` progress.
 #[tauri::command]
 pub async fn faces_models_ensure(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || crate::faces::ensure_face_models(&app))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "faces_models_ensure",
+        move || crate::faces::ensure_face_models(&app),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Run the "Find People" pass (detect → align → embed → cluster). `force` re-processes everything.
@@ -3092,9 +3680,15 @@ pub async fn faces_run(
     scope: Option<core_library::ScanScope>,
 ) -> Result<crate::faces::FacesRunStats, String> {
     let scope = scope.unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || crate::faces::run_pass(&app, force, &scope))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "faces_run",
+        move || crate::faces::run_pass(&app, force, &scope),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Request the running scan to stop after the current batch commits. No-op if idle. Faces run inside
@@ -3110,11 +3704,17 @@ pub fn faces_cancel(app: AppHandle) {
 /// Whether the face stage participates in the unified AI scan (Settings toggle; default on).
 #[tauri::command]
 pub async fn face_stage_enabled(app: AppHandle) -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::face_stage_enabled(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "face_stage_enabled",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::face_stage_enabled(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3122,11 +3722,17 @@ pub async fn face_stage_enabled(app: AppHandle) -> Result<bool, String> {
 /// Enable/disable the face stage in the unified scan.
 #[tauri::command]
 pub async fn set_face_stage_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_face_stage_enabled(&db.conn, enabled).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "set_face_stage_enabled",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_face_stage_enabled(&db.conn, enabled).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3134,11 +3740,17 @@ pub async fn set_face_stage_enabled(app: AppHandle, enabled: bool) -> Result<(),
 /// People for the sidebar (named first, then unnamed "Suggested" clusters); each with a cover crop.
 #[tauri::command]
 pub async fn people_list(app: AppHandle, include_hidden: bool) -> Result<Vec<PersonRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::list_people(&db.conn, include_hidden).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "people_list",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::list_people(&db.conn, include_hidden).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3150,12 +3762,18 @@ pub async fn person_faces(
     person_id: i64,
     status: Option<String>,
 ) -> Result<Vec<PersonFaceRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::person_faces(&db.conn, person_id, status.as_deref())
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "person_faces",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::person_faces(&db.conn, person_id, status.as_deref())
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3163,11 +3781,17 @@ pub async fn person_faces(
 /// Faces detected in one image (+ their person names) — the RightInfo "People" chips.
 #[tauri::command]
 pub async fn image_faces(app: AppHandle, id: i64) -> Result<Vec<ImageFaceRow>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::image_faces(&db.conn, id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_faces",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::image_faces(&db.conn, id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3179,17 +3803,23 @@ pub async fn person_set_name(
     person_id: i64,
     name: Option<String>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_person_name(
-            &db.conn,
-            person_id,
-            name.as_deref(),
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "person_set_name",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_person_name(
+                &db.conn,
+                person_id,
+                name.as_deref(),
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3197,12 +3827,18 @@ pub async fn person_set_name(
 /// Hide/unhide a person (excluded from the sidebar + library filter when hidden).
 #[tauri::command]
 pub async fn person_set_hidden(app: AppHandle, person_id: i64, hidden: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_person_hidden(&db.conn, person_id, hidden, core_library::now_epoch())
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "person_set_hidden",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_person_hidden(&db.conn, person_id, hidden, core_library::now_epoch())
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3210,12 +3846,18 @@ pub async fn person_set_hidden(app: AppHandle, person_id: i64, hidden: bool) -> 
 /// Set a person's cover (key) face. The face must belong to the person.
 #[tauri::command]
 pub async fn person_set_cover(app: AppHandle, person_id: i64, face_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_person_cover(&db.conn, person_id, face_id, core_library::now_epoch())
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "person_set_cover",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_person_cover(&db.conn, person_id, face_id, core_library::now_epoch())
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3223,13 +3865,19 @@ pub async fn person_set_cover(app: AppHandle, person_id: i64, face_id: i64) -> R
 /// Merge person `src` into `dst` (move all faces + rejections, delete `src`). Atomic; not reversible.
 #[tauri::command]
 pub async fn person_merge(app: AppHandle, dst: i64, src: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-        core_library::merge_people(&tx, dst, src).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "person_merge",
+        move || {
+            let st = app.state::<AppState>();
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+            core_library::merge_people(&tx, dst, src).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3237,11 +3885,17 @@ pub async fn person_merge(app: AppHandle, dst: i64, src: i64) -> Result<(), Stri
 /// Confirm a face belongs to its person ("yes" in the Review flow).
 #[tauri::command]
 pub async fn face_confirm(app: AppHandle, face_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::confirm_face(&db.conn, face_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "face_confirm",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::confirm_face(&db.conn, face_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3249,11 +3903,17 @@ pub async fn face_confirm(app: AppHandle, face_id: i64) -> Result<(), String> {
 /// Reject a face from its person ("not this person") — unlink + remember the rejection.
 #[tauri::command]
 pub async fn face_reject(app: AppHandle, face_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::reject_face(&db.conn, face_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "face_reject",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::reject_face(&db.conn, face_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3265,11 +3925,18 @@ pub async fn face_assign(
     face_id: i64,
     person_id: Option<i64>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::assign_face_person(&db.conn, face_id, person_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "face_assign",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::assign_face_person(&db.conn, face_id, person_id)
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3277,17 +3944,23 @@ pub async fn face_assign(
 /// Delete ALL face + person data (privacy "Delete all face data"). Atomic; not reversible.
 #[tauri::command]
 pub async fn faces_delete_all(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        // Guard against an in-flight scan repopulating the data we're about to wipe.
-        if st.analysis_running.load(Ordering::SeqCst) {
-            return Err("an AI scan is running — stop it before deleting face data".into());
-        }
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        let tx = db.conn.transaction().map_err(|e| e.to_string())?;
-        core_library::delete_all_face_data(&tx).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "faces_delete_all",
+        move || {
+            let st = app.state::<AppState>();
+            // Guard against an in-flight scan repopulating the data we're about to wipe.
+            if st.analysis_running.load(Ordering::SeqCst) {
+                return Err("an AI scan is running — stop it before deleting face data".into());
+            }
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+            core_library::delete_all_face_data(&tx).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3303,15 +3976,22 @@ pub async fn suggest_train(app: AppHandle) -> Result<(), String> {
 /// The suggester's state: live-model metrics, the label census by provenance, and scored counts.
 #[tauri::command]
 pub async fn suggest_status(app: AppHandle) -> Result<core_library::SuggestStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let mut status = core_library::suggest_status(&db.conn, crate::analysis::EMBEDDING_VERSION)
-            .map_err(|e| e.to_string())?;
-        // The run flag lives in app state, not the catalog — see `SuggestStatus::running`.
-        status.running = crate::suggest::is_running(&st);
-        Ok(status)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "suggest_status",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let mut status =
+                core_library::suggest_status(&db.conn, crate::analysis::EMBEDDING_VERSION)
+                    .map_err(|e| e.to_string())?;
+            // The run flag lives in app state, not the catalog — see `SuggestStatus::running`.
+            status.running = crate::suggest::is_running(&st);
+            Ok(status)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3321,9 +4001,15 @@ pub async fn suggest_status(app: AppHandle) -> Result<core_library::SuggestStatu
 #[tauri::command]
 pub async fn features_backfill(app: AppHandle) -> Result<usize, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || crate::features::run_backfill(&app2))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "features_backfill",
+        move || crate::features::run_backfill(&app2),
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Real per-image histogram for the Library metadata panel, computed from the cached thumbnail (no
@@ -3331,30 +4017,37 @@ pub async fn features_backfill(app: AppHandle) -> Result<usize, String> {
 /// Develop histogram), falling back to the camera placeholder. `None` if nothing is cached yet.
 #[tauri::command]
 pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<Histogram>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let (hash, edit_version) = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let hash =
-                match core_library::image_by_id(&db.conn, image_id).map_err(|e| e.to_string())? {
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "image_histogram",
+        move || {
+            let st = app.state::<AppState>();
+            let (hash, edit_version) = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                let hash = match core_library::image_by_id(&db.conn, image_id)
+                    .map_err(|e| e.to_string())?
+                {
                     Some(r) => r.content_hash,
                     None => return Ok(None),
                 };
-            let version = core_library::get_edit_with_version(&db.conn, image_id)
-                .ok()
-                .flatten()
-                .map(|(_, v)| v);
-            (hash, version)
-        };
-        let jpeg = edit_version
-            .and_then(|v| st.thumbs.read_edited(&hash, PROCESS_VERSION, v).ok())
-            .or_else(|| st.thumbs.read_canonical(&hash, PROCESS_VERSION).ok())
-            .or_else(|| st.thumbs.read(&hash, core_library::THUMB_SIZE).ok());
-        let Some(jpeg) = jpeg else {
-            return Ok(None);
-        };
-        Ok(core_pipeline::histogram_from_jpeg(&jpeg))
-    })
+                let version = core_library::get_edit_with_version(&db.conn, image_id)
+                    .ok()
+                    .flatten()
+                    .map(|(_, v)| v);
+                (hash, version)
+            };
+            let jpeg = edit_version
+                .and_then(|v| st.thumbs.read_edited(&hash, PROCESS_VERSION, v).ok())
+                .or_else(|| st.thumbs.read_canonical(&hash, PROCESS_VERSION).ok())
+                .or_else(|| st.thumbs.read(&hash, core_library::THUMB_SIZE).ok());
+            let Some(jpeg) = jpeg else {
+                return Ok(None);
+            };
+            Ok(core_pipeline::histogram_from_jpeg(&jpeg))
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3363,11 +4056,17 @@ pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<His
 /// "Source frames" section. `None` when `image_id` is an ordinary, un-merged image.
 #[tauri::command]
 pub async fn image_sources(app: AppHandle, image_id: i64) -> Result<Option<MergeSources>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::merge_sources(&db.conn, image_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_sources",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::merge_sources(&db.conn, image_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3379,11 +4078,17 @@ pub async fn image_pair(
     app: AppHandle,
     image_id: i64,
 ) -> Result<Option<core_library::PairInfo>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::pair_info(&db.conn, image_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_pair",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::pair_info(&db.conn, image_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3392,16 +4097,22 @@ pub async fn image_pair(
 /// Files on disk are untouched — this only drops the catalog link.
 #[tauri::command]
 pub async fn image_pair_unlink(app: AppHandle, secondary_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::unlink_pair(&db.conn, secondary_id).map_err(|e| e.to_string())?;
-        }
-        // The companion re-enters the default grid query — refresh whoever is showing it.
-        let _ = app.emit("library:changed", ());
-        Ok::<_, String>(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_pair_unlink",
+        move || {
+            let st = app.state::<AppState>();
+            {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::unlink_pair(&db.conn, secondary_id).map_err(|e| e.to_string())?;
+            }
+            // The companion re-enters the default grid query — refresh whoever is showing it.
+            let _ = app.emit("library:changed", ());
+            Ok::<_, String>(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3410,11 +4121,17 @@ pub async fn image_pair_unlink(app: AppHandle, secondary_id: i64) -> Result<(), 
 /// existing catalog onto the durable on-disk format. Returns the count written.
 #[tauri::command]
 pub async fn sidecars_write_all(app: AppHandle) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::write_all_sidecars(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Sidecar,
+        true,
+        "sidecars_write_all",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::write_all_sidecars(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3423,11 +4140,17 @@ pub async fn sidecars_write_all(app: AppHandle) -> Result<usize, String> {
 /// after a catalog loss or when moving between machines). Returns the count hydrated.
 #[tauri::command]
 pub async fn sidecars_rebuild(app: AppHandle) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::rebuild_from_sidecars(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Sidecar,
+        true,
+        "sidecars_rebuild",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::rebuild_from_sidecars(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3435,11 +4158,17 @@ pub async fn sidecars_rebuild(app: AppHandle) -> Result<usize, String> {
 /// Manual ground-truth labels for one image (the "Contains person/animal" checkboxes).
 #[tauri::command]
 pub async fn image_user_labels(app: AppHandle, id: i64) -> Result<UserLabels, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::user_labels(&db.conn, id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "image_user_labels",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::user_labels(&db.conn, id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3452,12 +4181,18 @@ pub async fn set_image_user_label(
     field: String,
     value: Option<bool>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_user_label(&db.conn, id, &field, value, core_library::now_epoch())
-            .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "set_image_user_label",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_user_label(&db.conn, id, &field, value, core_library::now_epoch())
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3472,35 +4207,41 @@ pub async fn set_image_user_label_many(
     value: Option<bool>,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let mut db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_user_label_many(
-            &mut db.conn,
-            &image_ids,
-            &field,
-            value,
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())?;
-        let et = format!("label.{field}_set");
-        let ctx = format!(
-            "{{\"field\":\"{field}\",\"value\":{}}}",
-            match value {
-                Some(true) => "true",
-                Some(false) => "false",
-                None => "null",
-            }
-        );
-        log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
-            core_library::Event {
-                event_type: et.clone(),
-                context: Some(ctx.clone()),
-                ..Default::default()
-            }
-        });
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "set_image_user_label_many",
+        move || {
+            let st = app.state::<AppState>();
+            let mut db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_user_label_many(
+                &mut db.conn,
+                &image_ids,
+                &field,
+                value,
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())?;
+            let et = format!("label.{field}_set");
+            let ctx = format!(
+                "{{\"field\":\"{field}\",\"value\":{}}}",
+                match value {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "null",
+                }
+            );
+            log_batch(st.inner(), &db.conn, &image_ids, &group_id, |_| {
+                core_library::Event {
+                    event_type: et.clone(),
+                    context: Some(ctx.clone()),
+                    ..Default::default()
+                }
+            });
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3508,11 +4249,17 @@ pub async fn set_image_user_label_many(
 /// Configured MegaDetector input size (640 or 1280).
 #[tauri::command]
 pub async fn analysis_detector_size(app: AppHandle) -> Result<u32, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::animal_detector_size(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "analysis_detector_size",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::animal_detector_size(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3532,14 +4279,21 @@ fn clear_analyzer_cache(_st: &AppState) -> Result<(), String> {
 /// rebuilds at the new resolution.
 #[tauri::command]
 pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::set_animal_detector_size(&db.conn, size).map_err(|e| e.to_string())?;
-        }
-        clear_analyzer_cache(&st)
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "set_analysis_detector_size",
+        move || {
+            let st = app.state::<AppState>();
+            {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::set_animal_detector_size(&db.conn, size)
+                    .map_err(|e| e.to_string())?;
+            }
+            clear_analyzer_cache(&st)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3547,11 +4301,17 @@ pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(),
 /// Configured AI-masking quality tier (`"realtime"` | `"balanced"` | `"max"`).
 #[tauri::command]
 pub async fn mask_ai_tier_get(app: AppHandle) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::mask_ai_tier(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "mask_ai_tier_get",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::mask_ai_tier(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3560,11 +4320,17 @@ pub async fn mask_ai_tier_get(app: AppHandle) -> Result<String, String> {
 /// change swaps the encoder); the segmenter itself rebuilds lazily when the tier differs.
 #[tauri::command]
 pub async fn mask_ai_tier_set(app: AppHandle, tier: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::set_mask_ai_tier(&db.conn, &tier).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Analysis,
+        false,
+        "mask_ai_tier_set",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::set_mask_ai_tier(&db.conn, &tier).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3671,11 +4437,17 @@ fn validate_sparse_params(
 /// All presets (summaries) for the panel.
 #[tauri::command]
 pub async fn presets_list(app: AppHandle) -> Result<Vec<core_library::PresetSummary>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::list_presets(&db.conn).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "presets_list",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::list_presets(&db.conn).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3686,11 +4458,17 @@ pub async fn presets_get(
     app: AppHandle,
     preset_id: i64,
 ) -> Result<Option<core_library::PresetFull>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::get_preset(&db.conn, preset_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "presets_get",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::get_preset(&db.conn, preset_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3705,29 +4483,36 @@ pub async fn presets_save(
     is_favorite: Option<bool>,
     params: DevelopParams,
 ) -> Result<i64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let full = serde_json::to_value(&params).map_err(|e| e.to_string())?;
-        let sparse = core_preset::subset(&full, &field_keys);
-        validate_sparse_params(&sparse)?;
-        let sparse_json =
-            serde_json::to_string(&serde_json::Value::Object(sparse)).map_err(|e| e.to_string())?;
-        let keys_json = serde_json::to_string(&field_keys).map_err(|e| e.to_string())?;
-        let group = group_name.unwrap_or_else(|| "My Presets".into());
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let name = core_library::unique_name(&db.conn, &group, &name).map_err(|e| e.to_string())?;
-        core_library::insert_preset(
-            &db.conn,
-            &name,
-            &group,
-            is_favorite.unwrap_or(false),
-            &keys_json,
-            &sparse_json,
-            PROCESS_VERSION,
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "presets_save",
+        move || {
+            let full = serde_json::to_value(&params).map_err(|e| e.to_string())?;
+            let sparse = core_preset::subset(&full, &field_keys);
+            validate_sparse_params(&sparse)?;
+            let sparse_json = serde_json::to_string(&serde_json::Value::Object(sparse))
+                .map_err(|e| e.to_string())?;
+            let keys_json = serde_json::to_string(&field_keys).map_err(|e| e.to_string())?;
+            let group = group_name.unwrap_or_else(|| "My Presets".into());
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let name =
+                core_library::unique_name(&db.conn, &group, &name).map_err(|e| e.to_string())?;
+            core_library::insert_preset(
+                &db.conn,
+                &name,
+                &group,
+                is_favorite.unwrap_or(false),
+                &keys_json,
+                &sparse_json,
+                PROCESS_VERSION,
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3742,25 +4527,31 @@ pub async fn presets_update(
     is_favorite: Option<bool>,
     sort_order: Option<i64>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        if (name.is_some() || group_name.is_some())
-            && core_library::is_builtin(&db.conn, preset_id).map_err(|e| e.to_string())?
-        {
-            return Err("built-in presets cannot be renamed or moved".to_string());
-        }
-        core_library::update_preset(
-            &db.conn,
-            preset_id,
-            name.as_deref(),
-            group_name.as_deref(),
-            is_favorite,
-            sort_order,
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "presets_update",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            if (name.is_some() || group_name.is_some())
+                && core_library::is_builtin(&db.conn, preset_id).map_err(|e| e.to_string())?
+            {
+                return Err("built-in presets cannot be renamed or moved".to_string());
+            }
+            core_library::update_preset(
+                &db.conn,
+                preset_id,
+                name.as_deref(),
+                group_name.as_deref(),
+                is_favorite,
+                sort_order,
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3768,14 +4559,20 @@ pub async fn presets_update(
 /// Delete a user preset (built-ins are refused).
 #[tauri::command]
 pub async fn presets_delete(app: AppHandle, preset_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        if core_library::is_builtin(&db.conn, preset_id).map_err(|e| e.to_string())? {
-            return Err("built-in presets cannot be deleted".to_string());
-        }
-        core_library::delete_preset(&db.conn, preset_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "presets_delete",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            if core_library::is_builtin(&db.conn, preset_id).map_err(|e| e.to_string())? {
+                return Err("built-in presets cannot be deleted".to_string());
+            }
+            core_library::delete_preset(&db.conn, preset_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3783,32 +4580,38 @@ pub async fn presets_delete(app: AppHandle, preset_id: i64) -> Result<(), String
 /// Duplicate a preset (including a built-in) as a new editable user preset.
 #[tauri::command]
 pub async fn presets_duplicate(app: AppHandle, preset_id: i64) -> Result<i64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let p = core_library::get_preset(&db.conn, preset_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "preset not found".to_string())?;
-        let group = if p.builtin {
-            "My Presets".to_string()
-        } else {
-            p.group_name
-        };
-        let name = core_library::unique_name(&db.conn, &group, &format!("{} copy", p.name))
-            .map_err(|e| e.to_string())?;
-        let keys_json = serde_json::to_string(&p.field_keys).map_err(|e| e.to_string())?;
-        core_library::insert_preset(
-            &db.conn,
-            &name,
-            &group,
-            false,
-            &keys_json,
-            &p.params,
-            PROCESS_VERSION,
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "presets_duplicate",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let p = core_library::get_preset(&db.conn, preset_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "preset not found".to_string())?;
+            let group = if p.builtin {
+                "My Presets".to_string()
+            } else {
+                p.group_name
+            };
+            let name = core_library::unique_name(&db.conn, &group, &format!("{} copy", p.name))
+                .map_err(|e| e.to_string())?;
+            let keys_json = serde_json::to_string(&p.field_keys).map_err(|e| e.to_string())?;
+            core_library::insert_preset(
+                &db.conn,
+                &name,
+                &group,
+                false,
+                &keys_json,
+                &p.params,
+                PROCESS_VERSION,
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3823,18 +4626,25 @@ pub async fn presets_apply(
     amount: Option<f32>,
     replace_all: Option<bool>,
 ) -> Result<DevelopParams, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let preset = core_library::get_preset(&db.conn, preset_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "preset not found".to_string())?;
-        let mut overlay = sparse_map(&preset.params)?;
-        core_preset::migrate_sparse(&mut overlay, preset.process_version);
-        let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
-        let merged = core_preset::apply_sparse(&base, &overlay, amount.unwrap_or(1.0));
-        serde_json::from_value::<DevelopParams>(merged).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "presets_apply",
+        move || {
+            let st = app.state::<AppState>();
+            let _publication = st.publications.mutation_guard();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let preset = core_library::get_preset(&db.conn, preset_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "preset not found".to_string())?;
+            let mut overlay = sparse_map(&preset.params)?;
+            core_preset::migrate_sparse(&mut overlay, preset.process_version);
+            let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
+            let merged = core_preset::apply_sparse(&base, &overlay, amount.unwrap_or(1.0));
+            serde_json::from_value::<DevelopParams>(merged).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3850,15 +4660,21 @@ pub async fn develop_apply_settings(
     amount: Option<f32>,
     replace_all: Option<bool>,
 ) -> Result<DevelopParams, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let full = serde_json::to_value(&params).map_err(|e| e.to_string())?;
-        let overlay = core_preset::subset(&full, &field_keys);
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
-        let merged = core_preset::apply_sparse(&base, &overlay, amount.unwrap_or(1.0));
-        serde_json::from_value::<DevelopParams>(merged).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "develop_apply_settings",
+        move || {
+            let full = serde_json::to_value(&params).map_err(|e| e.to_string())?;
+            let overlay = core_preset::subset(&full, &field_keys);
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
+            let merged = core_preset::apply_sparse(&base, &overlay, amount.unwrap_or(1.0));
+            serde_json::from_value::<DevelopParams>(merged).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3870,26 +4686,32 @@ pub async fn presets_export(
     preset_id: i64,
     dest_path: String,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let p = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::get_preset(&db.conn, preset_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "preset not found".to_string())?
-        };
-        let env = PresetEnvelope {
-            schema_version: Some(1),
-            name: p.name,
-            group_name: Some(p.group_name),
-            field_keys: p.field_keys,
-            process_version: Some(p.process_version),
-            params: serde_json::from_str(&p.params).map_err(|e| e.to_string())?,
-        };
-        let json = serde_json::to_string_pretty(&env).map_err(|e| e.to_string())?;
-        write_atomic(Path::new(&dest_path), json.as_bytes())?;
-        Ok(())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Export,
+        true,
+        "presets_export",
+        move || {
+            let st = app.state::<AppState>();
+            let p = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::get_preset(&db.conn, preset_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "preset not found".to_string())?
+            };
+            let env = PresetEnvelope {
+                schema_version: Some(1),
+                name: p.name,
+                group_name: Some(p.group_name),
+                field_keys: p.field_keys,
+                process_version: Some(p.process_version),
+                params: serde_json::from_str(&p.params).map_err(|e| e.to_string())?,
+            };
+            let json = serde_json::to_string_pretty(&env).map_err(|e| e.to_string())?;
+            write_atomic(Path::new(&dest_path), json.as_bytes())?;
+            Ok(())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3951,38 +4773,45 @@ pub async fn presets_import_file(
     app: AppHandle,
     src_path: String,
 ) -> Result<PresetImportResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        // Bound the read before pulling the file into memory (a hostile/huge file can't be slurped).
-        let size = std::fs::metadata(&src_path)
-            .map_err(|e| e.to_string())?
-            .len();
-        if size > core_preset::MAX_IMPORT_BYTES as u64 {
-            return Err(format!(
-                "preset file too large ({size} bytes; max {})",
-                core_preset::MAX_IMPORT_BYTES
-            ));
-        }
-        let bytes = std::fs::read(&src_path).map_err(|e| e.to_string())?;
-        let (name, group, field_keys, sparse_json, report) = parse_import(&bytes, &src_path)?;
-        // Validate before storing so a buggy importer surfaces here, not at apply.
-        validate_sparse_params(&sparse_map(&sparse_json)?)?;
-        let keys_json = serde_json::to_string(&field_keys).map_err(|e| e.to_string())?;
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let name = core_library::unique_name(&db.conn, &group, &name).map_err(|e| e.to_string())?;
-        let preset_id = core_library::insert_preset(
-            &db.conn,
-            &name,
-            &group,
-            false,
-            &keys_json,
-            &sparse_json,
-            PROCESS_VERSION,
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok::<_, String>(PresetImportResult { preset_id, report })
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Import,
+        true,
+        "presets_import_file",
+        move || {
+            // Bound the read before pulling the file into memory (a hostile/huge file can't be slurped).
+            let size = std::fs::metadata(&src_path)
+                .map_err(|e| e.to_string())?
+                .len();
+            if size > core_preset::MAX_IMPORT_BYTES as u64 {
+                return Err(format!(
+                    "preset file too large ({size} bytes; max {})",
+                    core_preset::MAX_IMPORT_BYTES
+                ));
+            }
+            let bytes = std::fs::read(&src_path).map_err(|e| e.to_string())?;
+            let (name, group, field_keys, sparse_json, report) = parse_import(&bytes, &src_path)?;
+            // Validate before storing so a buggy importer surfaces here, not at apply.
+            validate_sparse_params(&sparse_map(&sparse_json)?)?;
+            let keys_json = serde_json::to_string(&field_keys).map_err(|e| e.to_string())?;
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let name =
+                core_library::unique_name(&db.conn, &group, &name).map_err(|e| e.to_string())?;
+            let preset_id = core_library::insert_preset(
+                &db.conn,
+                &name,
+                &group,
+                false,
+                &keys_json,
+                &sparse_json,
+                PROCESS_VERSION,
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(PresetImportResult { preset_id, report })
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -3995,11 +4824,17 @@ pub async fn snapshots_list(
     app: AppHandle,
     image_id: i64,
 ) -> Result<Vec<core_library::SnapshotSummary>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::list_snapshots(&db.conn, image_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        false,
+        "snapshots_list",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::list_snapshots(&db.conn, image_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -4012,22 +4847,28 @@ pub async fn snapshot_create(
     name: String,
     params: DevelopParams,
 ) -> Result<i64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let name = core_library::unique_snapshot_name(&db.conn, image_id, &name)
-            .map_err(|e| e.to_string())?;
-        core_library::create_snapshot(
-            &db.conn,
-            image_id,
-            &name,
-            &json,
-            PROCESS_VERSION,
-            core_library::now_epoch(),
-        )
-        .map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "snapshot_create",
+        move || {
+            let json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let name = core_library::unique_snapshot_name(&db.conn, image_id, &name)
+                .map_err(|e| e.to_string())?;
+            core_library::create_snapshot(
+                &db.conn,
+                image_id,
+                &name,
+                &json,
+                PROCESS_VERSION,
+                core_library::now_epoch(),
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -4036,17 +4877,23 @@ pub async fn snapshot_create(
 /// commits the returned params so the restore becomes an undoable step.
 #[tauri::command]
 pub async fn snapshot_restore(app: AppHandle, snapshot_id: i64) -> Result<DevelopParams, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let (json, pv) = core_library::get_snapshot_params(&db.conn, snapshot_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "snapshot not found".to_string())?;
-        let mut value: serde_json::Value =
-            serde_json::from_str(&json).map_err(|e| e.to_string())?;
-        core_preset::migrate_full(&mut value, pv);
-        serde_json::from_value::<DevelopParams>(value).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "snapshot_restore",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let (json, pv) = core_library::get_snapshot_params(&db.conn, snapshot_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "snapshot not found".to_string())?;
+            let mut value: serde_json::Value =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            core_preset::migrate_full(&mut value, pv);
+            serde_json::from_value::<DevelopParams>(value).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -4054,11 +4901,17 @@ pub async fn snapshot_restore(app: AppHandle, snapshot_id: i64) -> Result<Develo
 /// Rename a snapshot.
 #[tauri::command]
 pub async fn snapshot_rename(app: AppHandle, snapshot_id: i64, name: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::rename_snapshot(&db.conn, snapshot_id, &name).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "snapshot_rename",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::rename_snapshot(&db.conn, snapshot_id, &name).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -4066,11 +4919,17 @@ pub async fn snapshot_rename(app: AppHandle, snapshot_id: i64, name: String) -> 
 /// Delete a snapshot.
 #[tauri::command]
 pub async fn snapshot_delete(app: AppHandle, snapshot_id: i64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        core_library::delete_snapshot(&db.conn, snapshot_id).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "snapshot_delete",
+        move || {
+            let st = app.state::<AppState>();
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            core_library::delete_snapshot(&db.conn, snapshot_id).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -4091,346 +4950,352 @@ pub async fn snapshot_delete(app: AppHandle, snapshot_id: i64) -> Result<(), Str
 pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, String> {
     use std::sync::atomic::AtomicBool;
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Import,
+        true,
+        "hdr_merge",
+        move || {
+            let st = app.state::<AppState>();
 
-        // Single-flight: a merge decodes N full-res RAWs; a second one would thrash memory.
-        if st.hdr_running.swap(true, Ordering::SeqCst) {
-            return Err("an HDR merge is already running".to_string());
-        }
-        st.hdr_cancel.store(false, Ordering::SeqCst);
-        // Resets BOTH the running gate and the cancel flag on drop, so an early return / error can
-        // never wedge the gate or leave a stale cancel latched for the next merge.
-        struct Running<'a>(&'a AtomicBool, &'a AtomicBool);
-        impl Drop for Running<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-                self.1.store(false, Ordering::SeqCst);
+            // Single-flight: a merge decodes N full-res RAWs; a second one would thrash memory.
+            if st.hdr_running.swap(true, Ordering::SeqCst) {
+                return Err("an HDR merge is already running".to_string());
             }
-        }
-        let _running = Running(&st.hdr_running, &st.hdr_cancel);
-        // Gate the FS watcher so it can't index the freshly-renamed EXR before our own catalog
-        // step (insert is hash-idempotent, but the watcher path would race the returned row).
-        let _watch_guard = crate::watch::ImportGuard::new(app.clone());
+            st.workers.reset_cancel(&st.hdr_cancel)?;
+            // Resets BOTH the running gate and the cancel flag on drop, so an early return / error can
+            // never wedge the gate or leave a stale cancel latched for the next merge.
+            struct Running<'a>(&'a AtomicBool, &'a AtomicBool);
+            impl Drop for Running<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                    self.1.store(false, Ordering::SeqCst);
+                }
+            }
+            let _running = Running(&st.hdr_running, &st.hdr_cancel);
+            // Gate the FS watcher so it can't index the freshly-renamed EXR before our own catalog
+            // step (insert is hash-idempotent, but the watcher path would race the returned row).
+            let _watch_guard = crate::watch::ImportGuard::new(app.clone());
 
-        // Dedupe while preserving selection order — a duplicate id would double-count a frame and
-        // skew the exposure-weighted merge.
-        let mut seen_ids = std::collections::HashSet::new();
-        let image_ids: Vec<i64> = image_ids
-            .into_iter()
-            .filter(|id| seen_ids.insert(*id))
-            .collect();
+            // Dedupe while preserving selection order — a duplicate id would double-count a frame and
+            // skew the exposure-weighted merge.
+            let mut seen_ids = std::collections::HashSet::new();
+            let image_ids: Vec<i64> = image_ids
+                .into_iter()
+                .filter(|id| seen_ids.insert(*id))
+                .collect();
 
-        if !(2..=9).contains(&image_ids.len()) {
-            return Err(format!(
-                "select 2–9 bracketed RAW frames to merge (got {})",
-                image_ids.len()
-            ));
-        }
-        let total = image_ids.len() + 2;
-        let progress = |done: usize, stage: &str| {
-            let _ = app.emit(
-                "hdr:progress",
-                serde_json::json!({"done": done, "total": total, "stage": stage}),
-            );
-        };
-
-        // Load + validate the source rows (brief lock).
-        struct Frame {
-            id: i64,
-            path: PathBuf,
-            hash_hex: String,
-            folder_id: i64,
-        }
-        let frames: Vec<Frame> = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            image_ids
-                .iter()
-                .map(|&id| {
-                    let (path, status, format, hash, folder_id): (
-                        String,
-                        String,
-                        Option<String>,
-                        Vec<u8>,
-                        i64,
-                    ) = db
-                        .conn
-                        .query_row(
-                            "SELECT path, status, IFNULL(format,'raw'), content_hash,
-                                    IFNULL(folder_id, -1)
-                             FROM images WHERE id = ?1",
-                            core_db::rusqlite::params![id],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                        )
-                        .map_err(|_| format!("image {id} not found"))?;
-                    if status != "present" {
-                        return Err(format!("{path}: file is missing — relink it first"));
-                    }
-                    match format.as_deref() {
-                        Some("raw") | None => {}
-                        Some(other) => {
-                            return Err(format!(
-                                "{path}: HDR merge takes RAW frames only (this is {other})"
-                            ))
-                        }
-                    }
-                    Ok(Frame {
-                        id,
-                        path: PathBuf::from(path),
-                        hash_hex: hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        folder_id,
-                    })
-                })
-                .collect::<Result<_, String>>()?
-        };
-
-        // Numeric exposure per frame → EV, reference (median EV), shortest (max EV). Metadata-only
-        // (no pixel decode) alongside, to catch a mixed-camera selection before the expensive
-        // full-res decode loop below.
-        // TODO(P4): auto-bracket suggestion — burst edges in pano_detect already absorb HDR
-        // brackets; a varying-EV burst category can reuse that pipeline.
-        progress(0, "reading exposure");
-        type CamId = (Option<String>, Option<String>);
-        let (exposures, cam_ids): (Vec<core_hdr::ExposureInfo>, Vec<CamId>) = frames
-            .iter()
-            .map(|f| {
-                let src = core_raw::source_from_path(&f.path)
-                    .map_err(|e| format!("{}: {e}", f.path.display()))?;
-                let (t, n, iso) = core_raw::read_exposure_numeric(&src)
-                    .map_err(|e| format!("{}: {e}", f.path.display()))?
-                    .ok_or_else(|| {
-                        format!(
-                            "{}: missing shutter/aperture/ISO EXIF (needed for EV math)",
-                            f.path.display()
-                        )
-                    })?;
-                let meta = core_raw::read_metadata(&src)
-                    .map_err(|e| format!("{}: {e}", f.path.display()))?;
-                Ok((
-                    core_hdr::ExposureInfo {
-                        exposure_time_s: t,
-                        f_number: n,
-                        iso,
-                    },
-                    (meta.camera_make, meta.camera_model),
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?
-            .into_iter()
-            .unzip();
-        // Refuse mixed-camera brackets up front: the merged EXR carries one reference frame's
-        // metadata, so frames from different bodies would silently blend mismatched color/WB.
-        let (first_make, first_model) = &cam_ids[0];
-        for (make, model) in &cam_ids[1..] {
-            if (make, model) != (first_make, first_model) {
+            if !(2..=9).contains(&image_ids.len()) {
                 return Err(format!(
-                    "all frames must come from the same camera (found {} {} and {} {})",
-                    first_make.as_deref().unwrap_or("?"),
-                    first_model.as_deref().unwrap_or("?"),
-                    make.as_deref().unwrap_or("?"),
-                    model.as_deref().unwrap_or("?"),
+                    "select 2–9 bracketed RAW frames to merge (got {})",
+                    image_ids.len()
                 ));
             }
-        }
-        let evs: Vec<f64> = exposures
-            .iter()
-            .map(|e| core_hdr::ev100(e).map_err(|e| e.to_string()))
-            .collect::<Result<_, String>>()?;
-        if evs.iter().all(|&ev| (ev - evs[0]).abs() < 0.2) {
-            return Err(
-                "all frames have the same exposure — select a bracketed set (varying shutter)"
-                    .to_string(),
-            );
-        }
-        let ref_idx = core_hdr::reference_index(&exposures).map_err(|e| e.to_string())?;
-        let shortest_idx = (0..evs.len())
-            .max_by(|&a, &b| evs[a].total_cmp(&evs[b]))
-            .expect("non-empty");
+            let total = image_ids.len() + 2;
+            let progress = |done: usize, stage: &str| {
+                let _ = app.emit(
+                    "hdr:progress",
+                    serde_json::json!({"done": done, "total": total, "stage": stage}),
+                );
+            };
 
-        // Decode the reference first (capturing its as-shot WB), then stream the rest. The reference
-        // stays resident because each moving frame is aligned against its pixels; `with_reference`
-        // clones it into the accumulator for deghosting, so the original is dropped only after the
-        // alignment loop.
-        let ref_src = core_raw::source_from_path(&frames[ref_idx].path)
-            .map_err(|e| format!("{}: {e}", frames[ref_idx].path.display()))?;
-        let (ref_img, ref_wb) =
-            core_raw::develop_linear_wb(&ref_src, None).map_err(|e| e.to_string())?;
-        let (ref_w, ref_h) = (ref_img.width, ref_img.height);
-        let mut acc = core_hdr::MergeAccumulator::with_reference(
-            &ref_img,
-            ref_idx == shortest_idx,
-            core_hdr::DeghostParams::default(),
-        )
-        .map_err(|e| e.to_string())?;
-        let mut done = 1;
-        // Frames the aligner couldn't confidently register — merged unaligned, surfaced to the user.
-        let mut warnings: Vec<String> = Vec::new();
-        progress(done, "merging");
-        for (i, frame) in frames.iter().enumerate() {
-            if i == ref_idx {
-                continue;
+            // Load + validate the source rows (brief lock).
+            struct Frame {
+                id: i64,
+                path: PathBuf,
+                hash_hex: String,
+                folder_id: i64,
             }
-            // Poll cancel between frames (each frame is a multi-second decode + align + warp).
-            if st.hdr_cancel.load(Ordering::SeqCst) {
-                return Err("cancelled".to_string());
-            }
-            let src = core_raw::source_from_path(&frame.path)
-                .map_err(|e| format!("{}: {e}", frame.path.display()))?;
-            let (img, _) = core_raw::develop_linear_wb(&src, Some(ref_wb))
-                .map_err(|e| format!("{}: {e}", frame.path.display()))?;
-            let scale = core_hdr::relative_scale(&exposures[i], &exposures[ref_idx])
-                .map_err(|e| e.to_string())? as f32;
+            let frames: Vec<Frame> = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                image_ids
+                    .iter()
+                    .map(|&id| {
+                        let (path, status, format, hash, folder_id): (
+                            String,
+                            String,
+                            Option<String>,
+                            Vec<u8>,
+                            i64,
+                        ) = db
+                            .conn
+                            .query_row(
+                                "SELECT path, status, IFNULL(format,'raw'), content_hash,
+                                    IFNULL(folder_id, -1)
+                             FROM images WHERE id = ?1",
+                                core_db::rusqlite::params![id],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                            )
+                            .map_err(|_| format!("image {id} not found"))?;
+                        if status != "present" {
+                            return Err(format!("{path}: file is missing — relink it first"));
+                        }
+                        match format.as_deref() {
+                            Some("raw") | None => {}
+                            Some(other) => {
+                                return Err(format!(
+                                    "{path}: HDR merge takes RAW frames only (this is {other})"
+                                ))
+                            }
+                        }
+                        Ok(Frame {
+                            id,
+                            path: PathBuf::from(path),
+                            hash_hex: hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                            folder_id,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?
+            };
 
-            // Hand-held alignment: recover the affine transform mapping this frame onto the
-            // reference grid, warp it there (with a validity mask), and merge the aligned pixels.
-            // If the pair won't register, fall back to an unaligned merge with a warning.
-            progress(done, "aligning");
-            let aligned = core_pano::align::estimate_alignment_rgb(
-                &ref_img.data,
-                ref_w as usize,
-                ref_h as usize,
-                &img.data,
-                img.width as usize,
-                img.height as usize,
-                core_pano::align::AlignModel::Affine,
-            );
-            progress(done, "merging");
-            match aligned {
-                Some(m) => {
-                    let (warped, mask) = core_hdr::warp_into_reference(&img, ref_w, ref_h, &m);
-                    let warped_img = core_raw::LinearImage {
-                        width: ref_w,
-                        height: ref_h,
-                        data: warped,
-                    };
-                    acc.add_frame_masked(&warped_img, scale, i == shortest_idx, &mask)
-                        .map_err(|e| format!("{}: {e}", frame.path.display()))?;
-                }
-                None => {
-                    warnings.push(format!(
-                        "frame {} ({}) couldn't be aligned — merged unaligned",
-                        i + 1,
-                        frame
-                            .path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?"),
+            // Numeric exposure per frame → EV, reference (median EV), shortest (max EV). Metadata-only
+            // (no pixel decode) alongside, to catch a mixed-camera selection before the expensive
+            // full-res decode loop below.
+            // TODO(P4): auto-bracket suggestion — burst edges in pano_detect already absorb HDR
+            // brackets; a varying-EV burst category can reuse that pipeline.
+            progress(0, "reading exposure");
+            type CamId = (Option<String>, Option<String>);
+            let (exposures, cam_ids): (Vec<core_hdr::ExposureInfo>, Vec<CamId>) = frames
+                .iter()
+                .map(|f| {
+                    let src = core_raw::source_from_path(&f.path)
+                        .map_err(|e| format!("{}: {e}", f.path.display()))?;
+                    let (t, n, iso) = core_raw::read_exposure_numeric(&src)
+                        .map_err(|e| format!("{}: {e}", f.path.display()))?
+                        .ok_or_else(|| {
+                            format!(
+                                "{}: missing shutter/aperture/ISO EXIF (needed for EV math)",
+                                f.path.display()
+                            )
+                        })?;
+                    let meta = core_raw::read_metadata(&src)
+                        .map_err(|e| format!("{}: {e}", f.path.display()))?;
+                    Ok((
+                        core_hdr::ExposureInfo {
+                            exposure_time_s: t,
+                            f_number: n,
+                            iso,
+                        },
+                        (meta.camera_make, meta.camera_model),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
+                .unzip();
+            // Refuse mixed-camera brackets up front: the merged EXR carries one reference frame's
+            // metadata, so frames from different bodies would silently blend mismatched color/WB.
+            let (first_make, first_model) = &cam_ids[0];
+            for (make, model) in &cam_ids[1..] {
+                if (make, model) != (first_make, first_model) {
+                    return Err(format!(
+                        "all frames must come from the same camera (found {} {} and {} {})",
+                        first_make.as_deref().unwrap_or("?"),
+                        first_model.as_deref().unwrap_or("?"),
+                        make.as_deref().unwrap_or("?"),
+                        model.as_deref().unwrap_or("?"),
                     ));
-                    acc.add_frame(&img, scale, i == shortest_idx)
-                        .map_err(|e| format!("{}: {e}", frame.path.display()))?;
                 }
+            }
+            let evs: Vec<f64> = exposures
+                .iter()
+                .map(|e| core_hdr::ev100(e).map_err(|e| e.to_string()))
+                .collect::<Result<_, String>>()?;
+            if evs.iter().all(|&ev| (ev - evs[0]).abs() < 0.2) {
+                return Err(
+                    "all frames have the same exposure — select a bracketed set (varying shutter)"
+                        .to_string(),
+                );
+            }
+            let ref_idx = core_hdr::reference_index(&exposures).map_err(|e| e.to_string())?;
+            let shortest_idx = (0..evs.len())
+                .max_by(|&a, &b| evs[a].total_cmp(&evs[b]))
+                .expect("non-empty");
+
+            // Decode the reference first (capturing its as-shot WB), then stream the rest. The reference
+            // stays resident because each moving frame is aligned against its pixels; `with_reference`
+            // clones it into the accumulator for deghosting, so the original is dropped only after the
+            // alignment loop.
+            let ref_src = core_raw::source_from_path(&frames[ref_idx].path)
+                .map_err(|e| format!("{}: {e}", frames[ref_idx].path.display()))?;
+            let (ref_img, ref_wb) =
+                core_raw::develop_linear_wb(&ref_src, None).map_err(|e| e.to_string())?;
+            let (ref_w, ref_h) = (ref_img.width, ref_img.height);
+            let mut acc = core_hdr::MergeAccumulator::with_reference(
+                &ref_img,
+                ref_idx == shortest_idx,
+                core_hdr::DeghostParams::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            let mut done = 1;
+            // Frames the aligner couldn't confidently register — merged unaligned, surfaced to the user.
+            let mut warnings: Vec<String> = Vec::new();
+            progress(done, "merging");
+            for (i, frame) in frames.iter().enumerate() {
+                if i == ref_idx {
+                    continue;
+                }
+                // Poll cancel between frames (each frame is a multi-second decode + align + warp).
+                if st.hdr_cancel.load(Ordering::SeqCst) {
+                    return Err("cancelled".to_string());
+                }
+                let src = core_raw::source_from_path(&frame.path)
+                    .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+                let (img, _) = core_raw::develop_linear_wb(&src, Some(ref_wb))
+                    .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+                let scale = core_hdr::relative_scale(&exposures[i], &exposures[ref_idx])
+                    .map_err(|e| e.to_string())? as f32;
+
+                // Hand-held alignment: recover the affine transform mapping this frame onto the
+                // reference grid, warp it there (with a validity mask), and merge the aligned pixels.
+                // If the pair won't register, fall back to an unaligned merge with a warning.
+                progress(done, "aligning");
+                let aligned = core_pano::align::estimate_alignment_rgb(
+                    &ref_img.data,
+                    ref_w as usize,
+                    ref_h as usize,
+                    &img.data,
+                    img.width as usize,
+                    img.height as usize,
+                    core_pano::align::AlignModel::Affine,
+                );
+                progress(done, "merging");
+                match aligned {
+                    Some(m) => {
+                        let (warped, mask) = core_hdr::warp_into_reference(&img, ref_w, ref_h, &m);
+                        let warped_img = core_raw::LinearImage {
+                            width: ref_w,
+                            height: ref_h,
+                            data: warped,
+                        };
+                        acc.add_frame_masked(&warped_img, scale, i == shortest_idx, &mask)
+                            .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+                    }
+                    None => {
+                        warnings.push(format!(
+                            "frame {} ({}) couldn't be aligned — merged unaligned",
+                            i + 1,
+                            frame
+                                .path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?"),
+                        ));
+                        acc.add_frame(&img, scale, i == shortest_idx)
+                            .map_err(|e| format!("{}: {e}", frame.path.display()))?;
+                    }
+                }
+                done += 1;
+                progress(done, "merging");
+            }
+            drop(ref_img);
+            let merged = acc.finish().map_err(|e| e.to_string())?;
+
+            // Destination: library_root/YYYY/YYYY-MM-DD (import's date routing) when a root is set,
+            // else next to the reference frame. Metadata = the reference frame's (rides inside the EXR).
+            let meta = core_raw::read_metadata(&ref_src).map_err(|e| e.to_string())?;
+            let library_root: Option<String> = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::library_root(&db.conn).map_err(|e| e.to_string())?
+            };
+            let ref_parent = frames[ref_idx]
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "reference frame has no parent directory".to_string())?;
+            let dest_dir = match &library_root {
+                Some(root) => {
+                    let capture = meta
+                        .capture_date
+                        .unwrap_or_else(core_library::index::now_epoch);
+                    Path::new(root).join(core_import::date_subpath(capture))
+                }
+                None => ref_parent.clone(),
+            };
+            std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+            let ref_stem = frames[ref_idx]
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("merge");
+            let dest = core_import::unique_dest(&dest_dir, &format!("{ref_stem}_HDR.exr"));
+
+            let sources: Vec<core_raw::HdrSourceInfo> = frames
+                .iter()
+                .enumerate()
+                .map(|(i, f)| core_raw::HdrSourceInfo {
+                    image_id: f.id,
+                    content_hash_hex: f.hash_hex.clone(),
+                    relative_ev: (evs[i] - evs[ref_idx]) as f32,
+                })
+                .collect();
+            core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx)
+                .map_err(|e| e.to_string())?;
+            drop(merged);
+            if st.hdr_cancel.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&dest);
+                return Err("cancelled".into());
             }
             done += 1;
-            progress(done, "merging");
-        }
-        drop(ref_img);
-        let merged = acc.finish().map_err(|e| e.to_string())?;
+            progress(done, "writing");
 
-        // Destination: library_root/YYYY/YYYY-MM-DD (import's date routing) when a root is set,
-        // else next to the reference frame. Metadata = the reference frame's (rides inside the EXR).
-        let meta = core_raw::read_metadata(&ref_src).map_err(|e| e.to_string())?;
-        let library_root: Option<String> = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::library_root(&db.conn).map_err(|e| e.to_string())?
-        };
-        let ref_parent = frames[ref_idx]
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "reference frame has no parent directory".to_string())?;
-        let dest_dir = match &library_root {
-            Some(root) => {
-                let capture = meta
-                    .capture_date
-                    .unwrap_or_else(core_library::index::now_epoch);
-                Path::new(root).join(core_import::date_subpath(capture))
-            }
-            None => ref_parent.clone(),
-        };
-        std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-        let ref_stem = frames[ref_idx]
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("merge");
-        let dest = core_import::unique_dest(&dest_dir, &format!("{ref_stem}_HDR.exr"));
-
-        let sources: Vec<core_raw::HdrSourceInfo> = frames
-            .iter()
-            .enumerate()
-            .map(|(i, f)| core_raw::HdrSourceInfo {
-                image_id: f.id,
-                content_hash_hex: f.hash_hex.clone(),
-                relative_ev: (evs[i] - evs[ref_idx]) as f32,
-            })
-            .collect();
-        core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx)
-            .map_err(|e| e.to_string())?;
-        drop(merged);
-        if st.hdr_cancel.load(Ordering::SeqCst) {
-            let _ = std::fs::remove_file(&dest);
-            return Err("cancelled".into());
-        }
-        done += 1;
-        progress(done, "writing");
-
-        // Catalog: hash + thumb + meta from the file (metadata flows from the EXR attributes),
-        // then a brief lock to insert. Folder row: the library root when routing under it,
-        // else the reference frame's own folder.
-        let processed = core_library::process_file(&dest, &st.thumbs, core_library::THUMB_SIZE)
-            .map_err(|e| {
-                // A written-but-uncatalogable EXR would sit orphaned in the library folder.
-                let _ = std::fs::remove_file(&dest);
-                e.to_string()
-            })?;
-        // Any catalog failure after a successful write would leave the EXR orphaned on disk —
-        // remove it on every error path out of this block (the collision branch's own remove
-        // stays; a second remove is a no-op).
-        let id = (|| -> Result<i64, String> {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let conn = &db.conn;
-            let folder_id = match &library_root {
-                Some(root) => {
-                    core_library::add_root(conn, Path::new(root)).map_err(|e| e.to_string())?
-                }
-                None if frames[ref_idx].folder_id >= 0 => frames[ref_idx].folder_id,
-                None => core_library::add_root(conn, &ref_parent).map_err(|e| e.to_string())?,
-            };
-            let id = core_library::insert_hdr_image(
-                conn,
-                folder_id,
-                core_library::index::now_epoch(),
-                &processed,
-                &sources,
-            )
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| {
-                // Byte-identical EXR already catalogued (same bracket merged before).
-                "an identical merge of these frames is already in the library".to_string()
-            })?;
-            Ok(id)
-        })()
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&dest);
-        })?;
-        // The image and its provenance are committed now. A response-query failure must not
-        // remove the successfully published file and leave a dangling catalog row.
-        let row = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            core_library::image_by_id(&db.conn, id)
+            // Catalog: hash + thumb + meta from the file (metadata flows from the EXR attributes),
+            // then a brief lock to insert. Folder row: the library root when routing under it,
+            // else the reference frame's own folder.
+            let processed = core_library::process_file(&dest, &st.thumbs, core_library::THUMB_SIZE)
+                .map_err(|e| {
+                    // A written-but-uncatalogable EXR would sit orphaned in the library folder.
+                    let _ = std::fs::remove_file(&dest);
+                    e.to_string()
+                })?;
+            // Any catalog failure after a successful write would leave the EXR orphaned on disk —
+            // remove it on every error path out of this block (the collision branch's own remove
+            // stays; a second remove is a no-op).
+            let id = (|| -> Result<i64, String> {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                let conn = &db.conn;
+                let folder_id = match &library_root {
+                    Some(root) => {
+                        core_library::add_root(conn, Path::new(root)).map_err(|e| e.to_string())?
+                    }
+                    None if frames[ref_idx].folder_id >= 0 => frames[ref_idx].folder_id,
+                    None => core_library::add_root(conn, &ref_parent).map_err(|e| e.to_string())?,
+                };
+                let id = core_library::insert_hdr_image(
+                    conn,
+                    folder_id,
+                    core_library::index::now_epoch(),
+                    &processed,
+                    &sources,
+                )
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| "merged image row vanished after insert".to_string())?
-        };
-        done += 1;
-        progress(done, "done");
-        let _ = app.emit(
-            "hdr:done",
-            serde_json::json!({ "image": &row, "warnings": warnings }),
-        );
-        let _ = app.emit("library:changed", ());
-        crate::thumb_queue::enqueue_all(&app);
-        Ok(row)
-    })
+                .ok_or_else(|| {
+                    // Byte-identical EXR already catalogued (same bracket merged before).
+                    "an identical merge of these frames is already in the library".to_string()
+                })?;
+                Ok(id)
+            })()
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&dest);
+            })?;
+            // The image and its provenance are committed now. A response-query failure must not
+            // remove the successfully published file and leave a dangling catalog row.
+            let row = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                core_library::image_by_id(&db.conn, id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "merged image row vanished after insert".to_string())?
+            };
+            done += 1;
+            progress(done, "done");
+            let _ = app.emit(
+                "hdr:done",
+                serde_json::json!({ "image": &row, "warnings": warnings }),
+            );
+            let _ = app.emit("library:changed", ());
+            crate::thumb_queue::enqueue_all(&app);
+            Ok(row)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }
@@ -4450,33 +5315,39 @@ pub fn hdr_cancel(app: AppHandle) {
 /// catalog (Darkroom itself always reads the source `.exr`).
 #[tauri::command]
 pub async fn hdr_export_dng(app: AppHandle, image_id: i64, dest: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        // Keep the watcher from cataloguing an existing export between the source-path check and
-        // atomic replacement. A newly catalogued file would otherwise become a protected source.
-        let _watch_guard = crate::watch::ImportGuard::new(app.clone());
-        let (path, format) = {
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            db.conn
-                .query_row(
-                    "SELECT path, IFNULL(format,'raw') FROM images WHERE id = ?1",
-                    core_db::rusqlite::params![image_id],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-                )
-                .map_err(|_| format!("image {image_id} not found"))?
-        };
-        if format != "hdr" {
-            return Err(format!(
-                "image {image_id} is not a merged-HDR image (format={format})"
-            ));
-        }
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let lin = core_raw::hdr_file::read_hdr_linear(&bytes).map_err(|e| e.to_string())?;
-        let meta = core_raw::hdr_file::read_hdr_meta(&bytes);
-        let dest_path = Path::new(&dest);
-        ensure_export_destination(st.inner(), dest_path)?;
-        core_raw::write_hdr_dng(dest_path, &lin, &meta).map_err(|e| e.to_string())
-    })
+    crate::jobs::spawn_blocking(
+        app.clone(),
+        core_app::jobs::JobClass::Export,
+        true,
+        "hdr_export_dng",
+        move || {
+            let st = app.state::<AppState>();
+            // Keep the watcher from cataloguing an existing export between the source-path check and
+            // atomic replacement. A newly catalogued file would otherwise become a protected source.
+            let _watch_guard = crate::watch::ImportGuard::new(app.clone());
+            let (path, format) = {
+                let db = st.db.lock().map_err(|e| e.to_string())?;
+                db.conn
+                    .query_row(
+                        "SELECT path, IFNULL(format,'raw') FROM images WHERE id = ?1",
+                        core_db::rusqlite::params![image_id],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .map_err(|_| format!("image {image_id} not found"))?
+            };
+            if format != "hdr" {
+                return Err(format!(
+                    "image {image_id} is not a merged-HDR image (format={format})"
+                ));
+            }
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let lin = core_raw::hdr_file::read_hdr_linear(&bytes).map_err(|e| e.to_string())?;
+            let meta = core_raw::hdr_file::read_hdr_meta(&bytes);
+            let dest_path = Path::new(&dest);
+            ensure_export_destination(st.inner(), dest_path)?;
+            core_raw::write_hdr_dng(dest_path, &lin, &meta).map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| e.to_string())?
 }

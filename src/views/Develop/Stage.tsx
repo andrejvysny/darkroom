@@ -137,9 +137,9 @@ export default function Stage({
     interactive: !cropMode,
     transformViewState: (live) =>
       useDevelopStore.getState().cropMode ? fitViewState() : live,
-    render: async (d, canvas) => {
+    render: async (d, canvas, isCurrent) => {
       const frame = await renderFn(d);
-      if (frame) {
+      if (frame && isCurrent()) {
         lastFrameRef.current = frame;
         // Size + paint the backing store, THEN publish the matching CSS box + view — one atomic
         // "painted state". Nothing else ever resizes or clears the canvas.

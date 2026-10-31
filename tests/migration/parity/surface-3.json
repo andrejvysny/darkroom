@@ -1,0 +1,104 @@
+{
+  "surface": [
+    {
+      "kind": "contract",
+      "name": "UpdateBanner",
+      "source": "src/App.tsx",
+      "evidence": "<UpdateBanner",
+      "target": "ui-egui",
+      "task": "DARKROOM-153",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "UpdateBanner"
+    },
+    {
+      "kind": "contract",
+      "name": "Toast",
+      "source": "src/App.tsx",
+      "evidence": "<Toast",
+      "target": "ui-egui",
+      "task": "DARKROOM-140",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Toast"
+    },
+    {
+      "kind": "contract",
+      "name": "TopBar",
+      "source": "src/App.tsx",
+      "evidence": "<TopBar",
+      "target": "ui-egui",
+      "task": "DARKROOM-140",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "TopBar"
+    },
+    {
+      "kind": "contract",
+      "name": "Startup services",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "setup(",
+      "target": "core-runtime",
+      "task": "DARKROOM-136",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Startup services"
+    },
+    {
+      "kind": "contract",
+      "name": "Window platform behavior",
+      "source": "src/lib/platform.ts",
+      "evidence": "Windows",
+      "target": "ui-egui",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Window platform behavior"
+    },
+    {
+      "kind": "contract",
+      "name": "Browser versus Tauri",
+      "source": "src/main.tsx",
+      "evidence": "__TAURI_INTERNALS__",
+      "target": "ui-egui",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Browser versus Tauri"
+    },
+    {
+      "kind": "contract",
+      "name": "Loupe",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<Loupe",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Loupe interactive surface."
+    },
+    {
+      "kind": "contract",
+      "name": "HistoryPanel",
+      "source": "src/views/Develop/DevelopView.tsx",
+      "evidence": "<HistoryPanel",
+      "target": "ui-egui",
+      "task": "DARKROOM-143",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "HistoryPanel interactive surface."
+    },
+    {
+      "kind": "contract",
+      "name": "MaskOverlay",
+      "source": "src/views/Develop/Stage.tsx",
+      "evidence": "<MaskOverlay",
+      "target": "ui-egui",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "MaskOverlay interactive surface."
+    },
+    {
+      "kind": "contract",
+      "name": "CropOverlay",
+      "source": "src/views/Develop/Stage.tsx",
+      "evidence": "<CropOverlay",
+      "target": "ui-egui",
+      "task": "DARKROOM-143",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "CropOverlay interactive surface."
+    }
+  ]
+}

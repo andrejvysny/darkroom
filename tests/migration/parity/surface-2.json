@@ -1,0 +1,354 @@
+{
+  "surface": [
+    {
+      "kind": "screen",
+      "name": "ModelManagerModal",
+      "source": "src/App.tsx",
+      "evidence": "<ModelManagerModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents ModelManagerModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "PanoramaModal",
+      "source": "src/App.tsx",
+      "evidence": "<PanoramaModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents PanoramaModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "CreatePresetDialog",
+      "source": "src/views/Develop/DevelopView.tsx",
+      "evidence": "<CreatePresetDialog",
+      "target": "ui-egui",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents CreatePresetDialog in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "ImportReportModal",
+      "source": "src/views/Develop/DevelopView.tsx",
+      "evidence": "<ImportReportModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents ImportReportModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "DeleteRejectedModal",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<DeleteRejectedModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents DeleteRejectedModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "ImportDialog",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<ImportDialog",
+      "target": "ui-egui",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents ImportDialog in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "ScanModal",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<ScanModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents ScanModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "SettingsModal",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<SettingsModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents SettingsModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "UnsupportedModal",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<UnsupportedModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents UnsupportedModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "PeopleReview",
+      "source": "src/views/Library/PeopleNav.tsx",
+      "evidence": "<PeopleReview",
+      "target": "ui-egui",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents PeopleReview in the application."
+    },
+    {
+      "kind": "storage",
+      "name": "darkroom.suggestions.show",
+      "source": "src/store/app.ts",
+      "evidence": "darkroom.suggestions.show",
+      "target": "ui-egui",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: storage migration test not yet identified",
+      "behavior": "Persists darkroom.suggestions.show in localStorage."
+    },
+    {
+      "kind": "storage",
+      "name": "darkroom.export.dir",
+      "source": "src/views/Export/ExportModal.tsx",
+      "evidence": "darkroom.export.dir",
+      "target": "ui-egui",
+      "task": "DARKROOM-149",
+      "test": "coverage gap: storage migration test not yet identified",
+      "behavior": "Persists darkroom.export.dir in localStorage."
+    },
+    {
+      "kind": "storage",
+      "name": "darkroom.export.presets",
+      "source": "src/views/Export/ExportModal.tsx",
+      "evidence": "darkroom.export.presets",
+      "target": "ui-egui",
+      "task": "DARKROOM-149",
+      "test": "coverage gap: storage migration test not yet identified",
+      "behavior": "Persists darkroom.export.presets in localStorage."
+    },
+    {
+      "kind": "storage",
+      "name": "darkroom.export.last",
+      "source": "src/views/Export/ExportModal.tsx",
+      "evidence": "darkroom.export.last",
+      "target": "ui-egui",
+      "task": "DARKROOM-149",
+      "test": "coverage gap: storage migration test not yet identified",
+      "behavior": "Persists darkroom.export.last in localStorage."
+    },
+    {
+      "kind": "storage",
+      "name": "darkroom.bootstrapped",
+      "source": "src/lib/useLibrary.ts",
+      "evidence": "darkroom.bootstrapped",
+      "target": "ui-egui",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: storage migration test not yet identified",
+      "behavior": "Persists darkroom.bootstrapped in localStorage."
+    },
+    {
+      "kind": "storage",
+      "name": "darkroom.autoUpdateCheck",
+      "source": "src/lib/useUpdater.ts",
+      "evidence": "darkroom.autoUpdateCheck",
+      "target": "ui-egui",
+      "task": "DARKROOM-139",
+      "test": "coverage gap: storage migration test not yet identified",
+      "behavior": "Persists darkroom.autoUpdateCheck in localStorage."
+    },
+    {
+      "kind": "contract",
+      "name": "Global keyboard",
+      "source": "src/hooks/useKeyboard.ts",
+      "evidence": "keydown",
+      "target": "ui-egui",
+      "task": "DARKROOM-140",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Global keyboard"
+    },
+    {
+      "kind": "contract",
+      "name": "Culling keyboard",
+      "source": "src/hooks/useCulling.ts",
+      "evidence": "keydown",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Culling keyboard"
+    },
+    {
+      "kind": "contract",
+      "name": "Dedup review keyboard",
+      "source": "src/views/Dedup/DedupView.tsx",
+      "evidence": "keydown",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Dedup review keyboard"
+    },
+    {
+      "kind": "contract",
+      "name": "Dedup hero keyboard",
+      "source": "src/views/Dedup/HeroStage.tsx",
+      "evidence": "keydown",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Dedup hero keyboard"
+    },
+    {
+      "kind": "contract",
+      "name": "Develop keyboard",
+      "source": "src/views/Develop/DevelopView.tsx",
+      "evidence": "keydown",
+      "target": "ui-egui",
+      "task": "DARKROOM-143",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Develop keyboard"
+    },
+    {
+      "kind": "contract",
+      "name": "Quit flush and shutdown",
+      "source": "src-tauri/src/quit.rs",
+      "evidence": "FLUSH_EVENT",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Quit flush and shutdown"
+    },
+    {
+      "kind": "contract",
+      "name": "Model download capabilities",
+      "source": "src/lib/useModelDownloads.ts",
+      "evidence": "mask_ai:models",
+      "target": "ui-egui",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Model download capabilities"
+    },
+    {
+      "kind": "contract",
+      "name": "Library watcher",
+      "source": "src-tauri/src/watch.rs",
+      "evidence": "library:changed",
+      "target": "core-runtime",
+      "task": "DARKROOM-136",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Library watcher"
+    },
+    {
+      "kind": "contract",
+      "name": "Application shutdown",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "RunEvent::Exit",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Drain sidecar and prefetch queues and checkpoint WAL on exit."
+    },
+    {
+      "kind": "contract",
+      "name": "Unified scan job",
+      "source": "src-tauri/src/scan.rs",
+      "evidence": "scan_running",
+      "target": "core-runtime",
+      "task": "DARKROOM-136",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Guard one scan and propagate cancellation to analysis, panorama detection and model downloads."
+    },
+    {
+      "kind": "contract",
+      "name": "Capability flags",
+      "source": "src-tauri/src/model_mgmt.rs",
+      "evidence": "pub struct ModelGroup",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Expose readiness and downloadable files for analysis, faces and mask_ai."
+    },
+    {
+      "kind": "contract",
+      "name": "Keyboard global actions",
+      "source": "src/hooks/useKeyboard.ts",
+      "evidence": "toLowerCase()",
+      "target": "ui-egui",
+      "task": "DARKROOM-140",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Cmd/Ctrl+K opens palette; Cmd/Ctrl+E opens Develop; Cmd/Ctrl+Shift+E exports. Escape closes palette or loupe. Bare G/D switch views outside text inputs."
+    },
+    {
+      "kind": "contract",
+      "name": "Keyboard culling actions",
+      "source": "src/hooks/useCulling.ts",
+      "evidence": "ArrowLeft",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Arrow keys and brackets navigate; 0–5 rate; P/X/R/U flag."
+    },
+    {
+      "kind": "contract",
+      "name": "Keyboard develop actions",
+      "source": "src/views/Develop/DevelopView.tsx",
+      "evidence": "KeyN",
+      "target": "ui-egui",
+      "task": "DARKROOM-143",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Cmd/Ctrl+Shift+N creates preset; Cmd/Ctrl+Shift+C/V copies/pastes settings; Cmd/Ctrl+Z undoes; Cmd/Ctrl+Shift+Z redoes; backslash compares. Editing shortcuts ignore text inputs."
+    },
+    {
+      "kind": "contract",
+      "name": "Keyboard dedup actions",
+      "source": "src/views/Dedup/DedupView.tsx",
+      "evidence": "setKeeper",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Navigate and rate; keep, reject, select keeper, accept, change review mode, show bin and undo."
+    },
+    {
+      "kind": "contract",
+      "name": "Keyboard text and dialogs",
+      "source": "src/views/Library/ImportDialog.tsx",
+      "evidence": "Escape",
+      "target": "ui-egui",
+      "task": "DARKROOM-140",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Escape closes dialogs; Enter commits relevant text fields."
+    },
+    {
+      "kind": "contract",
+      "name": "PanoramaSuggestions",
+      "source": "src/App.tsx",
+      "evidence": "<PanoSuggestions",
+      "target": "ui-egui",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "PanoramaSuggestions"
+    },
+    {
+      "kind": "contract",
+      "name": "DownloadPill",
+      "source": "src/App.tsx",
+      "evidence": "<DownloadPill",
+      "target": "ui-egui",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "DownloadPill"
+    },
+    {
+      "kind": "contract",
+      "name": "PanoramaPill",
+      "source": "src/App.tsx",
+      "evidence": "<PanoramaPill",
+      "target": "ui-egui",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "PanoramaPill"
+    }
+  ]
+}

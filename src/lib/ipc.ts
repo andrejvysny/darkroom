@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { log } from "./logger";
+import { beginDevelopRenderObservation } from "./developRenderObservation";
 
 function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -1367,6 +1368,7 @@ export async function developRender(
   cropPreview = false,
 ): Promise<RenderedFrame | null> {
   const requestId = ++renderRequestSeq;
+  const observe = beginDevelopRenderObservation({ requestId, imageId, params });
   const buf = await invoke<ArrayBuffer>("develop_render", {
     imageId,
     params,
@@ -1377,6 +1379,7 @@ export async function developRender(
     cropPreview,
     requestId,
   });
+  observe(buf);
   if (buf.byteLength === 0) return null; // superseded
   if (buf.byteLength < 9) {
     log.error("develop", "render response too short", {

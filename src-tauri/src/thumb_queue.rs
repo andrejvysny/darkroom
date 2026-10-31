@@ -26,6 +26,8 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// Canonical thumbnail long-edge + JPEG quality. 1024 covers the grid (512) and filmstrip (256) via
 /// in-browser downscale, and is a good first-paint source for the Develop view (upscaled).
+const MAX_PENDING: usize = 4096;
+const PAGE_SIZE: usize = 256;
 const CANONICAL_EDGE: u32 = 1024;
 const CANONICAL_QUALITY: u8 = 85;
 /// Display-sharp preview JPEG quality (slightly higher than the thumb — it's viewed full-screen).
@@ -57,7 +59,14 @@ struct QueueState {
     /// True while a Develop session is open; the worker parks between jobs so it doesn't contend
     /// with interactive renders for the GPU.
     interactive: bool,
+    scan: Option<i64>,
+    scan_generation: u64,
     shutdown: bool,
+}
+
+enum NextJob {
+    Render(i64),
+    Refill(i64, u64),
 }
 
 struct Inner {
@@ -93,36 +102,88 @@ impl ThumbQueue {
 
     /// Append ids to the bulk backfill (deduped). Already-cached ids are cheaply skipped by the
     /// worker's pre-check, so re-enqueuing the whole library after an import is idempotent.
+    #[cfg(test)]
     pub fn enqueue_bulk(&self, ids: impl IntoIterator<Item = i64>) {
         let mut st = self.lock();
-        let mut added = false;
-        for id in ids {
-            if st.queued.insert(id) {
-                st.back.push_back(id);
-                added = true;
-            }
-        }
-        drop(st);
-        if added {
-            self.inner.cv.notify_all();
-        }
-    }
-
-    /// Promote ids to the FRONT (visible range / just-opened) so they render next, preserving the
-    /// caller's order. Already-queued ids are moved up from the bulk tier.
-    pub fn prioritize(&self, ids: &[i64]) {
-        if ids.is_empty() {
+        if st.shutdown {
             return;
         }
+        for id in ids {
+            if st.queued.contains(&id) {
+                continue;
+            }
+            if st.queued.len() == MAX_PENDING {
+                st.scan = Some(i64::MIN);
+                st.scan_generation = st.scan_generation.wrapping_add(1);
+                break;
+            }
+            st.queued.insert(id);
+            st.back.push_back(id);
+        }
+        drop(st);
+        self.inner.cv.notify_all();
+    }
+
+    pub fn prioritize(&self, ids: &[i64]) {
         let mut st = self.lock();
-        // Reverse so the caller's first id ends up frontmost after the push_fronts.
+        if st.shutdown {
+            return;
+        }
         for &id in ids.iter().rev() {
             st.back.retain(|&x| x != id);
             st.front.retain(|&x| x != id);
+            if !st.queued.contains(&id) && st.queued.len() == MAX_PENDING {
+                if let Some(evicted) = st.back.pop_back().or_else(|| st.front.pop_back()) {
+                    st.queued.remove(&evicted);
+                    st.scan = Some(i64::MIN);
+                    st.scan_generation = st.scan_generation.wrapping_add(1);
+                }
+            }
             st.queued.insert(id);
             st.front.push_front(id);
         }
         drop(st);
+        self.inner.cv.notify_all();
+    }
+
+    fn request_scan(&self) {
+        let mut st = self.lock();
+        if st.shutdown {
+            return;
+        }
+        st.scan = Some(i64::MIN);
+        st.scan_generation = st.scan_generation.wrapping_add(1);
+        drop(st);
+        self.inner.cv.notify_all();
+    }
+
+    pub fn shutdown(&self) {
+        self.lock().shutdown = true;
+        self.inner.cv.notify_all();
+    }
+
+    fn refill(&self, generation: u64, ids: Vec<i64>) {
+        let mut st = self.lock();
+        if st.scan_generation != generation {
+            return;
+        }
+        st.scan = if ids.len() < PAGE_SIZE {
+            None
+        } else {
+            ids.last().copied()
+        };
+        for id in ids {
+            if st.queued.contains(&id) {
+                continue;
+            }
+            if st.queued.len() == MAX_PENDING {
+                st.scan = Some(i64::MIN);
+                st.scan_generation = st.scan_generation.wrapping_add(1);
+                break;
+            }
+            st.queued.insert(id);
+            st.back.push_back(id);
+        }
         self.inner.cv.notify_all();
     }
 
@@ -135,7 +196,7 @@ impl ThumbQueue {
     }
 
     /// Block until a renderable job is available and no Develop session is active. `None` on shutdown.
-    fn next_job(&self) -> Option<i64> {
+    fn next_job(&self) -> Option<NextJob> {
         let mut st = self.lock();
         loop {
             if st.shutdown {
@@ -144,7 +205,10 @@ impl ThumbQueue {
             if !st.interactive {
                 if let Some(id) = st.front.pop_front().or_else(|| st.back.pop_front()) {
                     st.queued.remove(&id);
-                    return Some(id);
+                    return Some(NextJob::Render(id));
+                }
+                if let Some(cursor) = st.scan {
+                    return Some(NextJob::Refill(cursor, st.scan_generation));
                 }
             }
             st = self.inner.cv.wait(st).unwrap_or_else(|p| {
@@ -193,23 +257,65 @@ pub fn spawn_worker(app: AppHandle) {
         }
         st.thumb_queue.clone()
     };
-    let _ = std::thread::Builder::new()
-        .name("thumb-queue".into())
-        .spawn(move || {
-            while let Some(id) = queue.next_job() {
-                render_one(&app, id);
+    let worker_app = app.clone();
+    if let Err(error) = crate::jobs::worker(&app, "thumb-queue", move || {
+        while let Some(job) = queue.next_job() {
+            match job {
+                NextJob::Refill(cursor, generation) => {
+                    let st = worker_app.state::<AppState>();
+                    let ids = {
+                        let db = st.db.lock().map_err(|e| e.to_string())?;
+                        let mut stmt = db.conn.prepare("SELECT id FROM images WHERE status = 'present' AND id > ?1 ORDER BY id LIMIT ?2").map_err(|e| e.to_string())?;
+                        let rows = stmt
+                            .query_map([cursor, PAGE_SIZE as i64], |r| r.get(0))
+                            .map_err(|e| e.to_string())?;
+                        rows.collect::<Result<Vec<i64>, _>>()
+                            .map_err(|e| e.to_string())?
+                    };
+                    queue.refill(generation, ids);
+                }
+                NextJob::Render(id) => loop {
+                    let st = worker_app.state::<AppState>();
+                    if queue.lock().shutdown {
+                        break;
+                    }
+                    let spec =
+                        crate::jobs::spec(st.inner(), core_app::jobs::JobClass::Thumbnail, false);
+                    let bytes = spec.estimated_bytes;
+                    let task_app = worker_app.clone();
+                    match st.jobs.submit(spec, move |ctx| {
+                        ctx.checkpoint()?;
+                        render_one(&task_app, id);
+                        Ok(())
+                    }) {
+                        Ok(handle) => {
+                            if let Err(error) = handle.wait() {
+                                tracing::warn!(?error, "thumbnail job failed");
+                            }
+                            break;
+                        }
+                        Err(core_app::jobs::SubmitError::Capacity) => {
+                            if !st.jobs.wait_capacity(bytes) {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, "thumbnail job rejected");
+                            break;
+                        }
+                    }
+                },
             }
-        });
+        }
+        Ok(())
+    }) {
+        tracing::error!(%error, "thumbnail worker failed to start");
+    }
 }
 
-/// Enqueue every present image for canonical backfill (startup + after each import). Idempotent.
+/// Request paged backfill without materializing the catalog.
 pub fn enqueue_all(app: &AppHandle) {
-    let st = app.state::<AppState>();
-    let ids = {
-        let Ok(db) = st.db.lock() else { return };
-        core_library::present_image_ids(&db.conn).unwrap_or_default()
-    };
-    st.thumb_queue.enqueue_bulk(ids);
+    app.state::<AppState>().thumb_queue.request_scan();
 }
 
 /// Render an image's missing tiers (small thumb + display-sharp preview) from ONE decode, then notify
@@ -222,29 +328,60 @@ fn render_one(app: &AppHandle, image_id: i64) {
     let Some(gpu) = st.gpu.as_ref() else { return };
 
     // Cheap pre-check (no decode): which tiers are missing? Also read the configured preview edge.
-    let (pedge, need_thumb, need_preview) = {
+    let sequence = st.publications.sequence();
+    let (row, pedge, precheck_version) = {
         let Ok(db) = st.db.lock() else { return };
-        // ONE query for both: the startup backfill runs this pre-check for every present image, so
-        // a second round-trip per id meant a second catalog-lock acquisition per id — 200k of them
-        // on a 100k library, all contending with foreground queries on the single connection.
-        let Ok(Some((hash, edit_version))) = core_library::thumb_precheck(&db.conn, image_id)
-        else {
+        let Ok(Some(row)) = core_library::image_by_id(&db.conn, image_id) else {
             return;
         };
-        let pedge = core_library::preview_edge(&db.conn).unwrap_or(0);
-        let need_thumb = match edit_version {
-            Some(v) => st.thumbs.read_edited(&hash, PROCESS_VERSION, v).is_err(),
-            None => !st.thumbs.has_canonical(&hash, PROCESS_VERSION),
+        let present: bool = db
+            .conn
+            .query_row(
+                "SELECT status = 'present' FROM images WHERE id = ?1",
+                [image_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !present {
+            return;
+        }
+        let Ok(Some((_, version))) = core_library::thumb_precheck(&db.conn, image_id) else {
+            return;
         };
-        let need_preview = pedge > 0
-            && match edit_version {
-                Some(v) => !st
-                    .thumbs
-                    .has_edited_preview(&hash, PROCESS_VERSION, v, pedge),
-                None => !st.thumbs.has_preview(&hash, PROCESS_VERSION, pedge),
-            };
-        (pedge, need_thumb, need_preview)
+        (
+            row,
+            core_library::preview_edge(&db.conn).unwrap_or(0),
+            version,
+        )
     };
+    let key = core_runtime::publication::SourceKey {
+        hash: row.content_hash,
+        path: row.path,
+    };
+    let Ok(token) = st.publications.capture_at(
+        core_model::identity::ImageId(image_id),
+        key.clone(),
+        sequence,
+    ) else {
+        return;
+    };
+    if st.publications.sequence() != sequence {
+        return;
+    }
+    let need_thumb = match precheck_version {
+        Some(v) => st
+            .thumbs
+            .read_edited(&key.hash, PROCESS_VERSION, v)
+            .is_err(),
+        None => !st.thumbs.has_canonical(&key.hash, PROCESS_VERSION),
+    };
+    let need_preview = pedge > 0
+        && match precheck_version {
+            Some(v) => !st
+                .thumbs
+                .has_edited_preview(&key.hash, PROCESS_VERSION, v, pedge),
+            None => !st.thumbs.has_preview(&key.hash, PROCESS_VERSION, pedge),
+        };
     if !need_thumb && !need_preview {
         return;
     }
@@ -265,30 +402,59 @@ fn render_one(app: &AppHandle, image_id: i64) {
             return;
         }
     };
-    let write_thumb = |jpeg: &[u8]| -> bool {
-        match edit_version {
-            Some(v) => st
-                .thumbs
-                .write_edited(&hash, PROCESS_VERSION, v, jpeg)
-                .is_ok(),
-            None => st
-                .thumbs
-                .write_canonical(&hash, PROCESS_VERSION, jpeg)
-                .is_ok(),
-        }
+    if hash != key.hash {
+        return;
+    }
+    let publish = |jpeg: &[u8], preview: bool| -> bool {
+        st.publications
+            .with_current(&token, || {
+                let current = {
+                    let Ok(db) = st.db.lock() else { return false };
+                    let Ok(Some(row)) = core_library::image_by_id(&db.conn, image_id) else {
+                        return false;
+                    };
+                    let present: bool = db
+                        .conn
+                        .query_row(
+                            "SELECT status = 'present' FROM images WHERE id = ?1",
+                            [image_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    let version = core_library::thumb_precheck(&db.conn, image_id)
+                        .ok()
+                        .flatten();
+                    present
+                        && row.path == key.path
+                        && row.content_hash == key.hash
+                        && version.is_some_and(|(_, v)| v == edit_version)
+                };
+                if !current {
+                    return false;
+                }
+                match (preview, edit_version) {
+                    (false, Some(v)) => st
+                        .thumbs
+                        .write_edited(&hash, PROCESS_VERSION, v, jpeg)
+                        .is_ok(),
+                    (false, None) => st
+                        .thumbs
+                        .write_canonical(&hash, PROCESS_VERSION, jpeg)
+                        .is_ok(),
+                    (true, Some(v)) => st
+                        .thumbs
+                        .write_edited_preview(&hash, PROCESS_VERSION, v, pedge, jpeg)
+                        .is_ok(),
+                    (true, None) => st
+                        .thumbs
+                        .write_preview(&hash, PROCESS_VERSION, pedge, jpeg)
+                        .is_ok(),
+                }
+            })
+            .unwrap_or(false)
     };
-    let write_preview = |jpeg: &[u8]| -> bool {
-        match edit_version {
-            Some(v) => st
-                .thumbs
-                .write_edited_preview(&hash, PROCESS_VERSION, v, pedge, jpeg)
-                .is_ok(),
-            None => st
-                .thumbs
-                .write_preview(&hash, PROCESS_VERSION, pedge, jpeg)
-                .is_ok(),
-        }
-    };
+    let write_thumb = |jpeg: &[u8]| publish(jpeg, false);
+    let write_preview = |jpeg: &[u8]| publish(jpeg, true);
 
     let mut wrote = false;
     if need_preview {
@@ -323,7 +489,12 @@ fn render_one(app: &AppHandle, image_id: i64) {
     }
 
     if wrote {
-        let _ = app.emit("thumb:rendered", ThumbRendered { image_id, hash });
+        let _ = st.publications.with_current(&token, || {
+            let _ = app.emit("thumb:rendered", ThumbRendered { image_id, hash });
+        });
         enforce_thumb_cap_after_write(&st);
     }
 }
+
+#[cfg(test)]
+mod tests;

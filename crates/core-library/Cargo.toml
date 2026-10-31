@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+core-model = { path = "../core-model" }
 core-db = { path = "../core-db" }
 core-raw = { path = "../core-raw" }
 # Pick/reject preference model (pure math). The catalog seam lives in `suggest.rs`.

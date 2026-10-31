@@ -12,7 +12,7 @@ import { usePresets } from "./usePresets";
 import { useHistory } from "./useHistory";
 import { useAppStore } from "../../store/app";
 import { useDevelopStore } from "../../store/develop";
-import { developPreviewJpeg } from "../../lib/ipc";
+import { developPreviewJpeg, imageMeta, type ImageRow } from "../../lib/ipc";
 import { log } from "../../lib/logger";
 
 export default function DevelopView() {
@@ -138,7 +138,17 @@ export default function DevelopView() {
   // Natural sensor dims from the selected ImageRow (drives viewport math + readout). Until the row
   // is available the aspect is unknown — GPU renders are suppressed (dimsKnown) so no wrong-aspect
   // frame is ever issued; the 3:2 placeholder only sizes the empty canvas.
-  const selectedRow = libraryImages.find((r) => r.id === selectedId) ?? null;
+  const libraryRow = libraryImages.find((r) => r.id === selectedId) ?? null;
+  const [loadedRow, setLoadedRow] = useState<ImageRow | null>(null);
+  useEffect(() => {
+    if (selectedId === null || libraryRow) return;
+    let active = true;
+    void imageMeta(selectedId).then(row => { if (active) setLoadedRow(row); })
+      .catch(error => log.warn("develop", "selected photo metadata failed", log.errorSummary(error)));
+    return () => { active = false; };
+  }, [selectedId, libraryRow]);
+  // A newly mounted Library page may still be loading; selection metadata has independent ownership.
+  const selectedRow = libraryRow ?? (loadedRow?.id === selectedId ? loadedRow : null);
   const dimsKnown = (selectedRow?.width ?? 0) > 0;
   const natural = {
     w: selectedRow?.width ?? 3,

@@ -22,8 +22,8 @@ pub use error::PipelineError;
 pub use histogram::{histogram, histogram_from_jpeg, Histogram};
 pub use params::{
     AiCoverage, AiPoint, Border, BrushStroke, CbRgb, ChannelMix, ComponentKind, Crop, CurvePoint,
-    DevelopParams, HslBand, LocalAdjust, Mask, MaskComponent, MaskOp, ToneCurve, ViewParams,
-    MASK_CAP,
+    DevelopParams, GpuParamsExt, GpuViewParamsExt, HslBand, LocalAdjust, Mask, MaskComponent,
+    MaskOp, ToneCurve, ViewParams, MASK_CAP,
 };
 
 // Re-export the linear buffer type for convenience.
