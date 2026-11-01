@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Border, CbRgb, ChannelMix, Crop, Denoise, HslBand, Mask, ToneCurve, HSL_BANDS};
 
 /// Editable adjustments applied to the cached linear buffer. All default to a no-op.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DevelopParams {
     /// Exposure in stops (EV). 0 = unchanged.
@@ -138,5 +138,11 @@ impl DevelopParams {
         self.hsl
             .iter()
             .all(|b| b.h == 0.0 && b.s == 0.0 && b.l == 0.0)
+    }
+
+    /// Approximate serialized footprint used for the history byte budget; exact JSON size
+    /// dominates by brush strokes/masks, so a serialization pass beats field estimation.
+    pub fn estimated_bytes(&self) -> usize {
+        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
     }
 }
