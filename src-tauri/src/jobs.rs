@@ -4,19 +4,41 @@ use core_app::jobs::{JobClass, JobFailure, JobOwner, JobSpec, QueuePolicy};
 use core_runtime::jobs::JobContext;
 use tauri::{AppHandle, Manager, Runtime};
 
-pub async fn spawn_blocking<R, T, F>(
+/// Use for any operation that can fail; a failed inner result marks the job Failed.
+pub async fn spawn_fallible<R, U, E, F>(
     app: AppHandle<R>,
     class: JobClass,
     durable: bool,
     operation: &'static str,
     task: F,
-) -> Result<T, String>
+) -> Result<Result<U, E>, String>
 where
     R: Runtime,
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    U: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<U, E> + Send + 'static,
 {
-    execute(app, class, durable, operation, move |_| Ok(task())).await
+    spawn_job(app, class, durable, operation, move |_| task()).await
+}
+
+/// For long operations with commit boundaries; call `mark_committed` after durable side effects.
+pub async fn spawn_job<R, U, E, F>(
+    app: AppHandle<R>,
+    class: JobClass,
+    durable: bool,
+    operation: &'static str,
+    task: F,
+) -> Result<Result<U, E>, String>
+where
+    R: Runtime,
+    U: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce(&JobContext) -> Result<U, E> + Send + 'static,
+{
+    execute(app, class, durable, operation, move |context| {
+        Ok(task(&context))
+    })
+    .await
 }
 
 pub async fn viewport_render<R: Runtime, T: Send + 'static>(
@@ -25,7 +47,7 @@ pub async fn viewport_render<R: Runtime, T: Send + 'static>(
     task: impl FnOnce(u64) -> T + Send + 'static,
 ) -> Result<T, String> {
     let host = app.clone();
-    execute(
+    match execute(
         app,
         JobClass::Viewport,
         false,
@@ -40,10 +62,15 @@ pub async fn viewport_render<R: Runtime, T: Send + 'static>(
                 id,
                 image_id,
             )?;
-            Ok(task(id))
+            Ok(Ok::<T, std::convert::Infallible>(task(id)))
         },
     )
     .await
+    {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(unreachable)) => match unreachable {},
+        Err(error) => Err(error),
+    }
 }
 
 fn claim_viewport(
@@ -63,17 +90,18 @@ fn claim_viewport(
     Ok(())
 }
 
-async fn execute<R, T, F>(
+async fn execute<R, T, E, F>(
     app: AppHandle<R>,
     class: JobClass,
     durable: bool,
     operation: &'static str,
     task: F,
-) -> Result<T, String>
+) -> Result<Result<T, E>, String>
 where
     R: Runtime,
     T: Send + 'static,
-    F: FnOnce(JobContext) -> Result<T, JobFailure> + Send + 'static,
+    E: Send + 'static,
+    F: FnOnce(JobContext) -> Result<Result<T, E>, JobFailure> + Send + 'static,
 {
     let handle = {
         let st = app.state::<AppState>();
@@ -87,7 +115,7 @@ where
         let epoch = spec.owner.catalog_epoch;
         let host = app.clone();
         st.jobs
-            .submit(spec, move |context| {
+            .submit_fallible(spec, move |context| {
                 context.checkpoint()?;
                 if host.state::<AppState>().workers.is_stopping() && !durable {
                     return Err(JobFailure::Cancelled);
@@ -96,7 +124,11 @@ where
                     return Err(JobFailure::Superseded);
                 }
                 let result = task(context.clone())?;
-                if !durable {
+                // A committed task already describes durable writes; rejecting its result
+                // here would report failure for work that exists (e.g. an import whose
+                // catalog was replaced after its rows committed). The worker records
+                // `Interrupted` if a cancel was meanwhile requested.
+                if !durable && !context.is_committed() {
                     context.checkpoint()?;
                     if host.state::<AppState>().publications.epoch() != epoch {
                         return Err(JobFailure::Superseded);
@@ -193,6 +225,9 @@ pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     st.jobs.stop();
     st.jobs.join();
     st.sidecar_queue.shutdown();
+    // The mirroring worker owns intents that are durable in the catalog, so it may leave rows
+    // queued; it only has to stop touching the disk and let itself be joined.
+    st.outbox.shutdown();
     for error in st.workers.join() {
         tracing::error!(%error, "background worker failed");
     }
@@ -268,5 +303,38 @@ mod tests {
         assert_eq!(old.wait(), Err(JobFailure::Superseded));
         assert_eq!(latest.load(Ordering::SeqCst), new.id().0);
         assert_eq!(current.load(Ordering::SeqCst), 22);
+    }
+
+    #[test]
+    fn fallible_failure_is_recorded_failed_and_worker_survives() {
+        use core_app::jobs::JobState;
+        let pool = core_runtime::jobs::Supervisor::new(
+            core_runtime::jobs::Config {
+                max_jobs: 4,
+                max_bytes: 40,
+                max_terminal_records: 4,
+                workers: 3,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let spec = JobSpec {
+            owner: JobOwner {
+                catalog_epoch: core_model::identity::CatalogEpoch(0),
+                editor_session: None,
+            },
+            class: JobClass::UserCommand,
+            policy: QueuePolicy::Ordered,
+            estimated_bytes: 10,
+            durable: false,
+        };
+        let failed = pool
+            .submit_fallible(spec, |_| Ok(Err::<(), String>("x".into())))
+            .unwrap();
+        assert_eq!(failed.wait(), Ok(Err("x".to_string())));
+        assert_eq!(failed.status().unwrap().state, JobState::Failed);
+        let ok = pool.submit(spec, |_| Ok(5)).unwrap();
+        assert_eq!(ok.wait(), Ok(5));
+        assert_eq!(ok.status().unwrap().state, JobState::Succeeded);
     }
 }

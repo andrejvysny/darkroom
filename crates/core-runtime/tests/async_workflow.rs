@@ -1,6 +1,8 @@
+use core_app::jobs::JobState;
 use core_app::ports::{CatalogPort, Clock, EffectExecutor, EventSink, RenderBackend};
 use core_app::subscription::SnapshotUpdate;
 use core_app::workflow::{Command, Completion, Effect, Operation, Outcome};
+use core_app::AppError;
 use core_model::catalog::QueryParams;
 use core_runtime::async_workflow::AsyncCatalogWorkflow;
 use core_runtime::jobs::Config;
@@ -28,6 +30,7 @@ struct Executor {
     started: mpsc::Sender<Operation>,
     gate: Mutex<Option<mpsc::Receiver<()>>>,
     panic_first: bool,
+    fail_open: Option<AppError>,
 }
 impl EffectExecutor for Executor {
     fn execute(&self, effect: Effect, _: &dyn CatalogPort) -> Completion {
@@ -39,6 +42,14 @@ impl EffectExecutor for Executor {
         if self.panic_first && matches!(effect.operation, Operation::OpenCatalog(_)) {
             panic!("executor failure");
         }
+        if let Some(error) = &self.fail_open {
+            if matches!(effect.operation, Operation::OpenCatalog(_)) {
+                return Completion {
+                    token: effect.token,
+                    result: Err(error.clone()),
+                };
+            }
+        }
         let result = match &effect.operation {
             Operation::OpenCatalog(_) => Outcome::Opened,
             Operation::CloseCatalog => Outcome::Closed,
@@ -49,6 +60,7 @@ impl EffectExecutor for Executor {
             Operation::LoadFolders => Outcome::Folders(vec![]),
             Operation::LoadDates => Outcome::Dates(vec![]),
             Operation::SelectImage { .. } => Outcome::Image(None),
+            Operation::LoadEdit { .. } => Outcome::Edit(None),
         };
         Completion {
             token: effect.token,
@@ -105,6 +117,7 @@ fn executor(
             started,
             gate: Mutex::new(block.then_some(gate)),
             panic_first,
+            fail_open: None,
         }),
         rx,
         release,
@@ -228,4 +241,39 @@ fn repeated_worker_notifications_coalesce_until_pump() {
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
     release.release();
     workflow.wait_idle().unwrap();
+}
+
+#[test]
+fn failed_open_is_failed_job_and_keeps_typed_error() {
+    let (started, rx) = mpsc::channel();
+    let executor = Arc::new(Executor {
+        started,
+        gate: Mutex::new(None),
+        panic_first: false,
+        fail_open: Some(AppError::SchemaTooNew {
+            found: 99,
+            supported: 1,
+        }),
+    });
+    let mut workflow = workflow(executor);
+    workflow.open_initial().unwrap();
+    assert!(matches!(next(&rx), Operation::OpenCatalog(_)));
+    workflow.wait_idle().unwrap();
+    assert_eq!(
+        workflow.snapshot().error,
+        Some(AppError::SchemaTooNew {
+            found: 99,
+            supported: 1
+        })
+    );
+    assert!(workflow
+        .job_snapshots()
+        .iter()
+        .any(|job| job.state == JobState::Failed));
+    workflow.dispatch(Command::RequestShutdown).unwrap();
+    workflow.wait_idle().unwrap();
+    assert!(workflow
+        .job_snapshots()
+        .iter()
+        .any(|job| job.state == JobState::Succeeded));
 }

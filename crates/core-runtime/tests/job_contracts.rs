@@ -2,7 +2,8 @@ use core_app::jobs::{
     JobClass, JobFailure, JobOwner, JobProgress, JobSpec, JobState, QueuePolicy, SubmitError,
 };
 use core_model::identity::CatalogEpoch;
-use core_runtime::jobs::{Config, Supervisor};
+use core_runtime::jobs::{Config, JobHandle, Supervisor};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -37,6 +38,38 @@ fn receive<T>(rx: &mpsc::Receiver<T>) -> T {
         .expect("worker did not signal")
 }
 
+/// Occupy both pool workers with blocking priority-0 jobs; releasing the two senders
+/// lets them finish.
+fn occupy_workers(pool: &Supervisor) -> (Vec<JobHandle<()>>, mpsc::Sender<()>, mpsc::Sender<()>) {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_a, gate_a) = mpsc::channel::<()>();
+    let (release_b, gate_b) = mpsc::channel::<()>();
+    let first_started = started_tx.clone();
+    let blockers = vec![
+        pool.submit(
+            spec(JobClass::Viewport, QueuePolicy::Ordered, 10),
+            move |_| {
+                first_started.send(()).unwrap();
+                gate_a.recv().unwrap();
+                Ok(())
+            },
+        )
+        .unwrap(),
+        pool.submit(
+            spec(JobClass::UserCommand, QueuePolicy::Ordered, 10),
+            move |_| {
+                started_tx.send(()).unwrap();
+                gate_b.recv().unwrap();
+                Ok(())
+            },
+        )
+        .unwrap(),
+    ];
+    receive(&started_rx);
+    receive(&started_rx);
+    (blockers, release_a, release_b)
+}
+
 #[test]
 fn capacity_is_retained_until_result_is_taken_or_handle_dropped() {
     let pool = make_pool(1, 10, 4);
@@ -49,6 +82,11 @@ fn capacity_is_retained_until_result_is_taken_or_handle_dropped() {
         })
         .unwrap();
     receive(&rx);
+    // Ensure the worker commits `Succeeded` before shutdown: a cancel request that
+    // beats the commit would legitimately retire the uncommitted disposable value.
+    while !job.status().is_some_and(|s| s.state.is_terminal()) {
+        std::thread::yield_now();
+    }
     pool.join();
     assert_eq!(pool.metrics().reserved_bytes, 10);
     assert_eq!(job.wait(), Ok(7));
@@ -493,4 +531,350 @@ fn oversized_latest_intent_supersedes_queued_work_without_escaping_budget() {
     assert_eq!(old.wait(), Err(JobFailure::Superseded));
     assert_eq!(blocker.wait(), Ok(()));
     assert_eq!(pool.metrics().reserved_bytes, 0);
+}
+
+#[test]
+fn fallible_domain_error_is_failed_and_delivers_typed_error() {
+    let pool = make_pool(1, 10, 4);
+    let job = pool
+        .submit_fallible(spec(JobClass::Analysis, QueuePolicy::Ordered, 10), |_| {
+            Ok(Err::<(), String>("boom".to_string()))
+        })
+        .unwrap();
+    assert_eq!(job.wait(), Ok(Err("boom".to_string())));
+    assert_eq!(job.status().unwrap().state, JobState::Failed);
+}
+
+#[test]
+fn worker_survives_domain_failure_and_next_job_succeeds() {
+    let pool = make_pool(1, 10, 4);
+    let failing = pool
+        .submit_fallible(spec(JobClass::Analysis, QueuePolicy::Ordered, 10), |_| {
+            Ok(Err::<(), String>("boom".to_string()))
+        })
+        .unwrap();
+    assert_eq!(failing.wait(), Ok(Err("boom".to_string())));
+    let next = pool
+        .submit(spec(JobClass::Analysis, QueuePolicy::Ordered, 10), |_| {
+            Ok(7)
+        })
+        .unwrap();
+    assert_eq!(next.wait(), Ok(7));
+    assert_eq!(next.status().unwrap().state, JobState::Succeeded);
+    assert_eq!(pool.worker_failures(), 0);
+}
+
+#[test]
+fn fallible_success_is_succeeded() {
+    let pool = make_pool(1, 10, 4);
+    let job = pool
+        .submit_fallible(spec(JobClass::Analysis, QueuePolicy::Ordered, 10), |_| {
+            Ok(Ok::<i32, &str>(1))
+        })
+        .unwrap();
+    assert_eq!(job.wait(), Ok(Ok(1)));
+    assert_eq!(job.status().unwrap().state, JobState::Succeeded);
+}
+
+#[test]
+fn domain_failure_wins_over_cancel_request() {
+    let pool = make_pool(1, 10, 4);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let job = pool
+        .submit_fallible(
+            spec(JobClass::Analysis, QueuePolicy::Ordered, 10),
+            move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Err::<(), &str>("late failure"))
+            },
+        )
+        .unwrap();
+    receive(&started_rx);
+    assert!(job.cancel());
+    assert_eq!(job.status().unwrap().state, JobState::CancelRequested);
+    release_tx.send(()).unwrap();
+    assert_eq!(job.wait(), Ok(Err("late failure")));
+    assert_eq!(job.status().unwrap().state, JobState::Failed);
+}
+
+#[test]
+fn cancel_and_supersede_stay_distinct() {
+    let pool = make_pool(1, 10, 4);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let job = pool
+        .submit_fallible(
+            spec(JobClass::Analysis, QueuePolicy::Ordered, 10),
+            move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Ok::<(), &str>(()))
+            },
+        )
+        .unwrap();
+    receive(&started_rx);
+    assert!(job.cancel());
+    release_tx.send(()).unwrap();
+    assert_eq!(job.wait(), Err(JobFailure::Cancelled));
+    assert_eq!(job.status().unwrap().state, JobState::Cancelled);
+}
+
+#[test]
+fn panic_under_cancel_request_is_failed() {
+    let pool = make_pool(2, 20, 8);
+    let (started_tx, started_rx) = mpsc::channel();
+    let job = pool
+        .submit(
+            spec(JobClass::Analysis, QueuePolicy::Ordered, 10),
+            move |_| -> Result<i32, JobFailure> {
+                started_tx.send(()).unwrap();
+                panic!("boom");
+            },
+        )
+        .unwrap();
+    receive(&started_rx);
+    job.cancel();
+    assert_eq!(job.wait(), Err(JobFailure::Panic));
+    assert_eq!(job.status().unwrap().state, JobState::Failed);
+}
+
+#[test]
+fn superseded_under_cancel_request_stays_superseded() {
+    let pool = make_pool(2, 20, 8);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let job = pool
+        .submit(
+            spec(JobClass::Analysis, QueuePolicy::Ordered, 10),
+            move |_| -> Result<i32, JobFailure> {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(JobFailure::Superseded)
+            },
+        )
+        .unwrap();
+    receive(&started_rx);
+    job.cancel();
+    release_tx.send(()).unwrap();
+    assert_eq!(job.wait(), Err(JobFailure::Superseded));
+    assert_eq!(job.status().unwrap().state, JobState::Superseded);
+}
+
+#[test]
+fn domain_failure_terminal_snapshot_is_retained_after_wait() {
+    let pool = make_pool(1, 10, 4);
+    let job = pool
+        .submit_fallible(spec(JobClass::Analysis, QueuePolicy::Ordered, 10), |_| {
+            Ok(Err::<(), &str>("boom"))
+        })
+        .unwrap();
+    let id = job.id();
+    assert_eq!(job.wait(), Ok(Err("boom")));
+    assert!(pool
+        .snapshot()
+        .iter()
+        .any(|record| record.id == id && record.state == JobState::Failed));
+}
+
+#[test]
+fn cancel_after_commit_is_interrupted_and_delivers_payload() {
+    let pool = make_pool(2, 20, 8);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let job = pool
+        .submit(
+            spec(JobClass::Import, QueuePolicy::Ordered, 10),
+            move |ctx| {
+                ctx.mark_committed();
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(3)
+            },
+        )
+        .unwrap();
+    receive(&started_rx);
+    assert!(job.cancel());
+    release_tx.send(()).unwrap();
+    assert_eq!(job.wait(), Ok(3));
+    assert_eq!(job.status().unwrap().state, JobState::Interrupted);
+}
+
+#[test]
+fn cancel_before_commit_still_cancelled() {
+    let pool = make_pool(2, 20, 8);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let job = pool
+        .submit(
+            spec(JobClass::Import, QueuePolicy::Ordered, 10),
+            move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(3)
+            },
+        )
+        .unwrap();
+    receive(&started_rx);
+    assert!(job.cancel());
+    release_tx.send(()).unwrap();
+    assert_eq!(job.wait(), Err(JobFailure::Cancelled));
+    assert_eq!(job.status().unwrap().state, JobState::Cancelled);
+}
+
+#[test]
+fn task_returning_cancelled_after_commit_is_interrupted() {
+    let pool = make_pool(2, 20, 8);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let job = pool
+        .submit(
+            spec(JobClass::Import, QueuePolicy::Ordered, 10),
+            move |ctx| -> Result<i32, JobFailure> {
+                ctx.mark_committed();
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                observed_tx.send(ctx.is_cancel_requested()).unwrap();
+                Err(JobFailure::Cancelled)
+            },
+        )
+        .unwrap();
+    receive(&started_rx);
+    assert!(job.cancel());
+    release_tx.send(()).unwrap();
+    assert!(receive(&observed_rx));
+    assert_eq!(job.wait(), Err(JobFailure::Cancelled));
+    assert_eq!(job.status().unwrap().state, JobState::Interrupted);
+}
+
+/// A task whose durable writes committed is never reported `Superseded`: the late
+/// supersede ends `Interrupted` and the result still reaches the handle.
+#[test]
+fn superseded_after_commit_is_interrupted() {
+    let pool = make_pool(2, 20, 8);
+    let job = pool
+        .submit(
+            spec(JobClass::Import, QueuePolicy::Ordered, 10),
+            move |ctx| -> Result<i32, JobFailure> {
+                ctx.mark_committed();
+                Err(JobFailure::Superseded)
+            },
+        )
+        .unwrap();
+    assert_eq!(job.wait(), Err(JobFailure::Superseded));
+    assert_eq!(job.status().unwrap().state, JobState::Interrupted);
+}
+
+#[test]
+fn is_committed_reflects_mark() {
+    let pool = make_pool(2, 20, 8);
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let job = pool
+        .submit(
+            spec(JobClass::Import, QueuePolicy::Ordered, 10),
+            move |ctx| -> Result<(), JobFailure> {
+                let before = ctx.is_committed();
+                ctx.mark_committed();
+                let after = ctx.is_committed();
+                observed_tx.send((before, after)).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(job.wait(), Ok(()));
+    assert_eq!(receive(&observed_rx), (false, true));
+}
+
+#[test]
+fn stop_cancels_queued_nondurable_but_not_durable() {
+    let pool = make_pool(4, 40, 8);
+    let (blockers, release_a, release_b) = occupy_workers(&pool);
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_task = ran.clone();
+    let disposable = pool
+        .submit(
+            spec(JobClass::Analysis, QueuePolicy::Ordered, 10),
+            move |_| {
+                ran_in_task.store(true, Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap();
+    let mut durable_spec = spec(JobClass::Export, QueuePolicy::Ordered, 10);
+    durable_spec.durable = true;
+    let durable = pool.submit(durable_spec, |_| Ok(2)).unwrap();
+    pool.stop();
+    pool.stop();
+    assert_eq!(disposable.wait(), Err(JobFailure::Cancelled));
+    assert_eq!(disposable.status().unwrap().state, JobState::Cancelled);
+    let pending: Vec<_> = pool
+        .pending_after_stop()
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert!(pending.contains(&durable.id()));
+    for blocker in &blockers {
+        assert!(pending.contains(&blocker.id()));
+    }
+    assert!(!pending.contains(&disposable.id()));
+    release_a.send(()).unwrap();
+    release_b.send(()).unwrap();
+    assert_eq!(durable.wait(), Ok(2));
+    assert_eq!(durable.status().unwrap().state, JobState::Succeeded);
+    for blocker in blockers {
+        // Non-durable running jobs were only cancel-*requested* by stop; they kept
+        // running (they were never retired early) but land in `Cancelled` on return.
+        assert_eq!(blocker.wait(), Err(JobFailure::Cancelled));
+        assert_eq!(blocker.status().unwrap().state, JobState::Cancelled);
+    }
+    assert!(!ran.load(Ordering::SeqCst));
+    assert!(pool.pending_after_stop().is_empty());
+}
+
+/// The trash/resolve commands rely on this: `cull_delete_rejected`, `dedup_resolve` and the flag
+/// mutations they must not race with are all `UserCommand` + `Ordered` jobs with the same owner,
+/// so the worker's candidate filter never lets one overlap another — a photo cannot be
+/// un-rejected between a delete's plan and finalize.
+#[test]
+fn ordered_user_commands_with_same_owner_never_overlap() {
+    let pool = make_pool(4, 100, 8);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let first = pool
+        .submit(
+            spec(JobClass::UserCommand, QueuePolicy::Ordered, 10),
+            move |_| {
+                release_rx.recv().unwrap(); // blocks until released
+                Ok(())
+            },
+        )
+        .unwrap();
+    while !first.status().is_some_and(|s| s.state == JobState::Running) {
+        std::thread::yield_now();
+    }
+
+    let (second_started_tx, second_started_rx) = mpsc::channel::<()>();
+    let second = pool
+        .submit(
+            spec(JobClass::UserCommand, QueuePolicy::Ordered, 10),
+            move |_| {
+                second_started_tx.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    // The first job owns the lane: the second must sit queued, not started.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        matches!(second_started_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "second Ordered UserCommand started while the first was still running"
+    );
+
+    release_tx.send(()).unwrap();
+    receive(&second_started_rx); // released -> the lane opens for the second job
+    assert_eq!(first.wait(), Ok(()));
+    assert_eq!(second.wait(), Ok(()));
+    pool.join();
 }

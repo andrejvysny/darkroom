@@ -3,19 +3,25 @@ mod catalog_adapter;
 mod commands;
 mod events;
 mod features;
+mod import_control;
 mod jobs;
 mod logging;
 mod model_mgmt;
+mod outbox_worker;
 mod pano_detect;
 mod panorama;
 mod prefetch;
 mod protocol;
 mod quit;
 mod scan;
+mod settings_bridge;
 mod sidecar_queue;
+mod sidecar_write;
+mod source_fence;
 mod state;
 mod suggest;
 mod thumb_queue;
+mod trash_flow;
 mod watch;
 
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
@@ -121,6 +127,8 @@ pub fn run() {
             // Start the background canonical-thumbnail worker (parks until there's work).
             thumb_queue::spawn_worker(app.handle().clone());
             sidecar_queue::spawn_worker(app.handle().clone());
+            // Mirrors committed edits into their sidecars, draining whatever a previous run left.
+            outbox_worker::spawn_worker(app.handle().clone());
             prefetch::spawn_worker(app.handle().clone());
 
             // Best-effort daily catalog backup (own background thread; logs its own outcome).
@@ -184,6 +192,7 @@ pub fn run() {
             commands::develop_edit_status,
             commands::develop_flush_ack,
             commands::develop_set_edit,
+            commands::prepare_restart,
             commands::develop_render,
             commands::develop_regen_thumb,
             commands::develop_preview_jpeg,
@@ -325,6 +334,8 @@ pub fn run() {
             commands::logs_delete_all,
             commands::catalog_backup_now,
             commands::catalog_backup_status,
+            commands::settings_bridge_write,
+            commands::settings_bridge_export,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -346,7 +357,19 @@ pub fn run() {
                     .sidecar_queue
                     .flush_blocking(std::time::Duration::from_secs(2))
                 {
-                    tracing::warn!("sidecar queue did not drain before exit");
+                    let pending = st.sidecar_queue.pending_report();
+                    let (outbox_pending, outbox_failing, outbox_error) = st.outbox.pending_report();
+                    tracing::warn!(
+                        dirty = pending.dirty,
+                        deferred = pending.deferred,
+                        failing = pending.failing,
+                        last_error = pending.last_error.as_deref().unwrap_or(""),
+                        outbox_pending,
+                        outbox_failing,
+                        outbox_last_error = outbox_error.as_deref().unwrap_or(""),
+                        "sidecar queue did not drain before exit; the outbox intents are durable and \
+                         the next launch mirrors them"
+                    );
                 }
                 crate::jobs::shutdown(app_handle);
                 let lock = st.db.lock();

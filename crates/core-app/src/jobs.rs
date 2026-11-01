@@ -31,6 +31,9 @@ pub struct JobSpec {
     pub class: JobClass,
     pub policy: QueuePolicy,
     pub estimated_bytes: u64,
+    /// Must run to completion even during shutdown. Reserve for short operations
+    /// (catalog open/close, edit flush). Long work should be non-durable and call
+    /// `JobContext::mark_committed` at its commit boundaries.
     pub durable: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +42,9 @@ pub enum JobState {
     Running,
     CancelRequested,
     Succeeded,
+    /// Cancellation was honoured after the job committed part of its work; the payload
+    /// describing what was committed is delivered.
+    Interrupted,
     Cancelled,
     Superseded,
     Failed,
@@ -47,7 +53,7 @@ impl JobState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Cancelled | Self::Superseded | Self::Failed
+            Self::Succeeded | Self::Interrupted | Self::Cancelled | Self::Superseded | Self::Failed
         )
     }
 }

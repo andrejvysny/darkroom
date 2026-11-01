@@ -41,7 +41,51 @@ pub struct PublicationGate {
 pub struct SourceMutationGuard<'a> {
     state: std::sync::MutexGuard<'a, State>,
 }
+fn retire_state(state: &mut State, id: ImageId) {
+    state.sequence = state
+        .sequence
+        .checked_add(1)
+        .expect("publication sequence exhausted");
+    let entry = state.sources.entry(id).or_insert(Entry {
+        key: None,
+        revision: 0,
+    });
+    entry.revision = entry
+        .revision
+        .checked_add(1)
+        .expect("source revision exhausted");
+    entry.key = None;
+}
+
+fn replace_source_state(state: &mut State, id: ImageId, key: SourceKey) {
+    state.sequence = state
+        .sequence
+        .checked_add(1)
+        .expect("publication sequence exhausted");
+    let entry = state.sources.entry(id).or_insert(Entry {
+        key: None,
+        revision: 0,
+    });
+    entry.revision = entry
+        .revision
+        .checked_add(1)
+        .expect("source revision exhausted");
+    entry.key = Some(key);
+}
+
 impl SourceMutationGuard<'_> {
+    pub fn retire(&mut self, id: ImageId) {
+        retire_state(&mut self.state, id);
+    }
+
+    pub fn replace_source(&mut self, id: ImageId, key: SourceKey) {
+        replace_source_state(&mut self.state, id, key);
+    }
+
+    pub fn epoch(&self) -> CatalogEpoch {
+        CatalogEpoch(self.state.epoch)
+    }
+
     pub fn invalidate_all(&mut self) {
         self.state.epoch = self
             .state
@@ -136,11 +180,15 @@ impl PublicationGate {
         self.state.lock().expect("publication gate poisoned")
     }
 
-    pub fn with_tokens<T>(
+    /// Validate `tokens`, then hand out the source-mutation guard and hold the gate across the
+    /// caller's catalog commit — the same validation and lock order as [`Self::with_tokens`]
+    /// (gate before catalog), but the caller keeps the guard, so a row inserted by that commit can
+    /// register its identity via [`SourceMutationGuard::replace_source`] without releasing the gate
+    /// (a released gate would let a concurrent retire/reset slip between commit and registration).
+    pub fn tokens_guard(
         &self,
         tokens: &[PublicationToken],
-        f: impl FnOnce() -> T,
-    ) -> Result<T, Stale> {
+    ) -> Result<SourceMutationGuard<'_>, Stale> {
         let state = self.state.lock().expect("publication gate poisoned");
         if tokens.iter().any(|token| {
             state.epoch != token.epoch
@@ -150,6 +198,15 @@ impl PublicationGate {
         }) {
             return Err(Stale);
         }
+        Ok(SourceMutationGuard { state })
+    }
+
+    pub fn with_tokens<T>(
+        &self,
+        tokens: &[PublicationToken],
+        f: impl FnOnce() -> T,
+    ) -> Result<T, Stale> {
+        let _guard = self.tokens_guard(tokens)?;
         Ok(f())
     }
     pub fn with_sequence<T>(&self, sequence: u64, f: impl FnOnce() -> T) -> Result<T, Stale> {
@@ -177,24 +234,29 @@ impl PublicationGate {
         f()
     }
 
+    /// Hold across the catalog commit (lock order: gate before catalog). Use the
+    /// guard to record source identity changes made by that commit.
+    pub fn commit_guard(&self, epoch: CatalogEpoch) -> Result<SourceMutationGuard<'_>, Stale> {
+        let state = self.state.lock().expect("publication gate poisoned");
+        if state.epoch != epoch.0 {
+            return Err(Stale);
+        }
+        Ok(SourceMutationGuard { state })
+    }
+
+    /// Runs `f` while holding an epoch-fenced commit guard; `Err(Stale)` if the
+    /// epoch is no longer current by the time the gate is acquired.
+    pub fn with_epoch<T>(&self, epoch: CatalogEpoch, f: impl FnOnce() -> T) -> Result<T, Stale> {
+        let _guard = self.commit_guard(epoch)?;
+        Ok(f())
+    }
+
     pub fn retire(&self, id: ImageId) {
         self.retire_with(id, || ());
     }
     pub fn retire_with<T>(&self, id: ImageId, f: impl FnOnce() -> T) -> T {
         let mut state = self.state.lock().expect("publication gate poisoned");
-        state.sequence = state
-            .sequence
-            .checked_add(1)
-            .expect("publication sequence exhausted");
-        let entry = state.sources.entry(id).or_insert(Entry {
-            key: None,
-            revision: 0,
-        });
-        entry.revision = entry
-            .revision
-            .checked_add(1)
-            .expect("source revision exhausted");
-        entry.key = None;
+        retire_state(&mut state, id);
         f()
     }
 
@@ -206,19 +268,7 @@ impl PublicationGate {
     }
     pub fn replace_source_with<T>(&self, id: ImageId, key: SourceKey, f: impl FnOnce() -> T) -> T {
         let mut state = self.state.lock().expect("publication gate poisoned");
-        state.sequence = state
-            .sequence
-            .checked_add(1)
-            .expect("publication sequence exhausted");
-        let entry = state.sources.entry(id).or_insert(Entry {
-            key: None,
-            revision: 0,
-        });
-        entry.revision = entry
-            .revision
-            .checked_add(1)
-            .expect("source revision exhausted");
-        entry.key = Some(key);
+        replace_source_state(&mut state, id, key);
         f()
     }
 

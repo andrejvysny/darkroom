@@ -20,13 +20,16 @@ pub struct Config {
     pub workers: usize,
 }
 type Payload = Box<dyn Any + Send>;
-type Task = Box<dyn FnOnce(JobContext) -> Result<Payload, JobFailure> + Send>;
+// The `bool` is `domain_failed`: the task delivered its payload, but the operation
+// itself reported a typed error, so the job must be recorded `Failed`, not `Succeeded`.
+type Task = Box<dyn FnOnce(JobContext) -> Result<(Payload, bool), JobFailure> + Send>;
 struct Record {
     snapshot: JobSnapshot,
     task: Option<Task>,
     result: Option<Result<Payload, JobFailure>>,
     charged: bool,
     handle: bool,
+    committed: bool,
     waker: Option<Waker>,
     completion: Arc<Completion>,
 }
@@ -82,6 +85,34 @@ impl JobContext {
         }
         drop(state);
         notify(&self.shared);
+    }
+    /// Call after durable side effects land. A later cancellation then yields
+    /// `Interrupted` and the payload is delivered instead of retired.
+    pub fn mark_committed(&self) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = state.records.get_mut(&self.id) {
+            record.committed = true;
+        }
+        drop(state);
+    }
+    /// True once the task has called `mark_committed()`: its durable side effects have
+    /// landed, so the task's result must still be delivered even if a cancel or supersede
+    /// arrives afterwards (the worker then records `Interrupted`, not a discarded failure).
+    pub fn is_committed(&self) -> bool {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .records
+            .get(&self.id)
+            .is_some_and(|record| record.committed)
+    }
+    /// Cheap check for engines between files/chunks: true when cancellation has been
+    /// requested, the record is gone, or the job was superseded.
+    pub fn is_cancel_requested(&self) -> bool {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            state.records.get(&self.id).map(|r| r.snapshot.state),
+            None | Some(JobState::CancelRequested | JobState::Superseded)
+        )
     }
 }
 impl Supervisor {
@@ -141,6 +172,36 @@ impl Supervisor {
         spec: JobSpec,
         task: impl FnOnce(JobContext) -> Result<T, JobFailure> + Send + 'static,
     ) -> Result<JobHandle<T>, SubmitError> {
+        self.admit(spec, task, |value| (Box::new(value) as Payload, false))
+    }
+    /// Submit a task whose operation may fail with a typed error distinct from job failure.
+    ///
+    /// The inner `Result<T, E>` is always delivered to the handle; the job state reports
+    /// whether the operation itself succeeded (`Err(E)` records the job as `Failed`, even
+    /// when cancellation was also requested).
+    pub fn submit_fallible<T, E>(
+        &self,
+        spec: JobSpec,
+        task: impl FnOnce(JobContext) -> Result<Result<T, E>, JobFailure> + Send + 'static,
+    ) -> Result<JobHandle<Result<T, E>>, SubmitError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.admit(spec, task, |outcome| {
+            let domain_failed = outcome.is_err();
+            (Box::new(outcome) as Payload, domain_failed)
+        })
+    }
+    fn admit<T>(
+        &self,
+        spec: JobSpec,
+        task: impl FnOnce(JobContext) -> Result<T, JobFailure> + Send + 'static,
+        publish: impl FnOnce(T) -> (Payload, bool) + Send + 'static,
+    ) -> Result<JobHandle<T>, SubmitError>
+    where
+        T: Send + 'static,
+    {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopping {
             return Err(SubmitError::Stopped);
@@ -303,12 +364,11 @@ impl Supervisor {
                     state: JobState::Queued,
                     progress: None,
                 },
-                task: Some(Box::new(move |ctx| {
-                    task(ctx).map(|value| Box::new(value) as Payload)
-                })),
+                task: Some(Box::new(move |ctx| task(ctx).map(publish))),
                 result: None,
                 charged: true,
                 handle: true,
+                committed: false,
                 waker: None,
                 completion: completion.clone(),
             },
@@ -357,6 +417,19 @@ impl Supervisor {
             .unwrap_or_else(|e| e.into_inner())
             .records
             .values()
+            .map(|r| r.snapshot.clone())
+            .collect()
+    }
+    /// Snapshots of jobs that are still not terminal, so a host can show what
+    /// shutdown is still waiting for.
+    pub fn pending_after_stop(&self) -> Vec<JobSnapshot> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .records
+            .values()
+            .filter(|r| !r.snapshot.state.is_terminal())
             .map(|r| r.snapshot.clone())
             .collect()
     }

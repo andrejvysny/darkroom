@@ -183,6 +183,7 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, image_id: i64, amount: f32) -> Resu
     // (the user may have navigated away during the compute; the buffers stay cached for their return).
     emit_phase(app, "upload");
     let blended = blend(clean.as_ref(), denoised.as_ref(), a);
+    let mut published = false;
     if st.current_image.load(Ordering::SeqCst) == image_id {
         let prepared = gpu
             .pipeline
@@ -197,12 +198,17 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, image_id: i64, amount: f32) -> Resu
                     if slot.as_ref().is_some_and(|(id, _)| *id == image_id) {
                         *slot = None;
                     }
+                    published = true;
                 }
                 Ok(())
             })
             .map_err(|_| "denoise stale: catalog source changed".to_string())??;
     }
-    let _ = app.emit("denoise:done", serde_json::json!({ "imageId": image_id }));
+    // Only announce completion when the render swap actually landed — a cancel/navigation skip
+    // must not tell the UI to re-render a denoised image that was never published.
+    if published {
+        let _ = app.emit("denoise:done", serde_json::json!({ "imageId": image_id }));
+    }
     Ok(())
 }
 

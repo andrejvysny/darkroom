@@ -46,7 +46,7 @@ pub(super) fn run(shared: Arc<Shared>, foreground: bool) {
             }
         };
         notify(&shared);
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut result = catch_unwind(AssertUnwindSafe(|| {
             task(JobContext {
                 shared: shared.clone(),
                 id,
@@ -56,27 +56,25 @@ pub(super) fn run(shared: Arc<Shared>, foreground: bool) {
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let record = state.records.get_mut(&id).unwrap();
         let mut retired = None;
-        let result = if record.snapshot.state == JobState::CancelRequested
-            && !record.snapshot.spec.durable
-            && result.is_ok()
-        {
-            retired = result.ok();
-            Err(JobFailure::Cancelled)
-        } else {
-            result
-        };
-        record.snapshot.state = match &result {
-            Ok(_) => JobState::Succeeded,
-            Err(JobFailure::Cancelled) => JobState::Cancelled,
-            Err(JobFailure::Superseded) => JobState::Superseded,
-            Err(_) => JobState::Failed,
-        };
+        let (final_state, retire) = terminal(
+            &result,
+            record.snapshot.state == JobState::CancelRequested,
+            record.committed,
+            record.snapshot.spec.durable,
+        );
+        // Only an uncommitted, non-durable `Ok` result may be rewritten to `Cancelled`;
+        // delivered values and typed errors always reach the handle untouched.
+        if retire {
+            retired = result.ok().map(|(payload, _)| payload);
+            result = Err(JobFailure::Cancelled);
+        }
+        record.snapshot.state = final_state;
         *record
             .completion
             .snapshot
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(record.snapshot.clone());
-        record.result = Some(result);
+        record.result = Some(result.map(|(payload, _)| payload));
         let waker = record.waker.take();
         let abandoned = !record.handle;
         if abandoned {
@@ -90,6 +88,38 @@ pub(super) fn run(shared: Arc<Shared>, foreground: bool) {
             wake(waker);
         }
         notify(&shared);
+    }
+}
+
+/// Terminal mapping for a finished task. Returns the final state and whether the
+/// delivered value may be retired. A delivered domain failure outranks a cancel
+/// request: the typed error must still reach the handle, so it is never retired.
+/// A committed job whose cancellation or supersession was honoured reports `Interrupted`
+/// and keeps its payload, telling the caller work was retained instead of "nothing
+/// happened" — the durable writes the commit describes outrank the late supersede.
+fn terminal(
+    result: &Result<(Payload, bool), JobFailure>,
+    cancel_requested: bool,
+    committed: bool,
+    durable: bool,
+) -> (JobState, bool) {
+    match result {
+        Ok((_, true)) => (JobState::Failed, false),
+        Ok((_, false)) if cancel_requested => {
+            if committed {
+                (JobState::Interrupted, false)
+            } else if !durable {
+                (JobState::Cancelled, true)
+            } else {
+                (JobState::Succeeded, false)
+            }
+        }
+        Ok(_) => (JobState::Succeeded, false),
+        Err(JobFailure::Cancelled) if committed => (JobState::Interrupted, false),
+        Err(JobFailure::Cancelled) => (JobState::Cancelled, false),
+        Err(JobFailure::Superseded) if committed => (JobState::Interrupted, false),
+        Err(JobFailure::Superseded) => (JobState::Superseded, false),
+        Err(_) => (JobState::Failed, false),
     }
 }
 pub(super) fn uncharge(state: &mut State, id: JobId) {

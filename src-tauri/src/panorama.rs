@@ -381,6 +381,7 @@ fn pano_dest_path(first_source: &Path) -> Result<PathBuf, String> {
 /// and between blended frames — so a stop request lands within a frame rather than a whole phase.
 pub fn merge<R: Runtime>(
     app: &AppHandle<R>,
+    ctx: &core_runtime::jobs::JobContext,
     ids: Vec<i64>,
     projection: String,
     boundary_warp: f32,
@@ -407,10 +408,13 @@ pub fn merge<R: Runtime>(
     // from inside its rayon-parallel phases.
     let cancel_flag = &st.panorama_cancel;
     let workers = &st.workers;
-    let cancelled = move || workers.is_stopping() || cancel_flag.load(Ordering::SeqCst);
+    let cancelled = move || {
+        workers.is_stopping() || cancel_flag.load(Ordering::SeqCst) || ctx.is_cancel_requested()
+    };
 
     // Brief lock: resolve paths + the first source's folder (the pano lands in the same folder).
     let paths = resolve_paths(&st, &ids)?;
+    let tokens = crate::source_fence::capture_sources(&st, &ids)?;
     let folder_id: i64 = {
         let db = st.db.lock().map_err(|e| e.to_string())?;
         db.conn
@@ -477,29 +481,47 @@ pub fn merge<R: Runtime>(
         let _ = std::fs::remove_file(&dest);
         e.to_string()
     })?;
-    let new_id: i64 = (|| -> Result<i64, String> {
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        let id = core_library::insert_image(&tx, folder_id, core_library::now_epoch(), &processed)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "merged panorama is already in the catalog".to_string())?;
-        // Only link frames the stitcher actually used — registration can drop non-overlapping
-        // frames from `ids`, and a source row for a frame that isn't in the output would lie about
-        // what went into the pano.
-        for (pos, &idx) in result.used_indices.iter().enumerate() {
-            tx.execute(
+    let new_id: i64 = st
+        .publications
+        .tokens_guard(&tokens)
+        .map(|mut guard| -> Result<i64, String> {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            let id =
+                core_library::insert_image(&tx, folder_id, core_library::now_epoch(), &processed)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "merged panorama is already in the catalog".to_string())?;
+            // Only link frames the stitcher actually used — registration can drop non-overlapping
+            // frames from `ids`, and a source row for a frame that isn't in the output would lie about
+            // what went into the pano.
+            for (pos, &idx) in result.used_indices.iter().enumerate() {
+                tx.execute(
                 "INSERT OR IGNORE INTO panorama_sources (pano_image_id, source_image_id, position)
                  VALUES (?1, ?2, ?3)",
                 core_db::rusqlite::params![id, ids[idx], pos as i64],
             )
             .map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(id)
-    })()
-    .inspect_err(|_| {
-        let _ = std::fs::remove_file(&dest);
-    })?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            // Register the committed row's identity while the gate is still held: the rowid may
+            // be one retired by an earlier delete (`images.id` has no AUTOINCREMENT), and an
+            // unregistered reuse would stay Stale until restart.
+            guard.replace_source(
+                core_model::identity::ImageId(id),
+                core_runtime::publication::SourceKey {
+                    hash: processed.content_hash_hex.clone(),
+                    path: processed.path.clone(),
+                },
+            );
+            Ok(id)
+        })
+        .map_err(|_| "a source photo changed during the merge; nothing was published".to_string())
+        .flatten()
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&dest);
+        })?;
+    // The DNG + catalog row are committed; a later cancel must not retire the published id.
+    ctx.mark_committed();
 
     // Free the dialog's cached preview frames — the merge is done, the memory matters more.
     if let Ok(mut cache) = st.panorama_preview_cache.lock() {

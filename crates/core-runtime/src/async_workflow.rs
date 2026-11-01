@@ -17,7 +17,7 @@ type WakeState = Arc<(Mutex<bool>, Condvar)>;
 
 struct Active {
     effect: Effect,
-    handle: JobHandle<Completion>,
+    handle: JobHandle<Result<Completion, Completion>>,
 }
 
 /// Owns application state on the caller thread; catalog effects execute serially on workers.
@@ -178,9 +178,14 @@ impl AsyncCatalogWorkflow {
         let task_effect = effect.clone();
         let catalog = self.catalog.clone();
         let executor = self.executor.clone();
-        match self.supervisor.submit(spec, move |ctx| {
+        match self.supervisor.submit_fallible(spec, move |ctx| {
             ctx.checkpoint()?;
-            Ok(executor.execute(task_effect, catalog.as_ref()))
+            let completion = executor.execute(task_effect, catalog.as_ref());
+            Ok(if completion.result.is_err() {
+                Err(completion)
+            } else {
+                Ok(completion)
+            })
         }) {
             Ok(handle) => {
                 self.active = Some(Active { effect, handle });
@@ -209,10 +214,13 @@ impl AsyncCatalogWorkflow {
         };
         let active = self.active.take().expect("completed active effect");
         if self.session.is_current(&active.effect) {
-            let completion = result.unwrap_or_else(|failure| Completion {
-                token: active.effect.token,
-                result: Err(job_error(failure)),
-            });
+            let completion = match result {
+                Ok(Ok(completion)) | Ok(Err(completion)) => completion,
+                Err(failure) => Completion {
+                    token: active.effect.token,
+                    result: Err(job_error(failure)),
+                },
+            };
             self.pending.extend(self.session.complete(completion)?);
         }
         self.prune();

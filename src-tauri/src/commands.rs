@@ -1,4 +1,4 @@
-//! IPC command handlers. Heavy/DB work runs on `spawn_blocking`; state is fetched via the
+//! IPC command handlers. Heavy/DB work runs on `spawn_fallible`/`spawn_job`; state is fetched via the
 //! `AppHandle` inside the blocking closure (never held across `.await`).
 
 use crate::state::{AppState, GpuRender};
@@ -13,6 +13,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
+
+// The legacy settings-bridge commands live in their own module but are re-exported through
+// `commands::` — the parity handler scanner (xtask/src/parity.rs) registers every command under
+// this path, and `generate_handler!` entries must read `commands::<name>,`. The `__cmd__` /
+// `__tauri_command_name_` items are the `#[tauri::command]` macro's companions, which the
+// handler macro resolves through this module too.
+pub use crate::settings_bridge::{
+    __cmd__settings_bridge_export, __cmd__settings_bridge_write,
+    __tauri_command_name_settings_bridge_export, __tauri_command_name_settings_bridge_write,
+    settings_bridge_export, settings_bridge_write,
+};
 
 #[tauri::command]
 pub fn frontend_log(
@@ -34,34 +45,13 @@ pub fn frontend_log(
 // and previews re-render; stored edit params are untouched.
 // v6 fixes sequential local-mask composition and bounded tone-curve extrema. Saved parameters
 // remain intact; both canonical and edited caches now include this renderer version.
-pub const PROCESS_VERSION: i64 = 6;
+/// Aliased to `core_model::identity::CURRENT_PROCESS_VERSION` so the native state machine and the
+/// legacy host can never drift apart on the number that keys render caches and stored edits.
+pub const PROCESS_VERSION: i64 = core_model::identity::CURRENT_PROCESS_VERSION.0;
 
 /// Default cap on the Unsupported list — enough to see every camera the library trips over without
 /// shipping a 50k-row table to the frontend.
 const DECODE_FAILURE_LIMIT: i64 = 500;
-
-/// Delete cached thumbnails for content hashes no longer referenced by any present row. A byte-
-/// identical keeper still shares its hash, so presence is re-checked before deleting (lowercase-hex
-/// compare against the stored BLOB).
-fn gc_orphan_thumbs(
-    conn: &core_db::rusqlite::Connection,
-    thumbs: &core_library::ThumbCache,
-    hashes: &[String],
-) {
-    use core_db::rusqlite::OptionalExtension;
-    for h in hashes {
-        let still_present = conn
-            .query_row(
-                "SELECT 1 FROM images WHERE lower(hex(content_hash)) = ?1 AND status='present' LIMIT 1",
-                [h],
-                |_| Ok(()),
-            )
-            .optional();
-        if matches!(still_present, Ok(None)) {
-            let _ = thumbs.remove_hash(h);
-        }
-    }
-}
 
 /// Evict thumbnails down to the configured cache cap (best-effort). The cap is read under a brief
 /// lock, then released before the (slower) filesystem eviction runs.
@@ -75,7 +65,7 @@ pub(crate) fn enforce_thumb_cap(st: &AppState) {
 
 #[tauri::command]
 pub async fn library_query(app: AppHandle, params: QueryParams) -> Result<Vec<ImageRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -91,7 +81,7 @@ pub async fn library_query(app: AppHandle, params: QueryParams) -> Result<Vec<Im
 
 #[tauri::command]
 pub async fn library_count(app: AppHandle, params: QueryParams) -> Result<i64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -107,7 +97,7 @@ pub async fn library_count(app: AppHandle, params: QueryParams) -> Result<i64, S
 
 #[tauri::command]
 pub async fn library_folders(app: AppHandle) -> Result<Vec<FolderRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -123,7 +113,7 @@ pub async fn library_folders(app: AppHandle) -> Result<Vec<FolderRow>, String> {
 
 #[tauri::command]
 pub async fn library_date_tree(app: AppHandle) -> Result<Vec<DateTreeYear>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -139,7 +129,7 @@ pub async fn library_date_tree(app: AppHandle) -> Result<Vec<DateTreeYear>, Stri
 
 #[tauri::command]
 pub async fn image_meta(app: AppHandle, id: i64) -> Result<Option<ImageRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -166,17 +156,20 @@ pub fn gpu_status(app: AppHandle) -> Option<core_pipeline::GpuAdapterInfo> {
 /// The DB lock is held only briefly (root upsert + known-path read, then the transactional
 /// insert) — the multi-second parallel decode/hash/thumbnail work runs UNLOCKED so concurrent
 /// `library_query` calls stay responsive during indexing.
+///
+/// Cancellable and non-durable: a cancel or shutdown before the single commit writes no catalog
+/// rows at all (thumbnail files are a content-addressed cache), so shutdown never waits for a scan.
 #[tauri::command]
 pub async fn library_index_root(app: AppHandle, path: String) -> Result<IndexStats, String> {
     let app2 = app.clone();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_job(
         app.clone(),
         core_app::jobs::JobClass::Import,
-        true,
+        false,
         "library_index_root",
-        move || {
+        move |ctx| {
             let st = app2.state::<AppState>();
-            index_root_blocking(&app2, &st, &PathBuf::from(&path), true)
+            index_root_blocking(&app2, &st, &PathBuf::from(&path), true, ctx)
         },
     )
     .await
@@ -190,7 +183,7 @@ pub async fn decode_failures_list(
     app: AppHandle,
     limit: Option<i64>,
 ) -> Result<Vec<core_library::DecodeFailureRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -211,7 +204,7 @@ pub async fn decode_failures_list(
 pub async fn decode_failures_counts(
     app: AppHandle,
 ) -> Result<core_library::DecodeFailureCounts, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -230,7 +223,7 @@ pub async fn decode_failures_counts(
 /// Returns how many rows were removed. Touches only bookkeeping — no file is read or moved.
 #[tauri::command]
 pub async fn decode_failures_forget(app: AppHandle, paths: Vec<String>) -> Result<usize, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -249,13 +242,17 @@ pub async fn decode_failures_forget(app: AppHandle, paths: Vec<String>) -> Resul
 /// (recursively), sequential hash+meta+thumbnail, then a single transactional insert. Emits
 /// `import:progress` / `import:done`. When `analyze`, kicks off background AI analysis of the
 /// newly-added images (only if models are already downloaded). Runs synchronously on the caller's
-/// (blocking) thread.
+/// (blocking) thread; `ctx` cancels it before anything is written and marks the single commit.
 fn index_root_blocking(
     app: &AppHandle,
     st: &AppState,
     root: &Path,
     analyze: bool,
+    ctx: &core_runtime::jobs::JobContext,
 ) -> Result<IndexStats, String> {
+    // Captured before the first lock: every later catalog write is fenced on this generation.
+    let epoch = st.publications.epoch();
+
     // --- brief lock: upsert folder + snapshot known paths + still-standing decode failures ---
     let (folder_id, known, known_bad) = {
         let db = st.db.lock().map_err(|e| e.to_string())?;
@@ -281,22 +278,25 @@ fn index_root_blocking(
     let done = AtomicUsize::new(0);
     // The path rides along with its result: a `LibError` carries no path, and every failure has to
     // be recorded against the file that produced it.
-    let results: Vec<_> = todo
-        .iter()
-        .map(|p| {
-            let r = core_library::process_file(p, &st.thumbs, core_library::THUMB_SIZE);
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n == total || n.is_multiple_of(4) {
-                let _ = app.emit(
-                    "import:progress",
-                    serde_json::json!({"done": n, "total": total}),
-                );
-            }
-            (p, r)
-        })
-        .collect();
+    let mut results = Vec::with_capacity(total);
+    for p in &todo {
+        // Nothing has reached the catalog yet (thumbnails are a content-addressed cache), so a
+        // cancellation here is a clean "nothing was written" exit.
+        if ctx.is_cancel_requested() || st.workers.is_stopping() {
+            return Err("indexing cancelled before commit; nothing was written".to_string());
+        }
+        let r = core_library::process_file(p, &st.thumbs, core_library::THUMB_SIZE);
+        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == total || n.is_multiple_of(4) {
+            let _ = app.emit(
+                "import:progress",
+                serde_json::json!({"done": n, "total": total}),
+            );
+        }
+        results.push((p, r));
+    }
 
-    // --- brief lock: transactional insert ---
+    // --- fenced transactional insert: publication gate BEFORE the catalog lock (lock order) ---
     let imported_at = core_library::now_epoch();
     let mut stats = IndexStats {
         scanned: total,
@@ -304,15 +304,26 @@ fn index_root_blocking(
         ..Default::default()
     };
     {
+        // The fence covers ONLY the catalog lock + transaction. Nothing after `tx.commit()`
+        // may hold the global publication gate: thumbnail eviction, emits and queueing are IO
+        // and must not stall every other sidecar/thumbnail/analysis publication in the app.
+        // `images.id` has no AUTOINCREMENT, so an inserted id may be a rowid retired by an
+        // earlier delete; the fence that made the write atomic also registers its identity.
+        let mut fence = st
+            .publications
+            .commit_guard(epoch)
+            .map_err(|_| "catalog was replaced while indexing; nothing was written".to_string())?;
         let mut db = st.db.lock().map_err(|e| e.to_string())?;
         let tx = db.conn.transaction().map_err(|e| e.to_string())?;
+        let mut inserted: Vec<(i64, String, String)> = Vec::new();
         for (path, r) in &results {
             match r {
                 Ok(p) => match core_library::insert_image(&tx, folder_id, imported_at, p)
                     .map_err(|e| e.to_string())?
                 {
-                    Some(_) => {
+                    Some(id) => {
                         stats.added += 1;
+                        inserted.push((id, p.content_hash_hex.clone(), p.path.clone()));
                         // A file that used to fail and now indexes leaves no stale record behind.
                         let _ = core_library::clear_decode_failure(&tx, &p.path);
                     }
@@ -336,6 +347,17 @@ fn index_root_blocking(
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
+        for (id, hash_hex, path) in &inserted {
+            fence.replace_source(
+                core_model::identity::ImageId(*id),
+                core_runtime::publication::SourceKey {
+                    hash: hash_hex.clone(),
+                    path: path.clone(),
+                },
+            );
+        }
+        // Durable from here on: a later cancellation ends `Interrupted` and still delivers stats.
+        ctx.mark_committed();
     }
 
     enforce_thumb_cap(st);
@@ -357,22 +379,25 @@ fn index_root_blocking(
 #[tauri::command]
 pub async fn database_reset(app: AppHandle) -> Result<IndexStats, String> {
     let app2 = app.clone();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
         "database_reset",
         move || {
             let st = app2.state::<AppState>();
-            let _sources = st.publications.invalidate_all_guard();
-            st.clear_source_caches();
-
-            // Wipe all catalog rows (folders included → no watched roots remain).
+            // Catalog wipe + global retirement stay under the guard (lock order: gate, then db).
             {
+                let _sources = st.publications.invalidate_all_guard();
+                st.clear_source_caches();
+                // Wipe all catalog rows (folders included → no watched roots remain).
                 let mut db = st.db.lock().map_err(|e| e.to_string())?;
                 db.wipe().map_err(|e| e.to_string())?;
             }
-            // Clear derived caches (thumbnails on disk + warm GPU resources + last histogram).
+            // Clear derived caches (thumbnail files on disk + warm GPU resources + last histogram).
+            // The eviction runs after the guard and db lock are dropped: the thumbnail cache is
+            // content-addressed, so a concurrent thumbnail write after the wipe is harmless, and
+            // bulk file deletes must not hold the catalog hostage.
             let _ = st.thumbs.evict_to(0);
             if let Ok(mut slot) = st.full_render_cache.lock() {
                 *slot = None;
@@ -417,7 +442,7 @@ pub(crate) fn stored_edit_is_unreadable(stored: Option<&str>) -> bool {
 /// Saved develop params for an image (defaults if none).
 #[tauri::command]
 pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopParams, String> {
-    crate::jobs::spawn_blocking(app.clone(), core_app::jobs::JobClass::UserCommand, true, "develop_get_edit",
+    crate::jobs::spawn_fallible(app.clone(), core_app::jobs::JobClass::UserCommand, true, "develop_get_edit",
         move || {
         let st = app.state::<AppState>();
         let db = st.db.lock().map_err(|e| e.to_string())?;
@@ -442,7 +467,7 @@ pub async fn develop_get_edit(app: AppHandle, image_id: i64) -> Result<DevelopPa
 /// silently invite edits that `develop_set_edit` then refuses. Cheap — one row read.
 #[tauri::command]
 pub async fn develop_edit_status(app: AppHandle, image_id: i64) -> Result<bool, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -468,7 +493,7 @@ pub async fn develop_set_edit(
     // `true` to overwrite even an unreadable stored blob (explicit Reset). Defaults to `false`.
     force: Option<bool>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -490,7 +515,11 @@ pub async fn develop_set_edit(
                  corruption); Reset to discard it"
                 ));
             }
-            core_library::set_edit(
+            // Commit the edit AND the durable intent to mirror it into the sidecar beside the RAW in
+            // one transaction (migration 026): if the process dies before the file lands, the next
+            // launch still knows this revision is owed a write. `set_edit` would only have moved the
+            // params, leaving the "still owed" knowledge in memory.
+            core_library::save_edit_with_intent(
                 &db.conn,
                 image_id,
                 PROCESS_VERSION,
@@ -498,6 +527,8 @@ pub async fn develop_set_edit(
                 core_library::now_epoch(),
             )
             .map_err(|e| e.to_string())?;
+            // Rating/keywords ride along in the same sidecar, so the coalescing queue keeps its mark;
+            // the outbox worker is what guarantees *this* revision reaches disk.
             sync_sidecar(st.inner(), image_id);
             let _ = core_library::append_event(
                 &db.conn,
@@ -514,6 +545,10 @@ pub async fn develop_set_edit(
                     },
                 ),
             );
+            // Wake the mirroring worker now that the intent is committed. Takes only the worker's own
+            // lock, and only after the catalog guard is gone, so no lock order is introduced.
+            drop(db);
+            st.outbox.notify();
             Ok(())
         },
     )
@@ -526,6 +561,34 @@ pub async fn develop_set_edit(
 #[tauri::command]
 pub fn develop_flush_ack(app: AppHandle, ok: bool) {
     app.state::<AppState>().quit.ack(ok);
+}
+
+/// Run the save barrier for an updater relaunch. `Ok(true)` = safe to relaunch.
+///
+/// The updater restarts the process through `plugin-process`, which never raises a quit the barrier
+/// can hold, so the frontend must ask before calling `relaunch()`. A rejected barrier leaves the app
+/// running with `app:save-barrier` announced; the caller must not relaunch on anything but `true`.
+#[tauri::command]
+pub async fn prepare_restart(app: AppHandle) -> Result<bool, String> {
+    // On an executor thread, never the main one: the barrier needs the run loop alive to deliver
+    // `app:flush-edits` to the webview and take the `develop_flush_ack` back.
+    crate::jobs::spawn_fallible(
+        app.clone(),
+        core_app::jobs::JobClass::UserCommand,
+        true,
+        "prepare_restart",
+        move || {
+            let reason = crate::quit::BarrierReason::UpdaterRestart;
+            let result = crate::quit::run_save_barrier(&app, reason);
+            if result.is_safe() {
+                Ok(true)
+            } else {
+                Err(result.message(reason))
+            }
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Hard cap on the full-res texture's long edge — keeps it within the GPU max texture dimension
@@ -548,7 +611,7 @@ pub async fn develop_preview_jpeg(
     app: AppHandle,
     image_id: i64,
 ) -> Result<tauri::ipc::Response, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Viewport,
         false,
@@ -813,7 +876,7 @@ struct EditChanged {
 /// edit version, or null when the image has no edit; a superseded render never publishes old state.
 #[tauri::command]
 pub async fn develop_regen_thumb(app: AppHandle, image_id: i64) -> Result<Option<i64>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Thumbnail,
         false,
@@ -1380,7 +1443,7 @@ pub async fn develop_histogram(
     image_id: i64,
     mut params: DevelopParams,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Viewport,
         false,
@@ -1556,7 +1619,7 @@ pub async fn export_image(
 ) -> Result<(), String> {
     // JPEG encoder quality (1..=100); default 92 when unset. Ignored for PNG.
     let quality = quality.unwrap_or(92).clamp(1, 100);
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Export,
         true,
@@ -1647,7 +1710,7 @@ where
         + Send
         + 'static,
 {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1718,7 +1781,7 @@ pub async fn cull_set_rating(
     candidate_ids: Option<Vec<i64>>,
     suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1757,7 +1820,7 @@ pub async fn cull_set_flag(
     candidate_ids: Option<Vec<i64>>,
     suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1796,7 +1859,7 @@ pub async fn cull_set_label(
     group_id: Option<String>,
     suggestion: Option<SuggestionCtx>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1853,7 +1916,7 @@ pub async fn cull_set_rating_many(
     stars: i64,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1886,7 +1949,7 @@ pub async fn cull_set_flag_many(
     flag: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1921,7 +1984,7 @@ pub async fn cull_set_label_many(
     label: Option<String>,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1955,7 +2018,7 @@ pub async fn cull_rejected_summary(
     app: AppHandle,
     params: QueryParams,
 ) -> Result<core_library::RejectSummary, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -1976,51 +2039,21 @@ pub async fn cull_rejected_summary(
 /// The frontend passes only the *filter*, never image ids: the target set is re-derived here with
 /// the `reject` flag forced on (`core_library::rejected_ids`), so a stale or malformed request can
 /// never reach a picked or unflagged photo. Files remain recoverable from the Trash; the catalog
-/// removal is not undoable in-app.
+/// removal is not undoable in-app. The Trash moves run with neither the catalog nor the publication
+/// gate locked (see [`crate::trash_flow`]); a catalog reset mid-run leaves the new catalog untouched.
 #[tauri::command]
 pub async fn cull_delete_rejected(
     app: AppHandle,
     params: QueryParams,
 ) -> Result<core_library::RejectDeleteResult, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
         "cull_delete_rejected",
         move || {
             let st = app.state::<AppState>();
-            let _sources = st.publications.invalidate_all_guard();
-            st.clear_source_caches();
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let res =
-                core_library::delete_rejected(&db.conn, &params).map_err(|e| e.to_string())?;
-            gc_orphan_thumbs(&db.conn, &st.thumbs, &res.hashes);
-            tracing::info!(
-                trashed = res.trashed,
-                failed = res.failed,
-                companions = res.companions,
-                "deleted rejected photos"
-            );
-            let _ = core_library::append_event(
-                &db.conn,
-                &crate::events::stamp(
-                    st.inner(),
-                    core_library::Event {
-                        event_type: "culling.delete_rejected".into(),
-                        flag: Some("reject".into()),
-                        touch_count: Some(res.trashed as i64),
-                        context: Some(
-                            serde_json::json!({
-                                "companions": res.companions,
-                                "failed": res.failed,
-                            })
-                            .to_string(),
-                        ),
-                        ..Default::default()
-                    },
-                ),
-            );
-            Ok::<_, String>(res)
+            crate::trash_flow::run_delete_rejected(st.inner(), &params)
         },
     )
     .await
@@ -2031,7 +2064,7 @@ pub async fn cull_delete_rejected(
 
 #[tauri::command]
 pub async fn keywords_list(app: AppHandle) -> Result<Vec<KeywordRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -2048,7 +2081,7 @@ pub async fn keywords_list(app: AppHandle) -> Result<Vec<KeywordRow>, String> {
 
 #[tauri::command]
 pub async fn keywords_for_image(app: AppHandle, image_id: i64) -> Result<Vec<KeywordRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2069,7 +2102,7 @@ pub async fn keyword_add_to_image(
     image_id: i64,
     name: String,
 ) -> Result<KeywordRow, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2094,7 +2127,7 @@ pub async fn keyword_add_to_images(
     image_ids: Vec<i64>,
     name: String,
 ) -> Result<KeywordRow, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2119,7 +2152,7 @@ pub async fn keyword_remove_from_image(
     image_id: i64,
     keyword_id: i64,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2140,7 +2173,7 @@ pub async fn keyword_remove_from_image(
 
 #[tauri::command]
 pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2173,7 +2206,7 @@ pub async fn keyword_delete(app: AppHandle, keyword_id: i64) -> Result<(), Strin
 
 #[tauri::command]
 pub async fn collections_list(app: AppHandle) -> Result<Vec<CollectionRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -2193,7 +2226,7 @@ pub async fn collections_for_image(
     app: AppHandle,
     image_id: i64,
 ) -> Result<Vec<CollectionRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2215,7 +2248,7 @@ pub async fn collection_create(
     is_smart: bool,
     query: Option<String>,
 ) -> Result<i64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2248,7 +2281,7 @@ pub async fn collection_add_images(
     collection_id: i64,
     image_ids: Vec<i64>,
 ) -> Result<usize, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2271,7 +2304,7 @@ pub async fn collection_remove_images(
     collection_id: i64,
     image_ids: Vec<i64>,
 ) -> Result<usize, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2293,7 +2326,7 @@ pub async fn collection_remove_images(
 /// live) for catalogs created before the setting existed; `None` if neither is available.
 #[tauri::command]
 pub async fn app_library_root(app: AppHandle) -> Result<Option<String>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2325,7 +2358,7 @@ pub async fn app_library_root(app: AppHandle) -> Result<Option<String>, String> 
 /// Existing photos are NOT moved — only future copy/move imports file into the new location.
 #[tauri::command]
 pub async fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2348,7 +2381,7 @@ pub async fn dedup_scan(
     app: AppHandle,
     category: String,
 ) -> Result<Vec<core_dedup::DupGroup>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -2367,6 +2400,9 @@ pub async fn dedup_scan(
     .map_err(|e| e.to_string())?
 }
 
+/// Resolve one duplicate group: keep `keep_id`, send `trash_ids` to the OS Trash and drop their
+/// rows. The Trash moves run with neither the catalog nor the publication gate locked (see
+/// [`crate::trash_flow`]); a catalog reset mid-run leaves the new catalog untouched and reports 0.
 #[tauri::command]
 pub async fn dedup_resolve(
     app: AppHandle,
@@ -2378,61 +2414,21 @@ pub async fn dedup_resolve(
     auto_keeper_id: Option<i64>,
     group_id: Option<String>,
 ) -> Result<usize, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
         "dedup_resolve",
         move || {
             let st = app.state::<AppState>();
-            let _sources = st.publications.invalidate_all_guard();
-            st.clear_source_caches();
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let res =
-                core_dedup::resolve(&db.conn, keep_id, &trash_ids).map_err(|e| e.to_string())?;
-            gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
-
-            // Behavioral log: the keeper choice + full candidate set + (if known) the auto-suggested
-            // keeper, so we can later learn keeper ranking and detect user overrides.
-            let candidates = candidate_ids.unwrap_or_else(|| {
-                let mut v = trash_ids.clone();
-                v.push(keep_id);
-                v.sort_unstable();
-                v
-            });
-            let gid = group_id.or_else(|| candidates.iter().min().map(|m| format!("dedup-{m}")));
-            let cands_json = core_library::ids_json(&candidates);
-            let ev = |event_type: &str| {
-                crate::events::stamp(
-                    st.inner(),
-                    core_library::Event {
-                        event_type: event_type.into(),
-                        group_id: gid.clone(),
-                        candidate_ids: Some(cands_json.clone()),
-                        suggestion_id: auto_keeper_id,
-                        ..Default::default()
-                    },
-                )
-            };
-            let _ = core_library::append_event(&db.conn, &ev("dedup.group_shown"));
-            let _ = core_library::append_event(
-                &db.conn,
-                &core_library::Event {
-                    chosen_id: Some(keep_id),
-                    rejected_ids: Some(core_library::ids_json(&trash_ids)),
-                    ..ev("dedup.keeper_chosen")
-                },
-            );
-            if auto_keeper_id.is_some_and(|ak| ak != keep_id) {
-                let _ = core_library::append_event(
-                    &db.conn,
-                    &core_library::Event {
-                        chosen_id: Some(keep_id),
-                        ..ev("dedup.override")
-                    },
-                );
-            }
-            Ok::<_, String>(res.trashed)
+            crate::trash_flow::run_resolve(
+                st.inner(),
+                keep_id,
+                &trash_ids,
+                candidate_ids,
+                auto_keeper_id,
+                group_id,
+            )
         },
     )
     .await
@@ -2440,23 +2436,19 @@ pub async fn dedup_resolve(
 }
 
 /// Auto-resolve all byte-identical duplicate groups (keep one copy each, trash the rest). Returns
-/// the number of files trashed. Same-capture/perceptual matches are never auto-resolved.
+/// the number of files trashed. Same-capture/perceptual matches are never auto-resolved. The Trash
+/// moves run with neither the catalog nor the publication gate locked (see [`crate::trash_flow`]);
+/// a catalog reset mid-run leaves the new catalog untouched and reports 0.
 #[tauri::command]
 pub async fn dedup_resolve_bulk(app: AppHandle) -> Result<usize, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
         "dedup_resolve_bulk",
         move || {
             let st = app.state::<AppState>();
-            let _sources = st.publications.invalidate_all_guard();
-            st.clear_source_caches();
-            let db = st.db.lock().map_err(|e| e.to_string())?;
-            let res =
-                core_dedup::auto_resolve_byte_identical(&db.conn).map_err(|e| e.to_string())?;
-            gc_orphan_thumbs(&db.conn, &st.thumbs, &res.trashed_hashes);
-            Ok::<_, String>(res.trashed)
+            crate::trash_flow::run_resolve_bulk(st.inner())
         },
     )
     .await
@@ -2472,7 +2464,7 @@ pub async fn dedup_scan_perceptual(
     threshold: u32,
 ) -> Result<Vec<core_dedup::DupGroup>, String> {
     let app2 = app.clone();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -2593,38 +2585,56 @@ pub struct ImportOptions {
 }
 
 /// Apply on-import options to the freshly-added rows under one brief lock (reuses the same
-/// core-library batch fns that back the cull / keyword / collection IPC commands).
-fn apply_import_options(st: &AppState, ids: &[i64], opts: &ImportOptions) -> Result<(), String> {
+/// core-library batch fns that back the cull / keyword / collection IPC commands), fenced on the
+/// catalog generation the import started on. A catalog replaced underneath the import holds none of
+/// these rows, so a stale epoch is not an error — there is simply nothing to apply.
+fn apply_import_options(
+    st: &AppState,
+    ids: &[i64],
+    opts: &ImportOptions,
+    epoch: core_model::identity::CatalogEpoch,
+) -> Result<(), String> {
     if ids.is_empty() {
         return Ok(());
     }
-    let mut db = st.db.lock().map_err(|e| e.to_string())?;
-    if let Some(stars) = opts.rating {
-        core_library::set_rating_many(&mut db.conn, ids, stars).map_err(|e| e.to_string())?;
-    }
-    if let Some(flag) = opts.flag.as_deref() {
-        if flag != "none" && !flag.is_empty() {
-            core_library::set_flag_many(&mut db.conn, ids, flag).map_err(|e| e.to_string())?;
+    // Lock order: publication gate before the catalog lock.
+    match st.publications.with_epoch(epoch, || -> Result<(), String> {
+        let mut db = st.db.lock().map_err(|e| e.to_string())?;
+        if let Some(stars) = opts.rating {
+            core_library::set_rating_many(&mut db.conn, ids, stars).map_err(|e| e.to_string())?;
+        }
+        if let Some(flag) = opts.flag.as_deref() {
+            if flag != "none" && !flag.is_empty() {
+                core_library::set_flag_many(&mut db.conn, ids, flag).map_err(|e| e.to_string())?;
+            }
+        }
+        for kw in &opts.keywords {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                core_library::add_keyword_to_images(&db.conn, ids, kw)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        let collection_id = match (opts.collection_id, opts.new_collection.as_deref()) {
+            (Some(id), _) => Some(id),
+            (None, Some(name)) if !name.trim().is_empty() => Some(
+                core_library::create_collection(&db.conn, name.trim(), false, None)
+                    .map_err(|e| e.to_string())?,
+            ),
+            _ => None,
+        };
+        if let Some(cid) = collection_id {
+            core_library::add_images_to_collection(&db.conn, cid, ids)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }) {
+        Ok(applied) => applied,
+        Err(core_runtime::publication::Stale) => {
+            tracing::warn!("catalog replaced during import; options skipped");
+            Ok(())
         }
     }
-    for kw in &opts.keywords {
-        let kw = kw.trim();
-        if !kw.is_empty() {
-            core_library::add_keyword_to_images(&db.conn, ids, kw).map_err(|e| e.to_string())?;
-        }
-    }
-    let collection_id = match (opts.collection_id, opts.new_collection.as_deref()) {
-        (Some(id), _) => Some(id),
-        (None, Some(name)) if !name.trim().is_empty() => Some(
-            core_library::create_collection(&db.conn, name.trim(), false, None)
-                .map_err(|e| e.to_string())?,
-        ),
-        _ => None,
-    };
-    if let Some(cid) = collection_id {
-        core_library::add_images_to_collection(&db.conn, cid, ids).map_err(|e| e.to_string())?;
-    }
-    Ok(())
 }
 
 /// Fast import listing: enumerate the RAW files under `source` from filesystem metadata only — NO
@@ -2637,7 +2647,7 @@ pub async fn import_list(
     source: String,
     recursive: Option<bool>,
 ) -> Result<Vec<core_import::SourceFile>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Import,
         false,
@@ -2663,7 +2673,7 @@ pub async fn import_dedup(
     paths: Vec<String>,
 ) -> Result<Vec<core_import::DedupResult>, String> {
     let app2 = app.clone();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Import,
         true,
@@ -2721,7 +2731,7 @@ pub async fn import_thumb(
     path: String,
     max_edge: Option<u32>,
 ) -> Result<tauri::ipc::Response, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Import,
         true,
@@ -2740,6 +2750,11 @@ pub async fn import_thumb(
 /// Commit a staged import: copy/move/reference only the `selected` source files, then apply
 /// `options` to the freshly-added rows. Emits `import:progress` (live rows) + `import:done`.
 ///
+/// Cancellable and non-durable: a job cancel or app shutdown stops the run between chunks, and the
+/// `import:done` stats then describe exactly what was committed (`interrupted`). Rows already
+/// committed stay committed — the job is marked committed at its first catalog write, so shutdown
+/// never waits for the rest of the batch.
+///
 /// `pairing` decides what happens to a JPEG/HEIF the camera wrote beside a RAW: `"pair"` links it
 /// to that RAW (one grid cell), anything else (the default) catalogs every file standalone.
 #[tauri::command]
@@ -2753,12 +2768,12 @@ pub async fn import_commit(
     pairing: Option<String>,
 ) -> Result<core_import::ImportStats, String> {
     let app2 = app.clone();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_job(
         app.clone(),
         core_app::jobs::JobClass::Import,
-        true,
+        false,
         "import_commit",
-        move || {
+        move |ctx| {
             let st = app2.state::<AppState>();
             let import_mode = match mode.as_str() {
                 "move" => core_import::ImportMode::Move,
@@ -2779,6 +2794,9 @@ pub async fn import_commit(
             // ids for the on-import options pass (single-threaded blocking import → RefCell is enough).
             let pending = std::cell::RefCell::new(Vec::<core_library::ImageRow>::new());
             let added_ids = std::cell::RefCell::new(Vec::<i64>::new());
+            // Cooperative cancellation (job cancel / app shutdown) plus the catalog generation the
+            // run started on, which every catalog commit below is fenced on.
+            let control = crate::import_control::HostImportControl::new(&st, ctx);
             let stats = core_import::import_files(
                 &st.db,
                 &st.thumbs,
@@ -2803,16 +2821,20 @@ pub async fn import_commit(
                         );
                     }
                 },
+                &control,
             )
             .map_err(|e| e.to_string())?;
 
-            apply_import_options(&st, &added_ids.into_inner(), &options)?;
+            apply_import_options(&st, &added_ids.into_inner(), &options, control.epoch())?;
             enforce_thumb_cap(&st);
+            // Always report the run: an interrupted one still has committed rows the grid must show.
             let _ = app2.emit("import:done", &stats);
-            crate::thumb_queue::enqueue_all(&app2);
-            // Freshly-imported photos get their feature vectors without the user having to know the
-            // Settings button exists. Background + skips images that already have a row.
-            crate::features::spawn_backfill(&app2);
+            if !st.workers.is_stopping() {
+                crate::thumb_queue::enqueue_all(&app2);
+                // Freshly-imported photos get their feature vectors without the user having to know the
+                // Settings button exists. Background + skips images that already have a row.
+                crate::features::spawn_backfill(&app2);
+            }
             Ok::<_, String>(stats)
         },
     )
@@ -2832,7 +2854,7 @@ pub async fn set_logs_directory(
     app: AppHandle,
     path: String,
 ) -> Result<crate::logging::LogsStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2850,7 +2872,7 @@ pub fn set_log_level(level: String) -> Result<crate::logging::LogsStatus, String
 
 #[tauri::command]
 pub async fn logs_export_zip(app: AppHandle, dest: String) -> Result<u64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Export,
         true,
@@ -2868,7 +2890,7 @@ pub fn logs_delete_all() -> Result<crate::logging::LogsStatus, String> {
 
 #[tauri::command]
 pub async fn catalog_backup_now(app: AppHandle) -> Result<crate::backup::BackupStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Maintenance,
         true,
@@ -2887,7 +2909,7 @@ pub fn catalog_backup_status(app: AppHandle) -> Result<crate::backup::BackupStat
 /// Configured thumbnail-cache cap in bytes (default when unset).
 #[tauri::command]
 pub async fn thumb_cache_cap(app: AppHandle) -> Result<u64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2905,7 +2927,7 @@ pub async fn thumb_cache_cap(app: AppHandle) -> Result<u64, String> {
 /// Current on-disk size of the thumbnail cache in bytes.
 #[tauri::command]
 pub async fn thumb_cache_size(app: AppHandle) -> Result<u64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2922,7 +2944,7 @@ pub async fn thumb_cache_size(app: AppHandle) -> Result<u64, String> {
 /// Persist a new thumbnail-cache cap and immediately evict down to it. Returns bytes freed.
 #[tauri::command]
 pub async fn set_thumb_cache_cap(app: AppHandle, bytes: u64) -> Result<u64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2944,7 +2966,7 @@ pub async fn set_thumb_cache_cap(app: AppHandle, bytes: u64) -> Result<u64, Stri
 /// from the display on first launch).
 #[tauri::command]
 pub async fn preview_edge(app: AppHandle) -> Result<u32, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -2978,7 +3000,7 @@ pub async fn set_preview_edge(app: AppHandle, edge: u32) -> Result<(), String> {
 /// Total / analyzed / pending image counts + models-ready + running flags (for the Detected panel).
 #[tauri::command]
 pub async fn analysis_status(app: AppHandle) -> Result<crate::analysis::AnalysisStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -2995,7 +3017,7 @@ pub async fn analysis_status(app: AppHandle) -> Result<crate::analysis::Analysis
 /// Download any missing model files (first run only). Emits `analysis:models` progress.
 #[tauri::command]
 pub async fn analysis_models_ensure(app: AppHandle) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3022,7 +3044,7 @@ pub async fn analysis_run(
 ) -> Result<crate::analysis::RunStats, String> {
     let scope = scope.unwrap_or_default();
     let stages = crate::scan::AI_STAGES.to_vec();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3043,7 +3065,7 @@ pub async fn scan_run(
     app: AppHandle,
     selection: crate::scan::ScanSelection,
 ) -> Result<crate::scan::ScanResult, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3077,7 +3099,7 @@ pub fn scan_running(app: AppHandle) -> bool {
 /// id must never reach a run.
 #[tauri::command]
 pub async fn scan_prefs_get(app: AppHandle) -> Result<Vec<core_library::StageId>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -3097,7 +3119,7 @@ pub async fn scan_prefs_set(
     app: AppHandle,
     stages: Vec<core_library::StageId>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3118,7 +3140,7 @@ pub async fn image_scan_state(
     app: AppHandle,
     image_id: i64,
 ) -> Result<core_library::ImageScanState, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3137,7 +3159,7 @@ pub async fn scan_scope_counts(
     scope: Option<core_library::ScanScope>,
 ) -> Result<core_library::ScopeCounts, String> {
     let scope = scope.unwrap_or_default();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3163,7 +3185,7 @@ pub fn analysis_cancel(app: AppHandle) {
 /// Denoise availability + running state (drives the Develop "Denoise" panel).
 #[tauri::command]
 pub async fn denoise_status(app: AppHandle) -> Result<crate::denoise::DenoiseStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -3182,7 +3204,7 @@ pub async fn denoise_status(app: AppHandle) -> Result<crate::denoise::DenoiseSta
 /// `denoise:progress` / `denoise:done`; the frontend re-renders on `denoise:done`.
 #[tauri::command]
 pub async fn denoise_apply(app: AppHandle, image_id: i64, amount: f32) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3197,7 +3219,7 @@ pub async fn denoise_apply(app: AppHandle, image_id: i64, amount: f32) -> Result
 /// next render re-decodes the clean image.
 #[tauri::command]
 pub async fn denoise_clear(app: AppHandle, image_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3232,7 +3254,7 @@ pub async fn panorama_preview(
     boundary_warp: f32,
     auto_crop: bool,
 ) -> Result<tauri::ipc::Response, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Viewport,
         false,
@@ -3260,14 +3282,15 @@ pub async fn panorama_merge(
     detect_group_id: Option<i64>,
 ) -> Result<i64, String> {
     let emitter = app.clone();
-    let result = crate::jobs::spawn_blocking(
+    let result = crate::jobs::spawn_job(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
         "panorama_merge",
-        move || {
+        move |ctx| {
             crate::panorama::merge(
                 &app,
+                ctx,
                 image_ids,
                 projection,
                 boundary_warp,
@@ -3297,7 +3320,7 @@ pub fn panorama_cancel(app: AppHandle) {
 
 #[tauri::command]
 pub async fn panorama_status(app: AppHandle) -> Result<crate::panorama::PanoStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -3328,7 +3351,7 @@ pub fn panorama_preview_release(app: AppHandle) {
 #[tauri::command]
 pub async fn pano_detect_run(app: AppHandle, force: bool) -> Result<usize, String> {
     let emitter = app.clone();
-    let result = crate::jobs::spawn_blocking(
+    let result = crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3354,7 +3377,7 @@ pub fn pano_detect_cancel(app: AppHandle) {
 pub async fn pano_detect_status(
     app: AppHandle,
 ) -> Result<crate::pano_detect::PanoDetectStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -3374,7 +3397,7 @@ pub async fn pano_detect_groups(
     app: AppHandle,
     include_dismissed: bool,
 ) -> Result<Vec<core_library::pano_detect::PanoGroupRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3395,7 +3418,7 @@ pub async fn pano_detect_dismiss(
     group_id: i64,
     dismissed: bool,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3416,7 +3439,7 @@ pub async fn pano_detect_mark_merged(
     group_id: i64,
     merged_image_id: i64,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3434,7 +3457,7 @@ pub async fn pano_detect_mark_merged(
 /// state, on-disk size, and per-file + per-tier detail. Drives the AI Models manager UI.
 #[tauri::command]
 pub async fn models_overview(app: AppHandle) -> Result<Vec<crate::model_mgmt::ModelGroup>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3474,7 +3497,7 @@ pub async fn models_remove(
     group: String,
     tier: Option<String>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3499,7 +3522,7 @@ pub async fn models_remove(
 /// Download the interactive-segmentation (AI masking) model weights. Emits `mask_ai:models` progress.
 #[tauri::command]
 pub async fn mask_ai_models_ensure(app: AppHandle) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3521,7 +3544,7 @@ pub fn mask_ai_ready(app: AppHandle) -> bool {
 /// use, then runs the heavy encode) so the first click segments instantly. Fire-and-forget from the UI.
 #[tauri::command]
 pub async fn mask_ai_encode(app: AppHandle, image_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3545,7 +3568,7 @@ pub async fn mask_ai_prompt(
     image_id: i64,
     points: Vec<core_pipeline::AiPoint>,
 ) -> Result<crate::segment::PromptResult, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3565,7 +3588,7 @@ pub async fn mask_ai_prompt(
 /// Detected-object category counts (distinct images) for the LeftNav facet.
 #[tauri::command]
 pub async fn analysis_facets(app: AppHandle) -> Result<Vec<FacetRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3583,7 +3606,7 @@ pub async fn analysis_facets(app: AppHandle) -> Result<Vec<FacetRow>, String> {
 /// Detected objects for one image (metadata panel).
 #[tauri::command]
 pub async fn image_detections(app: AppHandle, id: i64) -> Result<Vec<DetectionRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3601,7 +3624,7 @@ pub async fn image_detections(app: AppHandle, id: i64) -> Result<Vec<DetectionRo
 /// Generated caption + keywords for one image (metadata panel).
 #[tauri::command]
 pub async fn image_caption(app: AppHandle, id: i64) -> Result<Option<CaptionRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3619,7 +3642,7 @@ pub async fn image_caption(app: AppHandle, id: i64) -> Result<Option<CaptionRow>
 /// MobileCLIP presence-probe scores for one image (advisory AI readout; `None` until the probe ran).
 #[tauri::command]
 pub async fn image_presence(app: AppHandle, id: i64) -> Result<Option<PresenceRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3639,7 +3662,7 @@ pub async fn image_presence(app: AppHandle, id: i64) -> Result<Option<PresenceRo
 /// People status: present-image total, how many are face-processed, total faces/people, model state.
 #[tauri::command]
 pub async fn faces_status(app: AppHandle) -> Result<crate::faces::FacesStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -3656,7 +3679,7 @@ pub async fn faces_status(app: AppHandle) -> Result<crate::faces::FacesStatus, S
 /// Download any missing face models (~190 MB, first run only). Emits `faces:models` progress.
 #[tauri::command]
 pub async fn faces_models_ensure(app: AppHandle) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3680,7 +3703,7 @@ pub async fn faces_run(
     scope: Option<core_library::ScanScope>,
 ) -> Result<crate::faces::FacesRunStats, String> {
     let scope = scope.unwrap_or_default();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -3704,7 +3727,7 @@ pub fn faces_cancel(app: AppHandle) {
 /// Whether the face stage participates in the unified AI scan (Settings toggle; default on).
 #[tauri::command]
 pub async fn face_stage_enabled(app: AppHandle) -> Result<bool, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3722,7 +3745,7 @@ pub async fn face_stage_enabled(app: AppHandle) -> Result<bool, String> {
 /// Enable/disable the face stage in the unified scan.
 #[tauri::command]
 pub async fn set_face_stage_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3740,7 +3763,7 @@ pub async fn set_face_stage_enabled(app: AppHandle, enabled: bool) -> Result<(),
 /// People for the sidebar (named first, then unnamed "Suggested" clusters); each with a cover crop.
 #[tauri::command]
 pub async fn people_list(app: AppHandle, include_hidden: bool) -> Result<Vec<PersonRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -3762,7 +3785,7 @@ pub async fn person_faces(
     person_id: i64,
     status: Option<String>,
 ) -> Result<Vec<PersonFaceRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3781,7 +3804,7 @@ pub async fn person_faces(
 /// Faces detected in one image (+ their person names) — the RightInfo "People" chips.
 #[tauri::command]
 pub async fn image_faces(app: AppHandle, id: i64) -> Result<Vec<ImageFaceRow>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3803,7 +3826,7 @@ pub async fn person_set_name(
     person_id: i64,
     name: Option<String>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3827,7 +3850,7 @@ pub async fn person_set_name(
 /// Hide/unhide a person (excluded from the sidebar + library filter when hidden).
 #[tauri::command]
 pub async fn person_set_hidden(app: AppHandle, person_id: i64, hidden: bool) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3846,7 +3869,7 @@ pub async fn person_set_hidden(app: AppHandle, person_id: i64, hidden: bool) -> 
 /// Set a person's cover (key) face. The face must belong to the person.
 #[tauri::command]
 pub async fn person_set_cover(app: AppHandle, person_id: i64, face_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3865,7 +3888,7 @@ pub async fn person_set_cover(app: AppHandle, person_id: i64, face_id: i64) -> R
 /// Merge person `src` into `dst` (move all faces + rejections, delete `src`). Atomic; not reversible.
 #[tauri::command]
 pub async fn person_merge(app: AppHandle, dst: i64, src: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3885,7 +3908,7 @@ pub async fn person_merge(app: AppHandle, dst: i64, src: i64) -> Result<(), Stri
 /// Confirm a face belongs to its person ("yes" in the Review flow).
 #[tauri::command]
 pub async fn face_confirm(app: AppHandle, face_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3903,7 +3926,7 @@ pub async fn face_confirm(app: AppHandle, face_id: i64) -> Result<(), String> {
 /// Reject a face from its person ("not this person") — unlink + remember the rejection.
 #[tauri::command]
 pub async fn face_reject(app: AppHandle, face_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3925,7 +3948,7 @@ pub async fn face_assign(
     face_id: i64,
     person_id: Option<i64>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3944,7 +3967,7 @@ pub async fn face_assign(
 /// Delete ALL face + person data (privacy "Delete all face data"). Atomic; not reversible.
 #[tauri::command]
 pub async fn faces_delete_all(app: AppHandle) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -3976,7 +3999,7 @@ pub async fn suggest_train(app: AppHandle) -> Result<(), String> {
 /// The suggester's state: live-model metrics, the label census by provenance, and scored counts.
 #[tauri::command]
 pub async fn suggest_status(app: AppHandle) -> Result<core_library::SuggestStatus, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -4001,7 +4024,7 @@ pub async fn suggest_status(app: AppHandle) -> Result<core_library::SuggestStatu
 #[tauri::command]
 pub async fn features_backfill(app: AppHandle) -> Result<usize, String> {
     let app2 = app.clone();
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -4017,7 +4040,7 @@ pub async fn features_backfill(app: AppHandle) -> Result<usize, String> {
 /// Develop histogram), falling back to the camera placeholder. `None` if nothing is cached yet.
 #[tauri::command]
 pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<Histogram>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -4056,7 +4079,7 @@ pub async fn image_histogram(app: AppHandle, image_id: i64) -> Result<Option<His
 /// "Source frames" section. `None` when `image_id` is an ordinary, un-merged image.
 #[tauri::command]
 pub async fn image_sources(app: AppHandle, image_id: i64) -> Result<Option<MergeSources>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4078,7 +4101,7 @@ pub async fn image_pair(
     app: AppHandle,
     image_id: i64,
 ) -> Result<Option<core_library::PairInfo>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4097,7 +4120,7 @@ pub async fn image_pair(
 /// Files on disk are untouched — this only drops the catalog link.
 #[tauri::command]
 pub async fn image_pair_unlink(app: AppHandle, secondary_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4121,7 +4144,7 @@ pub async fn image_pair_unlink(app: AppHandle, secondary_id: i64) -> Result<(), 
 /// existing catalog onto the durable on-disk format. Returns the count written.
 #[tauri::command]
 pub async fn sidecars_write_all(app: AppHandle) -> Result<usize, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Sidecar,
         true,
@@ -4140,7 +4163,7 @@ pub async fn sidecars_write_all(app: AppHandle) -> Result<usize, String> {
 /// after a catalog loss or when moving between machines). Returns the count hydrated.
 #[tauri::command]
 pub async fn sidecars_rebuild(app: AppHandle) -> Result<usize, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Sidecar,
         true,
@@ -4158,7 +4181,7 @@ pub async fn sidecars_rebuild(app: AppHandle) -> Result<usize, String> {
 /// Manual ground-truth labels for one image (the "Contains person/animal" checkboxes).
 #[tauri::command]
 pub async fn image_user_labels(app: AppHandle, id: i64) -> Result<UserLabels, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4181,7 +4204,7 @@ pub async fn set_image_user_label(
     field: String,
     value: Option<bool>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4207,7 +4230,7 @@ pub async fn set_image_user_label_many(
     value: Option<bool>,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4249,7 +4272,7 @@ pub async fn set_image_user_label_many(
 /// Configured MegaDetector input size (640 or 1280).
 #[tauri::command]
 pub async fn analysis_detector_size(app: AppHandle) -> Result<u32, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4279,7 +4302,7 @@ fn clear_analyzer_cache(_st: &AppState) -> Result<(), String> {
 /// rebuilds at the new resolution.
 #[tauri::command]
 pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4301,7 +4324,7 @@ pub async fn set_analysis_detector_size(app: AppHandle, size: u32) -> Result<(),
 /// Configured AI-masking quality tier (`"realtime"` | `"balanced"` | `"max"`).
 #[tauri::command]
 pub async fn mask_ai_tier_get(app: AppHandle) -> Result<String, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -4320,7 +4343,7 @@ pub async fn mask_ai_tier_get(app: AppHandle) -> Result<String, String> {
 /// change swaps the encoder); the segmenter itself rebuilds lazily when the tier differs.
 #[tauri::command]
 pub async fn mask_ai_tier_set(app: AppHandle, tier: String) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Analysis,
         false,
@@ -4437,7 +4460,7 @@ fn validate_sparse_params(
 /// All presets (summaries) for the panel.
 #[tauri::command]
 pub async fn presets_list(app: AppHandle) -> Result<Vec<core_library::PresetSummary>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -4458,7 +4481,7 @@ pub async fn presets_get(
     app: AppHandle,
     preset_id: i64,
 ) -> Result<Option<core_library::PresetFull>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -4483,7 +4506,7 @@ pub async fn presets_save(
     is_favorite: Option<bool>,
     params: DevelopParams,
 ) -> Result<i64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4527,7 +4550,7 @@ pub async fn presets_update(
     is_favorite: Option<bool>,
     sort_order: Option<i64>,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4559,7 +4582,7 @@ pub async fn presets_update(
 /// Delete a user preset (built-ins are refused).
 #[tauri::command]
 pub async fn presets_delete(app: AppHandle, preset_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4580,7 +4603,7 @@ pub async fn presets_delete(app: AppHandle, preset_id: i64) -> Result<(), String
 /// Duplicate a preset (including a built-in) as a new editable user preset.
 #[tauri::command]
 pub async fn presets_duplicate(app: AppHandle, preset_id: i64) -> Result<i64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4626,7 +4649,7 @@ pub async fn presets_apply(
     amount: Option<f32>,
     replace_all: Option<bool>,
 ) -> Result<DevelopParams, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4660,7 +4683,7 @@ pub async fn develop_apply_settings(
     amount: Option<f32>,
     replace_all: Option<bool>,
 ) -> Result<DevelopParams, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4686,7 +4709,7 @@ pub async fn presets_export(
     preset_id: i64,
     dest_path: String,
 ) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Export,
         true,
@@ -4773,7 +4796,7 @@ pub async fn presets_import_file(
     app: AppHandle,
     src_path: String,
 ) -> Result<PresetImportResult, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Import,
         true,
@@ -4824,7 +4847,7 @@ pub async fn snapshots_list(
     app: AppHandle,
     image_id: i64,
 ) -> Result<Vec<core_library::SnapshotSummary>, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         false,
@@ -4847,7 +4870,7 @@ pub async fn snapshot_create(
     name: String,
     params: DevelopParams,
 ) -> Result<i64, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4877,7 +4900,7 @@ pub async fn snapshot_create(
 /// commits the returned params so the restore becomes an undoable step.
 #[tauri::command]
 pub async fn snapshot_restore(app: AppHandle, snapshot_id: i64) -> Result<DevelopParams, String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4901,7 +4924,7 @@ pub async fn snapshot_restore(app: AppHandle, snapshot_id: i64) -> Result<Develo
 /// Rename a snapshot.
 #[tauri::command]
 pub async fn snapshot_rename(app: AppHandle, snapshot_id: i64, name: String) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4919,7 +4942,7 @@ pub async fn snapshot_rename(app: AppHandle, snapshot_id: i64, name: String) -> 
 /// Delete a snapshot.
 #[tauri::command]
 pub async fn snapshot_delete(app: AppHandle, snapshot_id: i64) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
         true,
@@ -4950,12 +4973,12 @@ pub async fn snapshot_delete(app: AppHandle, snapshot_id: i64) -> Result<(), Str
 pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, String> {
     use std::sync::atomic::AtomicBool;
 
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_job(
         app.clone(),
         core_app::jobs::JobClass::Import,
-        true,
+        false,
         "hdr_merge",
-        move || {
+        move |ctx| {
             let st = app.state::<AppState>();
 
             // Single-flight: a merge decodes N full-res RAWs; a second one would thrash memory.
@@ -4976,6 +4999,12 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
             // Gate the FS watcher so it can't index the freshly-renamed EXR before our own catalog
             // step (insert is hash-idempotent, but the watcher path would race the returned row).
             let _watch_guard = crate::watch::ImportGuard::new(app.clone());
+            // The user's stop flag, a shutdown, or a supervisor cancel all stop the job.
+            let cancelled = || {
+                st.workers.is_stopping()
+                    || st.hdr_cancel.load(Ordering::SeqCst)
+                    || ctx.is_cancel_requested()
+            };
 
             // Dedupe while preserving selection order — a duplicate id would double-count a frame and
             // skew the exposure-weighted merge.
@@ -5047,6 +5076,12 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                     })
                     .collect::<Result<_, String>>()?
             };
+            // Fence the inputs now: the minutes of unlocked decode below must not let a deleted
+            // source's rowid be reused before we attach `hdr_sources` provenance to it.
+            let tokens = crate::source_fence::capture_sources(
+                &st,
+                &frames.iter().map(|f| f.id).collect::<Vec<_>>(),
+            )?;
 
             // Numeric exposure per frame → EV, reference (median EV), shortest (max EV). Metadata-only
             // (no pixel decode) alongside, to catch a mixed-camera selection before the expensive
@@ -5135,7 +5170,7 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                     continue;
                 }
                 // Poll cancel between frames (each frame is a multi-second decode + align + warp).
-                if st.hdr_cancel.load(Ordering::SeqCst) {
+                if cancelled() {
                     return Err("cancelled".to_string());
                 }
                 let src = core_raw::source_from_path(&frame.path)
@@ -5231,7 +5266,7 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
             core_raw::write_hdr_exr(&dest, &merged, &meta, &sources, ref_idx)
                 .map_err(|e| e.to_string())?;
             drop(merged);
-            if st.hdr_cancel.load(Ordering::SeqCst) {
+            if cancelled() {
                 let _ = std::fs::remove_file(&dest);
                 return Err("cancelled".into());
             }
@@ -5250,33 +5285,53 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
             // Any catalog failure after a successful write would leave the EXR orphaned on disk —
             // remove it on every error path out of this block (the collision branch's own remove
             // stays; a second remove is a no-op).
-            let id = (|| -> Result<i64, String> {
-                let db = st.db.lock().map_err(|e| e.to_string())?;
-                let conn = &db.conn;
-                let folder_id = match &library_root {
-                    Some(root) => {
-                        core_library::add_root(conn, Path::new(root)).map_err(|e| e.to_string())?
-                    }
-                    None if frames[ref_idx].folder_id >= 0 => frames[ref_idx].folder_id,
-                    None => core_library::add_root(conn, &ref_parent).map_err(|e| e.to_string())?,
-                };
-                let id = core_library::insert_hdr_image(
-                    conn,
-                    folder_id,
-                    core_library::index::now_epoch(),
-                    &processed,
-                    &sources,
-                )
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    // Byte-identical EXR already catalogued (same bracket merged before).
-                    "an identical merge of these frames is already in the library".to_string()
+            let id = st
+                .publications
+                .tokens_guard(&tokens)
+                .map(|mut guard| -> Result<i64, String> {
+                    let db = st.db.lock().map_err(|e| e.to_string())?;
+                    let conn = &db.conn;
+                    let folder_id = match &library_root {
+                        Some(root) => core_library::add_root(conn, Path::new(root))
+                            .map_err(|e| e.to_string())?,
+                        None if frames[ref_idx].folder_id >= 0 => frames[ref_idx].folder_id,
+                        None => {
+                            core_library::add_root(conn, &ref_parent).map_err(|e| e.to_string())?
+                        }
+                    };
+                    let id = core_library::insert_hdr_image(
+                        conn,
+                        folder_id,
+                        core_library::index::now_epoch(),
+                        &processed,
+                        &sources,
+                    )
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        // Byte-identical EXR already catalogued (same bracket merged before).
+                        "an identical merge of these frames is already in the library".to_string()
+                    })?;
+                    // Register the committed row's identity while the gate is still held: the
+                    // rowid may be one retired by an earlier delete (`images.id` has no
+                    // AUTOINCREMENT), and an unregistered reuse would stay Stale until restart.
+                    guard.replace_source(
+                        core_model::identity::ImageId(id),
+                        core_runtime::publication::SourceKey {
+                            hash: processed.content_hash_hex.clone(),
+                            path: processed.path.clone(),
+                        },
+                    );
+                    Ok(id)
+                })
+                .map_err(|_| {
+                    "a source photo changed during the merge; nothing was published".to_string()
+                })
+                .flatten()
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&dest);
                 })?;
-                Ok(id)
-            })()
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(&dest);
-            })?;
+            // Image + provenance committed; a later cancel must not retire the published row.
+            ctx.mark_committed();
             // The image and its provenance are committed now. A response-query failure must not
             // remove the successfully published file and leave a dangling catalog row.
             let row = {
@@ -5315,7 +5370,7 @@ pub fn hdr_cancel(app: AppHandle) {
 /// catalog (Darkroom itself always reads the source `.exr`).
 #[tauri::command]
 pub async fn hdr_export_dng(app: AppHandle, image_id: i64, dest: String) -> Result<(), String> {
-    crate::jobs::spawn_blocking(
+    crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::Export,
         true,

@@ -33,7 +33,101 @@ pub struct TrashOutcome {
     pub trashed: usize,
     /// Files that could not be trashed (permissions, locked volume); their rows were left intact.
     pub failed: usize,
+    /// Trashed file whose row was repointed or replaced before finalize; the row was left untouched.
+    pub changed: usize,
     pub hashes: Vec<String>,
+}
+
+/// One file the catalog intends to trash, as it was when planned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashTarget {
+    pub id: i64,
+    pub path: String,
+    pub hash_hex: String,
+}
+
+/// Brief lock: snapshot (id, path, content hash) for each id; ids without a row are skipped.
+pub fn plan_trash(conn: &Connection, ids: &[i64]) -> Result<Vec<TrashTarget>, LibError> {
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let row: Option<(String, Vec<u8>)> = conn
+            .query_row(
+                "SELECT path, content_hash FROM images WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((path, hash)) = row {
+            out.push(TrashTarget {
+                id,
+                path,
+                hash_hex: hex_lower(&hash),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// No catalog access. Trash each target's file (and its `.json` sidecar, best-effort) with
+/// `remove`; returns the targets whose file is now gone (already-missing counts as gone) and the
+/// number that failed.
+pub fn trash_files(
+    targets: &[TrashTarget],
+    remove: &dyn Fn(&Path) -> bool,
+) -> (Vec<TrashTarget>, usize) {
+    let mut gone = Vec::new();
+    let mut failed = 0usize;
+    for t in targets {
+        let p = Path::new(&t.path);
+        if p.exists() && !remove(p) {
+            failed += 1;
+            continue; // leave the row intact — the file is still there
+        }
+        // Best-effort: the sidecar carries only derived state, so a failure here is not fatal.
+        let sidecar = crate::sidecar::sidecar_path(&t.path);
+        if sidecar.exists() {
+            remove(&sidecar);
+        }
+        gone.push(t.clone());
+    }
+    (gone, failed)
+}
+
+/// Brief lock: in one transaction delete each gone target's row ONLY if the row still has the same
+/// path and content hash as planned (a row repointed/replaced meanwhile is kept and counted in
+/// [`TrashOutcome::changed`]). Returns trashed (rows removed), failed (passed through), hashes of
+/// removed rows.
+pub fn finalize_trash(
+    conn: &Connection,
+    gone: &[TrashTarget],
+    failed: usize,
+) -> Result<TrashOutcome, LibError> {
+    let mut out = TrashOutcome {
+        failed,
+        ..TrashOutcome::default()
+    };
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut del = tx.prepare(
+            "DELETE FROM images WHERE id = ?1 AND path = ?2 AND lower(hex(content_hash)) = ?3",
+        )?;
+        let mut still = tx.prepare("SELECT 1 FROM images WHERE id = ?1")?;
+        for t in gone {
+            if del.execute(params![t.id, t.path, t.hash_hex])? > 0 {
+                out.trashed += 1;
+                out.hashes.push(t.hash_hex.clone());
+                continue;
+            }
+            // Zero rows deleted: either the row vanished on its own (not our business) or its
+            // path/hash moved under us — only the latter is a repoint we deliberately preserved.
+            let kept: Option<i64> = still.query_row(params![t.id], |r| r.get(0)).optional()?;
+            if kept.is_some() {
+                out.changed += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(out)
 }
 
 /// Send each image's file (and its `.json` sidecar) to the Trash, then drop the rows of those whose
@@ -53,44 +147,9 @@ pub fn trash_images_with(
     ids: &[i64],
     remove: &dyn Fn(&Path) -> bool,
 ) -> Result<TrashOutcome, LibError> {
-    let mut out = TrashOutcome::default();
-    let mut to_delete: Vec<i64> = Vec::with_capacity(ids.len());
-
-    for &id in ids {
-        let row: Option<(String, Vec<u8>)> = conn
-            .query_row(
-                "SELECT path, content_hash FROM images WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((path, hash)) = row else { continue };
-
-        let p = Path::new(&path);
-        if p.exists() && !remove(p) {
-            out.failed += 1;
-            continue; // leave the row intact — the file is still there
-        }
-        // Best-effort: the sidecar carries only derived state, so a failure here is not fatal.
-        let sidecar = crate::sidecar::sidecar_path(&path);
-        if sidecar.exists() {
-            remove(&sidecar);
-        }
-        to_delete.push(id);
-        out.hashes.push(hex_lower(&hash));
-    }
-
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare("DELETE FROM images WHERE id = ?1")?;
-        for id in &to_delete {
-            stmt.execute(params![id])?;
-        }
-    }
-    tx.commit()?;
-
-    out.trashed = to_delete.len();
-    Ok(out)
+    let targets = plan_trash(conn, ids)?;
+    let (gone, failed) = trash_files(&targets, remove);
+    finalize_trash(conn, &gone, failed)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
