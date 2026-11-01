@@ -189,14 +189,131 @@ fn gui(name: &str) -> bool {
         || name.starts_with("egui-")
 }
 
-fn service(name: &str) -> bool {
-    (name.starts_with("core-") && !matches!(name, "core-model" | "core-app"))
-        || matches!(
-            name,
-            "rusqlite" | "sqlx" | "diesel" | "sqlite" | "libsqlite3-sys"
-        )
-        || name.starts_with("sqlx-")
+fn tauri(name: &str) -> bool {
+    name == "tauri" || name.starts_with("tauri-")
+}
+
+fn sql(name: &str) -> bool {
+    matches!(
+        name,
+        "rusqlite" | "sqlx" | "diesel" | "sqlite" | "libsqlite3-sys"
+    ) || name.starts_with("sqlx-")
         || name.starts_with("diesel-")
+}
+
+fn wgpu_family(name: &str) -> bool {
+    matches!(
+        name,
+        "wgpu" | "wgpu-core" | "wgpu-hal" | "wgpu-types" | "naga"
+    )
+}
+
+/// Architectural role of a package, driving the forbidden-reachability matrix in [`check`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    Model,
+    App,
+    Runtime,
+    Engine,
+    Renderer,
+    Ui,
+    Host,
+    External,
+}
+
+impl Role {
+    fn label(self) -> &'static str {
+        match self {
+            Role::Model => "model",
+            Role::App => "app",
+            Role::Runtime => "runtime",
+            Role::Engine => "engine",
+            Role::Renderer => "renderer",
+            Role::Ui => "ui",
+            Role::Host => "host",
+            Role::External => "external",
+        }
+    }
+}
+
+fn role(package_name: &str, manifest_path: &str) -> Role {
+    let manifest = manifest_path.replace('\\', "/");
+    match package_name {
+        "core-model" => Role::Model,
+        "core-app" => Role::App,
+        "core-runtime" => Role::Runtime,
+        // Crate does not exist yet; the rule is enforced the day `render-wgpu` lands.
+        "render-wgpu" => Role::Renderer,
+        "ui-egui" => Role::Ui,
+        "darkroom" | "darkroom-native" => Role::Host,
+        // The layer checker itself is exempt from the matrix.
+        "xtask" => Role::External,
+        _ => {
+            if manifest.ends_with("/apps/darkroom/Cargo.toml")
+                || manifest.ends_with("/src-tauri/Cargo.toml")
+            {
+                Role::Host
+            } else if package_name.starts_with("core-") {
+                Role::Engine
+            } else {
+                Role::External
+            }
+        }
+    }
+}
+
+/// Whether `from` (role of the source package, `from_native_host` true for the
+/// `apps/darkroom` host but not the legacy `src-tauri` host) may not reach a
+/// package of role `to` named `to_name`.
+fn forbidden(from: Role, to: Role, from_native_host: bool, to_name: &str) -> bool {
+    match from {
+        Role::Model => {
+            matches!(
+                to,
+                Role::App | Role::Runtime | Role::Engine | Role::Renderer | Role::Ui | Role::Host
+            ) || gui(to_name)
+                || sql(to_name)
+                || wgpu_family(to_name)
+                || to_name == "bytemuck"
+        }
+        Role::App => {
+            matches!(
+                to,
+                Role::Runtime | Role::Engine | Role::Renderer | Role::Ui | Role::Host
+            ) || gui(to_name)
+                || sql(to_name)
+                || wgpu_family(to_name)
+                || to_name == "bytemuck"
+        }
+        Role::Engine => {
+            matches!(
+                to,
+                Role::App | Role::Runtime | Role::Renderer | Role::Ui | Role::Host
+            ) || gui(to_name)
+        }
+        Role::Renderer => {
+            matches!(to, Role::App | Role::Runtime | Role::Ui | Role::Host)
+                || gui(to_name)
+                || sql(to_name)
+                || tauri(to_name)
+        }
+        Role::Runtime => {
+            matches!(to, Role::Renderer | Role::Ui | Role::Host)
+                || gui(to_name)
+                || wgpu_family(to_name)
+        }
+        // Ui may use egui and Model/App; wgpu types arrive only via Renderer.
+        Role::Ui => {
+            matches!(
+                to,
+                Role::Runtime | Role::Engine | Role::Renderer | Role::Host
+            ) || sql(to_name)
+                || tauri(to_name)
+        }
+        // apps/darkroom is the native executable: no tauri. src-tauri is the legacy host: no new rules.
+        Role::Host => from_native_host && tauri(to_name),
+        Role::External => false,
+    }
 }
 
 fn check(metadata: &Metadata) -> Result<(), String> {
@@ -218,29 +335,26 @@ fn check(metadata: &Metadata) -> Result<(), String> {
             .manifest_path
             .replace('\\', "/")
             .ends_with("/apps/darkroom/Cargo.toml");
-        let core = package.name.starts_with("core-");
-        let ui = package.name == "ui-egui";
+        let from = role(&package.name, &package.manifest_path);
         for dep in graph.reachable(id) {
             if dep == *id {
                 continue;
             }
             let target = graph.packages[dep];
-            if (core && gui(&target.name))
-                || (matches!(package.name.as_str(), "core-model" | "core-app")
-                    && (service(&target.name)
-                        || matches!(
-                            target.name.as_str(),
-                            "wgpu" | "wgpu-core" | "wgpu-hal" | "bytemuck"
-                        )))
-                || (ui && service(&target.name))
-                || (native && (target.name == "tauri" || target.name.starts_with("tauri-")))
-            {
+            let to = role(&target.name, &target.manifest_path);
+            if forbidden(from, to, native, &target.name) {
                 errors.push(format!(
-                    "{} may not reach {} ({})",
-                    package.name, target.name, target.version
+                    "{} may not reach {} ({}) [{} -> {}]",
+                    package.name,
+                    target.name,
+                    target.version,
+                    from.label(),
+                    to.label()
                 ));
             }
-            if (native || package.name == "core-pipeline") && target.name == "wgpu" {
+            if (native || package.name == "core-pipeline" || from == Role::Renderer)
+                && target.name == "wgpu"
+            {
                 wgpu.insert(target.id.as_str());
             }
         }

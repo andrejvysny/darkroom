@@ -341,6 +341,250 @@ fn model_rejects_gpu_database_engine_and_gui_dependencies_transitively() {
 }
 
 #[test]
+fn role_matrix_rejects_each_forbidden_edge() {
+    // (from, forbidden target, from-role, target-role); roles resolve by package name,
+    // so the default `/repo/crates/{name}/Cargo.toml` manifest is correct for these.
+    for (from, to, from_role, to_role) in [
+        ("core-raw", "core-app", "engine", "app"),
+        ("core-raw", "core-runtime", "engine", "runtime"),
+        ("core-library", "ui-egui", "engine", "ui"),
+        ("render-wgpu", "core-app", "renderer", "app"),
+        ("render-wgpu", "core-runtime", "renderer", "runtime"),
+        ("render-wgpu", "egui", "renderer", "external"),
+        ("render-wgpu", "rusqlite", "renderer", "external"),
+        ("core-runtime", "render-wgpu", "runtime", "renderer"),
+        ("core-runtime", "egui", "runtime", "external"),
+        ("core-runtime", "wgpu", "runtime", "external"),
+        ("ui-egui", "core-runtime", "ui", "runtime"),
+        ("ui-egui", "core-library", "ui", "engine"),
+        ("core-model", "core-app", "model", "app"),
+        ("core-app", "core-runtime", "app", "runtime"),
+    ] {
+        let data = metadata(
+            vec![
+                package(from, "1.0.0", vec![declared(to, None, "normal", None)]),
+                package(to, "1.0.0", vec![]),
+            ],
+            vec![&format!("{from}@1.0.0")[..]],
+            vec![
+                node(
+                    from,
+                    "1.0.0",
+                    vec![(to.replace('-', "_").as_str(), to, "1.0.0")],
+                ),
+                node(to, "1.0.0", vec![]),
+            ],
+        );
+        assert!(check(&data).unwrap_err().contains(&format!(
+            "{from} may not reach {to} (1.0.0) [{from_role} -> {to_role}]"
+        )));
+    }
+}
+
+#[test]
+fn engine_rejects_host_package() {
+    let mut host = package("darkroom-native", "1.0.0", vec![]);
+    host["manifest_path"] = json!("/repo/apps/darkroom/Cargo.toml");
+    let data = metadata(
+        vec![
+            package(
+                "core-import",
+                "1.0.0",
+                vec![declared("darkroom-native", None, "normal", None)],
+            ),
+            host,
+        ],
+        vec!["core-import@1.0.0"],
+        vec![
+            node(
+                "core-import",
+                "1.0.0",
+                vec![("darkroom_native", "darkroom-native", "1.0.0")],
+            ),
+            node("darkroom-native", "1.0.0", vec![]),
+        ],
+    );
+    assert!(check(&data)
+        .unwrap_err()
+        .contains("core-import may not reach darkroom-native (1.0.0) [engine -> host]"));
+}
+
+#[test]
+fn role_matrix_rejects_transitive_engine_to_app() {
+    let data = metadata(
+        vec![
+            package(
+                "core-raw",
+                "1.0.0",
+                vec![declared("helper", None, "normal", None)],
+            ),
+            package(
+                "helper",
+                "1.0.0",
+                vec![declared("core-app", None, "normal", None)],
+            ),
+            package("core-app", "1.0.0", vec![]),
+        ],
+        vec!["core-raw@1.0.0"],
+        vec![
+            node("core-raw", "1.0.0", vec![("helper", "helper", "1.0.0")]),
+            node("helper", "1.0.0", vec![("core_app", "core-app", "1.0.0")]),
+            node("core-app", "1.0.0", vec![]),
+        ],
+    );
+    assert!(check(&data)
+        .unwrap_err()
+        .contains("core-raw may not reach core-app (1.0.0) [engine -> app]"));
+}
+
+#[test]
+fn role_matrix_rejects_aliased_engine_to_app_dependency() {
+    let data = metadata(
+        vec![
+            package(
+                "core-raw",
+                "1.0.0",
+                vec![declared("core-app", Some("domain"), "normal", None)],
+            ),
+            package("core-app", "1.0.0", vec![]),
+        ],
+        vec!["core-raw@1.0.0"],
+        vec![
+            node("core-raw", "1.0.0", vec![("domain", "core-app", "1.0.0")]),
+            node("core-app", "1.0.0", vec![]),
+        ],
+    );
+    assert!(check(&data)
+        .unwrap_err()
+        .contains("core-raw may not reach core-app (1.0.0) [engine -> app]"));
+}
+
+#[test]
+fn role_matrix_accepts_valid_layered_graph() {
+    let mut host = package(
+        "darkroom-native",
+        "1.0.0",
+        vec![
+            declared("ui-egui", None, "normal", None),
+            declared("core-app", None, "normal", None),
+            declared("core-runtime", None, "normal", None),
+            declared("core-raw", None, "normal", None),
+            declared("core-pipeline", None, "normal", None),
+            declared("render-wgpu", None, "normal", None),
+            declared("wgpu", None, "normal", None),
+            declared("egui", None, "normal", None),
+        ],
+    );
+    host["manifest_path"] = json!("/repo/apps/darkroom/Cargo.toml");
+    let data = metadata(
+        vec![
+            package(
+                "ui-egui",
+                "1.0.0",
+                vec![declared("core-app", None, "normal", None)],
+            ),
+            package(
+                "core-app",
+                "1.0.0",
+                vec![declared("core-model", None, "normal", None)],
+            ),
+            package("core-model", "1.0.0", vec![]),
+            package(
+                "core-runtime",
+                "1.0.0",
+                vec![
+                    declared("core-app", None, "normal", None),
+                    declared("core-raw", None, "normal", None),
+                ],
+            ),
+            package("core-raw", "1.0.0", vec![]),
+            package(
+                "render-wgpu",
+                "1.0.0",
+                vec![
+                    declared("core-pipeline", None, "normal", None),
+                    declared("core-model", None, "normal", None),
+                ],
+            ),
+            package(
+                "core-pipeline",
+                "1.0.0",
+                vec![
+                    declared("core-model", None, "normal", None),
+                    declared("core-raw", None, "normal", None),
+                    declared("wgpu", None, "normal", None),
+                ],
+            ),
+            package("wgpu", "30.0.1", vec![]),
+            package("egui", "0.37.0", vec![]),
+            host,
+        ],
+        vec![
+            "ui-egui@1.0.0",
+            "core-app@1.0.0",
+            "core-model@1.0.0",
+            "core-runtime@1.0.0",
+            "core-raw@1.0.0",
+            "render-wgpu@1.0.0",
+            "core-pipeline@1.0.0",
+            "darkroom-native@1.0.0",
+        ],
+        vec![
+            node("ui-egui", "1.0.0", vec![("core_app", "core-app", "1.0.0")]),
+            node(
+                "core-app",
+                "1.0.0",
+                vec![("core_model", "core-model", "1.0.0")],
+            ),
+            node("core-model", "1.0.0", vec![]),
+            node(
+                "core-runtime",
+                "1.0.0",
+                vec![
+                    ("core_app", "core-app", "1.0.0"),
+                    ("core_raw", "core-raw", "1.0.0"),
+                ],
+            ),
+            node("core-raw", "1.0.0", vec![]),
+            node(
+                "render-wgpu",
+                "1.0.0",
+                vec![
+                    ("core_pipeline", "core-pipeline", "1.0.0"),
+                    ("core_model", "core-model", "1.0.0"),
+                ],
+            ),
+            node(
+                "core-pipeline",
+                "1.0.0",
+                vec![
+                    ("core_model", "core-model", "1.0.0"),
+                    ("core_raw", "core-raw", "1.0.0"),
+                    ("wgpu", "wgpu", "30.0.1"),
+                ],
+            ),
+            node("wgpu", "30.0.1", vec![]),
+            node("egui", "0.37.0", vec![]),
+            node(
+                "darkroom-native",
+                "1.0.0",
+                vec![
+                    ("ui_egui", "ui-egui", "1.0.0"),
+                    ("core_app", "core-app", "1.0.0"),
+                    ("core_runtime", "core-runtime", "1.0.0"),
+                    ("core_raw", "core-raw", "1.0.0"),
+                    ("core_pipeline", "core-pipeline", "1.0.0"),
+                    ("render_wgpu", "render-wgpu", "1.0.0"),
+                    ("wgpu", "wgpu", "30.0.1"),
+                    ("egui", "egui", "0.37.0"),
+                ],
+            ),
+        ],
+    );
+    assert!(check(&data).is_ok());
+}
+
+#[test]
 fn application_rejects_gpu_database_engine_and_gui_dependencies_transitively() {
     for forbidden in [
         "wgpu",

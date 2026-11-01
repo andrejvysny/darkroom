@@ -99,10 +99,10 @@
     {
       "name": "cull_delete_rejected",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Send every rejected photo matching `params` (plus the camera companions of a rejected RAW) to the OS Trash and drop its catalog rows.  The frontend passes only the *filter*, never image ids: the target set is re-derived here with the `reject` flag forced on (`core_library::rejected_ids`), so a stale or malformed request can never reach a picked or unflagged photo. Files remain recoverable from the Trash; the catalog removal is not undoable in-app.",
+      "behavior": "Send every rejected photo matching `params` (plus the camera companions of a rejected RAW) to the OS Trash and drop its catalog rows.  The frontend passes only the *filter*, never image ids: the target set is re-derived here with the `reject` flag forced on (`core_library::rejected_ids`), so a stale or malformed request can never reach a picked or unflagged photo. Files remain recoverable from the Trash; the catalog removal is not undoable in-app.  Runs as plan (brief lock: snapshot targets, retire their publication identities) \u2192 Trash IO with neither the catalog nor the publication gate locked \u2192 fenced finalize that deletes only rows still matching their planned path + content hash; a catalog reset mid-run leaves the new catalog untouched. Sources are retired per source, never a global epoch bump, so concurrent imports/indexes are not aborted as stale.",
       "target": "core-app",
       "task": "DARKROOM-146",
-      "test": "coverage gap: command-specific parity test not yet identified"
+      "test": "crates/core-library/tests/delete_rejected.rs"
     },
     {
       "name": "keywords_list",
@@ -243,18 +243,18 @@
     {
       "name": "dedup_resolve",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Keep selected image, move selected duplicate files to Trash, return count and clean orphan thumbnails.",
+      "behavior": "Keep selected image, move selected duplicate files to Trash, return count and clean orphan thumbnails.  Runs as plan (brief lock: snapshot victims, retire their publication identities) \u2192 Trash IO with neither the catalog nor the publication gate locked \u2192 fenced finalize that deletes only victim rows still matching their planned path + content hash; a catalog reset mid-run leaves the new catalog untouched. The keeper's file and row are re-checked before every move: if either vanishes the run aborts and kept rows stay in the catalog. Sources are retired per source, never a global epoch bump.",
       "target": "core-app",
       "task": "DARKROOM-148",
-      "test": "coverage gap: command-specific parity test not yet identified"
+      "test": "crates/core-dedup/tests/resolve.rs"
     },
     {
       "name": "dedup_resolve_bulk",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Move byte-identical duplicates to Trash; never auto-resolve same-capture or perceptual matches.",
+      "behavior": "Move byte-identical duplicates to Trash; never auto-resolve same-capture or perceptual matches.  Runs the same protocol on one epoch: one brief plan lock over every group, unlocked Trash IO per group, one fenced finalize lock deleting only rows still matching path + hash; keeper loss aborts only its own group. Sources are retired per source, never a global epoch bump.",
       "target": "core-app",
       "task": "DARKROOM-148",
-      "test": "coverage gap: command-specific parity test not yet identified"
+      "test": "crates/core-dedup/tests/resolve.rs"
     },
     {
       "name": "import_list",

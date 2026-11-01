@@ -3,18 +3,18 @@
     {
       "name": "import_commit",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Commit a staged import: copy/move/reference only the `selected` source files, then apply `options` to the freshly-added rows. Emits `import:progress` (live rows) + `import:done`.  `pairing` decides what happens to a JPEG/HEIF the camera wrote beside a RAW: `\"pair\"` links it to that RAW (one grid cell), anything else (the default) catalogs every file standalone.",
+      "behavior": "Commit a staged import: copy/move/reference only the `selected` source files, then apply `options` to the freshly-added rows. Emits `import:progress` (live rows) + `import:done`.  `pairing` decides what happens to a JPEG/HEIF the camera wrote beside a RAW: `\"pair\"` links it to that RAW (one grid cell), anything else (the default) catalogs every file standalone.  The run is non-durable and cancellable between 16-file chunks: an interrupted run keeps every committed row and still reports it (`import:done` payload gains `interrupted` and `notProcessed` = selected files never reached). Every catalog write is fenced on the catalog epoch the run started under — on a stale catalog nothing further is written and source originals are never trashed.",
       "target": "core-app",
       "task": "DARKROOM-147",
-      "test": "coverage gap: command-specific parity test not yet identified"
+      "test": "crates/core-import/tests/import_copy.rs"
     },
     {
       "name": "hdr_merge",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Single-flight merge 2\u20139 unique bracket frames into HDR EXR; publish via synced unique temporary file without overwrite, remove output on cancellation or catalog failure, emit progress and completion.",
+      "behavior": "Single-flight merge 2\u20139 unique bracket frames into HDR EXR; publish via synced unique temporary file without overwrite, remove output on cancellation or catalog failure, emit progress and completion.  Source publication tokens are captured only after validation, and the provenance insert runs under `tokens_guard`: if a source changed mid-merge its output is removed and nothing is published; a result committed before cancellation survives and the job reports `Interrupted`.",
       "target": "core-app",
       "task": "DARKROOM-150",
-      "test": "coverage gap: command-specific parity test not yet identified"
+      "test": "crates/core-runtime/tests/publication.rs"
     },
     {
       "name": "hdr_cancel",
@@ -227,10 +227,10 @@
     {
       "name": "panorama_merge",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Full-resolution merge \u2192 LinearRaw DNG next to the first source, registered in the catalog and linked to its sources. Resolves with the new image id when the whole job finishes; progress streams via `panorama:progress` / `panorama:done`, failures also emit `panorama:error` so the progress pill clears even if the caller dropped the promise.",
+      "behavior": "Full-resolution merge \u2192 LinearRaw DNG next to the first source, registered in the catalog and linked to its sources. Resolves with the new image id when the whole job finishes; progress streams via `panorama:progress` / `panorama:done`, failures also emit `panorama:error` so the progress pill clears even if the caller dropped the promise.  Source publication tokens are captured only after validation, and the provenance insert runs under `tokens_guard`: if a source changed mid-merge its output is removed and nothing is published; a result committed before cancellation survives and the job reports `Interrupted`.",
       "target": "core-app",
       "task": "DARKROOM-150",
-      "test": "coverage gap: command-specific parity test not yet identified"
+      "test": "crates/core-runtime/tests/publication.rs"
     },
     {
       "name": "panorama_cancel",

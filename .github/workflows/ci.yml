@@ -57,23 +57,13 @@ jobs:
       - name: Frontend type-check + build
         run: npm run build
 
-      - name: Native baseline type-check
-        run: npm run e2e:check-native
-
-      - name: Formatting
-        run: cargo fmt --all --check
-
-      - name: Migration parity contract
-        run: cargo xtask parity
-
-      - name: Native dependency boundaries
-        run: cargo xtask layers
-
-      - name: Clippy (warnings = errors)
-        run: cargo clippy --workspace --examples -- -D warnings
-
-      - name: Tests
-        run: cargo test --workspace
+      # The single shared checklist (scripts/repo-checks.sh): fmt, native baseline type-check,
+      # xtask parity + layers, `cargo test -p xtask`, both clippy sweeps (workspace+examples and
+      # darkroom-native/render-wgpu --all-targets), then workspace tests. `gpu` is the designated
+      # pixel-validation lane: the script exports DARKROOM_REQUIRE_FIXTURES/GPU before the test
+      # run and prints a summary naming the mode, so headless and GPU results are never confused.
+      - name: Repository checks (gpu lane)
+        run: bash scripts/repo-checks.sh gpu
 
       # Tier-1 UI: the frontend in Chromium against `src/dev/tauriMock.ts`. No GPU, no catalog, so it
       # is deterministic on a hosted runner — unlike the real-backend `tauri` project, which needs a

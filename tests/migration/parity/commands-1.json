@@ -51,7 +51,7 @@
     {
       "name": "library_index_root",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Index (or re-index) a folder as a watched root. Emits `import:progress`/`import:done`.  The DB lock is held only briefly (root upsert + known-path read, then the transactional insert) \u2014 the multi-second parallel decode/hash/thumbnail work runs UNLOCKED so concurrent `library_query` calls stay responsive during indexing.",
+      "behavior": "Index (or re-index) a folder as a watched root. Emits `import:progress`/`import:done`.  The DB lock is held only briefly (root upsert + known-path read, then the transactional insert) \u2014 the multi-second parallel decode/hash/thumbnail work runs UNLOCKED so concurrent `library_query` calls stay responsive during indexing.  Cancellable before the commit with nothing written; the insert is a single transaction fenced on the epoch captured before the first lock, and every inserted row's publication identity is registered under that same fence. A commit already made survives later cancellation (the job ends `Interrupted` and still delivers its stats).",
       "target": "core-app",
       "task": "DARKROOM-147",
       "test": "e2e/tests/native/migration-baseline.spec.ts"
@@ -83,7 +83,7 @@
     {
       "name": "database_reset",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Clear catalog and caches without touching source files; leave library empty until import.",
+      "behavior": "Clear catalog and caches without touching source files; leave library empty until import.  Thumbnail eviction runs after the catalog lock and the publication gate are released, so cache IO never holds either lock.",
       "target": "core-runtime",
       "task": "DARKROOM-152",
       "test": "coverage gap: command-specific parity test not yet identified"
@@ -123,10 +123,34 @@
     {
       "name": "develop_set_edit",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Persist non-destructive edits and sidecar; reject overwriting unreadable data unless explicitly forced; record process version and before/after event.",
+      "behavior": "Persist non-destructive edits plus the durable sidecar-mirror intent in one transaction (migration 026; restart-retried by the outbox worker, which mirrors the edit to sidecars and retries pending intents after a restart); reject overwriting unreadable data unless explicitly forced; record process version and before/after event.",
       "target": "core-runtime",
       "task": "DARKROOM-138",
-      "test": "e2e/tests/mock/develop-unreadable-edit.spec.ts"
+      "test": "crates/core-library/tests/outbox.rs"
+    },
+    {
+      "name": "prepare_restart",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Run the quit save barrier for an updater relaunch from a worker thread; resolve true only when the editor confirms every debounced edit is committed, otherwise cancel the restart and announce app:save-barrier.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "src-tauri/src/quit.rs"
+    },
+    {
+      "name": "settings_bridge_write",
+      "source": "src-tauri/src/settings_bridge.rs",
+      "behavior": "Validate a legacy web snapshot (core_model::settings::parse_web_snapshot) and atomically write it to the settings-store bridge file under the catalog's app-data dir; skip the write when the file on disk already holds a snapshot captured at or after this one.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "src-tauri/src/settings_bridge.rs"
+    },
+    {
+      "name": "settings_bridge_export",
+      "source": "src-tauri/src/settings_bridge.rs",
+      "behavior": "Validate a legacy web snapshot and atomically write it to a user-chosen export path (\"Export settings…\"); always overwrites the chosen file.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "src-tauri/src/settings_bridge.rs"
     },
     {
       "name": "develop_render",

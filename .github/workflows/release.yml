@@ -50,17 +50,17 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      - name: Formatting
-        run: cargo fmt --all --check
-
       - name: Frontend type-check + build
         run: npm run build
 
-      - name: Clippy (warnings = errors)
-        run: cargo clippy --workspace --examples -- -D warnings
-
-      - name: Tests
-        run: cargo test --workspace
+      # The single shared checklist (scripts/repo-checks.sh): fmt, native baseline type-check,
+      # xtask parity + layers, `cargo test -p xtask`, both clippy sweeps (workspace+examples and
+      # darkroom-native/render-wgpu --all-targets), then workspace tests — none of which the tag
+      # gate used to run except fmt/clippy/tests. macos-15 is an Apple Silicon runner with Metal,
+      # the same class ci.yml enforces DARKROOM_REQUIRE_GPU=1 on, so the gate runs the `gpu`
+      # pixel-validation lane for the exact tagged commit.
+      - name: Repository checks (gpu lane)
+        run: bash scripts/repo-checks.sh gpu
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium

@@ -42,6 +42,16 @@
     },
     {
       "kind": "event",
+      "name": "app:save-barrier",
+      "source": "src-tauri/src/quit.rs",
+      "evidence": "app:save-barrier",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "src-tauri/src/quit.rs",
+      "behavior": "Publishes app:save-barrier {reason, message} when the quit/updater save barrier ends without reaching disk, cancelling the exit; the UI offers retry, cancel, or ask again to discard."
+    },
+    {
+      "kind": "event",
       "name": "dedup:progress",
       "source": "src-tauri/src/commands.rs",
       "evidence": "dedup:progress",
