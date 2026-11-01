@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const PREFIX: &str = "catalog-";
+/// Pre-upgrade safety snapshots (see [`backup_pre_upgrade`]). Shares the [`PREFIX`] spelling but is
+/// deliberately excluded from rotation and from [`backups`].
+const PRE_PREFIX: &str = "catalog-pre-";
 const SUFFIX: &str = ".db";
 
 /// Snapshot `conn` into `<backups_dir>/catalog-<UTC stamp>.db`, then delete backups beyond the
@@ -17,6 +20,32 @@ pub fn backup_now(conn: &Connection, backups_dir: &Path, keep: usize) -> Result<
 
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let dest = backups_dir.join(format!("{PREFIX}{stamp}{SUFFIX}"));
+    vacuum_into(conn, &dest)?;
+    rotate(backups_dir, keep)?;
+    Ok(dest)
+}
+
+/// Snapshot `conn` into `<backups_dir>/catalog-pre-v{version}-<UTC stamp>.db` and return its path.
+///
+/// The safety copy taken BEFORE a schema upgrade (see `Db::open_with_upgrade_backup`). Unlike
+/// rotated backups it is never deleted: the pre-upgrade copy is the only way back if a migration
+/// turns out to be wrong, and rotating it away on the next manual backup would throw that away. It
+/// is likewise invisible to [`backups`] — it is not a restore point the UI can offer (opening it
+/// would just re-run the same migrations) and must not be mistaken for today's daily backup.
+pub fn backup_pre_upgrade(
+    conn: &Connection,
+    backups_dir: &Path,
+    version: i64,
+) -> Result<PathBuf, DbError> {
+    std::fs::create_dir_all(backups_dir)?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let dest = backups_dir.join(format!("{PRE_PREFIX}v{version}-{stamp}{SUFFIX}"));
+    vacuum_into(conn, &dest)?;
+    Ok(dest)
+}
+
+/// `VACUUM INTO` a single-file snapshot at `dest`.
+fn vacuum_into(conn: &Connection, dest: &Path) -> Result<(), DbError> {
     // Vacuum into a sibling `.part` and rename on success: a crash or a full disk mid-vacuum must
     // not leave a truncated file under a real backup name, which rotation would then keep as if it
     // were the good copy. `VACUUM INTO` refuses to write to an existing target file — that is why
@@ -28,7 +57,7 @@ pub fn backup_now(conn: &Connection, backups_dir: &Path, keep: usize) -> Result<
         std::fs::remove_file(&part)?;
     }
     if dest.exists() {
-        std::fs::remove_file(&dest)?;
+        std::fs::remove_file(dest)?;
     }
 
     let part_str = part.to_str().ok_or_else(|| {
@@ -44,12 +73,10 @@ pub fn backup_now(conn: &Connection, backups_dir: &Path, keep: usize) -> Result<
         let _ = std::fs::remove_file(&part);
         return Err(e.into());
     }
-    std::fs::rename(&part, &dest).inspect_err(|_| {
+    std::fs::rename(&part, dest).inspect_err(|_| {
         let _ = std::fs::remove_file(&part);
     })?;
-
-    rotate(backups_dir, keep)?;
-    Ok(dest)
+    Ok(())
 }
 
 /// Existing backups under `backups_dir`, newest first by mtime. Empty if the directory is
@@ -91,7 +118,11 @@ fn is_backup_file(p: &Path) -> bool {
     p.is_file()
         && p.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(PREFIX) && n.ends_with(SUFFIX))
+            // `catalog-pre-*` starts with `catalog-`, so it must be excluded explicitly: a
+            // pre-upgrade snapshot is neither rotatable nor a restorable daily copy.
+            .is_some_and(|n| {
+                n.starts_with(PREFIX) && !n.starts_with(PRE_PREFIX) && n.ends_with(SUFFIX)
+            })
 }
 
 #[cfg(test)]

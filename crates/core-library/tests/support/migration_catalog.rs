@@ -29,7 +29,11 @@ pub fn generate(root: &Path) -> Result<()> {
         b"synthetic corrupt sqlite evidence\n",
     )?;
     let newer = Db::open(&root.join("newer.db"))?;
-    newer.conn.execute_batch("PRAGMA user_version = 26")?;
+    // One version ahead of this build, so `Db::open` must refuse it as "from a newer build".
+    newer.conn.execute_batch(&format!(
+        "PRAGMA user_version = {}",
+        core_db::LATEST_SCHEMA_VERSION + 1
+    ))?;
     Ok(())
 }
 

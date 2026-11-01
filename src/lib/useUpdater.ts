@@ -7,7 +7,8 @@ import {
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useUpdateStore } from "../store/update";
 import { useAppStore } from "../store/app";
-import { developPersistence } from "./developPersistence";
+import { prepareRestart } from "./ipc";
+import { setPref } from "./settingsBridge";
 import { log } from "./logger";
 
 const AUTO_CHECK_KEY = "darkroom.autoUpdateCheck";
@@ -23,7 +24,7 @@ export function autoCheckEnabled(): boolean {
   return localStorage.getItem(AUTO_CHECK_KEY) !== "0";
 }
 export function setAutoCheckEnabled(on: boolean): void {
-  localStorage.setItem(AUTO_CHECK_KEY, on ? "1" : "0");
+  setPref(AUTO_CHECK_KEY, on ? "1" : "0");
 }
 
 function inTauri(): boolean {
@@ -105,10 +106,24 @@ export async function downloadAndInstall(): Promise<void> {
 
 /** Relaunch into the freshly-installed version. */
 export async function restartApp(): Promise<void> {
+  // The updater tears the process down through `plugin-process`, which never raises a quit the
+  // backend can hold — so the save barrier has to be asked explicitly. It runs the same flush ⌘Q
+  // waits on (a frontend-only `flushAll()` here would leave the process free to die mid-save) and
+  // answers `true` only once the editor confirms every debounced edit is committed.
+  let ok = false;
+  let reason = "Your edits could not be saved before the update. Please try again.";
   try {
-    // The updater's restart tears the process down without the quit barrier, so flush here too —
-    // an in-memory Develop edit would otherwise be lost to an update the user just accepted.
-    await developPersistence.flushAll();
+    ok = await prepareRestart();
+  } catch (err) {
+    reason = msg(err);
+  }
+  if (!ok) {
+    // The app stays running; the banner shows why and the user can retry or quit manually.
+    useUpdateStore.getState().patch({ status: "error", error: reason });
+    log.warn("updater", "restart cancelled by the save barrier", { reason });
+    return;
+  }
+  try {
     await relaunch();
   } catch (err) {
     log.warn("updater", "relaunch failed", log.errorSummary(err));

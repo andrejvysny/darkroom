@@ -12,7 +12,7 @@ pub use rusqlite;
 
 use rusqlite::Connection;
 use rusqlite_migration::{Migrations, M};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 /// Ordered migration SQL. `to_latest` sets `PRAGMA user_version` to the count applied, so the slice
@@ -43,11 +43,14 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/023_clip_embedding.sql"),
     include_str!("../migrations/024_suggestions.sql"),
     include_str!("../migrations/025_decode_failure.sql"),
+    include_str!("../migrations/026_sidecar_outbox.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
 /// `user_version` exceeds this was written by a newer build and is refused (downgrade guard).
-const LATEST_SCHEMA_VERSION: i64 = MIGRATION_SQL.len() as i64;
+/// Public so tests and callers can speak about "one version ahead of us" without hardcoding a
+/// number that changes with every migration.
+pub const LATEST_SCHEMA_VERSION: i64 = MIGRATION_SQL.len() as i64;
 
 static MIGRATIONS: LazyLock<Migrations<'static>> =
     LazyLock::new(|| Migrations::new(MIGRATION_SQL.iter().map(|s| M::up(s)).collect()));
@@ -60,7 +63,48 @@ pub struct Db {
 impl Db {
     /// Open (or create) the catalog at `path`, apply connection pragmas, and migrate to latest.
     pub fn open(path: &Path) -> Result<Self, DbError> {
-        let mut conn = Connection::open(path)?;
+        let mut conn = Self::connect(path)?;
+        MIGRATIONS.to_latest(&mut conn)?;
+        Ok(Self { conn })
+    }
+
+    /// [`Db::open`], except that upgrading an EXISTING catalog first takes a safety snapshot of it
+    /// as it was, into `backups_dir`. Returns the catalog plus the snapshot path — `Some` only when
+    /// migrations actually had to run, i.e. the file already existed with `0 < user_version <
+    /// LATEST_SCHEMA_VERSION`.
+    ///
+    /// The snapshot is a pre-condition, not a courtesy: a failed backup aborts the open with an
+    /// error and the catalog is left untouched at its old version. Migrations are irreversible (no
+    /// down scripts, `ALTER TABLE`/`CREATE TABLE` only), so without this copy one bad migration on
+    /// a user's only catalog means data loss. A brand-new catalog has nothing to lose, and an
+    /// already-current one is not rewritten, so neither produces a backup.
+    pub fn open_with_upgrade_backup(
+        path: &Path,
+        backups_dir: &Path,
+    ) -> Result<(Self, Option<PathBuf>), DbError> {
+        let mut conn = Self::connect(path)?;
+        // `connect` already refused a version beyond ours, so anything below it that is not 0 is a
+        // real catalog awaiting migration. A freshly created file reports 0 and is skipped.
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let snapshot = if user_version > 0 && user_version < LATEST_SCHEMA_VERSION {
+            Some(backup::backup_pre_upgrade(
+                &conn,
+                backups_dir,
+                LATEST_SCHEMA_VERSION,
+            )?)
+        } else {
+            None
+        };
+        MIGRATIONS.to_latest(&mut conn)?;
+        Ok((Self { conn }, snapshot))
+    }
+
+    /// Open `path`, apply the connection pragmas, and run the integrity + downgrade gates — WITHOUT
+    /// migrating. Shared by [`Db::open`] and [`Db::open_with_upgrade_backup`] so the gates can
+    /// never drift apart, and so an upgrade backup is only ever taken from a connection that passed
+    /// both (a corrupt catalog never gets a snapshot promoted to "your backup").
+    fn connect(path: &Path) -> Result<Connection, DbError> {
+        let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -84,8 +128,7 @@ impl Db {
                 supported: LATEST_SCHEMA_VERSION,
             });
         }
-        MIGRATIONS.to_latest(&mut conn)?;
-        Ok(Self { conn })
+        Ok(conn)
     }
 
     /// Delete every row from every catalog table, keeping the schema (and migration `user_version`)
@@ -141,7 +184,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 25, "expected 25 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 26, "expected 26 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")
@@ -777,6 +820,7 @@ mod tests {
             "person",
             "presets",
             "ratings_flags",
+            "sidecar_outbox",
             "suggestion_model",
             "user_events",
         ];

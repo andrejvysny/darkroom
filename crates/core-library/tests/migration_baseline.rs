@@ -30,7 +30,8 @@ fn copied_catalog_preserves_queries_and_relationships_after_reopen() {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            25
+            core_db::LATEST_SCHEMA_VERSION,
+            "the fixture catalog is at the current schema"
         );
         assert_edits(&db.conn);
         assert_queries(&db.conn);
@@ -187,13 +188,15 @@ fn refusal_preserves_invalid_inputs_and_existing_output() {
             Err(error) => error,
         };
         if name == "newer.db" {
-            assert!(matches!(
-                error,
-                core_db::DbError::SchemaTooNew {
-                    found: 26,
-                    supported: 25
-                }
-            ));
+            assert!(
+                matches!(
+                    error,
+                    core_db::DbError::SchemaTooNew { found, supported }
+                        if found == core_db::LATEST_SCHEMA_VERSION + 1
+                            && supported == core_db::LATEST_SCHEMA_VERSION
+                ),
+                "expected refusal of one version above the current schema, got {error:?}"
+            );
         } else {
             assert!(matches!(
                 error,

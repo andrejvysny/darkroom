@@ -13,3 +13,8 @@ thiserror = "2"
 # Already a workspace dependency (core-import, core-raw) — reused here only for the backup
 # filename timestamp, so this doesn't add a new dependency to the build graph.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+# `tests/upgrade_backup.rs` builds a schema-25 catalog by applying only the first 25 migrations, so
+# it needs the same migration engine (same pinned version => the same crate) `Db::open` uses.
+rusqlite_migration = "=2.5.0"

@@ -1,3 +1,4 @@
+use crate::outbox_worker::OutboxHandle;
 use crate::quit::QuitBarrier;
 use crate::sidecar_queue::SidecarQueue;
 use crate::thumb_queue::ThumbQueue;
@@ -39,6 +40,11 @@ pub struct AppState {
     /// Coalescing writer for per-image sidecars. Edits mark an image dirty here instead of writing
     /// the file inline, so the single SQLite connection is never held across an SSD write.
     pub sidecar_queue: SidecarQueue,
+    /// Handle to the durable sidecar-mirroring worker (`sidecar_outbox`, migration 026). Edits queue
+    /// an intent in the catalog inside their own transaction and call [`OutboxHandle::notify`]; the
+    /// worker performs the write and settles the row. Pending intents never block quit — they are
+    /// the reason a crash no longer loses a write.
+    pub outbox: OutboxHandle,
     /// Holds a normal quit open until the frontend has flushed its debounced Develop edits.
     pub quit: QuitBarrier,
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
@@ -270,6 +276,9 @@ impl AppState {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let session_id = format!("{start_ms:x}-{}", std::process::id());
+        // The mirroring worker reads the same catalog the intents are committed into; it holds only
+        // a handle to it, so a quit can ask it what is still owed without the worker being alive.
+        let outbox = OutboxHandle::new(db.clone());
 
         Ok(Self {
             workers: core_runtime::workers::ManagedWorkers::new(16),
@@ -290,6 +299,7 @@ impl AppState {
             gpu,
             thumb_queue: ThumbQueue::new(),
             sidecar_queue: SidecarQueue::new(),
+            outbox,
             quit: QuitBarrier::new(),
             full_render_cache: Mutex::new(None),
             preview_render_cache: Mutex::new(None),
