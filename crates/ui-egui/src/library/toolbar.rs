@@ -34,24 +34,39 @@ pub(crate) fn show(
                 .inner_margin(egui::Margin::symmetric(12, 0)),
         )
         .show(root, |ui| {
+            // Below this width the full right group would overlap the filters (minimum window).
+            let compact = ui.available_width() < COMPACT_BELOW;
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 filters(ui, snapshot, commands);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     view_toggle(ui);
-                    zoom(ui, lib);
-                    sort(ui, snapshot, commands);
+                    if !compact {
+                        zoom(ui, lib);
+                    }
+                    sort(ui, snapshot, commands, compact);
                     pagination(ui, snapshot, commands);
                 });
             });
         });
 }
 
+/// Toolbar width (points) under which the zoom slider and the "Sort" label are dropped.
+const COMPACT_BELOW: f32 = 820.0;
+
 fn filters(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec<Command>) {
     let query = &snapshot.library.query;
     ui.label(
-        RichText::new(format!("{} photos", fmt_count(snapshot.library.count)))
-            .monospace()
-            .color(theme::T2),
+        RichText::new(format!(
+            "{} {}",
+            fmt_count(snapshot.library.count),
+            if snapshot.library.count == 1 {
+                "photo"
+            } else {
+                "photos"
+            }
+        ))
+        .monospace()
+        .color(theme::T2),
     );
     ui.add_space(8.0);
     let min = u8::try_from(query.min_stars.unwrap_or(0).clamp(0, 5)).unwrap_or(0);
@@ -76,7 +91,12 @@ fn filters(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec
     }
 }
 
-fn sort(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec<Command>) {
+fn sort(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    commands: &mut Vec<Command>,
+    compact: bool,
+) {
     let current = snapshot
         .library
         .query
@@ -90,7 +110,7 @@ fn sort(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec<Co
     // Right-to-left layout: the combo is added first so the "Sort" label ends up on its left.
     egui::ComboBox::from_id_salt("library_sort")
         .selected_text(shown)
-        .width(140.0)
+        .width(if compact { 110.0 } else { 140.0 })
         .show_ui(ui, |ui| {
             for (key, label) in SORTS {
                 if ui.selectable_label(current == key, label).clicked() {
@@ -98,7 +118,9 @@ fn sort(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec<Co
                 }
             }
         });
-    ui.label(RichText::new("Sort").color(theme::T3));
+    if !compact {
+        ui.label(RichText::new("Sort").color(theme::T3));
+    }
 }
 
 fn zoom(ui: &mut egui::Ui, lib: &mut LibraryUi) {

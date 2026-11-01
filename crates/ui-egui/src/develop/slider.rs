@@ -91,12 +91,17 @@ pub(super) fn paint_track(ui: &Ui, track: Rect, frac: f32, bipolar: bool, active
             Stroke::new(1.0, theme::LINE2),
         );
     }
-    let fill = if active { theme::ACCENT } else { theme::T3 };
+    // Legacy always shows the accent fill; hover/drag only brightens it.
+    let fill = if active {
+        theme::ACCENT
+    } else {
+        theme::ACCENT_LINE
+    };
     painter.line_segment(
         [Pos2::new(x(from), y), Pos2::new(x(frac), y)],
         Stroke::new(2.0, fill),
     );
-    let knob = if active { theme::T1 } else { theme::T3 };
+    let knob = if active { theme::T1 } else { theme::T2 };
     painter.circle_filled(Pos2::new(x(frac), y), 6.0, theme::APP);
     painter.circle_filled(Pos2::new(x(frac), y), 4.5, knob);
 }

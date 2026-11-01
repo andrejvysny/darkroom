@@ -118,10 +118,7 @@ fn metadata(ui: &mut egui::Ui, row: &ImageRow) {
             "Focal",
             row.focal_length.map_or_else(dash, |f| format!("{f:.0} mm")),
         ),
-        (
-            "Aperture",
-            row.aperture.map_or_else(dash, |a| format!("f/{a}")),
-        ),
+        ("Aperture", row.aperture.map_or_else(dash, format_aperture)),
         ("Shutter", row.shutter.clone().unwrap_or_else(dash)),
         ("ISO", row.iso.map_or_else(dash, |i| i.to_string())),
         ("Size", size),
@@ -141,6 +138,12 @@ fn metadata(ui: &mut egui::Ui, row: &ImageRow) {
     }
 }
 
+/// EXIF apertures arrive widened from f32 (7.1 -> 7.099999904632568): show one decimal, drop ".0".
+pub(crate) fn format_aperture(aperture: f64) -> String {
+    let text = format!("{aperture:.1}");
+    format!("f/{}", text.strip_suffix(".0").unwrap_or(&text))
+}
+
 /// Epoch seconds -> UTC `YYYY-MM-DD` (Hinnant's civil-from-days).
 pub(crate) fn format_date(epoch_seconds: i64) -> String {
     let z = epoch_seconds.div_euclid(86_400) + 719_468;
@@ -157,7 +160,14 @@ pub(crate) fn format_date(epoch_seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_date;
+    use super::{format_aperture, format_date};
+
+    #[test]
+    fn apertures_hide_f32_widening() {
+        assert_eq!(format_aperture(f64::from(7.1_f32)), "f/7.1");
+        assert_eq!(format_aperture(14.0), "f/14");
+        assert_eq!(format_aperture(2.8), "f/2.8");
+    }
 
     #[test]
     fn civil_dates() {
