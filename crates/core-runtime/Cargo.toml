@@ -13,3 +13,6 @@ core-library = { path = "../core-library" }
 [dev-dependencies]
 serde_json = "1"
 image = "0.25"
+# `tests/catalog.rs` builds a schema-25 catalog with the same pinned migration engine `Db::open`
+# uses (mirrors `core-db`'s dev-dependency), to pin the pre-upgrade backup on the open path.
+rusqlite_migration = "=2.5.0"

@@ -1,10 +1,13 @@
 use core_app::ports::{Clock, EventSink, RenderBackend};
 use core_app::session::ApplicationSession;
+use core_app::state::DocumentStatus;
 use core_app::subscription::SnapshotUpdate;
-use core_app::workflow::{Command, Completion, Effect, Outcome};
+use core_app::workflow::{Command, Completion, Effect, Operation, Outcome};
 use core_app::AppError;
 use core_model::catalog::{ImageRow, QueryParams};
-use core_model::identity::ImageId;
+use core_model::document::EditDocument;
+use core_model::identity::{ImageId, ProcessVersion, CURRENT_PROCESS_VERSION};
+use core_model::DevelopParams;
 use std::sync::{Arc, Mutex};
 
 struct ClockStub;
@@ -272,4 +275,261 @@ fn failed_changed_query_does_not_relabel_previous_rows() {
         })
         .unwrap();
     assert!(session.snapshot().library.rows.is_empty());
+}
+
+// --- selection opens an authoritative editor document (brief WP7-3a) -------------------------
+
+const SUPPORTED_JSON: &str = r#"{"exposure":0.5,"contrast":12}"#;
+
+/// Dispatch a selection and hand back its two effects: the row lookup and the edit load.
+fn select(s: &mut ApplicationSession, id: i64) -> (Effect, Effect) {
+    let mut effects = s
+        .dispatch(Command::SelectImage(Some(ImageId(id))))
+        .expect("selection accepted");
+    assert_eq!(
+        effects.len(),
+        2,
+        "a selection issues a lookup and an edit load"
+    );
+    let load = effects.pop().expect("load effect");
+    let image = effects.pop().expect("image effect");
+    (image, load)
+}
+
+fn load_edit_effects(s: &mut ApplicationSession, id: i64) -> (Effect, Effect) {
+    let (image, load) = select(s, id);
+    assert_eq!(
+        image.operation,
+        Operation::SelectImage {
+            image_id: ImageId(id),
+            editor_session: s.snapshot().editor.editor_session,
+            selection_generation: s.snapshot().editor.selection_generation,
+        }
+    );
+    assert_eq!(
+        load.operation,
+        Operation::LoadEdit {
+            image_id: ImageId(id),
+            editor_session: s.snapshot().editor.editor_session,
+        }
+    );
+    assert!(s.is_current(&image) && s.is_current(&load));
+    (image, load)
+}
+
+/// Complete a `LoadEdit` and return the resulting document view.
+fn finish_load(
+    s: &mut ApplicationSession,
+    load: &Effect,
+    result: Result<Outcome, AppError>,
+) -> core_app::state::DocumentView {
+    assert!(matches!(load.operation, Operation::LoadEdit { .. }));
+    s.complete(Completion {
+        token: load.token,
+        result,
+    })
+    .expect("load completion accepted");
+    s.snapshot().editor.document.clone()
+}
+
+#[test]
+fn selection_opens_a_fresh_session_and_asks_for_the_stored_edit() {
+    let mut s = session();
+    open(&mut s);
+    let (image, load) = load_edit_effects(&mut s, 1);
+    let snapshot = s.snapshot();
+    assert_eq!(snapshot.editor.selected, Some(ImageId(1)));
+    assert_eq!(
+        snapshot.editor.editor_session.0, 1,
+        "editor allocates the session"
+    );
+    assert_eq!(
+        snapshot.editor.document,
+        core_app::state::DocumentView {
+            status: DocumentStatus::Loading,
+            params: None,
+            revision: None,
+            process_version: None,
+            dirty: false,
+        }
+    );
+    // A→B→A still yields a new session every time.
+    let second = s
+        .dispatch(Command::SelectImage(Some(ImageId(2))))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        second.operation.action(),
+        core_app::registry::ActionId::SelectImage
+    );
+    assert_eq!(s.snapshot().editor.editor_session.0, 2);
+    let again = s
+        .dispatch(Command::SelectImage(Some(ImageId(1))))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        again.operation.action(),
+        core_app::registry::ActionId::SelectImage
+    );
+    assert_eq!(s.snapshot().editor.editor_session.0, 3);
+    assert!(!s.is_current(&image));
+    assert!(s.is_current(&load), "a superseded load stays completable");
+    // Deselecting closes the document without loading anything.
+    assert!(s.dispatch(Command::SelectImage(None)).unwrap().is_empty());
+    let cleared = s.snapshot();
+    assert_eq!(cleared.editor.selected, None);
+    assert_eq!(cleared.editor.document.status, DocumentStatus::Empty);
+    assert_eq!(cleared.editor.editor_session, Default::default());
+}
+
+#[test]
+fn supported_edit_loads_with_its_stored_params_and_version() {
+    let mut s = session();
+    open(&mut s);
+    let (_image, load) = load_edit_effects(&mut s, 1);
+    let document = EditDocument::read(SUPPORTED_JSON, 5);
+    assert_eq!(document.preview().map(|p| p.exposure), Some(0.5));
+    let view = finish_load(&mut s, &load, Ok(Outcome::Edit(Some(document.clone()))));
+    assert_eq!(view.status, DocumentStatus::Ready);
+    assert_eq!(view.params.as_deref(), document.preview());
+    assert_eq!(view.process_version, Some(ProcessVersion(5)));
+    assert_eq!(view.revision, Some(core_model::identity::EditRevision(1)));
+    assert!(!view.dirty, "a freshly loaded stored edit is clean");
+    assert!(s.snapshot().error.is_none());
+}
+
+#[test]
+fn missing_edit_becomes_a_ready_default_document_at_the_current_version() {
+    let mut s = session();
+    open(&mut s);
+    let (_image, load) = load_edit_effects(&mut s, 7);
+    let view = finish_load(&mut s, &load, Ok(Outcome::Edit(None)));
+    assert_eq!(view.status, DocumentStatus::Ready);
+    assert_eq!(view.params.as_deref(), Some(&DevelopParams::default()));
+    assert_eq!(view.process_version, Some(CURRENT_PROCESS_VERSION));
+    assert!(!view.dirty);
+}
+
+#[test]
+fn unreadable_stored_edit_is_never_silently_defaulted() {
+    // A stored edit this build cannot interpret must surface as a refusal with no params, so no
+    // renderer can paint defaults and a later save can never overwrite it.
+    let mut s = session();
+    open(&mut s);
+    let (_image, unsupported) = load_edit_effects(&mut s, 1);
+    let view = finish_load(
+        &mut s,
+        &unsupported,
+        Ok(Outcome::Edit(Some(EditDocument::read(SUPPORTED_JSON, 7)))),
+    );
+    assert!(matches!(view.status, DocumentStatus::Unsupported(_)));
+    assert_eq!(view.params, None);
+    assert_eq!(view.revision, None);
+    assert_eq!(view.process_version, Some(ProcessVersion(7)));
+    assert!(!view.dirty);
+
+    let (_image, unknown_fields) = load_edit_effects(&mut s, 2);
+    let view = finish_load(
+        &mut s,
+        &unknown_fields,
+        Ok(Outcome::Edit(Some(EditDocument::read(
+            r#"{"exposure":0.5,"made_up":1}"#,
+            6,
+        )))),
+    );
+    assert!(matches!(view.status, DocumentStatus::Unsupported(_)));
+    assert_eq!(view.params, None);
+
+    let (_image, corrupt) = load_edit_effects(&mut s, 3);
+    let view = finish_load(
+        &mut s,
+        &corrupt,
+        Ok(Outcome::Edit(Some(EditDocument::read("{not json", 6)))),
+    );
+    assert_eq!(view.status, DocumentStatus::Corrupt);
+    assert_eq!(view.params, None);
+    assert_eq!(view.process_version, Some(ProcessVersion(6)));
+    assert!(s.snapshot().error.is_none());
+}
+
+#[test]
+fn load_result_for_a_superseded_session_is_ignored() {
+    let mut s = session();
+    open(&mut s);
+    let (_image_a, load_a) = load_edit_effects(&mut s, 1);
+    let (_image_b, load_b) = load_edit_effects(&mut s, 2);
+    let session_b = s.snapshot().editor.editor_session;
+    // A's stored edit arrives after B was selected: B keeps loading, and none of A's params leak.
+    let ignored = finish_load(
+        &mut s,
+        &load_a,
+        Ok(Outcome::Edit(Some(EditDocument::read(SUPPORTED_JSON, 6)))),
+    );
+    assert_eq!(ignored.status, DocumentStatus::Loading);
+    assert_eq!(ignored.params, None);
+    assert_eq!(s.snapshot().editor.editor_session, session_b);
+    let ready = finish_load(
+        &mut s,
+        &load_b,
+        Ok(Outcome::Edit(Some(EditDocument::read(
+            r#"{"contrast":20}"#,
+            6,
+        )))),
+    );
+    assert_eq!(ready.status, DocumentStatus::Ready);
+    assert_eq!(ready.params.as_deref().map(|p| p.contrast), Some(20.0));
+}
+
+#[test]
+fn failed_load_fails_the_document_and_leaves_the_application_error_alone() {
+    let mut s = session();
+    open(&mut s);
+    let (_image, load) = load_edit_effects(&mut s, 1);
+    // A pre-existing application error must survive: the load failure belongs to the document.
+    let query = s
+        .dispatch(Command::QueryLibrary(Box::default()))
+        .unwrap()
+        .remove(0);
+    let pre_existing = AppError::Catalog("catalog is busy".into());
+    finish(
+        &mut s,
+        &query,
+        Err(AppError::Catalog("catalog is busy".into())),
+    )
+    .unwrap();
+    assert_eq!(s.snapshot().error.as_ref(), Some(&pre_existing));
+    let view = finish_load(
+        &mut s,
+        &load,
+        Err(AppError::Catalog("edit read failed".into())),
+    );
+    assert_eq!(
+        view.status,
+        DocumentStatus::Error("edit read failed".into())
+    );
+    assert_eq!(view.params, None);
+    assert_eq!(s.snapshot().error, Some(pre_existing));
+    assert_eq!(s.snapshot().editor.selected, Some(ImageId(1)));
+}
+
+#[test]
+fn closing_the_catalog_closes_the_document() {
+    let mut s = session();
+    open(&mut s);
+    let (_image, load) = load_edit_effects(&mut s, 1);
+    finish_load(&mut s, &load, Ok(Outcome::Edit(None)));
+    assert_eq!(s.snapshot().editor.document.status, DocumentStatus::Ready);
+    let close = s.dispatch(Command::CloseCatalog).unwrap().remove(0);
+    finish(&mut s, &close, Ok(Outcome::Closed)).unwrap();
+    let snapshot = s.snapshot();
+    assert_eq!(snapshot.editor.document.status, DocumentStatus::Empty);
+    assert_eq!(
+        snapshot.editor.document,
+        core_app::state::DocumentView::default()
+    );
+    assert_eq!(snapshot.editor.selected, None);
+    // A reopening selection still advances the session counter.
+    open(&mut s);
+    let (_image, _load) = load_edit_effects(&mut s, 1);
+    assert_eq!(s.snapshot().editor.editor_session.0, 2);
 }

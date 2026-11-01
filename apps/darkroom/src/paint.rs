@@ -43,6 +43,29 @@ pub fn paint(
     output.textures_delta.clear();
 }
 
+/// Offscreen paint target for the headless probes (`--gpu-probe`, `--photo-probe`): a plain
+/// `RENDER_ATTACHMENT` texture of `size` the probes render one egui frame into.
+pub fn probe_target(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    size: [u32; 2],
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("probe-target"),
+        size: wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    })
+}
+
 pub fn ui(root: &mut egui::Ui) {
     egui::CentralPanel::default().show(root, |ui| {
         ui.heading("Darkroom native stack qualification");

@@ -1,12 +1,16 @@
+use crate::editor::{Editor, EditorCommand, EditorError, EditorEvent, EditorState, HistoryLimits};
 use crate::ports::{Clock, EventSink, RenderBackend};
 use crate::registry::{self, EnabledContext};
 use crate::state::{
-    ApplicationSnapshot, EditorSnapshot, JobsSnapshot, LibrarySnapshot, SettingsSnapshot,
+    ApplicationSnapshot, DocumentStatus, DocumentView, EditorSnapshot, JobsSnapshot,
+    LibrarySnapshot, SettingsSnapshot,
 };
 use crate::subscription::{Notice, Slot, SnapshotUpdate, Subscription};
 use crate::workflow::{Command, Completion, Effect, Operation, Outcome, RequestId, RequestToken};
 use crate::AppError;
-use core_model::identity::{CatalogEpoch, EditorSession, SelectionGeneration};
+use core_model::identity::{
+    CatalogEpoch, ImageId, ProcessVersion, SelectionGeneration, CURRENT_PROCESS_VERSION,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -17,7 +21,9 @@ pub struct ApplicationSession {
     slots: Vec<Weak<Mutex<Slot>>>,
     pending: HashMap<RequestToken, Operation>,
     next_request: u64,
-    editor_session: EditorSession,
+    /// Authoritative editor document; it allocates `EditorSession`s, so the snapshot's
+    /// `editor_session` is always a projection of its live session — never a second counter.
+    editor: Editor,
     selection_generation: SelectionGeneration,
 }
 impl ApplicationSession {
@@ -32,7 +38,7 @@ impl ApplicationSession {
             slots: Vec::new(),
             pending: HashMap::new(),
             next_request: 0,
-            editor_session: EditorSession::default(),
+            editor: Editor::new(HistoryLimits::default()),
             selection_generation: SelectionGeneration::default(),
             snapshot: Arc::new(ApplicationSnapshot {
                 revision: 0,
@@ -105,17 +111,16 @@ impl ApplicationSession {
             .catalog_epoch
             .checked_next()
             .ok_or(AppError::Exhausted)?;
-        let editor = self
-            .editor_session
-            .checked_next()
-            .ok_or(AppError::Exhausted)?;
         let selection = self
             .selection_generation
             .checked_next()
             .ok_or(AppError::Exhausted)?;
-        self.editor_session = editor;
         self.selection_generation = selection;
         self.pending.clear();
+        // The outgoing document dies with the catalog. Its unsaved revision is dropped for now:
+        // persisting `Closed { pending }` is the autosave brief's job, and until that lands no
+        // path may pretend the edit reached storage.
+        self.close_editor();
         let s = Arc::make_mut(&mut self.snapshot);
         s.catalog_epoch = epoch;
         s.catalog_ready = false;
@@ -123,6 +128,14 @@ impl ApplicationSession {
         s.editor = EditorSnapshot::default();
         s.error = None;
         Ok(())
+    }
+    /// Close the editor document, discarding the (not yet persistable) pending revision.
+    fn close_editor(&mut self) {
+        let _ = self.editor.apply(EditorCommand::Close);
+    }
+    /// Project the editor's state into the snapshot; call after EVERY editor mutation.
+    fn sync_document(&mut self) {
+        Arc::make_mut(&mut self.snapshot).editor.document = document_view(self.editor.state());
     }
     fn issue(&mut self, operation: Operation) -> Effect {
         self.next_request += 1;
@@ -187,7 +200,14 @@ impl ApplicationSession {
         if matches!(command, Command::SelectImage(Some(id)) if id.0 <= 0) {
             return Err(AppError::InvalidCommand("image id must be positive".into()));
         }
-        self.preflight(u64::from(!matches!(command, Command::SelectImage(None))))?;
+        // A selection carries two effects (the row lookup and the edit load); everything else
+        // issues at most one.
+        let requests = match &command {
+            Command::SelectImage(None) => 0,
+            Command::SelectImage(Some(_)) => 2,
+            _ => 1,
+        };
+        self.preflight(requests)?;
         let action = command.action();
         let effects = self.dispatch_valid(command)?;
         Arc::make_mut(&mut self.snapshot).error = None;
@@ -225,38 +245,55 @@ impl ApplicationSession {
         };
         Ok(effect.into_iter().collect())
     }
-    fn select(
-        &mut self,
-        id: Option<core_model::identity::ImageId>,
-    ) -> Result<Vec<Effect>, AppError> {
+    fn select(&mut self, id: Option<ImageId>) -> Result<Vec<Effect>, AppError> {
+        // Reserve the generation first: if it overflows, neither the editor nor the snapshot moved.
         let generation = self
             .selection_generation
             .checked_next()
             .ok_or(AppError::Exhausted)?;
-        let editor = self
-            .editor_session
-            .checked_next()
-            .ok_or(AppError::Exhausted)?;
+        // The outgoing document is always closed first, so the editor never holds two documents and
+        // the (not yet persistable) pending revision is discarded on every transition.
+        self.close_editor();
+        let session = match id {
+            None => None,
+            Some(image_id) => match self.editor.apply(EditorCommand::Open {
+                image: image_id,
+                // A stored edit keeps its own version; this is the version for an image with no edit.
+                default_process_version: CURRENT_PROCESS_VERSION,
+            }) {
+                Ok(EditorEvent::Opened(session)) => Some(session),
+                other => return Err(editor_refusal(image_id, other)),
+            },
+        };
         self.selection_generation = generation;
-        self.editor_session = editor;
         self.pending
             .retain(|_, op| !matches!(op, Operation::SelectImage { .. }));
+        let editor_session = session.unwrap_or_default();
         Arc::make_mut(&mut self.snapshot).editor = EditorSnapshot {
             selected: id,
             image: None,
-            editor_session: self.editor_session,
+            editor_session,
             selection_generation: generation,
+            document: document_view(self.editor.state()),
         };
-        Ok(id
-            .map(|image_id| {
-                self.issue(Operation::SelectImage {
-                    image_id,
-                    editor_session: self.editor_session,
-                    selection_generation: generation,
-                })
-            })
-            .into_iter()
-            .collect())
+        let Some(image_id) = id else {
+            return Ok(Vec::new());
+        };
+        // Both effects belong to the same editor session. The row lookup is replaced by a newer
+        // selection (only the newest row may reach the UI); the edit load is deliberately left
+        // pending so a late result still reaches `complete`, where the editor decides whether it
+        // is current or stale.
+        Ok(vec![
+            self.issue(Operation::SelectImage {
+                image_id,
+                editor_session,
+                selection_generation: generation,
+            }),
+            self.issue(Operation::LoadEdit {
+                image_id,
+                editor_session,
+            }),
+        ])
     }
     pub fn complete(&mut self, completion: Completion) -> Result<Vec<Effect>, AppError> {
         let operation = self
@@ -287,12 +324,37 @@ impl ApplicationSession {
         let requests = u64::from(matches!(completion.result, Ok(Outcome::Opened))) * 3;
         self.preflight(requests)?;
         self.pending.remove(&completion.token);
-        let effects = match completion.result {
-            Err(error) => {
+        let effects = match (operation, completion.result) {
+            // The editor alone decides whether a load result still matters: a result for a
+            // superseded session is dropped silently, because the newer selection owns the
+            // document now and must not be overwritten by the old image's params.
+            (Operation::LoadEdit { editor_session, .. }, Ok(Outcome::Edit(document))) => {
+                if self.editor.current_session() == Some(editor_session) {
+                    let _ = self.editor.apply(EditorCommand::Loaded {
+                        session: editor_session,
+                        stored: document,
+                    });
+                    self.sync_document();
+                }
+                Vec::new()
+            }
+            // A failed load is a document-level failure, not an application error: the user keeps
+            // the library and the selection, and the editor shows why this image has no params.
+            (Operation::LoadEdit { editor_session, .. }, Err(error)) => {
+                if self.editor.current_session() == Some(editor_session) {
+                    let _ = self.editor.apply(EditorCommand::LoadFailed {
+                        session: editor_session,
+                        message: error.to_string(),
+                    });
+                    self.sync_document();
+                }
+                Vec::new()
+            }
+            (_, Err(error)) => {
                 Arc::make_mut(&mut self.snapshot).error = Some(error);
                 Vec::new()
             }
-            Ok(outcome) => self.apply(outcome),
+            (_, Ok(outcome)) => self.apply(outcome),
         };
         self.publish(notice);
         Ok(effects)
@@ -309,7 +371,9 @@ impl ApplicationSession {
                     self.replace(Operation::LoadDates),
                 ]
             }
-            Outcome::Closed => Vec::new(),
+            // `Closed` needs no follow-up work, and `Edit` never reaches here: its result is
+            // consumed in `complete`, where the issuing operation's editor session is known.
+            Outcome::Closed | Outcome::Edit(_) => Vec::new(),
             Outcome::Library { rows, count } => {
                 let library = &mut Arc::make_mut(&mut self.snapshot).library;
                 library.rows = Arc::new(rows);
@@ -340,7 +404,62 @@ fn matches_outcome(operation: &Operation, outcome: &Outcome) -> bool {
             | (Operation::LoadFolders, Outcome::Folders(_))
             | (Operation::LoadDates, Outcome::Dates(_))
             | (Operation::SelectImage { .. }, Outcome::Image(_))
+            | (Operation::LoadEdit { .. }, Outcome::Edit(_))
     )
+}
+
+/// Project the authoritative editor state into the GPU-free snapshot view. The status is copied
+/// rather than inferred: an unreadable stored edit must stay visible as `Unsupported`/`Corrupt` so
+/// the renderer can never fall back to defaults and later overwrite it.
+fn document_view(state: &EditorState) -> DocumentView {
+    match state {
+        EditorState::Empty => DocumentView::default(),
+        EditorState::Loading { .. } => DocumentView {
+            status: DocumentStatus::Loading,
+            ..DocumentView::default()
+        },
+        EditorState::Ready(doc) => DocumentView {
+            status: DocumentStatus::Ready,
+            params: Some(doc.params.clone()),
+            revision: Some(doc.revision),
+            process_version: Some(doc.process_version),
+            dirty: doc.is_dirty(),
+        },
+        EditorState::Unsupported {
+            document, reason, ..
+        } => DocumentView {
+            status: DocumentStatus::Unsupported(reason.clone()),
+            params: None,
+            revision: None,
+            process_version: Some(ProcessVersion(document.process_version())),
+            dirty: false,
+        },
+        EditorState::Corrupt { document, .. } => DocumentView {
+            status: DocumentStatus::Corrupt,
+            params: None,
+            revision: None,
+            process_version: Some(ProcessVersion(document.process_version())),
+            dirty: false,
+        },
+        EditorState::Error { message, .. } => DocumentView {
+            status: DocumentStatus::Error(message.clone()),
+            params: None,
+            revision: None,
+            process_version: None,
+            dirty: false,
+        },
+    }
+}
+
+/// The editor only ever refuses an `Open` on session exhaustion; anything else is reported as an
+/// invalid command rather than silently leaving the selection without a document.
+fn editor_refusal(image_id: ImageId, outcome: Result<EditorEvent, EditorError>) -> AppError {
+    match outcome {
+        Err(EditorError::Exhausted) => AppError::Exhausted,
+        other => AppError::InvalidCommand(format!(
+            "editor could not open image {image_id:?}: {other:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -380,12 +499,29 @@ mod tests {
         assert_eq!(session.snapshot(), before);
         Arc::make_mut(&mut session.snapshot).catalog_epoch = CatalogEpoch(0);
         Arc::make_mut(&mut session.snapshot).catalog_ready = true;
-        session.editor_session = EditorSession(u64::MAX);
+        session.selection_generation = SelectionGeneration(u64::MAX);
         let before = session.snapshot();
         assert_eq!(
             session.dispatch(Command::SelectImage(None)),
             Err(AppError::Exhausted)
         );
         assert_eq!(session.snapshot(), before);
+        // A refused selection must not have opened (or half-opened) a document.
+        assert!(matches!(session.editor.state(), EditorState::Empty));
+    }
+    #[test]
+    fn selection_reserves_room_for_both_effects() {
+        let mut session = ApplicationSession::new(Arc::new(Stub), Arc::new(Stub), Arc::new(Stub));
+        Arc::make_mut(&mut session.snapshot).catalog_ready = true;
+        // One slot left: the row lookup fits, the edit load would not, so nothing is issued.
+        session.next_request = u64::MAX - 1;
+        let before = session.snapshot();
+        assert_eq!(
+            session.dispatch(Command::SelectImage(Some(ImageId(1)))),
+            Err(AppError::Exhausted)
+        );
+        assert_eq!(session.snapshot(), before);
+        assert!(matches!(session.editor.state(), EditorState::Empty));
+        assert!(session.pending.is_empty());
     }
 }

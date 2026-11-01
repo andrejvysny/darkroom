@@ -460,6 +460,113 @@ fn write_buffer_if_changed(
     queue.write_buffer(buf, 0, bytes);
 }
 
+/// Block until `readback` (previously filled by a `copy_texture_to_buffer` of an `ow×oh`
+/// `Rgba8Unorm` texture with `out_bpr`-padded rows) is mapped, then return tightly-packed RGBA8
+/// (`ow*oh*4`). Shared tail of [`DevelopPipeline::read_back`] (per-image readback buffers) and
+/// [`DevelopPipeline::read_back_texture`] (fresh staging buffer for a caller-owned texture).
+fn read_back_mapped(
+    ctx: &GpuContext,
+    readback: &wgpu::Buffer,
+    out_bpr: u32,
+    ow: u32,
+    oh: u32,
+) -> Result<Vec<u8>, PipelineError> {
+    // The source/viewport layout was validated before allocation. Reserve the host output
+    // before mapping the readback so an allocation error cannot leave that GPU buffer mapped.
+    let output_len = ow as usize * oh as usize * 4;
+    let mut out = Vec::new();
+    out.try_reserve_exact(output_len)
+        .map_err(|e| PipelineError::Allocation(format!("CPU readback: {e}")))?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .map_err(|e| PipelineError::Map(e.to_string()))?
+        .map_err(|e| PipelineError::Map(e.to_string()))?;
+
+    let data = match readback.slice(..).get_mapped_range() {
+        Ok(data) => data,
+        Err(error) => {
+            readback.unmap();
+            return Err(PipelineError::Map(error.to_string()));
+        }
+    };
+    out.resize(output_len, 0u8);
+    let row = ow as usize * 4;
+    if out_bpr as usize == row {
+        // Rows already tightly packed (width divisible by the 256-byte alignment) — one copy.
+        let len = out.len();
+        out.copy_from_slice(&data[..len]);
+    } else {
+        for y in 0..oh as usize {
+            let src = y * out_bpr as usize;
+            let dst = y * row;
+            out[dst..dst + row].copy_from_slice(&data[src..src + row]);
+        }
+    }
+    drop(data);
+    readback.unmap();
+    Ok(out)
+}
+
+/// Validate a caller-owned texture passed to [`DevelopPipeline::render_view_into_texture`]
+/// against the requested view. Typed error on every mismatch — a wrong texture must never panic
+/// the render thread.
+fn validate_render_target(
+    device: &wgpu::Device,
+    target: &wgpu::Texture,
+    view: &crate::params::ViewParams,
+) -> Result<(), PipelineError> {
+    let bad = |why: String| PipelineError::InvalidTarget(why);
+    if target.format() != wgpu::TextureFormat::Rgba8Unorm {
+        return Err(bad(format!(
+            "target format {:?} is not Rgba8Unorm",
+            target.format()
+        )));
+    }
+    if !target
+        .usage()
+        .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+    {
+        return Err(bad("target lacks RENDER_ATTACHMENT usage".to_string()));
+    }
+    if target.dimension() != wgpu::TextureDimension::D2
+        || target.mip_level_count() != 1
+        || target.sample_count() != 1
+    {
+        return Err(bad(format!(
+            "target must be a single-sampled 2D texture (dimension {:?}, {} mips, {} samples)",
+            target.dimension(),
+            target.mip_level_count(),
+            target.sample_count()
+        )));
+    }
+    let limits = device.limits();
+    if target.width() != view.out_w || target.height() != view.out_h {
+        return Err(bad(format!(
+            "target is {}x{}, view output is {}x{}",
+            target.width(),
+            target.height(),
+            view.out_w,
+            view.out_h
+        )));
+    }
+    if view.out_w == 0
+        || view.out_h == 0
+        || view.out_w > limits.max_texture_dimension_2d
+        || view.out_h > limits.max_texture_dimension_2d
+    {
+        return Err(bad(format!(
+            "view output {}x{} outside 1..={} px",
+            view.out_w, view.out_h, limits.max_texture_dimension_2d
+        )));
+    }
+    Ok(())
+}
+
 struct ViewTarget {
     width: u32,
     height: u32,
@@ -1263,18 +1370,47 @@ impl DevelopPipeline {
         // Poison policy: RECOVER. This mutex guards ordering, not data (`Mutex<()>` — there is no
         // state inside it to be left inconsistent). A panic in one GPU render must not make every
         // later render of that image panic too, which would kill the app on the second failure.
+        // Held for encode + copy + submit + readback as one unit: `readback` is shared too, so the
+        // two halves must never run under separate acquisitions.
         let _render_guard = prepared
             .render_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let output_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let enc = self.encode_develop(
+            ctx,
+            prepared,
+            params,
+            view,
+            ai_coverages,
+            &output_view,
+            (ow, oh),
+        )?;
+        self.read_back(ctx, out_tex, readback, out_bpr, ow, oh, enc)
+    }
+
+    /// Everything of a develop frame up to and including the main render pass into `target_view`:
+    /// uniform writes, LUT uploads, brush bake, mask pre-pass/refine, then the develop pass drawing
+    /// into `target_view`. Does NOT submit — the caller adds its tail (a `copy_texture_to_buffer`
+    /// via [`Self::read_back`], or nothing at all for the GPU-resident path) and submits. Same
+    /// order, same shared-state usage as the pre-split `render_to`.
+    ///
+    /// Caller MUST hold `prepared.render_lock`: every uniform/LUT/mask buffer written here is
+    /// per-image shared state.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_develop(
+        &self,
+        ctx: &GpuContext,
+        prepared: &PreparedImage,
+        params: &DevelopParams,
+        view: &crate::params::ViewParams,
+        ai_coverages: Option<&[AiCoverage]>,
+        target_view: &wgpu::TextureView,
+        target_size: (u32, u32),
+    ) -> Result<wgpu::CommandEncoder, PipelineError> {
         let device = &ctx.device;
         let (w, h) = (prepared.width, prepared.height);
-        // The source/viewport layout was validated before allocation. Reserve the host output
-        // before mapping the readback so an allocation error cannot leave that GPU buffer mapped.
-        let output_len = ow as usize * oh as usize * 4;
-        let mut out = Vec::new();
-        out.try_reserve_exact(output_len)
-            .map_err(|e| PipelineError::Allocation(format!("CPU readback: {e}")))?;
+        let (ow, oh) = target_size;
 
         // Every write below is diffed against its last payload (write_hashes): a pan/zoom frame
         // rewrites ONLY the view uniform; a slider move rewrites only what it feeds.
@@ -1563,7 +1699,6 @@ impl DevelopPipeline {
         }
         drop(layer_hashes);
 
-        let output_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("develop-enc"),
         });
@@ -1571,7 +1706,7 @@ impl DevelopPipeline {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("develop-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_view,
+                    view: target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1588,6 +1723,26 @@ impl DevelopPipeline {
             pass.set_bind_group(0, &prepared.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        Ok(enc)
+    }
+
+    /// Readback tail of [`Self::render_to`]: append the target→buffer copy to the encoder from
+    /// [`Self::encode_develop`], submit, block until the buffer is mapped, and return
+    /// tightly-packed RGBA8 (`ow*oh*4`, rows unpadded from `out_bpr`).
+    ///
+    /// Caller MUST hold `prepared.render_lock` — `readback` is a per-image shared buffer, so
+    /// encode and this tail belong to one lock acquisition.
+    #[allow(clippy::too_many_arguments)]
+    fn read_back(
+        &self,
+        ctx: &GpuContext,
+        out_tex: &wgpu::Texture,
+        readback: &wgpu::Buffer,
+        out_bpr: u32,
+        ow: u32,
+        oh: u32,
+        mut enc: wgpu::CommandEncoder,
+    ) -> Result<Vec<u8>, PipelineError> {
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: out_tex,
@@ -1610,39 +1765,7 @@ impl DevelopPipeline {
             },
         );
         ctx.queue.submit(Some(enc.finish()));
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv()
-            .map_err(|e| PipelineError::Map(e.to_string()))?
-            .map_err(|e| PipelineError::Map(e.to_string()))?;
-
-        let data = match readback.slice(..).get_mapped_range() {
-            Ok(data) => data,
-            Err(error) => {
-                readback.unmap();
-                return Err(PipelineError::Map(error.to_string()));
-            }
-        };
-        out.resize(output_len, 0u8);
-        let row = ow as usize * 4;
-        if out_bpr as usize == row {
-            // Rows already tightly packed (width divisible by the 256-byte alignment) — one copy.
-            let len = out.len();
-            out.copy_from_slice(&data[..len]);
-        } else {
-            for y in 0..oh as usize {
-                let src = y * out_bpr as usize;
-                let dst = y * row;
-                out[dst..dst + row].copy_from_slice(&data[src..src + row]);
-            }
-        }
-        drop(data);
-        readback.unmap();
-        Ok(out)
+        read_back_mapped(ctx, readback, out_bpr, ow, oh)
     }
 
     /// Render `prepared` with `params` at full source resolution; returns tightly-packed RGBA8
@@ -1759,6 +1882,126 @@ impl DevelopPipeline {
             ow,
             oh,
         )
+    }
+
+    /// Develop `prepared` into a caller-owned texture (format `Rgba8Unorm`, usage must include
+    /// RENDER_ATTACHMENT) at exactly `view.out_w × view.out_h`. Submits the work and returns the
+    /// submission index; does NOT read back — the developed pixels stay on the GPU (sampled by
+    /// egui for interactive native presentation). The caller owns the texture's lifetime and must
+    /// not reuse it while a previous submission that targets it may still be sampled
+    /// (renderer-side leasing).
+    ///
+    /// Uniform lifetime: uniforms live in `PreparedImage`'s shared buffers and are rewritten with
+    /// `queue.write_buffer` before each submit. wgpu applies `write_buffer` at the next `submit`,
+    /// so an already-submitted frame keeps the values it was submitted with — back-to-back
+    /// submissions without waiting in between each render their own params (proven by
+    /// `tests/texture_target.rs::back_to_back_submissions_keep_their_own_uniforms`).
+    ///
+    /// Validation failures (format / usage / size vs `view`) return
+    /// [`PipelineError::InvalidTarget`]; never panic. Takes `prepared`'s render lock for
+    /// encode + submit (no readback tail, so none is needed past the submit).
+    pub fn render_view_into_texture(
+        &self,
+        ctx: &GpuContext,
+        prepared: &PreparedImage,
+        params: &DevelopParams,
+        view: &crate::params::ViewParams,
+        ai_coverages: Option<&[AiCoverage]>,
+        target: &wgpu::Texture,
+    ) -> Result<wgpu::SubmissionIndex, PipelineError> {
+        validate_render_target(&ctx.device, target, view)?;
+        // One render at a time per image — shared uniforms/LUT/mask layers (same poison policy as
+        // `render_to`).
+        let _render_guard = prepared
+            .render_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let enc = self.encode_develop(
+            ctx,
+            prepared,
+            params,
+            view,
+            ai_coverages,
+            &target_view,
+            (view.out_w, view.out_h),
+        )?;
+        Ok(ctx.queue.submit(Some(enc.finish())))
+    }
+
+    /// Explicit CPU readback of a texture produced by [`Self::render_view_into_texture`] (tests,
+    /// export, diagnostics). Blocking: submits the copy and waits for the map. Returns
+    /// tightly-packed RGBA8 (`width*height*4`). The texture must be `Rgba8Unorm`, single-sampled
+    /// 2D, with `COPY_SRC` usage; mismatches return [`PipelineError::InvalidTarget`].
+    pub fn read_back_texture(
+        &self,
+        ctx: &GpuContext,
+        texture: &wgpu::Texture,
+    ) -> Result<Vec<u8>, PipelineError> {
+        let (ow, oh) = (texture.width(), texture.height());
+        let limits = ctx.device.limits();
+        if texture.format() != wgpu::TextureFormat::Rgba8Unorm {
+            return Err(PipelineError::InvalidTarget(format!(
+                "readback format {:?} is not Rgba8Unorm",
+                texture.format()
+            )));
+        }
+        if !texture.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+            return Err(PipelineError::InvalidTarget(
+                "readback target lacks COPY_SRC usage".to_string(),
+            ));
+        }
+        if texture.dimension() != wgpu::TextureDimension::D2
+            || texture.mip_level_count() != 1
+            || texture.sample_count() != 1
+        {
+            return Err(PipelineError::InvalidTarget(format!(
+                "readback target must be a single-sampled 2D texture (dimension {:?}, {} mips, {} samples)",
+                texture.dimension(),
+                texture.mip_level_count(),
+                texture.sample_count()
+            )));
+        }
+        let (bpr, readback_size) = crate::validation::output_layout(
+            ow,
+            oh,
+            limits.max_texture_dimension_2d,
+            limits.max_buffer_size,
+        )?;
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("develop-texture-readback"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("develop-texture-readback-enc"),
+            });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(oh),
+                },
+            },
+            wgpu::Extent3d {
+                width: ow,
+                height: oh,
+                depth_or_array_layers: 1,
+            },
+        );
+        ctx.queue.submit(Some(enc.finish()));
+        read_back_mapped(ctx, &readback, bpr, ow, oh)
     }
 
     /// Bake a mask's brush strokes into the per-image brush scratch texture. Clears first, then

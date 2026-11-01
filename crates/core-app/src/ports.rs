@@ -11,6 +11,10 @@ pub trait CatalogPort: Send + Sync {
     fn folders(&self) -> Result<Vec<FolderRow>, AppError>;
     fn dates(&self) -> Result<Vec<DateTreeYear>, AppError>;
     fn image(&self, id: i64) -> Result<Option<ImageRow>, AppError>;
+    /// Stored edit for `image_id` as `(raw params JSON, stored process_version)`, or `None` when the
+    /// image has no edit row. The JSON stays raw: interpretation is the model's job
+    /// (`core_model::document::EditDocument::read`), never the catalog's.
+    fn edit(&self, image_id: i64) -> Result<Option<(String, i64)>, AppError>;
 }
 
 pub trait Clock: Send + Sync {

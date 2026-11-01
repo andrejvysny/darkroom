@@ -14,6 +14,8 @@ pub enum PipelineError {
     BufferTooLarge { required: u64, max: u64 },
     #[error("image allocation: {0}")]
     Allocation(String),
+    #[error("invalid develop render target: {0}")]
+    InvalidTarget(String),
     #[error("buffer map: {0}")]
     Map(String),
     #[error("raw: {0}")]

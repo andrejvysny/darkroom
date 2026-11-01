@@ -20,10 +20,19 @@ pub struct CatalogAdapter {
     slot: Mutex<Slot>,
 }
 
-/// Explicit bridge for the legacy host, which still shares its catalog connection.
+/// Open the catalog for any host — the legacy one that shares the connection, and `CatalogPort::open`
+/// alike. Both therefore back up before migrating: an existing catalog below the current schema is
+/// snapshotted into a `backups` directory next to it before `MIGRATIONS` rewrite it
+/// ([`Db::open_with_upgrade_backup`], whose docs make the snapshot a pre-condition: migrations are
+/// irreversible, so without it one bad migration on a user's only catalog is data loss). The
+/// pre-upgrade copies are excluded from rotation, so the daily backup never rotates them away.
 pub fn open_database(path: &Path) -> Result<SharedDb, AppError> {
-    Db::open(path)
-        .map(|db| Arc::new(Mutex::new(db)))
+    // `path.parent()` is only `None` for a bare filename; anchoring the backups next to the
+    // catalog is what the corruption banner ("restore from the backups folder next to the
+    // catalog") promises, so fall back to the current directory rather than skipping the backup.
+    let backups_dir = path.parent().unwrap_or(Path::new(".")).join("backups");
+    Db::open_with_upgrade_backup(path, &backups_dir)
+        .map(|(db, _snapshot)| Arc::new(Mutex::new(db)))
         .map_err(db_error)
 }
 
@@ -116,6 +125,9 @@ impl CatalogPort for CatalogAdapter {
     }
     fn image(&self, id: i64) -> Result<Option<ImageRow>, AppError> {
         self.read(|db| core_library::image_by_id(&db.conn, id))
+    }
+    fn edit(&self, image_id: i64) -> Result<Option<(String, i64)>, AppError> {
+        self.read(|db| core_library::get_edit_with_process_version(&db.conn, image_id))
     }
 }
 

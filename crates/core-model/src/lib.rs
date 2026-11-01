@@ -8,6 +8,7 @@ pub mod document;
 pub mod geometry;
 pub mod identity;
 mod masks;
+pub mod settings;
 mod ui_numeric;
 mod view;
 

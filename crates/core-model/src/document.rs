@@ -13,7 +13,9 @@ pub enum ReadStatus {
 }
 
 /// Original JSON and its separately stored process version. No write or merge is implied.
-#[derive(Debug, Clone)]
+/// `PartialEq` compares interpretation (status, preview, version, raw text), so two documents the
+/// model reads identically are equal; it is required because workflow completions carry it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EditDocument {
     raw_json: String,
     process_version: i64,

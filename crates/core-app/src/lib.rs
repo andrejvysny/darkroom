@@ -1,4 +1,6 @@
 //! UI-independent application state and typed workflow boundaries.
+pub mod autosave;
+pub mod editor;
 pub mod error;
 pub mod jobs;
 pub mod ports;

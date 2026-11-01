@@ -14,6 +14,7 @@ pub mod index;
 pub mod keywords;
 pub mod maintenance;
 pub mod merge;
+pub mod outbox;
 pub mod pairs;
 pub mod pano_detect;
 pub mod presets;
@@ -47,7 +48,10 @@ pub use decode_failure::{
     record_decode_failure, record_failure_facts, skippable_failures, DecodeFailureCounts,
     DecodeFailureRow, FailureFacts,
 };
-pub use edits::{get_edit, get_edit_with_version, set_edit, thumb_precheck};
+pub use edits::{
+    get_edit, get_edit_with_process_version, get_edit_with_version, save_edit_with_intent,
+    set_edit, thumb_precheck,
+};
 pub use error::LibError;
 pub use events::{append_event, context_with_suggested, event_count, ids_json, Event};
 pub use face::{
@@ -75,6 +79,9 @@ pub use keywords::{
 };
 pub use maintenance::reap_dangling_import_sessions;
 pub use merge::insert_hdr_image;
+pub use outbox::{
+    complete_outbox, fail_outbox, mirrored_revision, pending_outbox, OutboxCompletion, OutboxItem,
+};
 pub use pairs::{link_pair, pair_info, primary_of, secondaries_of, unlink_pair, PairInfo};
 pub use presets::{
     delete_preset, get_preset, insert_preset, is_builtin, list_presets, seed_builtin_preset,
@@ -87,7 +94,8 @@ pub use query::{
 };
 pub use reconcile::{reconcile, ReconcileStats};
 pub use reject::{
-    delete_rejected, delete_rejected_with, summarize_rejected, RejectDeleteResult, RejectSummary,
+    delete_rejected, delete_rejected_with, finalize_delete_rejected, plan_delete_rejected,
+    summarize_rejected, RejectDeleteResult, RejectPlan, RejectSummary,
 };
 pub use settings::{
     animal_detector_size, default_scan_stages, face_stage_enabled, get_meta, library_root,
