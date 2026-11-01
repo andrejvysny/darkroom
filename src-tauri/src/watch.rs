@@ -7,6 +7,8 @@
 
 use crate::state::AppState;
 use core_library::THUMB_SIZE;
+use core_model::identity::ImageId;
+use core_runtime::publication::{SourceKey, SourceMutationGuard};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -257,8 +259,8 @@ fn reconcile_status<R: Runtime>(app: &AppHandle<R>) -> bool {
         }
         let exists = Path::new(&path).exists();
         match (status.as_str(), exists) {
-            ("present", false) => changes.push((id, path, status, "missing")),
-            ("missing", true) => changes.push((id, path, status, "present")),
+            ("present", false) => changes.push((id, path, status, "missing".to_string())),
+            ("missing", true) => changes.push((id, path, status, "present".to_string())),
             _ => {}
         }
     }
@@ -282,10 +284,61 @@ fn reconcile_status<R: Runtime>(app: &AppHandle<R>) -> bool {
     let Ok(tx) = db.conn.unchecked_transaction() else {
         return false;
     };
-    let mut changed = false;
+    // A `present` transition whose identity cannot be read aborts the whole pass (see
+    // `apply_status_updates`): the transaction drops uncommitted and the next watcher pass retries.
+    let Some(applied) =
+        apply_status_updates(&tx, &changes, &|| st.workers.is_stopping(), &|tx, id| {
+            identity_of(tx, id)
+        })
+    else {
+        return false;
+    };
+    if st.workers.is_stopping() {
+        return false;
+    }
+    if tx.commit().is_ok() && !applied.is_empty() {
+        drop(db);
+        apply_status_changes(&mut gate, &applied);
+        st.clear_source_caches();
+        true
+    } else {
+        false
+    }
+}
+
+/// Read a row's committed source identity inside the reconcile transaction. `None` when the row
+/// is gone or the catalog could not answer — the caller must treat both as unreadable.
+fn identity_of(tx: &core_db::rusqlite::Transaction<'_>, id: i64) -> Option<SourceKey> {
+    core_library::image_by_id(tx, id)
+        .ok()
+        .flatten()
+        .map(|row| SourceKey {
+            hash: row.content_hash,
+            path: row.path,
+        })
+}
+
+/// Apply the candidate status transitions inside the reconcile transaction, returning the rows
+/// actually updated together with their committed identities — or `None` when the caller must
+/// drop the transaction (rollback) and retry on the next pass: shutdown was requested, or a row
+/// becoming `present` had no readable identity. Retiring an id whose row is present is never
+/// safe: the gate's `capture` refuses a `None` key forever, so the image would stay unpublishable
+/// (sidecar mirroring, thumbnails, develop) for the whole run while catalog and disk both say
+/// `present` and reconcile never re-fires. Aborting before the commit keeps the row `missing` so
+/// the next pass re-attempts the transition.
+///
+/// `stopping` and the per-row identity read are seams so this runs in tests without an
+/// `AppHandle`; production passes the worker-stop flag and [`identity_of`].
+fn apply_status_updates(
+    tx: &core_db::rusqlite::Transaction<'_>,
+    changes: &[(i64, String, String, String)],
+    stopping: &dyn Fn() -> bool,
+    identity: &dyn Fn(&core_db::rusqlite::Transaction<'_>, i64) -> Option<SourceKey>,
+) -> Option<Vec<AppliedStatusChange>> {
+    let mut applied = Vec::new();
     for (id, path, old, new) in changes {
-        if st.workers.is_stopping() {
-            return false;
+        if stopping() {
+            return None;
         }
         if tx
             .execute(
@@ -295,19 +348,39 @@ fn reconcile_status<R: Runtime>(app: &AppHandle<R>) -> bool {
             .unwrap_or(0)
             > 0
         {
-            changed = true;
+            // Read the identity inside the transaction: if the commit later fails, these keys
+            // never reached the catalog and the gate must not learn about them.
+            let key = if new == "present" {
+                Some(identity(tx, *id)?)
+            } else {
+                None
+            };
+            applied.push(AppliedStatusChange { id: *id, key });
         }
     }
-    if st.workers.is_stopping() {
-        return false;
-    }
-    if tx.commit().is_ok() && changed {
-        drop(db);
-        gate.invalidate_all();
-        st.clear_source_caches();
-        true
-    } else {
-        false
+    Some(applied)
+}
+
+/// A status row the reconcile transaction actually changed, together with the source identity
+/// read from the catalog inside that same transaction.
+struct AppliedStatusChange {
+    id: i64,
+    /// Transitions to `present` carry their committed path+hash (an unreadable identity aborts
+    /// the pass before the commit, so it is never `None` here); transitions to `missing` carry
+    /// `None` — the file is gone from disk and the id is retired.
+    key: Option<SourceKey>,
+}
+
+/// Apply committed status transitions to the publication gate one source at a time. A single
+/// file appearing/disappearing MUST NOT bump the catalog epoch: that supersedes every in-flight
+/// job keyed on the epoch and stales pending publications for unrelated images. A `None` key
+/// retires the id — the safe direction, since tokens for that image go stale and are re-captured.
+fn apply_status_changes(gate: &mut SourceMutationGuard, applied: &[AppliedStatusChange]) {
+    for change in applied {
+        match &change.key {
+            Some(key) => gate.replace_source(ImageId(change.id), key.clone()),
+            None => gate.retire(ImageId(change.id)),
+        }
     }
 }
 
@@ -376,6 +449,13 @@ fn index_new<R: Runtime>(app: &AppHandle<R>, root: &Path) -> bool {
         if st.workers.is_stopping() {
             break;
         }
+        // Hold the source-mutation gate across the commit to serialize it against other source
+        // mutations (lock order: gate before catalog). A fresh insert can REUSE a rowid retired by
+        // a delete (`images.id` has no AUTOINCREMENT), so the committed row's identity is
+        // registered under this same guard (see `commit_indexed`) — without it, work for the
+        // reused id is refused as Stale until restart. A successful insert otherwise invalidates
+        // nothing, and bumping the epoch here would wrongly supersede in-flight jobs for
+        // unrelated images.
         let mut gate = st.publications.source_guard();
         let Ok(mut db) = st.db.lock() else { break };
         if st.workers.is_stopping() {
@@ -383,51 +463,103 @@ fn index_new<R: Runtime>(app: &AppHandle<R>, root: &Path) -> bool {
         }
         if !st.publication.is_current(&db, generation) {
             drop(db);
-            drop(gate);
             request_resync(app);
             return inserted_any || recorded > 0;
         }
-        let mut published = false;
-        if let Ok(tx) = db.conn.transaction() {
-            let mut inserted = false;
-            match &result {
-                Ok(p) => {
-                    if let Ok(Some(_)) = core_library::insert_image(&tx, folder_id, imported_at, p)
-                    {
-                        inserted = true;
-                    }
-                    let _ = core_library::clear_decode_failure(&tx, &p.path);
-                }
-                Err(e) => {
-                    if core_library::record_decode_failure(
-                        &tx,
-                        Some(folder_id),
-                        path,
-                        e,
-                        imported_at,
-                    )
-                    .is_ok()
-                    {
-                        recorded += 1;
-                    }
-                }
-            }
-            if st.workers.is_stopping() {
-                break;
-            }
-            if tx.commit().is_ok() && inserted {
-                gate.invalidate_all();
-                published = true;
-                inserted_any = true;
-            }
-        };
+        let outcome = commit_indexed(
+            &mut gate,
+            &mut db.conn,
+            folder_id,
+            imported_at,
+            path,
+            &|| st.workers.is_stopping(),
+            &result,
+        );
         drop(db);
-        if published {
-            st.clear_source_caches();
+        match outcome {
+            IndexCommit::Inserted => {
+                inserted_any = true;
+                st.clear_source_caches();
+            }
+            IndexCommit::FailureRecorded => recorded += 1,
+            IndexCommit::Stopped => break,
+            IndexCommit::Nothing | IndexCommit::Failed => {}
         }
     }
     // A newly-recorded failure changes the sidebar's Unsupported count, so it counts as a change.
     inserted_any || recorded > 0
+}
+
+/// Outcome of one fenced watcher catalog commit (see [`commit_indexed`]).
+enum IndexCommit {
+    /// A fresh row was inserted and committed; the gate now holds its identity.
+    Inserted,
+    /// A decode failure was recorded in the committed transaction.
+    FailureRecorded,
+    /// The transaction committed without writing a new identity (e.g. a duplicate hash).
+    Nothing,
+    /// Shutdown was requested before the commit; the transaction was rolled back.
+    Stopped,
+    /// The transaction could not be created or committed; nothing was written.
+    Failed,
+}
+
+/// Commit one processed watcher file under the caller's HELD source guard: one transaction for
+/// the row write, then — while the gate is still held — register the inserted row's identity
+/// (hash + path) so a REUSED rowid (SQLite recycles ids after deletes; no AUTOINCREMENT) is
+/// publishable immediately instead of being refused as Stale until restart. Registering inside
+/// the guard, not after releasing it, keeps a concurrent retire/reset from slipping between the
+/// commit and the registration. Lock order: the caller holds the gate; the catalog lock is
+/// taken through `conn` inside (gate → catalog).
+fn commit_indexed(
+    gate: &mut SourceMutationGuard<'_>,
+    conn: &mut core_db::rusqlite::Connection,
+    folder_id: i64,
+    imported_at: i64,
+    src_path: &Path,
+    stopping: &dyn Fn() -> bool,
+    result: &Result<core_library::ProcessedImage, core_library::LibError>,
+) -> IndexCommit {
+    let Ok(tx) = conn.transaction() else {
+        return IndexCommit::Failed;
+    };
+    let mut inserted: Option<i64> = None;
+    let mut recorded_failure = false;
+    match result {
+        Ok(p) => {
+            // As before: a failed insert is not a watcher error — no row appears, and the
+            // transaction still commits the failure-record cleanup.
+            inserted = core_library::insert_image(&tx, folder_id, imported_at, p).unwrap_or(None);
+            let _ = core_library::clear_decode_failure(&tx, &p.path);
+        }
+        Err(e) => {
+            recorded_failure =
+                core_library::record_decode_failure(&tx, Some(folder_id), src_path, e, imported_at)
+                    .is_ok();
+        }
+    }
+    if stopping() {
+        return IndexCommit::Stopped; // tx drops uncommitted → rollback
+    }
+    if tx.commit().is_err() {
+        return IndexCommit::Failed;
+    }
+    if let Some(id) = inserted {
+        let p = result.as_ref().expect("insert only succeeds for Ok");
+        gate.replace_source(
+            ImageId(id),
+            SourceKey {
+                hash: p.content_hash_hex.clone(),
+                path: p.path.clone(),
+            },
+        );
+        return IndexCommit::Inserted;
+    }
+    if recorded_failure {
+        IndexCommit::FailureRecorded
+    } else {
+        IndexCommit::Nothing
+    }
 }
 
 /// RAII marker that an import is running, so the FS watcher defers its sync pass for the duration
