@@ -302,13 +302,16 @@ fn forbidden(from: Role, to: Role, from_native_host: bool, to_name: &str) -> boo
                 || gui(to_name)
                 || wgpu_family(to_name)
         }
-        // Ui may use egui and Model/App; wgpu types arrive only via Renderer.
+        // Ui may use egui and Model/App only: no GPU, windowing, database, dialogs or tauri.
         Role::Ui => {
             matches!(
                 to,
                 Role::Runtime | Role::Engine | Role::Renderer | Role::Host
             ) || sql(to_name)
                 || tauri(to_name)
+                || wgpu_family(to_name)
+                || matches!(to_name, "winit" | "eframe" | "rfd")
+                || to_name.starts_with("egui-")
         }
         // apps/darkroom is the native executable: no tauri. src-tauri is the legacy host: no new rules.
         Role::Host => from_native_host && tauri(to_name),

@@ -10,6 +10,11 @@ pub enum ActionId {
     LoadFolders,
     LoadDates,
     RequestShutdown,
+    Undo,
+    Redo,
+    /// Exposure edits (discrete and gesture); other develop controls will share the requirement.
+    Exposure,
+    DiscardUnsavedEdits,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +23,10 @@ pub enum EnabledRequirement {
     Running,
     CatalogReady,
     HasSelection,
+    /// A Ready document whose image row (hence save identity) is loaded.
+    Editable,
+    CanUndo,
+    CanRedo,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -25,6 +34,9 @@ pub struct EnabledContext {
     pub running: bool,
     pub catalog_ready: bool,
     pub has_selection: bool,
+    pub editable: bool,
+    pub can_undo: bool,
+    pub can_redo: bool,
 }
 
 impl EnabledRequirement {
@@ -34,6 +46,9 @@ impl EnabledRequirement {
             Self::Running => context.running,
             Self::CatalogReady => context.running && context.catalog_ready,
             Self::HasSelection => context.running && context.catalog_ready && context.has_selection,
+            Self::Editable => Self::HasSelection.is_enabled(context) && context.editable,
+            Self::CanUndo => Self::Editable.is_enabled(context) && context.can_undo,
+            Self::CanRedo => Self::Editable.is_enabled(context) && context.can_redo,
         }
     }
 }
@@ -112,6 +127,38 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         menu: Some("File"),
         route: ActionId::RequestShutdown,
         enabled: EnabledRequirement::Running,
+    },
+    ActionDescriptor {
+        id: "undo",
+        label: "Undo",
+        shortcut: Some("CmdOrCtrl+Z"),
+        menu: Some("Edit"),
+        route: ActionId::Undo,
+        enabled: EnabledRequirement::CanUndo,
+    },
+    ActionDescriptor {
+        id: "redo",
+        label: "Redo",
+        shortcut: Some("CmdOrCtrl+Shift+Z"),
+        menu: Some("Edit"),
+        route: ActionId::Redo,
+        enabled: EnabledRequirement::CanRedo,
+    },
+    ActionDescriptor {
+        id: "exposure",
+        label: "Exposure",
+        shortcut: None,
+        menu: None,
+        route: ActionId::Exposure,
+        enabled: EnabledRequirement::Editable,
+    },
+    ActionDescriptor {
+        id: "discard_unsaved_edits",
+        label: "Discard Unsaved Edits",
+        shortcut: None,
+        menu: None,
+        route: ActionId::DiscardUnsavedEdits,
+        enabled: EnabledRequirement::CatalogReady,
     },
 ];
 

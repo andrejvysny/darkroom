@@ -47,7 +47,10 @@ impl Error for ErrorSource {
 /// Categories survive transport; presentation chooses user-facing wording.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppError {
-    SchemaTooNew { found: i64, supported: i64 },
+    SchemaTooNew {
+        found: i64,
+        supported: i64,
+    },
     Corrupt(ErrorSource),
     Catalog(ErrorSource),
     NotOpen,
@@ -55,6 +58,17 @@ pub enum AppError {
     Closed,
     Stale,
     Exhausted,
+    /// An edit command was refused; nothing changed. The reason names why (no document, protected
+    /// document, gesture state, non-finite value), never a silent default.
+    EditRefused(String),
+    /// A flush barrier (close/shutdown) was cancelled because saving `image` failed; the editor
+    /// stays open and usable and the unsaved edit is still pending.
+    SaveFailed {
+        image: String,
+        message: String,
+    },
+    /// The image's source file changed under the edit; the save is permanently refused.
+    SourceChanged,
 }
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -70,6 +84,12 @@ impl fmt::Display for AppError {
             Self::Closed => f.write_str("application session is closed"),
             Self::Stale => f.write_str("obsolete application request"),
             Self::Exhausted => f.write_str("application identity counter exhausted"),
+            Self::SourceChanged => f.write_str("source changed — not saved"),
+            Self::EditRefused(reason) => write!(f, "edit refused: {reason}"),
+            Self::SaveFailed { image, message } => write!(
+                f,
+                "Couldn't save your edits to {image}. Darkroom stayed open so nothing is lost. ({message})"
+            ),
         }
     }
 }

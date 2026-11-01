@@ -1,427 +1,15 @@
+pub use crate::native_app::NativeApplication;
 use crate::photo_worker;
-use core_app::ports::{Clock, EventSink, RenderBackend};
-use core_app::registry::{action, ActionId, EnabledContext};
-use core_app::state::{ApplicationSnapshot, DocumentStatus};
-use core_app::subscription::{Notice, SnapshotUpdate};
+use core_app::state::DocumentStatus;
 use core_app::workflow::Command;
 use core_app::AppError;
 use core_model::identity::{
     CacheVersion, DeviceEpoch, DisplayRevision, FrameKey, ImageId, RenderIdentity, RendererVersion,
-    SourceIdentity, SourceRevision, ViewportRevision,
+    SourceIdentity, SourceRevision,
 };
-use core_model::{Crop, DevelopParams};
-use core_pipeline::ViewParams;
-use core_runtime::async_workflow::AsyncCatalogWorkflow;
-use core_runtime::workflow::{InlineExecutor, RuntimePaths};
 use render_wgpu::QualityTier;
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    path::PathBuf,
-    sync::Arc,
-    time::Instant,
-};
-
-struct SystemClock;
-impl Clock for SystemClock {
-    fn now_millis(&self) -> u64 {
-        crate::settings::now_ms()
-    }
-}
-struct NativeEvents;
-impl EventSink for NativeEvents {
-    fn published(&self, update: &SnapshotUpdate) {
-        if let Notice::EffectCompleted {
-            result: Err(error), ..
-        } = &update.notice
-        {
-            eprintln!("catalog operation failed: {error}");
-        }
-    }
-}
-struct RenderCapability(bool);
-impl RenderBackend for RenderCapability {
-    fn available(&self) -> bool {
-        self.0
-    }
-}
-
-pub struct NativeApplication {
-    workflow: AsyncCatalogWorkflow,
-    catalog_path: PathBuf,
-}
-impl NativeApplication {
-    pub fn new(
-        path: PathBuf,
-        renderer_available: bool,
-        wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<Self, AppError> {
-        let mut workflow = AsyncCatalogWorkflow::new(
-            RuntimePaths {
-                catalog: path.clone(),
-            },
-            Arc::new(SystemClock),
-            Arc::new(NativeEvents),
-            Arc::new(RenderCapability(renderer_available)),
-            Arc::new(InlineExecutor),
-            wake,
-            core_runtime::jobs::Config {
-                workers: 2,
-                max_jobs: 16,
-                max_bytes: 128 * 1024 * 1024,
-                max_terminal_records: 128,
-            },
-        )?;
-        workflow.open_initial()?;
-        Ok(Self {
-            workflow,
-            catalog_path: path,
-        })
-    }
-    pub fn reopen_command(&self) -> Command {
-        Command::OpenCatalog(self.catalog_path.clone())
-    }
-    pub fn snapshot(&self) -> Arc<ApplicationSnapshot> {
-        self.workflow.snapshot()
-    }
-    pub fn dispatch(&mut self, command: Command) -> Result<(), AppError> {
-        self.workflow.dispatch(command)
-    }
-    pub fn pump(&mut self) -> Result<(), AppError> {
-        while self.workflow.pump()? {}
-        if self.workflow.needs_join() {
-            self.workflow.join_shutdown();
-        }
-        Ok(())
-    }
-    pub fn is_shutdown_complete(&self) -> bool {
-        self.workflow.is_shutdown_complete()
-    }
-    pub fn wait_idle(&mut self) -> Result<(), AppError> {
-        self.workflow.wait_idle()
-    }
-    pub fn shutdown(&mut self) -> Result<(), AppError> {
-        self.dispatch(Command::RequestShutdown)
-    }
-}
-
-/// A render plan the host must submit: `key` identifies the frame, the rest is the
-/// `PhotoRequest` payload for the photo worker. Computed by the central-panel draw (the only
-/// place the panel's rect is known) and consumed by the host after `run_ui`.
-pub struct PhotoPlan {
-    pub key: FrameKey,
-    pub path: PathBuf,
-    pub content_hash: String,
-    pub params: Arc<DevelopParams>,
-    pub view: ViewParams,
-}
-
-/// Photo presentation state for the central panel, owned by the host (`window.rs`): the egui
-/// texture of the presented frame, the status label, and the out-param for this frame's plan.
-pub struct PhotoUi {
-    /// Registered egui texture of the frame the presenter currently holds, with its pixel size.
-    pub texture: Option<(egui::TextureId, [u32; 2])>,
-    /// Explicit state label (protected/unsupported/failed). When set it replaces the image —
-    /// an unreadable or unsupported document must never be silently shown as a render.
-    pub message: Option<String>,
-    /// A frame is wanted but not yet presented (or absent at all).
-    pub loading: bool,
-    /// Device epoch stamped into every wanted key (the host's renderer epoch).
-    pub device_epoch: DeviceEpoch,
-    /// Filled by the central-panel draw when a frame should be rendered at the panel size.
-    pub plan: Option<PhotoPlan>,
-}
-
-/// The largest size with the frame's `frame_aspect` (W/H) that fits inside `panel_px`, each
-/// side >= 1, rounded. The fit view: the panel is the bounding box, the frame keeps its aspect,
-/// and the leftover panel area is background (the image is drawn centered, never stretched).
-///
-/// Degenerate input is clamped, never panicked: panel sides < 1 become 1; a non-finite or
-/// non-positive aspect falls back to the clamped panel size (nothing to fit against).
-pub fn fit_output(panel_px: (u32, u32), frame_aspect: f64) -> (u32, u32) {
-    let panel_w = panel_px.0.max(1);
-    let panel_h = panel_px.1.max(1);
-    if !frame_aspect.is_finite() || frame_aspect <= 0.0 {
-        return (panel_w, panel_h);
-    }
-    if f64::from(panel_w) >= f64::from(panel_h) * frame_aspect {
-        // Height-bound: full panel height, width from the aspect (<= panel_w by the guard).
-        let width = (f64::from(panel_h) * frame_aspect)
-            .round()
-            .clamp(1.0, f64::from(panel_w)) as u32;
-        (width, panel_h)
-    } else {
-        // Width-bound: full panel width, height from the aspect.
-        let height = (f64::from(panel_w) / frame_aspect)
-            .round()
-            .clamp(1.0, f64::from(panel_h)) as u32;
-        (panel_w, height)
-    }
-}
-
-/// Aspect (W/H) of what the pipeline outputs for this edit: the CROPPED frame's aspect, from
-/// the same crop-aware output dims the legacy develop viewport uses —
-/// [`Crop::output_size`] over the image's display dims (incl. rot90; the catalog stores the
-/// oriented display dims, which is exactly what `develop_linear` uprights to). Missing/zero
-/// catalog dims (legacy rows) fall back to `fallback` (no correction), never a bogus aspect.
-fn cropped_frame_aspect(
-    crop: &Crop,
-    width: Option<i64>,
-    height: Option<i64>,
-    fallback: f64,
-) -> f64 {
-    let (width, height) = match (width, height) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => (w as u32, h as u32),
-        _ => return fallback,
-    };
-    let (frame_w, frame_h) = crop.output_size(width, height);
-    f64::from(frame_w) / f64::from(frame_h)
-}
-
-/// Stable per-process hash of the viewport pixel size (fit view: no zoom yet, so the geometry
-/// revision depends on nothing else).
-fn viewport_revision(width: u32, height: u32) -> ViewportRevision {
-    let mut hasher = DefaultHasher::new();
-    width.hash(&mut hasher);
-    height.hash(&mut hasher);
-    ViewportRevision(hasher.finish())
-}
-
-/// The wanted frame for a `Ready` document at this panel rect, or `None` when nothing is
-/// renderable (no selection, document not `Ready`). Protection (denoise/AI masks, corrupt,
-/// unreadable) is enforced by the host through `PhotoUi::message` + the worker's own check; a
-/// plan is only ever produced for params the worker accepts.
-fn photo_plan(
-    snapshot: &ApplicationSnapshot,
-    rect: egui::Rect,
-    ppp: f32,
-    device_epoch: DeviceEpoch,
-) -> Option<PhotoPlan> {
-    let image = snapshot.editor.image.as_ref()?;
-    if snapshot.editor.document.status != DocumentStatus::Ready {
-        return None;
-    }
-    let params = snapshot.editor.document.params.clone()?;
-    let revision = snapshot.editor.document.revision?;
-    let process_version = snapshot.editor.document.process_version?;
-    let panel_w = (rect.width() * ppp).round().max(1.0) as u32;
-    let panel_h = (rect.height() * ppp).round().max(1.0) as u32;
-    // Aspect-correct fit view: the render target is the largest size with the CROPPED frame's
-    // aspect that fits the panel — drawing it 1:1 centered never stretches it to the panel.
-    let aspect = cropped_frame_aspect(
-        &params.crop,
-        image.width,
-        image.height,
-        f64::from(panel_w) / f64::from(panel_h),
-    );
-    let (width, height) = fit_output((panel_w, panel_h), aspect);
-    // The content hash rides in the request (the prepared-cache key); the identity pins the
-    // source revision, which a same-id re-index reflects there, not here.
-    let key = FrameKey {
-        identity: RenderIdentity {
-            source: SourceIdentity {
-                catalog_epoch: snapshot.catalog_epoch,
-                image_id: ImageId(image.id),
-                source_revision: SourceRevision(0),
-            },
-            editor_session: snapshot.editor.editor_session,
-            selection_generation: snapshot.editor.selection_generation,
-            edit_revision: revision,
-            process_version,
-            renderer_version: RendererVersion(1),
-            cache_version: CacheVersion(1),
-            viewport_revision: viewport_revision(width, height),
-            display_revision: DisplayRevision(0),
-            device_epoch,
-        },
-        viewport_px: (width, height),
-        scale_milli: (ppp * 1000.0).round() as u32,
-        quality: QualityTier::Settled,
-    };
-    Some(PhotoPlan {
-        key,
-        path: PathBuf::from(&image.path),
-        content_hash: image.content_hash.clone(),
-        params,
-        view: photo_worker::fit_view(width, height),
-    })
-}
-
-/// Status-area strip for the settings diagnostics collected at startup
-/// (`crate::settings::SettingsState::load`): a corrupt file repaired, a settings file written by
-/// a newer build, legacy keys the bridge refused. Same red-label style as the command error, in
-/// its own row under the top bar; the Dismiss button clears the whole strip. Renders nothing when
-/// there is nothing to report, so the ordinary layout is unchanged.
-pub fn settings_notice_strip(root: &mut egui::Ui, notices: &mut Vec<String>) {
-    if notices.is_empty() {
-        return;
-    }
-    egui::Panel::top("settings_notices").show(root, |ui| {
-        // Vertical, not horizontal: a label in a horizontal layout never wraps, so a long
-        // message (a quarantine path, a rejected legacy key) would push the rest of the strip —
-        // including Dismiss — off the window.
-        for notice in notices.iter() {
-            ui.colored_label(egui::Color32::RED, notice);
-        }
-        if ui.small_button("Dismiss").clicked() {
-            notices.clear();
-        }
-    });
-}
-
-/// The root UI. `command_error` is the last UI-command dispatch error (see
-/// `State::last_command_error` in `window.rs`); it is shown as a dismissible
-/// red label in the status area and set to `None` when the user dismisses it.
-/// `settings_notices` are the startup settings diagnostics (see [`settings_notice_strip`]).
-pub fn ui(
-    root: &mut egui::Ui,
-    snapshot: &ApplicationSnapshot,
-    reopen: &Command,
-    command_error: &mut Option<(String, Instant)>,
-    photo: &mut PhotoUi,
-    settings_notices: &mut Vec<String>,
-) -> Vec<Command> {
-    let mut commands = Vec::new();
-    let context = EnabledContext {
-        running: snapshot.running,
-        catalog_ready: snapshot.catalog_ready,
-        has_selection: snapshot.editor.selected.is_some(),
-    };
-    egui::Panel::top("catalog_actions").show(root, |ui| {
-        ui.horizontal(|ui| {
-            ui.heading("Darkroom");
-            if snapshot.jobs.metrics.queued + snapshot.jobs.metrics.running > 0 {
-                ui.spinner();
-            }
-            for (id, command) in [
-                (ActionId::OpenCatalog, reopen.clone()),
-                (ActionId::RefreshLibrary, Command::RefreshLibrary),
-                (ActionId::CloseCatalog, Command::CloseCatalog),
-            ] {
-                let descriptor = action(id);
-                if ui
-                    .add_enabled(
-                        descriptor.enabled.is_enabled(context),
-                        egui::Button::new(descriptor.label),
-                    )
-                    .clicked()
-                {
-                    commands.push(command);
-                }
-            }
-            pagination(ui, snapshot, &mut commands);
-            if let Some(message) = command_error.as_ref().map(|(message, _)| message.clone()) {
-                ui.colored_label(egui::Color32::RED, &message);
-                if ui.small_button("Dismiss").clicked() {
-                    *command_error = None;
-                }
-            }
-        });
-    });
-    settings_notice_strip(root, settings_notices);
-    egui::Panel::right("catalog_metadata").show(root, |ui| metadata(ui, snapshot));
-    egui::Panel::left("library_list").show(root, |ui| {
-        egui::ScrollArea::vertical().show_rows(
-            ui,
-            22.0,
-            snapshot.library.rows.len(),
-            |ui, range| {
-                for index in range {
-                    let row = &snapshot.library.rows[index];
-                    if ui
-                        .selectable_label(
-                            snapshot.editor.selected == Some(ImageId(row.id)),
-                            &row.filename,
-                        )
-                        .clicked()
-                    {
-                        commands.push(Command::SelectImage(Some(ImageId(row.id))));
-                    }
-                }
-            },
-        );
-    });
-    egui::CentralPanel::default().show(root, |ui| {
-        if let Some(error) = &snapshot.error {
-            ui.label(error.to_string());
-        }
-        // The panel rect in points is only known here; the plan carries it as physical pixels.
-        let rect = ui.available_rect_before_wrap();
-        photo.plan = if photo.message.is_some() {
-            None
-        } else {
-            photo_plan(
-                snapshot,
-                rect,
-                ui.ctx().pixels_per_point(),
-                photo.device_epoch,
-            )
-        };
-        if let Some(message) = &photo.message {
-            // A protected/unsupported/failed state names itself; never show a stale render
-            // of another state under it.
-            ui.label(message);
-        } else if let Some((texture, size)) = photo.texture {
-            // The frame was developed at the aspect-correct fitted size: draw it at exactly
-            // that size (points = px / pixels_per_point) centered in the panel; the rest of the
-            // panel stays the background color. The rect is never resized here — `ui.put`
-            // stretches the texture to the given rect — so a stale frame from a larger previous
-            // panel merely overflows, hidden by the panel's clip until the refit lands.
-            let ppp = ui.ctx().pixels_per_point().max(f32::EPSILON);
-            let size_points = egui::vec2(size[0].max(1) as f32 / ppp, size[1].max(1) as f32 / ppp);
-            let draw_rect = egui::Rect::from_center_size(rect.center(), size_points);
-            let image =
-                egui::Image::from_texture(egui::load::SizedTexture::new(texture, size_points))
-                    .fit_to_exact_size(size_points);
-            ui.put(draw_rect, image);
-            if photo.loading {
-                ui.spinner();
-            }
-        } else if photo.loading {
-            ui.spinner();
-            ui.label("Loading photo…");
-        } else if snapshot.editor.image.is_none() {
-            ui.label("Select a photo");
-        }
-        // Claim the panel area for this frame's layout regardless of what was drawn in it.
-        ui.allocate_rect(rect, egui::Sense::hover());
-    });
-    commands
-}
-
-fn metadata(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot) {
-    ui.heading("Photo information");
-    if let Some(image) = &snapshot.editor.image {
-        ui.label(&image.filename);
-        ui.label(&image.path);
-        for value in [
-            &image.camera_make,
-            &image.camera_model,
-            &image.lens,
-            &image.format,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            ui.label(value);
-        }
-        if let (Some(w), Some(h)) = (image.width, image.height) {
-            ui.label(format!("{w} × {h}"));
-        }
-        if let Some(iso) = image.iso {
-            ui.label(format!("ISO {iso}"));
-        }
-        if let Some(aperture) = image.aperture {
-            ui.label(format!("f/{aperture}"));
-        }
-        if let Some(shutter) = &image.shutter {
-            ui.label(shutter);
-        }
-        ui.label(format!("{} stars", image.stars));
-    } else {
-        ui.label("Select a photo");
-    }
-}
+use std::{path::PathBuf, sync::Arc, time::Instant};
+use ui_egui::{cropped_frame_aspect, fit_output, viewport_revision};
 
 /// Why a `--catalog-probe` run failed. Each variant maps to a distinct process exit code
 /// (see the table in `main.rs`); `kind` is the machine-readable failure category printed
@@ -752,7 +340,8 @@ pub fn photo_probe(
         Arc::clone(&gpu.pipeline),
         device_epoch,
         Arc::new(|| {}),
-    );
+    )
+    .map_err(|error| ProbeError::Render { error })?;
     worker.request(photo_worker::PhotoRequest {
         key,
         path: source_path.clone(),
@@ -784,6 +373,8 @@ pub fn photo_probe(
                 photo_worker::PhotoResult::Failed { message, .. } => {
                     Err(ProbeError::Render { error: message })
                 }
+                photo_worker::PhotoResult::WorkerDied(error) => Err(ProbeError::Render { error }),
+                photo_worker::PhotoResult::Abandoned(_) => continue,
             });
             if outcome.is_some() {
                 break;
@@ -802,7 +393,7 @@ pub fn photo_probe(
             }
         }
     }
-    worker.shutdown();
+    let _ = worker.shutdown();
     let lease = outcome.expect("loop ends with an outcome")?;
 
     // Aspect proof: the presented frame must carry the cropped frame's aspect, not the panel's
@@ -856,6 +447,7 @@ pub fn photo_probe(
         std::array::from_fn(|channel| sums[channel] as f64 / count as f64)
     };
 
+    let resources = worker.resource_report();
     let shutdown_error = |error: AppError| ProbeError::Shutdown {
         error: error.to_string(),
     };
@@ -864,7 +456,7 @@ pub fn photo_probe(
     // (see `present.rs`). This is what the read-back-only probe could not see: the real-window
     // crash where egui's `egui_user_image_0` bind group was rejected because the pooled target
     // lacked TEXTURE_BINDING. Any validation error is a render failure (exit 6).
-    crate::present::paint_probe_frame(&gpu, &lease)
+    let composited_diff = crate::present::paint_probe_frame(&gpu, &lease)
         .map_err(|error| ProbeError::Render { error })?;
     app.shutdown().map_err(shutdown_error)?;
     app.wait_idle().map_err(shutdown_error)?;
@@ -884,125 +476,19 @@ pub fn photo_probe(
         "height": frame_h,
         "aspect": aspect,
         "expected_aspect": expected_aspect,
+        "composited_mean_abs_diff": composited_diff,
         "mean_rgb": mean_rgb,
         "identical": identical,
         "egui_presented": true,
+        // Nominal allocation arithmetic, not measured memory.
+        "resources": {
+            "prepared_gpu_bytes": resources.prepared_gpu_bytes,
+            "prepared_count": resources.prepared_count,
+            "pool_bytes": resources.pool_bytes,
+            "pool_limit_bytes": resources.pool_limit_bytes,
+            "last_decode_cpu_bytes": resources.last_decode_cpu_bytes,
+            "peak_decode_cpu_bytes": resources.peak_decode_cpu_bytes,
+            "over_budget": resources.over_budget,
+        },
     }))
-}
-
-fn pagination(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec<Command>) {
-    let query = &snapshot.library.query;
-    let offset = query.offset.unwrap_or(0).max(0);
-    let limit = query.limit.unwrap_or(5000).max(1);
-    let loaded = i64::try_from(snapshot.library.rows.len()).unwrap_or(i64::MAX);
-    ui.label(format!(
-        "{}–{} of {} photos",
-        if loaded == 0 { 0 } else { offset + 1 },
-        offset.saturating_add(loaded),
-        snapshot.library.count
-    ));
-    for (label, next, enabled) in [
-        ("Previous", offset.saturating_sub(limit).max(0), offset > 0),
-        (
-            "Next",
-            offset.saturating_add(limit),
-            offset.saturating_add(loaded) < snapshot.library.count,
-        ),
-    ] {
-        if ui
-            .add_enabled(snapshot.catalog_ready && enabled, egui::Button::new(label))
-            .clicked()
-        {
-            let mut query = query.clone();
-            query.offset = Some(next);
-            query.limit = Some(limit);
-            commands.push(Command::QueryLibrary(Box::new(query)));
-        }
-    }
-}
-
-#[cfg(test)]
-mod fit_tests {
-    use super::{cropped_frame_aspect, fit_output};
-    use core_model::Crop;
-
-    const FIXTURE_ASPECT: f64 = 6960.0 / 4640.0;
-
-    #[test]
-    fn landscape_frame_into_tall_panel_is_width_bound() {
-        // A 3:2 photo in the 820×625-panel's-tall analogue (625 wide, 820 tall): the width
-        // caps, height comes from the aspect: round(625 / 1.5) = 417.
-        assert_eq!(fit_output((625, 820), FIXTURE_ASPECT), (625, 417));
-    }
-
-    #[test]
-    fn portrait_frame_into_wide_panel_is_height_bound() {
-        // The same photo rotated (2:3) in a wide panel: the height caps, width = round(625·⅔).
-        assert_eq!(fit_output((820, 625), 1.0 / FIXTURE_ASPECT), (417, 625));
-    }
-
-    #[test]
-    fn landscape_frame_into_wide_panel_is_height_bound() {
-        // The reported defect: 3:2 into 1024×1024 must be width-bound at full width, NOT the
-        // panel itself (that is the squashed-presentation regression).
-        assert_eq!(fit_output((1024, 1024), FIXTURE_ASPECT), (1024, 683));
-        // 820×625 panel, 3:2 photo: height-bound (820 >= 625·1.5 = 937.5 is false →
-        // width-bound actually): 820 < 937.5, so full width, height = round(820/1.5) = 547.
-        assert_eq!(fit_output((820, 625), FIXTURE_ASPECT), (820, 547));
-    }
-
-    #[test]
-    fn exact_fit_is_the_panel_itself() {
-        assert_eq!(fit_output((1024, 683), 1024.0 / 683.0), (1024, 683));
-        assert_eq!(fit_output((640, 480), 4.0 / 3.0), (640, 480));
-        assert_eq!(fit_output((1024, 1024), 1.0), (1024, 1024));
-    }
-
-    #[test]
-    fn one_pixel_panels_never_yield_a_zero_side() {
-        assert_eq!(fit_output((1, 1), FIXTURE_ASPECT), (1, 1));
-        assert_eq!(fit_output((1, 1), 1.0 / FIXTURE_ASPECT), (1, 1));
-        // Rounded short side would be 0 → clamped to 1.
-        assert_eq!(fit_output((820, 1), FIXTURE_ASPECT), (2, 1));
-        assert_eq!(fit_output((1, 820), FIXTURE_ASPECT), (1, 1));
-    }
-
-    #[test]
-    fn extreme_aspects_clamp_instead_of_collapsing_or_overflowing() {
-        assert_eq!(fit_output((100, 100), 1.0e9), (100, 1));
-        assert_eq!(fit_output((100, 100), 1.0e-9), (1, 100));
-        // Degenerate aspects fall back to the clamped panel (nothing to fit against).
-        assert_eq!(fit_output((10, 5), 0.0), (10, 5));
-        assert_eq!(fit_output((10, 5), -1.5), (10, 5));
-        assert_eq!(fit_output((10, 5), f64::NAN), (10, 5));
-        assert_eq!(fit_output((0, 0), FIXTURE_ASPECT), (1, 1));
-    }
-
-    #[test]
-    fn cropped_aspect_uses_crop_dims_including_rot90() {
-        // Full frame: the plain display aspect.
-        let full = Crop::default();
-        assert!((cropped_frame_aspect(&full, Some(6960), Some(4640), -1.0) - 1.5).abs() < 1e-12);
-        // Square-crop of a 3:2 frame: half-width, full height → W == H.
-        let square = Crop {
-            hw: 1.0 / 3.0,
-            hh: 0.5,
-            ..Default::default()
-        };
-        assert!(
-            (cropped_frame_aspect(&square, Some(6960), Some(4640), -1.0) - 1.0).abs() < 1e-6,
-            "hw·W must equal hh·H for a square crop"
-        );
-        // rot90 swaps the frame's axes.
-        let rot = Crop {
-            rot90: 1,
-            ..Default::default()
-        };
-        assert!(
-            (cropped_frame_aspect(&rot, Some(6960), Some(4640), -1.0) - 2.0 / 3.0).abs() < 1e-12
-        );
-        // Missing/zero catalog dims fall back to the caller's aspect, never 0/NaN.
-        assert_eq!(cropped_frame_aspect(&full, None, Some(4640), 1.25), 1.25);
-        assert_eq!(cropped_frame_aspect(&full, Some(0), Some(4640), 1.25), 1.25);
-    }
 }

@@ -276,6 +276,9 @@ pub fn relink_missing_image(
          WHERE id = ?4",
         params![p.path, folder_id, imported_at, id],
     )?;
+    // The source is back: any sidecar intent parked while it was missing is due now, without
+    // needing a new edit.
+    crate::outbox::reset_outbox_schedule(conn, Some(id))?;
     Ok(Some(id))
 }
 

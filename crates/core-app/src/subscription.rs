@@ -1,12 +1,18 @@
 use crate::registry::ActionId;
 use crate::state::ApplicationSnapshot;
 use crate::AppError;
+use core_model::identity::ImageId;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
     Initialized,
     JobsChanged,
+    SavesDispatched,
+    /// A close/replace/shutdown flush gave up waiting (see `BARRIER_TIMEOUT_MS`).
+    BarrierTimedOut,
+    /// The user discarded this image's unsaved edits.
+    UnsavedEditsDiscarded(ImageId),
     CommandAccepted(ActionId),
     EffectCompleted {
         action: ActionId,

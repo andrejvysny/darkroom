@@ -1,0 +1,327 @@
+//! Photo presentation bookkeeping for the native window.
+//!
+//! The editor snapshot is the single source of truth for *which* photo is shown. Every frame
+//! [`PhotoView::reconcile`] compares the presented/wanted frame against the snapshot's subject
+//! (catalog epoch, image, editor session, selection generation) and retires anything that no
+//! longer matches, so an old photo can never stay visible under a new selection, a loading
+//! document or a closed catalog.
+//!
+//! Frame order in the host: `reconcile` → `accept_results` → `ui_state` → egui `run_ui` →
+//! `submit` → paint + queue submit → `after_submit`.
+
+use crate::photo_worker::{self, PhotoRequest, PhotoResult};
+use core_app::state::{ApplicationSnapshot, DocumentStatus};
+use core_model::identity::{
+    CatalogEpoch, DeviceEpoch, EditorSession, FrameHandle, FrameKey, ImageId, SelectionGeneration,
+};
+use render_wgpu::{FrameLease, Offer, Presenter};
+use ui_egui::{PhotoRequestPlan, PhotoUi};
+
+#[cfg(test)]
+mod tests;
+
+/// egui registration of leased textures, abstracted so tests need no `egui_wgpu::Renderer`.
+pub trait TextureRegistry {
+    fn register(&mut self, lease: &FrameLease) -> (egui::TextureId, [u32; 2]);
+    fn free(&mut self, id: egui::TextureId);
+}
+
+/// The real registry: the host's egui renderer on the shared device.
+pub struct EguiRegistry<'a> {
+    pub device: &'a wgpu::Device,
+    pub renderer: &'a mut egui_wgpu::Renderer,
+}
+
+impl TextureRegistry for EguiRegistry<'_> {
+    fn register(&mut self, lease: &FrameLease) -> (egui::TextureId, [u32; 2]) {
+        crate::present::register_presented_frame(self.device, self.renderer, lease)
+    }
+
+    fn free(&mut self, id: egui::TextureId) {
+        self.renderer.free_texture(&id);
+    }
+}
+
+/// What a frame is *of*: every identity field of a [`FrameKey`] except the edit revision and
+/// the viewport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhotoSubject {
+    pub catalog_epoch: CatalogEpoch,
+    pub image_id: ImageId,
+    pub editor_session: EditorSession,
+    pub selection_generation: SelectionGeneration,
+}
+
+impl PhotoSubject {
+    pub fn of_key(key: &FrameKey) -> Self {
+        let identity = &key.identity;
+        Self {
+            catalog_epoch: identity.source.catalog_epoch,
+            image_id: identity.source.image_id,
+            editor_session: identity.editor_session,
+            selection_generation: identity.selection_generation,
+        }
+    }
+
+    /// `None` with the catalog closed or nothing selected.
+    pub fn of_snapshot(snapshot: &ApplicationSnapshot) -> Option<Self> {
+        if !snapshot.catalog_ready {
+            return None;
+        }
+        Some(Self {
+            catalog_epoch: snapshot.catalog_epoch,
+            image_id: snapshot.editor.selected?,
+            editor_session: snapshot.editor.editor_session,
+            selection_generation: snapshot.editor.selection_generation,
+        })
+    }
+}
+
+/// True when the snapshot holds a document this host can develop right now.
+pub fn renderable(snapshot: &ApplicationSnapshot) -> bool {
+    let editor = &snapshot.editor;
+    let Some(image) = editor.image.as_ref() else {
+        return false;
+    };
+    let document = &editor.document;
+    Some(ImageId(image.id)) == editor.selected
+        && document.status == DocumentStatus::Ready
+        && document.revision.is_some()
+        && document.process_version.is_some()
+        && document
+            .params
+            .as_deref()
+            .is_some_and(|params| photo_worker::unsupported_reason(params).is_none())
+}
+
+struct Registration {
+    texture: egui::TextureId,
+    handle: FrameHandle,
+    size: [u32; 2],
+    subject: PhotoSubject,
+}
+
+#[derive(Default)]
+pub struct PhotoView {
+    presenter: Presenter,
+    registration: Option<Registration>,
+    wanted: Option<FrameKey>,
+    failure: Option<(FrameKey, String)>,
+    /// Persistent host-level reason photos cannot be rendered at all (worker missing or dead).
+    unavailable: Option<String>,
+    pending_free: Vec<egui::TextureId>,
+    pending_leases: Vec<FrameLease>,
+    device_epoch: DeviceEpoch,
+}
+
+impl PhotoView {
+    pub fn new(device_epoch: DeviceEpoch) -> Self {
+        Self {
+            device_epoch,
+            ..Self::default()
+        }
+    }
+
+    /// The photo worker is missing or dead: show `message` instead of a spinner, forever.
+    pub fn set_unavailable(&mut self, message: String) {
+        self.unavailable.get_or_insert(message);
+    }
+
+    /// Retire everything that no longer belongs to the snapshot's subject. Nothing is freed
+    /// here: retirements wait for [`Self::after_submit`] so one rule covers every path.
+    pub fn reconcile(&mut self, snapshot: &ApplicationSnapshot) {
+        let subject = PhotoSubject::of_snapshot(snapshot).filter(|_| renderable(snapshot));
+        let keep = match (subject, &self.wanted) {
+            (Some(subject), Some(wanted)) => PhotoSubject::of_key(wanted) == subject,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if !keep {
+            self.retire_all();
+        }
+    }
+
+    /// Publish finished worker results through the presenter.
+    pub fn accept_results(&mut self, results: Vec<PhotoResult>, reg: &mut dyn TextureRegistry) {
+        for result in results {
+            match result {
+                PhotoResult::Frame(lease) => self.accept_frame(lease, reg),
+                // Worker death is handled by the host (`WorkerStatus`).
+                PhotoResult::WorkerDied(_) => {}
+                // Normally superseded (wanted already moved on). If it is still wanted, forget
+                // it so the next frame resubmits instead of waiting on dropped work.
+                PhotoResult::Abandoned(key) => {
+                    if self.wanted == Some(key) {
+                        self.wanted = None;
+                    }
+                }
+                PhotoResult::Failed { key, message } => {
+                    // A failure of a request nobody wants any more is dropped, never shown.
+                    if self.wanted == Some(key) {
+                        self.failure = Some((key, message));
+                    }
+                }
+            }
+        }
+    }
+
+    fn accept_frame(&mut self, lease: FrameLease, reg: &mut dyn TextureRegistry) {
+        let handle = lease.handle();
+        let subject = PhotoSubject::of_key(lease.key());
+        let (texture, size) = reg.register(&lease);
+        if self.presenter.offer(lease, self.device_epoch) == Offer::Presented {
+            if let Some(previous) = self.registration.replace(Registration {
+                texture,
+                handle,
+                size,
+                subject,
+            }) {
+                self.pending_free.push(previous.texture);
+            }
+            self.collect();
+        } else {
+            // A rejected lease was never in a draw list.
+            reg.free(texture);
+        }
+    }
+
+    /// Central-panel state for this frame, derived from the snapshot.
+    pub fn ui_state(&self, snapshot: &ApplicationSnapshot) -> PhotoUi {
+        let subject = PhotoSubject::of_snapshot(snapshot);
+        let message = self
+            .unavailable
+            .clone()
+            .or_else(|| document_message(snapshot));
+        let failure = self
+            .failure
+            .as_ref()
+            .filter(|(key, _)| {
+                self.wanted == Some(*key) && Some(PhotoSubject::of_key(key)) == subject
+            })
+            .map(|(_, error)| match snapshot.editor.image.as_ref() {
+                Some(image) => format!("{error} — {}", image.filename),
+                None => error.clone(),
+            });
+        let texture = self
+            .registration
+            .as_ref()
+            .filter(|reg| Some(reg.subject) == subject)
+            .map(|reg| (reg.texture, reg.size));
+        let presented = self.presenter.current().map(|lease| lease.key());
+        let satisfied = self.wanted.as_ref().is_some_and(|w| Some(w) == presented);
+        let loading = message.is_none()
+            && failure.is_none()
+            && snapshot.editor.image.is_some()
+            && match snapshot.editor.document.status {
+                DocumentStatus::Loading => true,
+                DocumentStatus::Ready => !satisfied,
+                _ => false,
+            };
+        PhotoUi {
+            texture,
+            message,
+            failure,
+            retry: false,
+            loading,
+            device_epoch: self.device_epoch,
+            plan: None,
+        }
+    }
+
+    /// After `run_ui`: turn the UI's plan/retry into a worker request (or nothing). A failed key
+    /// is never resubmitted automatically; only an explicit retry does.
+    pub fn submit(&mut self, plan: Option<PhotoRequestPlan>, retry: bool) -> Option<PhotoRequest> {
+        if retry {
+            self.failure = None;
+            self.wanted = None;
+        }
+        let plan = plan?;
+        if self.wanted == Some(plan.key) {
+            return None;
+        }
+        self.wanted = Some(plan.key);
+        self.failure = None;
+        self.presenter.want(plan.key);
+        self.sync_registration();
+        self.collect();
+        Some(PhotoRequest {
+            key: plan.key,
+            path: plan.path,
+            content_hash: plan.content_hash,
+            params: plan.params,
+            view: photo_worker::fit_view(plan.viewport_px.0, plan.viewport_px.1),
+        })
+    }
+
+    /// Call right after the egui draw list was submitted to the queue. The draw list built by
+    /// `run_ui` may reference a texture whose lease was retired this frame; freeing the egui
+    /// registration or returning the lease to the pool earlier would let a draw sample a freed
+    /// texture or a pool reuse overwrite it. Pool reuse after this point is ordered after the
+    /// sampling draw by the same queue.
+    pub fn after_submit(&mut self, reg: &mut dyn TextureRegistry) {
+        for id in self.pending_free.drain(..) {
+            reg.free(id);
+        }
+        self.pending_leases.clear();
+    }
+
+    /// Device/surface death: nothing is painted afterwards, so release immediately.
+    pub fn retire_for_device_loss(&mut self, reg: &mut dyn TextureRegistry) {
+        self.retire_all();
+        self.after_submit(reg);
+    }
+
+    fn retire_all(&mut self) {
+        self.presenter.retire_all();
+        self.wanted = None;
+        self.failure = None;
+        self.sync_registration();
+        self.collect();
+    }
+
+    fn collect(&mut self) {
+        self.pending_leases.extend(self.presenter.take_retired());
+    }
+
+    /// The registration follows the presenter's current lease; anything else is queued to free.
+    fn sync_registration(&mut self) {
+        let presented = self.presenter.current().map(|lease| lease.handle());
+        if self
+            .registration
+            .as_ref()
+            .is_some_and(|reg| Some(reg.handle) != presented)
+        {
+            if let Some(reg) = self.registration.take() {
+                self.pending_free.push(reg.texture);
+            }
+        }
+    }
+}
+
+/// Document-level state that replaces the image (and suppresses the plan): unsupported or
+/// unreadable edits must never be silently shown as a render.
+fn document_message(snapshot: &ApplicationSnapshot) -> Option<String> {
+    snapshot.editor.image.as_ref()?;
+    let document = &snapshot.editor.document;
+    match &document.status {
+        DocumentStatus::Ready => {
+            let feature = photo_worker::unsupported_reason(document.params.as_deref()?)?;
+            Some(format!(
+                "Darkroom can't render this photo yet: {feature} is not supported by this \
+                 build — nothing was changed."
+            ))
+        }
+        DocumentStatus::Unsupported(reason) => Some(format!(
+            "Darkroom can't read this photo's saved adjustments ({reason}) — nothing was changed."
+        )),
+        DocumentStatus::Corrupt => Some(
+            "Darkroom can't read this photo's saved adjustments — the saved edit is not \
+             readable. Nothing was changed."
+                .to_string(),
+        ),
+        DocumentStatus::Error(error) => Some(format!(
+            "Darkroom could not load this photo's adjustments: {error}. Nothing was changed."
+        )),
+        DocumentStatus::Loading | DocumentStatus::Empty => None,
+    }
+}

@@ -123,6 +123,39 @@ pub fn write_snapshot(w: &SidecarWrite) -> Result<(), LibError> {
     write_to_path(&w.path, &w.sidecar)
 }
 
+/// A unique, hidden sibling of `dest` for staging a sidecar write: `.<name>.<pid>-<n>.tmp` in the
+/// same directory (so the final rename never crosses a filesystem). Unique per process and per call,
+/// so concurrent stagings for different — or the same — destinations never collide.
+pub fn staging_path(dest: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()))
+}
+
+/// Serialize `w.sidecar` into a NEW file at `w.path` (`create_new`: never clobbers anything) and
+/// flush it. This is the staging half of an atomic sidecar write — the caller picks a unique path
+/// ([`staging_path`]), then publishes with `std::fs::rename` under whatever fence it needs. No
+/// database access and no locks: serialization and disk I/O happen here, outside any gate.
+pub fn write_staged(w: &SidecarWrite) -> Result<(), LibError> {
+    use std::io::Write;
+    let json = serde_json::to_vec_pretty(&w.sidecar)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&w.path)?;
+    let written = file.write_all(&json).and_then(|()| file.sync_all());
+    if let Err(error) = written {
+        drop(file);
+        let _ = std::fs::remove_file(&w.path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn write_to_path(path: &Path, sc: &Sidecar) -> Result<(), LibError> {
     let json = serde_json::to_vec_pretty(sc)?;
     // Atomic: write a temp sibling then rename, so a crash never leaves a half-written sidecar.

@@ -1,7 +1,8 @@
 use crate::AppError;
 use core_model::catalog::{DateTreeYear, FolderRow, ImageRow, QueryParams};
 use core_model::identity::{
-    CatalogEpoch, EditRevision, EditorSession, ImageId, ProcessVersion, SelectionGeneration,
+    CatalogEpoch, CatalogRevision, EditRevision, EditorSession, ImageId, ProcessVersion,
+    SelectionGeneration,
 };
 use core_model::DevelopParams;
 use std::sync::Arc;
@@ -54,6 +55,39 @@ pub struct DocumentView {
     pub revision: Option<EditRevision>,
     pub process_version: Option<ProcessVersion>,
     pub dirty: bool,
+    /// History availability for menus; always false unless `Ready`.
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+/// Where the durable sidecar mirror of the saved edit stands. Catalog durability
+/// (`SaveStatus::saved_catalog_revision`) and mirror durability are separate facts: a catalog save
+/// never implies a mirrored sidecar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MirrorStatus {
+    /// Nothing known (no save observed yet for this image).
+    #[default]
+    Unknown,
+    /// The catalog holds `owed_revision` but the sidecar write has not happened.
+    Pending { owed_revision: CatalogRevision },
+    /// The sidecar on disk carries catalog `revision`.
+    Mirrored { revision: CatalogRevision },
+    /// The sidecar write for the newest revision failed; the outbox keeps retrying.
+    Failing { error: String },
+}
+
+/// Durability of the selected image's edit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SaveStatus {
+    /// The editor holds unsaved changes.
+    pub dirty: bool,
+    /// A save is executing right now.
+    pub saving: bool,
+    /// Catalog `edits.revision` last acknowledged for this image in this catalog epoch.
+    pub saved_catalog_revision: Option<CatalogRevision>,
+    /// Latest save failure while retries are pending.
+    pub last_error: Option<String>,
+    pub mirror: MirrorStatus,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -63,6 +97,7 @@ pub struct EditorSnapshot {
     pub editor_session: EditorSession,
     pub selection_generation: SelectionGeneration,
     pub document: DocumentView,
+    pub save: SaveStatus,
 }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobsSnapshot {

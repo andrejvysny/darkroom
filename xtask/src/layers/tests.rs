@@ -620,3 +620,97 @@ fn application_rejects_gpu_database_engine_and_gui_dependencies_transitively() {
             .contains(&format!("core-app may not reach {forbidden}")));
     }
 }
+
+#[test]
+fn ui_rejects_gpu_windowing_database_and_service_dependencies_transitively() {
+    for forbidden in [
+        "core-runtime",
+        "core-db",
+        "core-library",
+        "core-raw",
+        "core-pipeline",
+        "render-wgpu",
+        "wgpu",
+        "winit",
+        "egui-wgpu",
+        "egui-winit",
+        "eframe",
+        "rfd",
+        "rusqlite",
+        "tauri",
+    ] {
+        let data = metadata(
+            vec![
+                package(
+                    "ui-egui",
+                    "1.0.0",
+                    vec![declared("helper", Some("alias"), "normal", None)],
+                ),
+                package("helper", "1.0.0", vec![]),
+                package(forbidden, "1.0.0", vec![]),
+            ],
+            vec!["ui-egui@1.0.0"],
+            vec![
+                node("ui-egui", "1.0.0", vec![("alias", "helper", "1.0.0")]),
+                node("helper", "1.0.0", vec![(forbidden, forbidden, "1.0.0")]),
+                node(forbidden, "1.0.0", vec![]),
+            ],
+        );
+        assert!(
+            check(&data)
+                .unwrap_err()
+                .contains(&format!("ui-egui may not reach {forbidden}")),
+            "{forbidden}"
+        );
+    }
+}
+
+#[test]
+fn ui_accepts_egui_core_app_and_core_model_only() {
+    let data = metadata(
+        vec![
+            package(
+                "ui-egui",
+                "1.0.0",
+                vec![
+                    declared("egui", None, "normal", None),
+                    declared("core-app", None, "normal", None),
+                    declared("core-model", None, "normal", None),
+                ],
+            ),
+            package(
+                "core-app",
+                "1.0.0",
+                vec![declared("core-model", None, "normal", None)],
+            ),
+            package("core-model", "1.0.0", vec![]),
+            package("egui", "0.37.0", vec![]),
+        ],
+        vec!["ui-egui@1.0.0"],
+        vec![
+            node(
+                "ui-egui",
+                "1.0.0",
+                vec![
+                    ("egui", "egui", "0.37.0"),
+                    ("core_app", "core-app", "1.0.0"),
+                    ("core_model", "core-model", "1.0.0"),
+                ],
+            ),
+            node(
+                "core-app",
+                "1.0.0",
+                vec![("core_model", "core-model", "1.0.0")],
+            ),
+            node("core-model", "1.0.0", vec![]),
+            node("egui", "0.37.0", vec![]),
+        ],
+    );
+    check(&data).unwrap();
+}
+
+#[test]
+fn real_workspace_passes_layer_rules() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    run(root).unwrap();
+}

@@ -451,7 +451,12 @@ fn write_ids(
     let mut settled = Vec::new();
     for &image_id in ids {
         match write_one(gate, db, image_id, write, &|| {})? {
-            SidecarOutcome::Written | SidecarOutcome::Gone => settled.push(image_id),
+            // `Unavailable` (row not present) is settled here, as `Gone` was before. Only develop
+            // edits carry a durable outbox intent that survives this; rating/flag/keyword marks
+            // for a missing source are dropped and are not re-applied on remount (pre-existing).
+            SidecarOutcome::Written | SidecarOutcome::Gone | SidecarOutcome::Unavailable => {
+                settled.push(image_id);
+            }
             SidecarOutcome::Retry => queue.defer(image_id, None, queue.now()),
             SidecarOutcome::Failed(error) => {
                 // Why keep the intent: a read-only card or a full volume is transient, and a dropped

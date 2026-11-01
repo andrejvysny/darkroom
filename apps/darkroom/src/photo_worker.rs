@@ -9,9 +9,10 @@
 //! Latest-wins intake: at most one unstarted request is queued; a newer request replaces it, so a
 //! burst of selection/resize events costs at most one in-flight render plus the newest pending one.
 //! Results for superseded requests are dropped by the `Presenter` on the UI side, never rendered
-//! here. Shutdown sets a stop flag, notifies, and joins — no detached threads. A request already
-//! in progress finishes its current GPU step; its result is dropped (send error) or rejected by
-//! the presenter.
+//! here. Shutdown sets a stop flag, notifies, and joins — no detached threads. Supersession and
+//! shutdown are checked only at stage boundaries (before/after decode, develop, prepare, and in
+//! every pool-wait iteration): a native decode or a GPU submission already in progress cannot be
+//! interrupted and finishes its current step.
 //!
 //! SDR slice only: the worker refuses edits whose params need engines this host does not run yet
 //! (AI denoise, AI/SAM mask coverages) — see [`unsupported_reason`]. HDR display is out of scope.
@@ -19,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -46,6 +47,10 @@ pub enum PhotoResult {
     Frame(FrameLease),
     /// The frame could not be produced; `message` is fit to show the user.
     Failed { key: FrameKey, message: String },
+    /// The request was superseded (or shutdown began) at a stage boundary; the host ignores it.
+    Abandoned(FrameKey),
+    /// Terminal: the worker thread panicked. No further results will arrive.
+    WorkerDied(String),
 }
 
 /// Why an otherwise-`Ready` document must not be rendered by this host. The name is shown to the
@@ -80,56 +85,182 @@ struct Slot {
     stop: bool,
 }
 
-/// Prepared-upload cache: at most two images, keyed by `(ImageId, content_hash)`. Selection
-/// history is LRU-shaped; at this size insertion-order eviction is sufficient. Generic over the
-/// payload so unit tests can exercise eviction without a GPU.
+/// Nominal byte budget for prepared GPU images. One 32 MP image incl. its lazily allocated mask
+/// array (~2.0 GB nominal) fits; two (~4.1 GB) do not, so the second prepare evicts the first. A
+/// 60 MP image (~3.8 GB nominal incl. masks) exceeds it: it opens alone and flags `over_budget`,
+/// as does a huge panorama; the GPU OOM error scope in `prepare` reports real failure. Nominal
+/// allocation arithmetic, not measured memory.
+pub(crate) const PREPARED_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Most prepared images kept regardless of budget.
+const PREPARED_MAX_ENTRIES: usize = 2;
+
+/// Payload with a (live) nominal resident byte size.
+pub(crate) trait SizedPayload {
+    fn bytes(&self) -> u64;
+}
+
+impl SizedPayload for PreparedImage {
+    fn bytes(&self) -> u64 {
+        self.resident_bytes().total()
+    }
+}
+
+/// Nominal resource numbers (allocation arithmetic, not measured memory) published by the worker
+/// after each request. Pool numbers come from `Renderer::resource_report`; prepared numbers are
+/// summed separately and are NOT folded into the pool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceReport {
+    pub prepared_gpu_bytes: u64,
+    pub prepared_count: usize,
+    pub pool_bytes: u64,
+    pub pool_limit_bytes: u64,
+    /// CPU bytes of the most recent transient decoded linear image (freed after upload).
+    pub last_decode_cpu_bytes: u64,
+    pub peak_decode_cpu_bytes: u64,
+    /// The last prepare needed more than the budget even after evicting everything else.
+    pub over_budget: bool,
+}
+
+/// Prepared-upload cache keyed by `(ImageId, content_hash)`, bounded by BYTES (and a small entry
+/// cap). LRU: front of `order` is least recent; `get` refreshes. Callers run [`Self::make_room`]
+/// BEFORE the expensive prepare. Generic over the payload so unit tests need no GPU.
 pub(crate) struct PreparedCache<V = PreparedImage> {
     entries: HashMap<(i64, String), Arc<V>>,
     order: Vec<(i64, String)>,
+    budget_bytes: u64,
+    max_entries: usize,
+    over_budget: bool,
+    last_decode_cpu_bytes: u64,
+    peak_decode_cpu_bytes: u64,
 }
 
 impl<V> PreparedCache<V> {
     fn new() -> Self {
+        Self::with_limits(PREPARED_BUDGET_BYTES, PREPARED_MAX_ENTRIES)
+    }
+
+    fn with_limits(budget_bytes: u64, max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
             order: Vec::new(),
+            budget_bytes,
+            max_entries,
+            over_budget: false,
+            last_decode_cpu_bytes: 0,
+            peak_decode_cpu_bytes: 0,
         }
     }
 
-    fn get(&self, key: &(i64, String)) -> Option<&Arc<V>> {
+    /// Lookup that refreshes recency.
+    fn get(&mut self, key: &(i64, String)) -> Option<&Arc<V>> {
+        if self.entries.contains_key(key) {
+            self.touch(key);
+        }
         self.entries.get(key)
+    }
+
+    fn touch(&mut self, key: &(i64, String)) {
+        if let Some(at) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(at);
+            self.order.push(k);
+        }
+    }
+
+    fn evict_lru(&mut self, keep: Option<&(i64, String)>) -> bool {
+        let Some(at) = self.order.iter().position(|k| Some(k) != keep) else {
+            return false;
+        };
+        let oldest = self.order.remove(at);
+        self.entries.remove(&oldest);
+        true
     }
 
     fn put(&mut self, key: (i64, String), prepared: Arc<V>) {
         if self.entries.insert(key.clone(), prepared).is_none() {
-            self.order.push(key);
-            while self.order.len() > 2 {
-                let oldest = self.order.remove(0);
-                self.entries.remove(&oldest);
-            }
+            self.order.push(key.clone());
+        } else {
+            self.touch(&key);
+        }
+        while self.order.len() > self.max_entries && self.evict_lru(Some(&key)) {}
+    }
+
+    fn note_decode(&mut self, cpu_bytes: u64) {
+        self.last_decode_cpu_bytes = cpu_bytes;
+        self.peak_decode_cpu_bytes = self.peak_decode_cpu_bytes.max(cpu_bytes);
+    }
+
+    fn report(&self, pool: render_wgpu::ResourceReport) -> ResourceReport
+    where
+        V: SizedPayload,
+    {
+        ResourceReport {
+            prepared_gpu_bytes: self.resident_bytes(),
+            prepared_count: self.entries.len(),
+            pool_bytes: pool.pool_bytes,
+            pool_limit_bytes: pool.pool_limit_bytes,
+            last_decode_cpu_bytes: self.last_decode_cpu_bytes,
+            peak_decode_cpu_bytes: self.peak_decode_cpu_bytes,
+            over_budget: self.over_budget,
         }
     }
 }
 
+impl<V: SizedPayload> PreparedCache<V> {
+    fn resident_bytes(&self) -> u64 {
+        self.entries.values().map(|v| v.bytes()).sum()
+    }
+
+    /// Evict LRU entries (never `keep`) until `incoming` more bytes fit the budget and a new entry
+    /// fits the entry cap, or nothing evictable is left. An `incoming` that cannot fit even then
+    /// still proceeds (a lone huge image must open) and sets `over_budget`.
+    fn make_room(&mut self, incoming: u64, keep: Option<&(i64, String)>) {
+        while (self.resident_bytes().saturating_add(incoming) > self.budget_bytes
+            || self.order.len() >= self.max_entries)
+            && self.evict_lru(keep)
+        {}
+        self.over_budget = self.resident_bytes().saturating_add(incoming) > self.budget_bytes;
+    }
+}
+
+/// "Should this request be dropped?" — stop flag set or a newer request queued (latest-wins).
+type Abandon<'a> = &'a dyn Fn() -> bool;
+
 /// The worker's runnable unit; the real one decodes + develops, unit tests inject a stub.
-type Runner = dyn FnMut(PhotoRequest, &mut PreparedCache) -> Option<PhotoResult> + Send + 'static;
+type Runner = dyn FnMut(PhotoRequest, &mut PreparedCache, Abandon<'_>) -> Option<PhotoResult>
+    + Send
+    + 'static;
+
+/// Spawns the worker body; the production one is `std::thread::Builder`, tests inject a failure.
+type Spawn = dyn FnOnce(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<JoinHandle<()>>;
+
+/// Liveness of the worker thread as seen by the UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerStatus {
+    Running,
+    /// The worker is gone (panic or unexpected exit); the string says why.
+    Stopped(String),
+}
 
 pub struct PhotoWorker {
     slot: Arc<(Mutex<Slot>, Condvar)>,
     results: Receiver<PhotoResult>,
     thread: Option<JoinHandle<()>>,
+    stopped: Option<String>,
+    report: Arc<Mutex<ResourceReport>>,
 }
 
 impl PhotoWorker {
     /// Start the decode/develop worker sharing the host's device. `ctx`/`pipeline` are the host's
     /// own handles; the worker wraps the pipeline in its own `Renderer` over the same
-    /// device/queue. `wake` must trigger a UI redraw (the winit event-loop proxy).
+    /// device/queue. `wake` must trigger a UI redraw (the winit event-loop proxy). `Err` when the
+    /// thread cannot be spawned.
     pub fn start(
         ctx: &GpuContext,
         pipeline: Arc<DevelopPipeline>,
         device_epoch: DeviceEpoch,
         wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let handles = || GpuContext {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
@@ -143,13 +274,47 @@ impl PhotoWorker {
             PoolLimits::default(),
         ));
         let worker_ctx = handles();
-        let runner = move |request: PhotoRequest, cache: &mut PreparedCache| {
-            develop(&worker_ctx, &pipeline, &renderer, request, cache)
-        };
-        Self::with_runner(Box::new(runner), wake)
+        let report = Arc::new(Mutex::new(ResourceReport::default()));
+        let published = Arc::clone(&report);
+        let runner =
+            move |request: PhotoRequest, cache: &mut PreparedCache, abandon: Abandon<'_>| {
+                let result = develop(&worker_ctx, &pipeline, &renderer, request, cache, abandon);
+                *published
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    cache.report(renderer.resource_report());
+                result
+            };
+        let mut worker = Self::with_runner(Box::new(runner), wake)?;
+        worker.report = report;
+        Ok(worker)
     }
 
-    fn with_runner(mut runner: Box<Runner>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+    /// Latest nominal resource numbers, published after each request (default before the first).
+    pub fn resource_report(&self) -> ResourceReport {
+        *self
+            .report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn with_runner(runner: Box<Runner>, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+        Self::with_spawn(
+            runner,
+            wake,
+            Box::new(|body| {
+                std::thread::Builder::new()
+                    .name("photo-worker".into())
+                    .spawn(body)
+            }),
+        )
+    }
+
+    fn with_spawn(
+        mut runner: Box<Runner>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        spawn: Box<Spawn>,
+    ) -> Result<Self, String> {
         let slot = Arc::new((
             Mutex::new(Slot {
                 request: None,
@@ -158,21 +323,23 @@ impl PhotoWorker {
             Condvar::new(),
         ));
         let (tx, results) = mpsc::channel();
-        let thread = {
+        let body = {
             let slot = Arc::clone(&slot);
-            std::thread::Builder::new()
-                .name("photo-worker".into())
-                .spawn(move || worker_loop(&slot, &tx, runner.as_mut(), &*wake))
-                .expect("spawn photo worker")
+            Box::new(move || worker_loop(&slot, &tx, runner.as_mut(), &*wake))
         };
-        Self {
+        let thread =
+            spawn(body).map_err(|e| format!("could not start photo worker thread: {e}"))?;
+        Ok(Self {
             slot,
             results,
             thread: Some(thread),
-        }
+            stopped: None,
+            report: Arc::new(Mutex::new(ResourceReport::default())),
+        })
     }
 
-    /// Latest-wins intake: replaces an unstarted request; a request already in flight finishes.
+    /// Latest-wins intake: replaces an unstarted request; a request already in flight is
+    /// abandoned at its next stage boundary. A dead worker ignores requests.
     pub fn request(&self, request: PhotoRequest) {
         let (lock, cvar) = &*self.slot;
         let mut guard = lock
@@ -182,33 +349,79 @@ impl PhotoWorker {
         cvar.notify_one();
     }
 
-    /// Non-blocking drain of finished results (UI thread, each redraw).
-    pub fn drain_results(&self) -> Vec<PhotoResult> {
+    /// Non-blocking drain of finished results (UI thread, each redraw). Notes worker death:
+    /// a `WorkerDied` result or a disconnected channel while no stop was requested.
+    pub fn drain_results(&mut self) -> Vec<PhotoResult> {
         let mut out = Vec::new();
-        while let Ok(result) = self.results.try_recv() {
-            out.push(result);
+        loop {
+            match self.results.try_recv() {
+                Ok(result) => {
+                    if let PhotoResult::WorkerDied(reason) = &result {
+                        self.stopped.get_or_insert_with(|| reason.clone());
+                    }
+                    out.push(result);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.stop_requested() {
+                        self.stopped.get_or_insert_with(|| {
+                            "the photo worker thread exited unexpectedly".to_string()
+                        });
+                    }
+                    break;
+                }
+            }
         }
         out
     }
 
-    /// Stop and join. A render in progress finishes its current GPU step; its result is dropped
-    /// (the loop observes the stop flag or a dead receiver).
-    pub fn shutdown(&mut self) {
+    /// Whether the worker is alive, as of the last [`Self::drain_results`] (which is what
+    /// detects a panic or disconnection; this never drains, so no result is lost).
+    pub fn status(&mut self) -> WorkerStatus {
+        match &self.stopped {
+            Some(reason) => WorkerStatus::Stopped(reason.clone()),
+            None => WorkerStatus::Running,
+        }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.slot
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop
+    }
+
+    /// Stop and join. Stage boundaries and pool waits observe the stop flag, so this returns
+    /// within about one `POOL_RETRY_SLEEP` unless a native decode/GPU step is in progress.
+    /// `Err` when the worker thread had panicked. Idempotent.
+    pub fn shutdown(&mut self) -> Result<(), String> {
         let (lock, cvar) = &*self.slot;
         lock.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stop = true;
         cvar.notify_all();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        match self.thread.take().map(JoinHandle::join) {
+            Some(Err(payload)) => Err(format!("photo worker panicked: {}", panic_text(&*payload))),
+            _ => Ok(()),
         }
     }
 }
 
 impl Drop for PhotoWorker {
     fn drop(&mut self) {
-        self.shutdown();
+        if let Err(error) = self.shutdown() {
+            eprintln!("{error}");
+        }
     }
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 fn worker_loop(
@@ -218,6 +431,12 @@ fn worker_loop(
     wake: &(dyn Fn() + Send + Sync),
 ) {
     let (lock, cvar) = slot;
+    let abandon = || {
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.stop || guard.request.is_some()
+    };
     let mut cache = PreparedCache::new();
     loop {
         let request = {
@@ -236,15 +455,29 @@ fn worker_loop(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
-        match runner(request, &mut cache) {
-            Some(result) => {
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner(request, &mut cache, &abandon)
+        }));
+        match ran {
+            Ok(Some(result)) => {
+                let silent = matches!(result, PhotoResult::Abandoned(_));
                 if tx.send(result).is_err() {
                     return; // host gone; stop rather than develop into a dead channel
                 }
                 // The frame or its message only becomes visible on a redraw; wake the loop.
-                wake();
+                if !silent {
+                    wake();
+                }
             }
-            None => return, // the runner observed shutdown; stop
+            Ok(None) => return, // the runner observed shutdown; stop
+            Err(payload) => {
+                let _ = tx.send(PhotoResult::WorkerDied(format!(
+                    "photo worker panicked: {}",
+                    panic_text(&*payload)
+                )));
+                wake();
+                return;
+            }
         }
     }
 }
@@ -254,6 +487,81 @@ fn worker_loop(
 const POOL_RETRY_LIMIT: u32 = 250;
 const POOL_RETRY_SLEEP: Duration = Duration::from_millis(20);
 
+/// Why [`render_until_free`] gave up.
+#[derive(Debug, PartialEq, Eq)]
+enum RenderStop {
+    Abandoned,
+    Busy,
+    Failed(String),
+}
+
+/// Retry `attempt` while the pool is exhausted, checking `abandon` before every attempt (so a
+/// superseded or shutting-down request leaves within one `POOL_RETRY_SLEEP`).
+fn render_until_free<T>(
+    abandon: Abandon<'_>,
+    mut attempt: impl FnMut() -> Result<T, render_wgpu::RenderError>,
+) -> Result<T, RenderStop> {
+    for tries in 1..=POOL_RETRY_LIMIT {
+        if abandon() {
+            return Err(RenderStop::Abandoned);
+        }
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(render_wgpu::RenderError::PoolExhausted { .. }) => {
+                if tries == POOL_RETRY_LIMIT {
+                    break;
+                }
+                std::thread::sleep(POOL_RETRY_SLEEP);
+            }
+            Err(error) => return Err(RenderStop::Failed(format!("develop failed: {error}"))),
+        }
+    }
+    Err(RenderStop::Busy)
+}
+
+/// Decode + upload `path` (cached by `cache_key`), checking `abandon` between stages. `Ok(None)`
+/// = abandoned. The prepared image is cached even when abandoned right after: it is valid work.
+fn prepare_image(
+    ctx: &GpuContext,
+    pipeline: &DevelopPipeline,
+    request: &PhotoRequest,
+    cache: &mut PreparedCache,
+    abandon: Abandon<'_>,
+) -> Result<Option<Arc<PreparedImage>>, String> {
+    let cache_key = (
+        request.key.identity.source.image_id.0,
+        request.content_hash.clone(),
+    );
+    if let Some(prepared) = cache.get(&cache_key) {
+        return Ok(Some(Arc::clone(prepared)));
+    }
+    let path = &request.path;
+    let source = core_raw::source_from_path(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if abandon() {
+        return Ok(None);
+    }
+    let linear = core_raw::develop_linear(&source)
+        .map_err(|error| format!("could not develop {}: {error}", path.display()))?;
+    if abandon() {
+        return Ok(None);
+    }
+    cache.note_decode(std::mem::size_of_val(linear.data.as_slice()) as u64);
+    // Evict BEFORE the expensive upload. Masks may be allocated lazily later, so reserve them.
+    let (w, h) = (linear.width, linear.height);
+    cache.make_room(
+        core_pipeline::backend::estimate_prepare_bytes(w, h)
+            + core_pipeline::backend::estimate_mask_bytes(w, h),
+        None,
+    );
+    let prepared = pipeline
+        .prepare(ctx, &linear)
+        .map_err(|error| format!("GPU prepare failed: {error}"))?;
+    let prepared = Arc::new(prepared);
+    cache.put(cache_key, Arc::clone(&prepared));
+    Ok(Some(prepared))
+}
+
 /// Decode (or reuse the cached upload) + develop into a leased target. Worker thread only.
 fn develop(
     ctx: &GpuContext,
@@ -261,72 +569,38 @@ fn develop(
     renderer: &Renderer,
     request: PhotoRequest,
     cache: &mut PreparedCache,
+    abandon: Abandon<'_>,
 ) -> Option<PhotoResult> {
-    let failed = |message: String| {
-        Some(PhotoResult::Failed {
-            key: request.key,
-            message,
-        })
-    };
+    let key = request.key;
+    let failed = |message: String| Some(PhotoResult::Failed { key, message });
     if let Some(feature) = unsupported_reason(&request.params) {
         return failed(format!(
             "Darkroom can't render this photo yet: {feature} is not supported by this build — \
              nothing was changed."
         ));
     }
+    if abandon() {
+        return Some(PhotoResult::Abandoned(key));
+    }
     // Intrinsic to the file, derived here — never trust a persisted `display_referred`
     // (legacy `decode_develop` does exactly this).
     let mut params = (*request.params).clone();
     params.display_referred = core_raw::is_display(&request.path);
 
-    let cache_key = (
-        request.key.identity.source.image_id.0,
-        request.content_hash.clone(),
-    );
-    let prepared = match cache.get(&cache_key) {
-        Some(prepared) => Arc::clone(prepared),
-        None => {
-            let source = match core_raw::source_from_path(&request.path) {
-                Ok(source) => source,
-                Err(error) => {
-                    return failed(format!(
-                        "could not read {}: {error}",
-                        request.path.display()
-                    ))
-                }
-            };
-            let linear = match core_raw::develop_linear(&source) {
-                Ok(linear) => linear,
-                Err(error) => {
-                    return failed(format!(
-                        "could not develop {}: {error}",
-                        request.path.display()
-                    ))
-                }
-            };
-            match pipeline.prepare(ctx, &linear) {
-                Ok(prepared) => {
-                    let prepared = Arc::new(prepared);
-                    cache.put(cache_key, Arc::clone(&prepared));
-                    prepared
-                }
-                Err(error) => return failed(format!("GPU prepare failed: {error}")),
-            }
-        }
+    let prepared = match prepare_image(ctx, pipeline, &request, cache, abandon) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return Some(PhotoResult::Abandoned(key)),
+        Err(message) => return failed(message),
     };
-    for attempt in 0..POOL_RETRY_LIMIT {
-        match renderer.render(request.key, &prepared, &params, &request.view) {
-            Ok(lease) => return Some(PhotoResult::Frame(lease)),
-            Err(render_wgpu::RenderError::PoolExhausted { .. }) => {
-                std::thread::sleep(POOL_RETRY_SLEEP);
-                if attempt + 1 == POOL_RETRY_LIMIT {
-                    return failed("GPU render targets are busy; try again".into());
-                }
-            }
-            Err(error) => return failed(format!("develop failed: {error}")),
-        }
+    let rendered = render_until_free(abandon, || {
+        renderer.render(key, &prepared, &params, &request.view)
+    });
+    match rendered {
+        Ok(lease) => Some(PhotoResult::Frame(lease)),
+        Err(RenderStop::Abandoned) => Some(PhotoResult::Abandoned(key)),
+        Err(RenderStop::Busy) => failed("GPU render targets are busy; try again".into()),
+        Err(RenderStop::Failed(message)) => failed(message),
     }
-    None
 }
 
 #[cfg(test)]

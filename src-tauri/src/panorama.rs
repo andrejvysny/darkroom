@@ -412,19 +412,19 @@ pub fn merge<R: Runtime>(
         workers.is_stopping() || cancel_flag.load(Ordering::SeqCst) || ctx.is_cancel_requested()
     };
 
-    // Brief lock: resolve paths + the first source's folder (the pano lands in the same folder).
-    let paths = resolve_paths(&st, &ids)?;
-    let tokens = crate::source_fence::capture_sources(&st, &ids)?;
-    let folder_id: i64 = {
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        db.conn
-            .query_row(
-                "SELECT folder_id FROM images WHERE id = ?1",
-                [ids[0]],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?
-    };
+    // ONE snapshot of the source rows: paths, the first source's folder (the pano lands in the same
+    // folder) and the publication tokens all come from it.
+    let snapshot = crate::source_fence::snapshot_sources(&st.publications, &st.db, &ids)?;
+    snapshot.require_present()?;
+    let paths: Vec<String> = snapshot
+        .sources()
+        .iter()
+        .map(|s| s.path.to_string_lossy().into_owned())
+        .collect();
+    let tokens = snapshot.tokens().to_vec();
+    let folder_id: i64 = snapshot.sources()[0]
+        .folder_id
+        .ok_or_else(|| format!("image {} has no folder", ids[0]))?;
 
     // The composite must stay openable in the (tiling-free) GPU develop pipeline.
     let device_cap = st
@@ -481,10 +481,11 @@ pub fn merge<R: Runtime>(
         let _ = std::fs::remove_file(&dest);
         e.to_string()
     })?;
-    let new_id: i64 = st
-        .publications
-        .tokens_guard(&tokens)
-        .map(|mut guard| -> Result<i64, String> {
+    let new_id: i64 = crate::source_fence::publish_owned(
+        &st.publications,
+        &tokens,
+        &dest,
+        |guard| -> Result<i64, String> {
             let db = st.db.lock().map_err(|e| e.to_string())?;
             let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
             let id =
@@ -514,12 +515,8 @@ pub fn merge<R: Runtime>(
                 },
             );
             Ok(id)
-        })
-        .map_err(|_| "a source photo changed during the merge; nothing was published".to_string())
-        .flatten()
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&dest);
-        })?;
+        },
+    )?;
     // The DNG + catalog row are committed; a later cancel must not retire the published id.
     ctx.mark_committed();
 

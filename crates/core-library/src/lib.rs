@@ -49,8 +49,8 @@ pub use decode_failure::{
     DecodeFailureRow, FailureFacts,
 };
 pub use edits::{
-    get_edit, get_edit_with_process_version, get_edit_with_version, save_edit_with_intent,
-    set_edit, thumb_precheck,
+    get_edit, get_edit_with_process_version, get_edit_with_version, save_edit_expecting_source,
+    save_edit_with_intent, set_edit, thumb_precheck,
 };
 pub use error::LibError;
 pub use events::{append_event, context_with_suggested, event_count, ids_json, Event};
@@ -80,7 +80,9 @@ pub use keywords::{
 pub use maintenance::reap_dangling_import_sessions;
 pub use merge::insert_hdr_image;
 pub use outbox::{
-    complete_outbox, fail_outbox, mirrored_revision, pending_outbox, OutboxCompletion, OutboxItem,
+    complete_outbox, defer_outbox, fail_outbox, mirror_state, mirrored_revision, next_outbox_due,
+    pending_outbox, pending_outbox_keyed, reset_outbox_schedule, MirrorState, OutboxCompletion,
+    OutboxCursor, OutboxItem,
 };
 pub use pairs::{link_pair, pair_info, primary_of, secondaries_of, unlink_pair, PairInfo};
 pub use presets::{
@@ -105,8 +107,8 @@ pub use settings::{
     PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
 };
 pub use sidecar::{
-    hydrate_if_blank, rebuild_from_sidecars, sidecar_snapshot, write_all_sidecars, write_sidecar,
-    write_snapshot, Sidecar, SidecarWrite,
+    hydrate_if_blank, rebuild_from_sidecars, sidecar_snapshot, staging_path, write_all_sidecars,
+    write_sidecar, write_snapshot, write_staged, Sidecar, SidecarWrite,
 };
 pub use snapshots::{
     create_snapshot, delete_snapshot, get_snapshot_params, list_snapshots, rename_snapshot,

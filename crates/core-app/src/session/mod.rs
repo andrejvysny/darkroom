@@ -1,18 +1,48 @@
-use crate::editor::{Editor, EditorCommand, EditorError, EditorEvent, EditorState, HistoryLimits};
+//! The application state owner. Split by concern: `edit` (editor commands, autosave bridge and the
+//! close/shutdown flush barrier), `view` (snapshot projections), `tests` (unit tests).
+mod edit;
+#[cfg(test)]
+mod tests;
+mod view;
+
+use crate::autosave::{Autosave, SaveKey};
+use crate::editor::{Editor, EditorCommand, EditorEvent, EditorState, HistoryLimits};
 use crate::ports::{Clock, EventSink, RenderBackend};
 use crate::registry::{self, EnabledContext};
 use crate::state::{
-    ApplicationSnapshot, DocumentStatus, DocumentView, EditorSnapshot, JobsSnapshot,
-    LibrarySnapshot, SettingsSnapshot,
+    ApplicationSnapshot, EditorSnapshot, JobsSnapshot, LibrarySnapshot, MirrorStatus, SaveStatus,
+    SettingsSnapshot,
 };
 use crate::subscription::{Notice, Slot, SnapshotUpdate, Subscription};
 use crate::workflow::{Command, Completion, Effect, Operation, Outcome, RequestId, RequestToken};
 use crate::AppError;
 use core_model::identity::{
-    CatalogEpoch, ImageId, ProcessVersion, SelectionGeneration, CURRENT_PROCESS_VERSION,
+    CatalogEpoch, CatalogRevision, ImageId, SelectionGeneration, CURRENT_PROCESS_VERSION,
 };
+use edit::UNSAVED_MESSAGE;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
+use view::{document_view, editor_refusal};
+
+/// What a pending flush barrier does once every captured save is acknowledged.
+enum BarrierKind {
+    Open(PathBuf),
+    Close,
+    Shutdown,
+}
+
+/// A catalog close/replace/shutdown held back until the edits it would orphan are saved.
+struct Barrier {
+    kind: BarrierKind,
+    target: crate::autosave::FlushTarget,
+    /// Session-clock time the barrier began; it gives up `BARRIER_TIMEOUT_MS` later.
+    started_at: u64,
+}
+
+/// A flush barrier that has not reached its target after this long is cancelled with
+/// `SaveFailed`; it is never treated as flushed.
+pub const BARRIER_TIMEOUT_MS: u64 = 30_000;
 
 pub struct ApplicationSession {
     clock: Arc<dyn Clock>,
@@ -25,6 +55,14 @@ pub struct ApplicationSession {
     /// `editor_session` is always a projection of its live session — never a second counter.
     editor: Editor,
     selection_generation: SelectionGeneration,
+    autosave: Autosave,
+    /// Save identity of the selected image; known once its row arrives (the content hash comes
+    /// from the row). `None` means edits are refused rather than defaulted.
+    key: Option<SaveKey>,
+    /// Catalog revision / mirror state last acknowledged for `key` in this epoch.
+    saved_revision: Option<CatalogRevision>,
+    mirror: MirrorStatus,
+    barrier: Option<Barrier>,
 }
 impl ApplicationSession {
     pub fn new(
@@ -40,6 +78,11 @@ impl ApplicationSession {
             next_request: 0,
             editor: Editor::new(HistoryLimits::default()),
             selection_generation: SelectionGeneration::default(),
+            autosave: Autosave::new(),
+            key: None,
+            saved_revision: None,
+            mirror: MirrorStatus::Unknown,
+            barrier: None,
             snapshot: Arc::new(ApplicationSnapshot {
                 revision: 0,
                 running: true,
@@ -115,12 +158,17 @@ impl ApplicationSession {
             .selection_generation
             .checked_next()
             .ok_or(AppError::Exhausted)?;
+        // The outgoing document dies with the catalog. Unsaved state is never dropped: refuse
+        // before touching anything while autosave or the editor still holds any.
+        if let Some(error) = self.unsaved_refusal() {
+            return Err(error);
+        }
         self.selection_generation = selection;
         self.pending.clear();
-        // The outgoing document dies with the catalog. Its unsaved revision is dropped for now:
-        // persisting `Closed { pending }` is the autosave brief's job, and until that lands no
-        // path may pretend the edit reached storage.
         self.close_editor();
+        if let Err(keys) = self.autosave.retain_epoch(epoch) {
+            return Err(self.save_failed(&keys[0], UNSAVED_MESSAGE.into()));
+        }
         let s = Arc::make_mut(&mut self.snapshot);
         s.catalog_epoch = epoch;
         s.catalog_ready = false;
@@ -129,9 +177,25 @@ impl ApplicationSession {
         s.error = None;
         Ok(())
     }
-    /// Close the editor document, discarding the (not yet persistable) pending revision.
+    /// Close the editor document, handing any unsaved revision to autosave under the outgoing
+    /// document's save identity.
     fn close_editor(&mut self) {
-        let _ = self.editor.apply(EditorCommand::Close);
+        let session = self.editor.current_session();
+        if let Ok(EditorEvent::Closed {
+            pending: Some((image, revision, params, pv)),
+        }) = self.editor.apply(EditorCommand::Close)
+        {
+            if let (Some(key), Some(session)) = (self.key.as_ref(), session) {
+                if key.image_id == image {
+                    let origin = crate::autosave::EditOrigin { session, revision };
+                    self.autosave
+                        .record(key.clone(), origin, params, pv, self.clock.now_millis());
+                }
+            }
+        }
+        self.key = None;
+        self.saved_revision = None;
+        self.mirror = MirrorStatus::Unknown;
     }
     /// Project the editor's state into the snapshot; call after EVERY editor mutation.
     fn sync_document(&mut self) {
@@ -181,16 +245,15 @@ impl ApplicationSession {
             running: s.running,
             catalog_ready: s.catalog_ready,
             has_selection: s.editor.selected.is_some(),
+            editable: self.key.is_some() && matches!(self.editor.state(), EditorState::Ready(_)),
+            can_undo: s.editor.document.can_undo,
+            can_redo: s.editor.document.can_redo,
         };
         if !registry::action(command.action())
             .enabled
             .is_enabled(context)
         {
-            return Err(if !s.running {
-                AppError::Closed
-            } else {
-                AppError::NotOpen
-            });
+            return Err(self.disabled_error(&command));
         }
         if matches!(&command, Command::OpenCatalog(path) if path.as_os_str().is_empty()) {
             return Err(AppError::InvalidCommand(
@@ -204,31 +267,32 @@ impl ApplicationSession {
         // issues at most one.
         let requests = match &command {
             Command::SelectImage(None) => 0,
-            Command::SelectImage(Some(_)) => 2,
+            Command::SelectImage(Some(_)) | Command::DiscardUnsavedEdits(_) => 2,
+            Command::Edit(_) => 0,
             _ => 1,
         };
         self.preflight(requests)?;
         let action = command.action();
+        let discarded = match &command {
+            Command::DiscardUnsavedEdits(image) => Some(*image),
+            _ => None,
+        };
         let effects = self.dispatch_valid(command)?;
         Arc::make_mut(&mut self.snapshot).error = None;
-        self.publish(Notice::CommandAccepted(action));
+        let notice = match discarded {
+            Some(image) => Notice::UnsavedEditsDiscarded(image),
+            None => Notice::CommandAccepted(action),
+        };
+        self.publish(notice);
         Ok(effects)
     }
     fn dispatch_valid(&mut self, command: Command) -> Result<Vec<Effect>, AppError> {
         let effect = match command {
-            Command::OpenCatalog(path) => {
-                self.reset()?;
-                Some(self.issue(Operation::OpenCatalog(path)))
-            }
-            Command::CloseCatalog => {
-                self.reset()?;
-                Some(self.issue(Operation::CloseCatalog))
-            }
-            Command::RequestShutdown => {
-                self.reset()?;
-                Arc::make_mut(&mut self.snapshot).running = false;
-                Some(self.issue(Operation::CloseCatalog))
-            }
+            Command::OpenCatalog(path) => return self.begin_replace(BarrierKind::Open(path)),
+            Command::CloseCatalog => return self.begin_replace(BarrierKind::Close),
+            Command::RequestShutdown => return self.begin_replace(BarrierKind::Shutdown),
+            Command::Edit(intent) => return self.edit(intent),
+            Command::DiscardUnsavedEdits(image) => return self.discard_unsaved(image),
             Command::QueryLibrary(query) => {
                 let library = &mut Arc::make_mut(&mut self.snapshot).library;
                 library.query = *query.clone();
@@ -251,8 +315,13 @@ impl ApplicationSession {
             .selection_generation
             .checked_next()
             .ok_or(AppError::Exhausted)?;
-        // The outgoing document is always closed first, so the editor never holds two documents and
-        // the (not yet persistable) pending revision is discarded on every transition.
+        // Selection is frozen while a flush barrier is pending: a new seq recorded after the
+        // barrier's target would be orphaned by the close that follows.
+        if self.barrier.is_some() {
+            return Err(AppError::EditRefused("catalog is closing".into()));
+        }
+        // The outgoing document is always closed first, so the editor never holds two documents;
+        // its pending revision is handed to autosave, never dropped.
         self.close_editor();
         let session = match id {
             None => None,
@@ -275,6 +344,7 @@ impl ApplicationSession {
             editor_session,
             selection_generation: generation,
             document: document_view(self.editor.state()),
+            save: SaveStatus::default(),
         };
         let Some(image_id) = id else {
             return Ok(Vec::new());
@@ -321,7 +391,13 @@ impl ApplicationSession {
             action: operation.action(),
             result: completion.result.as_ref().map(|_| ()).map_err(Clone::clone),
         };
-        let requests = u64::from(matches!(completion.result, Ok(Outcome::Opened))) * 3;
+        // A save completion may issue follow-up saves and the deferred close/open (+1).
+        let requests = u64::from(matches!(completion.result, Ok(Outcome::Opened))) * 3
+            + if matches!(operation, Operation::SaveEdit { .. }) {
+                self.autosave.len() as u64 + 1
+            } else {
+                0
+            };
         self.preflight(requests)?;
         self.pending.remove(&completion.token);
         let effects = match (operation, completion.result) {
@@ -330,14 +406,20 @@ impl ApplicationSession {
             // document now and must not be overwritten by the old image's params.
             (Operation::LoadEdit { editor_session, .. }, Ok(Outcome::Edit(document))) => {
                 if self.editor.current_session() == Some(editor_session) {
-                    let _ = self.editor.apply(EditorCommand::Loaded {
-                        session: editor_session,
-                        stored: document,
-                    });
-                    self.sync_document();
+                    self.finish_load(editor_session, document);
                 }
                 Vec::new()
             }
+            // The row carries the content hash, hence the save identity; it is bound to the
+            // selection's own session so a row can never key another selection's document.
+            (Operation::SelectImage { editor_session, .. }, Ok(Outcome::Image(row))) => {
+                if self.editor.current_session() == Some(editor_session) {
+                    self.bind_row(row.as_deref());
+                }
+                Arc::make_mut(&mut self.snapshot).editor.image = row.map(|row| *row);
+                Vec::new()
+            }
+            (Operation::SaveEdit { key, seq, .. }, result) => self.save_completed(key, seq, result),
             // A failed load is a document-level failure, not an application error: the user keeps
             // the library and the selection, and the editor shows why this image has no params.
             (Operation::LoadEdit { editor_session, .. }, Err(error)) => {
@@ -373,7 +455,9 @@ impl ApplicationSession {
             }
             // `Closed` needs no follow-up work, and `Edit` never reaches here: its result is
             // consumed in `complete`, where the issuing operation's editor session is known.
-            Outcome::Closed | Outcome::Edit(_) => Vec::new(),
+            Outcome::Closed | Outcome::Edit(_) | Outcome::Saved { .. } | Outcome::Image(_) => {
+                Vec::new()
+            }
             Outcome::Library { rows, count } => {
                 let library = &mut Arc::make_mut(&mut self.snapshot).library;
                 library.rows = Arc::new(rows);
@@ -386,10 +470,6 @@ impl ApplicationSession {
             }
             Outcome::Dates(rows) => {
                 Arc::make_mut(&mut self.snapshot).library.dates = Arc::new(rows);
-                Vec::new()
-            }
-            Outcome::Image(row) => {
-                Arc::make_mut(&mut self.snapshot).editor.image = row.map(|row| *row);
                 Vec::new()
             }
         }
@@ -405,123 +485,6 @@ fn matches_outcome(operation: &Operation, outcome: &Outcome) -> bool {
             | (Operation::LoadDates, Outcome::Dates(_))
             | (Operation::SelectImage { .. }, Outcome::Image(_))
             | (Operation::LoadEdit { .. }, Outcome::Edit(_))
+            | (Operation::SaveEdit { .. }, Outcome::Saved { .. })
     )
-}
-
-/// Project the authoritative editor state into the GPU-free snapshot view. The status is copied
-/// rather than inferred: an unreadable stored edit must stay visible as `Unsupported`/`Corrupt` so
-/// the renderer can never fall back to defaults and later overwrite it.
-fn document_view(state: &EditorState) -> DocumentView {
-    match state {
-        EditorState::Empty => DocumentView::default(),
-        EditorState::Loading { .. } => DocumentView {
-            status: DocumentStatus::Loading,
-            ..DocumentView::default()
-        },
-        EditorState::Ready(doc) => DocumentView {
-            status: DocumentStatus::Ready,
-            params: Some(doc.params.clone()),
-            revision: Some(doc.revision),
-            process_version: Some(doc.process_version),
-            dirty: doc.is_dirty(),
-        },
-        EditorState::Unsupported {
-            document, reason, ..
-        } => DocumentView {
-            status: DocumentStatus::Unsupported(reason.clone()),
-            params: None,
-            revision: None,
-            process_version: Some(ProcessVersion(document.process_version())),
-            dirty: false,
-        },
-        EditorState::Corrupt { document, .. } => DocumentView {
-            status: DocumentStatus::Corrupt,
-            params: None,
-            revision: None,
-            process_version: Some(ProcessVersion(document.process_version())),
-            dirty: false,
-        },
-        EditorState::Error { message, .. } => DocumentView {
-            status: DocumentStatus::Error(message.clone()),
-            params: None,
-            revision: None,
-            process_version: None,
-            dirty: false,
-        },
-    }
-}
-
-/// The editor only ever refuses an `Open` on session exhaustion; anything else is reported as an
-/// invalid command rather than silently leaving the selection without a document.
-fn editor_refusal(image_id: ImageId, outcome: Result<EditorEvent, EditorError>) -> AppError {
-    match outcome {
-        Err(EditorError::Exhausted) => AppError::Exhausted,
-        other => AppError::InvalidCommand(format!(
-            "editor could not open image {image_id:?}: {other:?}"
-        )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    struct Stub;
-    impl Clock for Stub {
-        fn now_millis(&self) -> u64 {
-            0
-        }
-    }
-    impl EventSink for Stub {
-        fn published(&self, _: &SnapshotUpdate) {}
-    }
-    impl RenderBackend for Stub {
-        fn available(&self) -> bool {
-            false
-        }
-    }
-    #[test]
-    fn exhausted_counters_do_not_mutate_state() {
-        let mut session = ApplicationSession::new(Arc::new(Stub), Arc::new(Stub), Arc::new(Stub));
-        session.next_request = u64::MAX;
-        let before = session.snapshot();
-        assert_eq!(
-            session.dispatch(Command::OpenCatalog("test".into())),
-            Err(AppError::Exhausted)
-        );
-        assert_eq!(session.snapshot(), before);
-        session.next_request = 0;
-        Arc::make_mut(&mut session.snapshot).catalog_epoch = CatalogEpoch(u64::MAX);
-        let before = session.snapshot();
-        assert_eq!(
-            session.dispatch(Command::OpenCatalog("test".into())),
-            Err(AppError::Exhausted)
-        );
-        assert_eq!(session.snapshot(), before);
-        Arc::make_mut(&mut session.snapshot).catalog_epoch = CatalogEpoch(0);
-        Arc::make_mut(&mut session.snapshot).catalog_ready = true;
-        session.selection_generation = SelectionGeneration(u64::MAX);
-        let before = session.snapshot();
-        assert_eq!(
-            session.dispatch(Command::SelectImage(None)),
-            Err(AppError::Exhausted)
-        );
-        assert_eq!(session.snapshot(), before);
-        // A refused selection must not have opened (or half-opened) a document.
-        assert!(matches!(session.editor.state(), EditorState::Empty));
-    }
-    #[test]
-    fn selection_reserves_room_for_both_effects() {
-        let mut session = ApplicationSession::new(Arc::new(Stub), Arc::new(Stub), Arc::new(Stub));
-        Arc::make_mut(&mut session.snapshot).catalog_ready = true;
-        // One slot left: the row lookup fits, the edit load would not, so nothing is issued.
-        session.next_request = u64::MAX - 1;
-        let before = session.snapshot();
-        assert_eq!(
-            session.dispatch(Command::SelectImage(Some(ImageId(1)))),
-            Err(AppError::Exhausted)
-        );
-        assert_eq!(session.snapshot(), before);
-        assert!(matches!(session.editor.state(), EditorState::Empty));
-        assert!(session.pending.is_empty());
-    }
 }

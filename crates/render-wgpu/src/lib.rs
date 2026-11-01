@@ -15,6 +15,6 @@ mod renderer;
 
 pub use pool::{FrameLease, PoolLimits, TexturePool, FRAME_USAGE};
 pub use presenter::{Offer, Presenter, StaleReason};
-pub use renderer::{RenderError, Renderer};
+pub use renderer::{RenderError, Renderer, ResourceReport};
 
 pub use core_model::identity::{FrameHandle, FrameKey, QualityTier};

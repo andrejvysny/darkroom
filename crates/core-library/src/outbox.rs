@@ -14,7 +14,7 @@
 //! lock free while a card is being written.
 
 use crate::error::LibError;
-use core_db::rusqlite::{params, Connection, OptionalExtension, Transaction};
+use core_db::rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
 
 /// One queued "this sidecar is owed a write" intent, as stored by the save that made it necessary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +30,13 @@ pub struct OutboxItem {
     pub attempts: i64,
     /// Why the last attempt failed; `None` while nothing has been tried yet.
     pub last_error: Option<String>,
+    /// Unix milliseconds before which the host must not attempt this intent again (0 = due now).
+    /// Durable, so pacing survives wake-ups and restarts.
+    pub next_attempt_at: i64,
 }
+
+/// `(next_attempt_at, enqueued_at, image_id)` — the total order [`pending_outbox`] pages by.
+pub type OutboxCursor = (i64, i64, i64);
 
 /// What reporting a successful sidecar write did to the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,30 +63,80 @@ pub enum OutboxCompletion {
     Gone,
 }
 
-/// The intents awaiting a sidecar write, oldest first so a long-blocked image is never starved by
-/// newer saves. At most one row per image exists (PK `image_id`), so this is one row per image.
-pub fn pending_outbox(conn: &Connection, limit: usize) -> Result<Vec<OutboxItem>, LibError> {
+/// A page of intents that are DUE (`next_attempt_at <= now_ms`), in `(next_attempt_at, enqueued_at,
+/// image_id)` order, strictly after the keyset position `after`.
+///
+/// Eligibility is filtered in SQL so a backed-off row can never be re-selected before its time, and
+/// the keyset lets one drain pass walk ALL due rows page by page: a block of unavailable or
+/// permission-failing rows pushes themselves to the future (or past the cursor) instead of pinning
+/// the head of the queue, so a healthy row behind them is always reached.
+pub fn pending_outbox(
+    conn: &Connection,
+    now_ms: i64,
+    after: Option<OutboxCursor>,
+    limit: usize,
+) -> Result<Vec<OutboxItem>, LibError> {
+    Ok(pending_outbox_keyed(conn, now_ms, after, limit)?
+        .into_iter()
+        .map(|(item, _)| item)
+        .collect())
+}
+
+/// [`pending_outbox`] plus each row's full keyset position (needed to continue the page walk).
+pub fn pending_outbox_keyed(
+    conn: &Connection,
+    now_ms: i64,
+    after: Option<OutboxCursor>,
+    limit: usize,
+) -> Result<Vec<(OutboxItem, OutboxCursor)>, LibError> {
+    // Row-value comparison against a floor tuple when there is no cursor: every real row is above it.
+    let (a, e, i) = after.unwrap_or((i64::MIN, i64::MIN, i64::MIN));
     let mut stmt = conn.prepare(
-        "SELECT image_id, edit_revision, content_hash, path, attempts, last_error
+        "SELECT image_id, edit_revision, content_hash, path, attempts, last_error,
+                next_attempt_at, enqueued_at
            FROM sidecar_outbox
-          ORDER BY enqueued_at, image_id
-          LIMIT ?1",
+          WHERE next_attempt_at <= :now
+            AND (next_attempt_at, enqueued_at, image_id) > (:after_next, :after_enq, :after_id)
+          ORDER BY next_attempt_at, enqueued_at, image_id
+          LIMIT :limit",
     )?;
-    let rows = stmt.query_map(params![limit as i64], |r| {
-        Ok(OutboxItem {
-            image_id: r.get(0)?,
-            edit_revision: r.get(1)?,
-            // Stored as the 32 raw BLAKE3 bytes; the queue hands out the hex form every other
-            // sidecar/cache key uses.
-            content_hash_hex: hex_or_raw(&r.get::<_, Vec<u8>>(2)?),
-            path: r.get(3)?,
-            attempts: r.get(4)?,
-            last_error: r.get(5)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        named_params! {
+            ":now": now_ms,
+            ":after_next": a,
+            ":after_enq": e,
+            ":after_id": i,
+            ":limit": limit as i64,
+        },
+        |r| {
+            let item = OutboxItem {
+                image_id: r.get(0)?,
+                edit_revision: r.get(1)?,
+                // Stored as the 32 raw BLAKE3 bytes; the queue hands out the hex form every other
+                // sidecar/cache key uses.
+                content_hash_hex: hex_or_raw(&r.get::<_, Vec<u8>>(2)?),
+                path: r.get(3)?,
+                attempts: r.get(4)?,
+                last_error: r.get(5)?,
+                next_attempt_at: r.get(6)?,
+            };
+            let cursor = (item.next_attempt_at, r.get::<_, i64>(7)?, item.image_id);
+            Ok((item, cursor))
+        },
+    )?;
     // A row that cannot be read must fail the drain: silently dropping an intent is exactly the
     // "lost write" this table exists to prevent.
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Earliest `next_attempt_at` among all queued intents (0 = something is due now), or `None` when
+/// the queue is empty. The worker compares it against its clock to decide whether to drain or sleep.
+pub fn next_outbox_due(conn: &Connection) -> Result<Option<i64>, LibError> {
+    Ok(
+        conn.query_row("SELECT MIN(next_attempt_at) FROM sidecar_outbox", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })?,
+    )
 }
 
 /// Record a successful sidecar write for `item`.
@@ -147,7 +203,8 @@ pub fn complete_outbox(conn: &Connection, item: &OutboxItem) -> Result<OutboxCom
             // retry now.
             tx.execute(
                 "UPDATE sidecar_outbox
-                    SET path = ?2, content_hash = ?3, attempts = 0, last_error = NULL
+                    SET path = ?2, content_hash = ?3, attempts = 0, last_error = NULL,
+                        next_attempt_at = 0
                   WHERE image_id = ?1 AND edit_revision = ?4",
                 params![item.image_id, path, content_hash, item.edit_revision],
             )?;
@@ -179,18 +236,68 @@ pub fn complete_outbox(conn: &Connection, item: &OutboxItem) -> Result<OutboxCom
 /// Note a failed sidecar write, so the retry loop can back off and the UI can name the image
 /// instead of looping silently. Only the intent that was attempted is touched: a newer save has
 /// already reset the counters, and blaming it for the older attempt would be wrong.
+/// `next_attempt_at` (unix ms) is when the host may try again; it is persisted so wake-ups and
+/// restarts honour it.
 pub fn fail_outbox(
     conn: &Connection,
     image_id: i64,
     edit_revision: i64,
     error: &str,
+    next_attempt_at: i64,
 ) -> Result<(), LibError> {
     conn.execute(
-        "UPDATE sidecar_outbox SET attempts = attempts + 1, last_error = ?3
-          WHERE image_id = ?1 AND edit_revision = ?2",
-        params![image_id, edit_revision, error],
+        "UPDATE sidecar_outbox
+            SET attempts = attempts + 1, last_error = :error, next_attempt_at = :next
+          WHERE image_id = :id AND edit_revision = :rev",
+        named_params! {
+            ":error": error,
+            ":next": next_attempt_at,
+            ":id": image_id,
+            ":rev": edit_revision,
+        },
     )?;
     Ok(())
+}
+
+/// Postpone an intent WITHOUT charging an attempt: the catalog moved under the write, or the source
+/// is not present right now. The intent stays queued (only a deleted row/edit ever deletes one);
+/// `reason` is recorded as `last_error` when given. Guarded on `edit_revision` like [`fail_outbox`].
+pub fn defer_outbox(
+    conn: &Connection,
+    image_id: i64,
+    edit_revision: i64,
+    next_attempt_at: i64,
+    reason: Option<&str>,
+) -> Result<(), LibError> {
+    conn.execute(
+        "UPDATE sidecar_outbox
+            SET next_attempt_at = :next, last_error = COALESCE(:reason, last_error)
+          WHERE image_id = :id AND edit_revision = :rev",
+        named_params! {
+            ":next": next_attempt_at,
+            ":reason": reason,
+            ":id": image_id,
+            ":rev": edit_revision,
+        },
+    )?;
+    Ok(())
+}
+
+/// Make intents due now: all rows (`None` — worker start, so a restart retries everything) or one
+/// image's (`Some` — relink / remount / status flipped back to `present`). `attempts` and
+/// `last_error` are kept so the UI still names a persistently failing image. Returns rows touched.
+pub fn reset_outbox_schedule(conn: &Connection, image_id: Option<i64>) -> Result<usize, LibError> {
+    Ok(match image_id {
+        Some(id) => conn.execute(
+            "UPDATE sidecar_outbox SET next_attempt_at = 0
+              WHERE image_id = :id AND next_attempt_at <> 0",
+            named_params! { ":id": id },
+        )?,
+        None => conn.execute(
+            "UPDATE sidecar_outbox SET next_attempt_at = 0 WHERE next_attempt_at <> 0",
+            [],
+        )?,
+    })
 }
 
 /// The image's durable save counter and the revision actually mirrored on disk, or `None` when the
@@ -202,6 +309,37 @@ pub fn mirrored_revision(conn: &Connection, image_id: i64) -> Result<Option<(i64
             "SELECT revision, mirrored_revision FROM edits WHERE image_id = ?1",
             params![image_id],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?)
+}
+
+/// Durable mirror state of one image's edit, for display: the save counter, the revision actually
+/// on disk, and the failure of the outbox intent for THIS revision (if any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorState {
+    pub revision: i64,
+    pub mirrored_revision: i64,
+    /// `last_error` of the queued intent for exactly `revision`; `None` before any failed attempt.
+    pub last_error: Option<String>,
+}
+
+/// `None` when the image has no edit row.
+pub fn mirror_state(conn: &Connection, image_id: i64) -> Result<Option<MirrorState>, LibError> {
+    Ok(conn
+        .query_row(
+            "SELECT e.revision, e.mirrored_revision, o.last_error
+               FROM edits e
+          LEFT JOIN sidecar_outbox o
+                 ON o.image_id = e.image_id AND o.edit_revision = e.revision
+              WHERE e.image_id = :image_id",
+            named_params! { ":image_id": image_id },
+            |r| {
+                Ok(MirrorState {
+                    revision: r.get(0)?,
+                    mirrored_revision: r.get(1)?,
+                    last_error: r.get(2)?,
+                })
+            },
         )
         .optional()?)
 }

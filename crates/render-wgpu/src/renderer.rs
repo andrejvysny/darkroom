@@ -60,6 +60,16 @@ impl From<PipelineError> for RenderError {
     }
 }
 
+/// Nominal GPU byte accounting of the frame-target pool (leased + free), for the host to sum
+/// with per-image `PreparedImage::resident_bytes`. Allocation arithmetic, not measured memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceReport {
+    /// Bytes of every texture the pool retains, whether leased out or free.
+    pub pool_bytes: u64,
+    /// The pool's hard cap (`PoolLimits::total_bytes`).
+    pub pool_limit_bytes: u64,
+}
+
 /// Develops frames into leased pooled targets on the host's device.
 ///
 /// `ctx` is a clone of the host's `GpuContext` (same `wgpu::Device`/`Queue`): the host presents
@@ -98,6 +108,18 @@ impl Renderer {
 
     pub fn device_epoch(&self) -> DeviceEpoch {
         self.device_epoch
+    }
+
+    /// Current pool byte usage (leased + free). Read-only; no behavior change.
+    pub fn resource_report(&self) -> ResourceReport {
+        let pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ResourceReport {
+            pool_bytes: pool.total_bytes(),
+            pool_limit_bytes: pool.limits().total_bytes,
+        }
     }
 
     /// The shared pool, for diagnostics/tests (live counts, byte accounting).

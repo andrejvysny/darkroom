@@ -321,7 +321,9 @@ export function libraryFolders(): Promise<FolderRow[]> {
 }
 
 /** Files the catalog could not take, most recently seen first. */
-export function decodeFailuresList(limit?: number): Promise<DecodeFailureRow[]> {
+export function decodeFailuresList(
+  limit?: number,
+): Promise<DecodeFailureRow[]> {
   return invoke<DecodeFailureRow[]>("decode_failures_list", { limit });
 }
 
@@ -1321,6 +1323,7 @@ export function developEditUnreadable(imageId: number): Promise<boolean> {
   return invoke<boolean>("develop_edit_status", { imageId });
 }
 
+/** Resolves with the committed edit revision (monotonic per image) — the quit barrier's ack names it. */
 export function developSetEdit(
   imageId: number,
   params: DevelopParams,
@@ -1328,8 +1331,8 @@ export function developSetEdit(
   touchCount?: number,
   /** Force overwrite even an unreadable stored blob (explicit Reset only). */
   force?: boolean,
-): Promise<void> {
-  return invoke<void>("develop_set_edit", {
+): Promise<number> {
+  return invoke<number>("develop_set_edit", {
     imageId,
     params,
     touchCount,
@@ -1497,7 +1500,13 @@ export function exportImage(
   dest: string,
   quality?: number,
 ): Promise<void> {
-  return invoke<void>("export_image", { imageId, params, format, dest, quality });
+  return invoke<void>("export_image", {
+    imageId,
+    params,
+    format,
+    dest,
+    quality,
+  });
 }
 
 // ── Presets + copy/paste settings ────────────────────────────────────────────
@@ -1726,12 +1735,7 @@ export function analysisCancel(): Promise<void> {
 
 /** A selectable scan stage. Mirrors the Rust `StageId`; the backend rejects anything else. */
 export type StageId =
-  | "objects"
-  | "animals"
-  | "faces"
-  | "captions"
-  | "embeddings"
-  | "panoramas";
+  "objects" | "animals" | "faces" | "captions" | "embeddings" | "panoramas";
 
 /** Stage order + labels for the scan modal and the per-photo readout. */
 export const SCAN_STAGES: { id: StageId; label: string; hint?: string }[] = [
@@ -1767,7 +1771,9 @@ export type ScopeCounts = {
 };
 
 /** Size the scan modal's rows for `scope` (null = whole library). Read-only; loads no models. */
-export function scanScopeCounts(scope: ScanScope | null = null): Promise<ScopeCounts> {
+export function scanScopeCounts(
+  scope: ScanScope | null = null,
+): Promise<ScopeCounts> {
   return invoke<ScopeCounts>("scan_scope_counts", { scope });
 }
 
@@ -2294,10 +2300,7 @@ export function facesDeleteAll(): Promise<void> {
 
 /** Stitch projection surface. "auto" lets the backend pick from the source images' overlap/FOV. */
 export type PanoramaProjection =
-  | "auto"
-  | "spherical"
-  | "cylindrical"
-  | "perspective";
+  "auto" | "spherical" | "cylindrical" | "perspective";
 
 /** Shared option set for `panoramaPreview`/`panoramaMerge` (mirrors the fixed Rust IPC contract —
  *  `panorama_preview`/`panorama_merge` take these fields; Tauri auto-converts the camelCase JS
@@ -2415,7 +2418,9 @@ export function panoDetectStatus(): Promise<PanoDetectStatus> {
 
 /** Detected panorama groups, most-recently-detected first. `includeDismissed` also returns groups
  *  the user has dismissed (still excludes nothing else — merged groups are always included). */
-export function panoDetectGroups(includeDismissed = false): Promise<PanoGroupRow[]> {
+export function panoDetectGroups(
+  includeDismissed = false,
+): Promise<PanoGroupRow[]> {
   return invoke<PanoGroupRow[]>("pano_detect_groups", { includeDismissed });
 }
 

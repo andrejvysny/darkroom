@@ -158,6 +158,31 @@ fn future_schema_loads_read_only_without_touching_the_file() {
 }
 
 #[test]
+fn future_schema_with_incompatible_shapes_is_not_quarantined() {
+    let tmp = TempDir::new("future-shapes");
+    let future = r#"{"schema": 99, "bootstrapped": 5, "autoUpdateCheck": "yes"}"#;
+    let file = tmp.settings_file();
+    write(&file, future);
+    let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let (mut store, outcome) = SettingsStore::open(tmp.paths(), 1).unwrap();
+    assert!(matches!(outcome, LoadOutcome::FutureSchema { found: 99 }));
+    let error = store
+        .update(|s| set_native(&mut s.bootstrapped, true, 1))
+        .unwrap_err();
+    assert!(matches!(error, StoreError::ReadOnly));
+    assert_eq!(read(&file), future);
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+    let names: Vec<String> = std::fs::read_dir(&tmp.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.contains("corrupt")),
+        "unexpected quarantine: {names:?}"
+    );
+}
+
+#[test]
 fn stale_tmp_file_is_ignored_on_load() {
     let tmp = TempDir::new("partial");
     let (mut store, _) = SettingsStore::open(tmp.paths(), 1).unwrap();

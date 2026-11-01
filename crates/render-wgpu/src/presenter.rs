@@ -40,10 +40,16 @@ pub enum StaleReason {
 /// Owner of "what is on screen". The UI/coordinator calls [`Self::want`] with its newest request;
 /// render workers call [`Self::offer`] when their render finishes, passing the *current* device
 /// epoch (bumped when the host retires the device).
+///
+/// A frame that stops being current is *retired*, not dropped: the host's draw list for the
+/// frame in flight may still reference its texture, and dropping the lease would hand the
+/// texture back to the pool before that draw is submitted. The host collects retired leases with
+/// [`Self::take_retired`] and drops them after submit.
 #[derive(Default)]
 pub struct Presenter {
     current: Option<crate::FrameLease>,
     wanted: Option<FrameKey>,
+    retired: Vec<crate::FrameLease>,
 }
 
 impl Presenter {
@@ -70,7 +76,7 @@ impl Presenter {
             None => true,
         };
         if !keep_current {
-            self.current = None; // lease dropped, texture back to the pool
+            self.retire_current();
         }
         self.wanted = Some(key);
     }
@@ -80,9 +86,24 @@ impl Presenter {
         self.current.as_ref()
     }
 
-    /// Session disposal / device loss: drop the presented frame (texture returns to the pool).
-    pub fn clear(&mut self) {
-        self.current = None;
+    /// Session disposal / catalog close / device loss: retire the presented frame and stop
+    /// wanting anything. With nothing wanted, [`Self::offer`] rejects every frame, so a render
+    /// that finishes after the close can never present.
+    pub fn retire_all(&mut self) {
+        self.retire_current();
+        self.wanted = None;
+    }
+
+    /// Leases that stopped being current since the last call; the caller drops them once no
+    /// draw list can still sample their textures.
+    pub fn take_retired(&mut self) -> Vec<crate::FrameLease> {
+        std::mem::take(&mut self.retired)
+    }
+
+    fn retire_current(&mut self) {
+        if let Some(lease) = self.current.take() {
+            self.retired.push(lease);
+        }
     }
 
     /// Publish a finished render if it is still valid to show. See [`StaleReason`] for the
@@ -101,7 +122,9 @@ impl Presenter {
             drop(lease);
             return Offer::Stale(reason);
         }
-        self.current = Some(lease);
+        if let Some(previous) = self.current.replace(lease) {
+            self.retired.push(previous);
+        }
         Offer::Presented
     }
 
@@ -115,22 +138,25 @@ impl Presenter {
         if key.identity.device_epoch != device_epoch {
             return Some(StaleReason::DeviceRetired);
         }
-        if let Some(wanted) = &self.wanted {
-            // 2. Rendered on the wanted frame's (current) device.
-            if key.identity.device_epoch != wanted.identity.device_epoch {
-                return Some(StaleReason::DeviceRetired);
-            }
-            // 3. Same subject as the wanted frame.
-            if !same_subject(&key.identity, &wanted.identity) {
-                return Some(StaleReason::OtherImageOrSession);
-            }
-            // 4. Same viewport geometry as the wanted frame.
-            if key.viewport_px != wanted.viewport_px
-                || key.scale_milli != wanted.scale_milli
-                || key.identity.viewport_revision != wanted.identity.viewport_revision
-            {
-                return Some(StaleReason::ViewportChanged);
-            }
+        let Some(wanted) = &self.wanted else {
+            // Nothing wanted (never asked, or retired by close/device loss): a finished render
+            // is a straggler of a request nobody holds any more.
+            return Some(StaleReason::NotWanted);
+        };
+        // 2. Rendered on the wanted frame's (current) device.
+        if key.identity.device_epoch != wanted.identity.device_epoch {
+            return Some(StaleReason::DeviceRetired);
+        }
+        // 3. Same subject as the wanted frame.
+        if !same_subject(&key.identity, &wanted.identity) {
+            return Some(StaleReason::OtherImageOrSession);
+        }
+        // 4. Same viewport geometry as the wanted frame.
+        if key.viewport_px != wanted.viewport_px
+            || key.scale_milli != wanted.scale_milli
+            || key.identity.viewport_revision != wanted.identity.viewport_revision
+        {
+            return Some(StaleReason::ViewportChanged);
         }
         // 5. Never regress a presented frame — but only against a current frame of the *same
         //    subject and viewport geometry*. A new subject's revisions start fresh (a new editor
@@ -164,14 +190,12 @@ impl Presenter {
             }
         }
         // 6. Quality/revision policy against the wanted frame.
-        if let Some(wanted) = &self.wanted {
-            // Interactive: progress during drags may be older than the wanted revision.
-            // Settled: only the final-quality render of the wanted revision itself.
-            if key.quality == QualityTier::Settled
-                && key.identity.edit_revision != wanted.identity.edit_revision
-            {
-                return Some(StaleReason::NotWanted);
-            }
+        // Interactive: progress during drags may be older than the wanted revision.
+        // Settled: only the final-quality render of the wanted revision itself.
+        if key.quality == QualityTier::Settled
+            && key.identity.edit_revision != wanted.identity.edit_revision
+        {
+            return Some(StaleReason::NotWanted);
         }
         None
     }

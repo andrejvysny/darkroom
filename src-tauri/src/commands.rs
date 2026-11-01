@@ -492,7 +492,7 @@ pub async fn develop_set_edit(
     touch_count: Option<i64>,
     // `true` to overwrite even an unreadable stored blob (explicit Reset). Defaults to `false`.
     force: Option<bool>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     crate::jobs::spawn_fallible(
         app.clone(),
         core_app::jobs::JobClass::UserCommand,
@@ -519,7 +519,7 @@ pub async fn develop_set_edit(
             // one transaction (migration 026): if the process dies before the file lands, the next
             // launch still knows this revision is owed a write. `set_edit` would only have moved the
             // params, leaving the "still owed" knowledge in memory.
-            core_library::save_edit_with_intent(
+            let revision = core_library::save_edit_with_intent(
                 &db.conn,
                 image_id,
                 PROCESS_VERSION,
@@ -549,18 +549,26 @@ pub async fn develop_set_edit(
             // lock, and only after the catalog guard is gone, so no lock order is introduced.
             drop(db);
             st.outbox.notify();
-            Ok(())
+            // The committed revision: the quit barrier's ack is checked against it.
+            Ok(revision)
         },
     )
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// The frontend's answer to the quit barrier's `app:flush-edits` request: `ok = false` means an
-/// edit is still unsaved, which cancels this quit attempt (see `crate::quit`).
+/// The frontend's answer to the quit barrier's `app:flush-edits` request. `barrier_id` echoes the
+/// request's `barrierId`; `ok = false` means an edit is still unsaved, which cancels this quit
+/// attempt; `saved` lists the committed revision per image, verified against the catalog (see
+/// `crate::quit`). An ack for any other barrier is ignored.
 #[tauri::command]
-pub fn develop_flush_ack(app: AppHandle, ok: bool) {
-    app.state::<AppState>().quit.ack(ok);
+pub fn develop_flush_ack(
+    app: AppHandle,
+    barrier_id: u64,
+    ok: bool,
+    saved: Vec<crate::quit::SavedRevisionArg>,
+) {
+    crate::quit::deliver_ack(&app, barrier_id, ok, saved);
 }
 
 /// Run the save barrier for an updater relaunch. `Ok(true)` = safe to relaunch.
@@ -568,27 +576,19 @@ pub fn develop_flush_ack(app: AppHandle, ok: bool) {
 /// The updater restarts the process through `plugin-process`, which never raises a quit the barrier
 /// can hold, so the frontend must ask before calling `relaunch()`. A rejected barrier leaves the app
 /// running with `app:save-barrier` announced; the caller must not relaunch on anything but `true`.
+///
+/// Deliberately NOT an ordered `UserCommand` job: the frontend's flush is an ordered
+/// `develop_set_edit`, which could not start until this barrier timed out. The coordinator runs on
+/// its own worker thread and this command only awaits its result.
 #[tauri::command]
 pub async fn prepare_restart(app: AppHandle) -> Result<bool, String> {
-    // On an executor thread, never the main one: the barrier needs the run loop alive to deliver
-    // `app:flush-edits` to the webview and take the `develop_flush_ack` back.
-    crate::jobs::spawn_fallible(
-        app.clone(),
-        core_app::jobs::JobClass::UserCommand,
-        true,
-        "prepare_restart",
-        move || {
-            let reason = crate::quit::BarrierReason::UpdaterRestart;
-            let result = crate::quit::run_save_barrier(&app, reason);
-            if result.is_safe() {
-                Ok(true)
-            } else {
-                Err(result.message(reason))
-            }
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?
+    let reason = crate::quit::BarrierReason::UpdaterRestart;
+    let result = crate::quit::run_save_barrier(&app, reason).await;
+    if result.is_safe() {
+        Ok(true)
+    } else {
+        Err(result.message(reason))
+    }
 }
 
 /// Hard cap on the full-res texture's long edge — keeps it within the GPU max texture dimension
@@ -1429,7 +1429,6 @@ pub async fn develop_render(
         Ok::<_, String>(tauri::ipc::Response::new(buf))
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Compute the histogram of the WHOLE developed crop (not the visible viewport). Renders the full
@@ -5028,60 +5027,36 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                 );
             };
 
-            // Load + validate the source rows (brief lock).
+            // ONE snapshot of the source rows: every field used below (path, status, format,
+            // hash, folder) and the tokens fencing the minutes of unlocked decode come from it, so
+            // a replaced or rowid-reused source cannot slip between a read and the capture.
             struct Frame {
                 id: i64,
                 path: PathBuf,
                 hash_hex: String,
                 folder_id: i64,
             }
-            let frames: Vec<Frame> = {
-                let db = st.db.lock().map_err(|e| e.to_string())?;
-                image_ids
-                    .iter()
-                    .map(|&id| {
-                        let (path, status, format, hash, folder_id): (
-                            String,
-                            String,
-                            Option<String>,
-                            Vec<u8>,
-                            i64,
-                        ) = db
-                            .conn
-                            .query_row(
-                                "SELECT path, status, IFNULL(format,'raw'), content_hash,
-                                    IFNULL(folder_id, -1)
-                             FROM images WHERE id = ?1",
-                                core_db::rusqlite::params![id],
-                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                            )
-                            .map_err(|_| format!("image {id} not found"))?;
-                        if status != "present" {
-                            return Err(format!("{path}: file is missing — relink it first"));
-                        }
-                        match format.as_deref() {
-                            Some("raw") | None => {}
-                            Some(other) => {
-                                return Err(format!(
-                                    "{path}: HDR merge takes RAW frames only (this is {other})"
-                                ))
-                            }
-                        }
-                        Ok(Frame {
-                            id,
-                            path: PathBuf::from(path),
-                            hash_hex: hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                            folder_id,
-                        })
-                    })
-                    .collect::<Result<_, String>>()?
-            };
-            // Fence the inputs now: the minutes of unlocked decode below must not let a deleted
-            // source's rowid be reused before we attach `hdr_sources` provenance to it.
-            let tokens = crate::source_fence::capture_sources(
-                &st,
-                &frames.iter().map(|f| f.id).collect::<Vec<_>>(),
-            )?;
+            let snapshot =
+                crate::source_fence::snapshot_sources(&st.publications, &st.db, &image_ids)?;
+            snapshot.require_present()?;
+            if let Some(s) = snapshot.sources().iter().find(|s| s.format != "raw") {
+                return Err(format!(
+                    "{}: HDR merge takes RAW frames only (this is {})",
+                    s.path.display(),
+                    s.format
+                ));
+            }
+            let tokens = snapshot.tokens().to_vec();
+            let frames: Vec<Frame> = snapshot
+                .sources()
+                .iter()
+                .map(|s| Frame {
+                    id: s.id,
+                    path: s.path.clone(),
+                    hash_hex: s.content_hash_hex.clone(),
+                    folder_id: s.folder_id.unwrap_or(-1),
+                })
+                .collect();
 
             // Numeric exposure per frame → EV, reference (median EV), shortest (max EV). Metadata-only
             // (no pixel decode) alongside, to catch a mixed-camera selection before the expensive
@@ -5285,10 +5260,11 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
             // Any catalog failure after a successful write would leave the EXR orphaned on disk —
             // remove it on every error path out of this block (the collision branch's own remove
             // stays; a second remove is a no-op).
-            let id = st
-                .publications
-                .tokens_guard(&tokens)
-                .map(|mut guard| -> Result<i64, String> {
+            let id = crate::source_fence::publish_owned(
+                &st.publications,
+                &tokens,
+                &dest,
+                |guard| -> Result<i64, String> {
                     let db = st.db.lock().map_err(|e| e.to_string())?;
                     let conn = &db.conn;
                     let folder_id = match &library_root {
@@ -5322,14 +5298,8 @@ pub async fn hdr_merge(app: AppHandle, image_ids: Vec<i64>) -> Result<ImageRow, 
                         },
                     );
                     Ok(id)
-                })
-                .map_err(|_| {
-                    "a source photo changed during the merge; nothing was published".to_string()
-                })
-                .flatten()
-                .inspect_err(|_| {
-                    let _ = std::fs::remove_file(&dest);
-                })?;
+                },
+            )?;
             // Image + provenance committed; a later cancel must not retire the published row.
             ctx.mark_committed();
             // The image and its provenance are committed now. A response-query failure must not

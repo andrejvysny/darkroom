@@ -1,5 +1,7 @@
+use crate::state::MirrorStatus;
 use crate::AppError;
 use core_model::catalog::{DateTreeYear, FolderRow, ImageRow, QueryParams};
+use core_model::identity::CatalogRevision;
 use std::path::Path;
 
 /// Concrete persistence stays behind this read-only first-slice interface.
@@ -15,6 +17,23 @@ pub trait CatalogPort: Send + Sync {
     /// image has no edit row. The JSON stays raw: interpretation is the model's job
     /// (`core_model::document::EditDocument::read`), never the catalog's.
     fn edit(&self, image_id: i64) -> Result<Option<(String, i64)>, AppError>;
+    /// Commit an edit (and its durable sidecar intent) in one transaction, after verifying the
+    /// image's content hash still equals `content_hash` (lowercase hex). A changed source is an
+    /// error carrying `source changed — not saved`; nothing is written.
+    fn save_edit(
+        &self,
+        image_id: i64,
+        content_hash: &str,
+        process_version: i64,
+        params_json: &str,
+    ) -> Result<SaveReceipt, AppError>;
+}
+
+/// What the catalog committed for one `save_edit`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveReceipt {
+    pub catalog_revision: CatalogRevision,
+    pub mirror: MirrorStatus,
 }
 
 pub trait Clock: Send + Sync {

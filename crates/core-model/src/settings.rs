@@ -230,12 +230,21 @@ pub struct WebSnapshot {
 /// Load a settings document. Unknown extra fields are ignored on read, so forward-compatible
 /// minor additions written by a newer app still load. Missing fields take [`Settings::default`].
 pub fn parse_settings(json: &str) -> Result<Settings, SettingsError> {
-    let settings: Settings =
+    // Probe only `schema` first: a newer build may have changed other fields' shapes, which
+    // must read as FutureSchema (file left alone), never as Corrupt (file quarantined).
+    let value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| SettingsError::Corrupt(e.to_string()))?;
-    if settings.schema > SETTINGS_SCHEMA {
-        return Err(SettingsError::FutureSchema(settings.schema));
+    let object = value
+        .as_object()
+        .ok_or_else(|| SettingsError::Corrupt("settings must be a JSON object".to_owned()))?;
+    if let Some(found) = object.get("schema").and_then(serde_json::Value::as_u64) {
+        if found > u64::from(SETTINGS_SCHEMA) {
+            return Err(SettingsError::FutureSchema(
+                u32::try_from(found).unwrap_or(u32::MAX),
+            ));
+        }
     }
-    Ok(settings)
+    serde_json::from_value(value).map_err(|e| SettingsError::Corrupt(e.to_string()))
 }
 
 /// Serialize with pretty printing and stable (declaration-order) keys.

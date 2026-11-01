@@ -184,7 +184,7 @@ const MIGRATIONS_V25: &[&str] = &[
 ];
 
 /// A production-shaped startup: an existing v25 `catalog.db` opened through the adapter host must
-/// get a `catalog-pre-v26-*` safety snapshot next to it BEFORE the migration rewrites it. This is
+/// get a `catalog-pre-v{LATEST}-*` safety snapshot next to it BEFORE the migration rewrites it. This is
 /// the path `AppState::new` and `CatalogPort::open` both take; `Db::open` alone would migrate with
 /// no way back.
 #[test]
@@ -249,7 +249,8 @@ fn opening_a_v25_catalog_through_the_adapter_backs_it_up_before_migrating() {
     let snapshot = &snapshots[0];
     let name = snapshot.file_name().unwrap().to_str().unwrap().to_string();
     assert!(
-        name.starts_with("catalog-pre-v26-") && name.ends_with(".db"),
+        name.starts_with(&format!("catalog-pre-v{}-", core_db::LATEST_SCHEMA_VERSION))
+            && name.ends_with(".db"),
         "unexpected pre-upgrade backup name: {name}"
     );
     let copied = core_db::rusqlite::Connection::open(snapshot).unwrap();

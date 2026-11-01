@@ -103,7 +103,7 @@ pub fn set_edit(
 /// `revision = revision + 1` (1 for a brand-new row): a save counter that cannot repeat, whatever
 /// the wall clock does, so a sidecar write can be pinned to the exact params it wrote. The
 /// `sidecar_outbox` row (one per image) is then upserted to that revision with the image's current
-/// path + content hash, and its attempt counters reset — a fresh save is a fresh start, and it
+/// path + content hash, and its attempt counters and retry schedule reset (`next_attempt_at = 0`: due now, never inheriting an older intent's backoff) — a fresh save is a fresh start, and it
 /// replaces whatever older intent was still queued.
 ///
 /// A missing image row is an error and writes nothing: an edit whose source file cannot be named has
@@ -119,7 +119,67 @@ pub fn save_edit_with_intent(
     params_json: &str,
     updated_at: i64,
 ) -> Result<i64, LibError> {
-    let identity = conn
+    save_edit_inner(
+        conn,
+        image_id,
+        None,
+        process_version,
+        params_json,
+        updated_at,
+    )
+    .map_err(|e| match e {
+        SaveError::Lib(e) => e,
+        SaveError::SourceChanged => LibError::Other("source changed — not saved".into()),
+    })
+}
+
+/// Why a guarded save wrote nothing. `SourceChanged` is permanent for that edit (retrying cannot
+/// help), so callers must tell it apart from a transient catalog failure.
+#[derive(Debug)]
+pub enum SaveError {
+    /// The image's `content_hash` no longer equals the one the edit was made against.
+    SourceChanged,
+    Lib(LibError),
+}
+
+impl<E: Into<LibError>> From<E> for SaveError {
+    fn from(error: E) -> Self {
+        Self::Lib(error.into())
+    }
+}
+
+/// [`save_edit_with_intent`] that first verifies, inside the same transaction, that the image's
+/// `content_hash` still equals `expected_hash_hex` (lowercase hex). A mismatch means the edit was
+/// made against a different source file than the one now catalogued under this id (replaced or
+/// relinked): nothing is written and the result is [`SaveError::SourceChanged`].
+pub fn save_edit_expecting_source(
+    conn: &Connection,
+    image_id: i64,
+    expected_hash_hex: &str,
+    process_version: i64,
+    params_json: &str,
+    updated_at: i64,
+) -> Result<i64, SaveError> {
+    save_edit_inner(
+        conn,
+        image_id,
+        Some(expected_hash_hex),
+        process_version,
+        params_json,
+        updated_at,
+    )
+}
+
+fn save_edit_inner(
+    conn: &Connection,
+    image_id: i64,
+    expected_hash_hex: Option<&str>,
+    process_version: i64,
+    params_json: &str,
+    updated_at: i64,
+) -> Result<i64, SaveError> {
+    let tx = conn.unchecked_transaction()?;
+    let identity = tx
         .query_row(
             "SELECT path, content_hash FROM images WHERE id = ?1",
             params![image_id],
@@ -128,10 +188,14 @@ pub fn save_edit_with_intent(
         .optional()?;
     let (path, content_hash) = match identity {
         Some(identity) => identity,
-        None => return Err(LibError::Other(format!("image {image_id} does not exist"))),
+        None => return Err(LibError::Other(format!("image {image_id} does not exist")).into()),
     };
-
-    let tx = conn.unchecked_transaction()?;
+    if let Some(expected) = expected_hash_hex {
+        let actual: String = content_hash.iter().map(|b| format!("{b:02x}")).collect();
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(SaveError::SourceChanged);
+        }
+    }
     tx.execute(
         "INSERT INTO edits(image_id, process_version, params, updated_at, revision)
          VALUES(?1,?2,?3,?4,1)
@@ -148,15 +212,16 @@ pub fn save_edit_with_intent(
         |r| r.get(0),
     )?;
     tx.execute(
-        "INSERT INTO sidecar_outbox(image_id, edit_revision, content_hash, path, enqueued_at, attempts, last_error)
-         VALUES(?1,?2,?3,?4,?5,0,NULL)
+        "INSERT INTO sidecar_outbox(image_id, edit_revision, content_hash, path, enqueued_at, attempts, last_error, next_attempt_at)
+         VALUES(?1,?2,?3,?4,?5,0,NULL,0)
          ON CONFLICT(image_id) DO UPDATE SET
             edit_revision = excluded.edit_revision,
             content_hash = excluded.content_hash,
             path = excluded.path,
             enqueued_at = excluded.enqueued_at,
             attempts = 0,
-            last_error = NULL",
+            last_error = NULL,
+            next_attempt_at = 0",
         params![image_id, revision, content_hash, path, crate::index::now_epoch()],
     )?;
     tx.commit()?;

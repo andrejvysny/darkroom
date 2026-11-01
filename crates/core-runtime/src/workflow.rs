@@ -2,7 +2,7 @@ use crate::catalog::CatalogAdapter;
 use core_app::ports::{CatalogPort, Clock, EffectExecutor, EventSink, RenderBackend};
 use core_app::workflow::{Command, Completion, Effect, Operation, Outcome};
 use core_app::{AppError, ApplicationSession};
-use core_model::document::EditDocument;
+use core_model::document::{params_to_json, EditDocument};
 use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
 /// Host-supplied paths; opening a catalog never discovers a production profile implicitly.
@@ -32,6 +32,21 @@ impl EffectExecutor for InlineExecutor {
             Operation::LoadEdit { image_id, .. } => catalog
                 .edit(image_id.0)
                 .map(|stored| Outcome::Edit(stored.map(|(json, pv)| EditDocument::read(json, pv)))),
+            Operation::SaveEdit {
+                key,
+                params,
+                process_version,
+                ..
+            } => params_to_json(&params)
+                .map_err(|e| AppError::Catalog(e.into()))
+                .map(|json| (key, json, process_version))
+                .and_then(|(key, json, pv)| {
+                    catalog.save_edit(key.image_id.0, &key.content_hash, pv.0, &json)
+                })
+                .map(|receipt| Outcome::Saved {
+                    catalog_revision: receipt.catalog_revision,
+                    mirror: receipt.mirror,
+                }),
         };
         Completion {
             token: effect.token,

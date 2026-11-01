@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 core-app = { path = "../../crates/core-app" }
 core-model = { path = "../../crates/core-model" }
+ui-egui = { path = "../../crates/ui-egui" }
 core-runtime = { path = "../../crates/core-runtime" }
 core-pipeline = { path = "../../crates/core-pipeline" }
 core-raw = { path = "../../crates/core-raw" }

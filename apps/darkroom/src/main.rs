@@ -1,6 +1,8 @@
 mod application;
 mod gpu;
+mod native_app;
 mod paint;
+mod photo_view;
 mod photo_worker;
 mod present;
 mod settings;

@@ -62,7 +62,7 @@ fn a_save_bumps_the_revision_and_keeps_exactly_one_intent_per_image() {
         "an unwritten sidecar is owed, not mirrored"
     );
 
-    let queued = pending_outbox(&db.conn, 10).unwrap();
+    let queued = pending_outbox(&db.conn, i64::MAX, None, 10).unwrap();
     assert_eq!(queued.len(), 1, "one intent per image");
     assert_eq!(queued[0].image_id, id);
     assert_eq!(queued[0].edit_revision, 1);
@@ -75,7 +75,7 @@ fn a_save_bumps_the_revision_and_keeps_exactly_one_intent_per_image() {
     // params matter, and two rows would race each other for the same sidecar file.
     let revision = save_edit_with_intent(&db.conn, id, 6, r#"{"exposure":2}"#, TIME).unwrap();
     assert_eq!(revision, 2);
-    let queued = pending_outbox(&db.conn, 10).unwrap();
+    let queued = pending_outbox(&db.conn, i64::MAX, None, 10).unwrap();
     assert_eq!(queued.len(), 1, "still one row, replaced not appended");
     assert_eq!(queued[0].edit_revision, 2);
     assert_eq!(mirrored_revision(&db.conn, id).unwrap(), Some((2, 0)));
@@ -106,9 +106,13 @@ fn a_superseded_completion_marks_nothing_and_the_current_one_completes() {
     let id = insert_image(&db.conn, &[0xcd; 32], "/lib/shot.cr3");
 
     save_edit_with_intent(&db.conn, id, 5, r#"{"exposure":1}"#, TIME).unwrap();
-    let stale = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let stale = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     save_edit_with_intent(&db.conn, id, 5, r#"{"exposure":2}"#, TIME + 1).unwrap();
-    let current = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let current = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(current.edit_revision, 2);
 
     // The host finished writing the OLD params after the user saved again: that success proves
@@ -117,7 +121,7 @@ fn a_superseded_completion_marks_nothing_and_the_current_one_completes() {
         complete_outbox(&db.conn, &stale).unwrap(),
         OutboxCompletion::Superseded
     );
-    let queued = pending_outbox(&db.conn, 10).unwrap();
+    let queued = pending_outbox(&db.conn, i64::MAX, None, 10).unwrap();
     assert_eq!(queued.len(), 1, "the newer intent survives");
     assert_eq!(queued[0].edit_revision, 2);
     assert_eq!(
@@ -131,7 +135,9 @@ fn a_superseded_completion_marks_nothing_and_the_current_one_completes() {
         OutboxCompletion::Completed
     );
     assert_eq!(mirrored_revision(&db.conn, id).unwrap(), Some((2, 2)));
-    assert!(pending_outbox(&db.conn, 10).unwrap().is_empty());
+    assert!(pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .is_empty());
     assert_eq!(outbox_count(&db.conn), 0);
 
     // Reporting the same success twice is harmless.
@@ -150,8 +156,10 @@ fn a_moved_or_replaced_relinkable_source_requeues_the_intent_at_the_new_identity
     save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
     // An older failed attempt on the old path: relinking must reset the retry pacing, because the
     // old path's failures say nothing about the new file.
-    fail_outbox(&db.conn, id, 1, "permission denied").unwrap();
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    fail_outbox(&db.conn, id, 1, "permission denied", 0).unwrap();
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(item.attempts, 1);
 
     // Renamed on disk (e.g. the watcher adopted the file's real name) while the write was in
@@ -167,7 +175,7 @@ fn a_moved_or_replaced_relinkable_source_requeues_the_intent_at_the_new_identity
         complete_outbox(&db.conn, &item).unwrap(),
         OutboxCompletion::Requeued
     );
-    let requeued = pending_outbox(&db.conn, 10)
+    let requeued = pending_outbox(&db.conn, i64::MAX, None, 10)
         .unwrap()
         .into_iter()
         .find(|i| i.image_id == id)
@@ -197,14 +205,18 @@ fn a_moved_or_replaced_relinkable_source_requeues_the_intent_at_the_new_identity
         complete_outbox(&db.conn, &requeued).unwrap(),
         OutboxCompletion::Completed
     );
-    assert!(pending_outbox(&db.conn, 10).unwrap().is_empty());
+    assert!(pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .is_empty());
     assert_eq!(mirrored_revision(&db.conn, id).unwrap(), Some((1, 1)));
 
     // Same for a replaced body (re-copied card): the hash no longer matches the intent, but the
     // present row still owes the write, so it re-queues at the new hash.
     let revision = save_edit_with_intent(&db.conn, id, 5, "{}", TIME + 1).unwrap();
     assert_eq!(revision, 2);
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     db.conn
         .execute(
             "UPDATE images SET content_hash = ?2 WHERE id = ?1",
@@ -215,7 +227,9 @@ fn a_moved_or_replaced_relinkable_source_requeues_the_intent_at_the_new_identity
         complete_outbox(&db.conn, &item).unwrap(),
         OutboxCompletion::Requeued
     );
-    let requeued = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let requeued = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(requeued.content_hash_hex, "22".repeat(32));
     assert_eq!(
         requeued.path, "/lib/renamed.cr3",
@@ -239,7 +253,9 @@ fn a_moved_source_that_is_not_present_keeps_the_intent_queued() {
     let db = Db::open(&scratch.0.join("catalog.db")).unwrap();
     let id = insert_image(&db.conn, &[0x5c; 32], "/lib/shot.cr3");
     save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
 
     // Moved AND its on-disk original vanished (watcher flagged `missing`) mid-write: nothing on
     // disk mirrors right now, but the row may come back (relink / remount). Only a gone row or a
@@ -254,7 +270,7 @@ fn a_moved_source_that_is_not_present_keeps_the_intent_queued() {
         complete_outbox(&db.conn, &item).unwrap(),
         OutboxCompletion::SourceChanged
     );
-    let kept = pending_outbox(&db.conn, 10)
+    let kept = pending_outbox(&db.conn, i64::MAX, None, 10)
         .unwrap()
         .into_iter()
         .find(|i| i.image_id == id)
@@ -274,18 +290,24 @@ fn a_moved_source_that_is_not_present_keeps_the_intent_queued() {
             params![id, "/lib/elsewhere.cr3"],
         )
         .unwrap();
-    let retried = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let retried = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(
         complete_outbox(&db.conn, &retried).unwrap(),
         OutboxCompletion::Requeued
     );
-    let relinked = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let relinked = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(relinked.path, "/lib/elsewhere.cr3");
     assert_eq!(
         complete_outbox(&db.conn, &relinked).unwrap(),
         OutboxCompletion::Completed
     );
-    assert!(pending_outbox(&db.conn, 10).unwrap().is_empty());
+    assert!(pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -294,7 +316,9 @@ fn a_deleted_image_or_edit_takes_the_intent_with_it() {
     let db = Db::open(&scratch.0.join("catalog.db")).unwrap();
     let id = insert_image(&db.conn, &[0x99; 32], "/lib/shot.cr3");
     save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
 
     db.conn
         .execute("DELETE FROM images WHERE id = ?1", params![id])
@@ -321,7 +345,9 @@ fn a_deleted_edit_drops_the_intent_it_could_not_keep() {
     let db = Db::open(&scratch.0.join("catalog.db")).unwrap();
     let id = insert_image(&db.conn, &[0x5a; 32], "/lib/shot.cr3");
     save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
 
     // `edits` has no cascade from `sidecar_outbox` — "reset develop params" deletes the edit row and
     // leaves the intent behind. Completing it must clear it, not mark a nonexistent edit mirrored.
@@ -349,13 +375,17 @@ fn a_failed_write_is_counted_and_survives_a_restart() {
     let id = insert_image(&db.conn, &[0x77; 32], "/lib/shot.cr3");
     save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
 
-    fail_outbox(&db.conn, id, 1, "disk full").unwrap();
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    fail_outbox(&db.conn, id, 1, "disk full", 0).unwrap();
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(item.attempts, 1);
     assert_eq!(item.last_error.as_deref(), Some("disk full"));
 
-    fail_outbox(&db.conn, id, 1, "read-only volume").unwrap();
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    fail_outbox(&db.conn, id, 1, "read-only volume", 0).unwrap();
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(
         item.attempts, 2,
         "the retry loop needs the attempt count to back off"
@@ -363,9 +393,9 @@ fn a_failed_write_is_counted_and_survives_a_restart() {
     assert_eq!(item.last_error.as_deref(), Some("read-only volume"));
 
     // An attempt attributed to a revision that is no longer queued changes nothing.
-    fail_outbox(&db.conn, id, 99, "stale").unwrap();
+    fail_outbox(&db.conn, id, 99, "stale", 0).unwrap();
     assert_eq!(
-        pending_outbox(&db.conn, 10).unwrap()[0].attempts,
+        pending_outbox(&db.conn, i64::MAX, None, 10).unwrap()[0].attempts,
         2,
         "only the attempted intent is touched"
     );
@@ -373,7 +403,9 @@ fn a_failed_write_is_counted_and_survives_a_restart() {
     // The crash test: drop the connection (quit), open it again (restart). The queue is still there.
     drop(db);
     let db = Db::open(&path).unwrap();
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(item.image_id, id);
     assert_eq!(item.edit_revision, 1);
     assert_eq!(item.attempts, 2);
@@ -386,7 +418,9 @@ fn a_failed_write_is_counted_and_survives_a_restart() {
         OutboxCompletion::Completed
     );
     assert_eq!(mirrored_revision(&db.conn, id).unwrap(), Some((1, 1)));
-    assert!(pending_outbox(&db.conn, 10).unwrap().is_empty());
+    assert!(pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -395,9 +429,13 @@ fn out_of_order_completions_never_rewind_the_mirror() {
     let db = Db::open(&scratch.0.join("catalog.db")).unwrap();
     let id = insert_image(&db.conn, &[0x33; 32], "/lib/shot.cr3");
     save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
-    let first = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let first = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     save_edit_with_intent(&db.conn, id, 5, "{}", TIME + 1).unwrap();
-    let second = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let second = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
 
     // The writer for revision 2 reports before the one for revision 1 (separate worker tasks).
     assert_eq!(
@@ -426,7 +464,7 @@ fn the_queue_is_oldest_first_and_respects_the_limit() {
         save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
         ids.push(id);
     }
-    let queued = pending_outbox(&db.conn, 10).unwrap();
+    let queued = pending_outbox(&db.conn, i64::MAX, None, 10).unwrap();
     assert_eq!(queued.len(), 3);
     // Same second, so the tie-break on image_id gives a stable, starvation-free order.
     assert_eq!(
@@ -434,8 +472,13 @@ fn the_queue_is_oldest_first_and_respects_the_limit() {
         ids,
         "oldest intent first"
     );
-    assert_eq!(pending_outbox(&db.conn, 2).unwrap().len(), 2);
-    assert!(pending_outbox(&db.conn, 0).unwrap().is_empty());
+    assert_eq!(
+        pending_outbox(&db.conn, i64::MAX, None, 2).unwrap().len(),
+        2
+    );
+    assert!(pending_outbox(&db.conn, i64::MAX, None, 0)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -475,7 +518,9 @@ fn an_intent_and_its_edit_commit_together() {
     assert_eq!(outbox_count(&db.conn), 1);
 
     // And the reverse: a completed mirror never leaves a row behind.
-    let item = pending_outbox(&db.conn, 10).unwrap().remove(0);
+    let item = pending_outbox(&db.conn, i64::MAX, None, 10)
+        .unwrap()
+        .remove(0);
     complete_outbox(&db.conn, &item).unwrap();
     assert_eq!(
         db.conn
@@ -489,4 +534,92 @@ fn an_intent_and_its_edit_commit_together() {
         0,
         "no owed write is unrecorded, and no recorded intent is unowed"
     );
+}
+#[test]
+fn due_filter_keyset_paging_and_schedule_controls() {
+    use core_library::{defer_outbox, next_outbox_due, reset_outbox_schedule};
+    let scratch = Scratch::new("schedule");
+    let db = Db::open(&scratch.0.join("catalog.db")).unwrap();
+    let ids: Vec<i64> = (0..5u8)
+        .map(|i| insert_image(&db.conn, &[i + 1; 32], &format!("/lib/{i}.cr3")))
+        .collect();
+    for &id in &ids {
+        save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
+    }
+    assert_eq!(next_outbox_due(&db.conn).unwrap(), Some(0));
+
+    // Paging by keyset walks every due row exactly once, whatever the page size.
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = core_library::pending_outbox_keyed(&db.conn, 1_000, after, 2).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|(_, cursor)| *cursor);
+        seen.extend(page.iter().map(|(item, _)| item.image_id));
+    }
+    assert_eq!(seen.len(), 5);
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 5, "no row repeated: {seen:?}");
+
+    // A backed-off row is invisible until its time; the others stay due. `defer` charges no attempt.
+    fail_outbox(&db.conn, ids[0], 1, "boom", 5_000).unwrap();
+    defer_outbox(&db.conn, ids[1], 1, 7_000, Some("not present")).unwrap();
+    let due_at = |now| -> Vec<i64> {
+        pending_outbox(&db.conn, now, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.image_id)
+            .collect()
+    };
+    assert_eq!(due_at(1_000), ids[2..].to_vec());
+    assert_eq!(next_outbox_due(&db.conn).unwrap(), Some(0));
+    assert_eq!(due_at(5_000).len(), 4);
+    assert_eq!(due_at(7_000).len(), 5);
+    let failed = pending_outbox(&db.conn, 5_000, None, 10).unwrap();
+    let failed = failed.iter().find(|r| r.image_id == ids[0]).unwrap();
+    assert_eq!((failed.attempts, failed.next_attempt_at), (1, 5_000));
+    let deferred = pending_outbox(&db.conn, 7_000, None, 10).unwrap();
+    let deferred = deferred.iter().find(|r| r.image_id == ids[1]).unwrap();
+    assert_eq!(deferred.attempts, 0, "defer is not a failed attempt");
+    assert_eq!(deferred.last_error.as_deref(), Some("not present"));
+
+    // A stale revision touches nothing.
+    defer_outbox(&db.conn, ids[2], 99, 9_000, None).unwrap();
+    assert_eq!(due_at(1_000), ids[2..].to_vec());
+
+    // Reset one, then all; attempts and last_error are preserved.
+    assert_eq!(reset_outbox_schedule(&db.conn, Some(ids[0])).unwrap(), 1);
+    assert_eq!(due_at(0).len(), 4);
+    reset_outbox_schedule(&db.conn, None).unwrap();
+    assert_eq!(due_at(0).len(), 5);
+    let kept = pending_outbox(&db.conn, 0, None, 10).unwrap();
+    let kept = kept.iter().find(|r| r.image_id == ids[0]).unwrap();
+    assert_eq!(
+        (kept.attempts, kept.last_error.as_deref()),
+        (1, Some("boom"))
+    );
+}
+
+#[test]
+fn a_superseding_save_resets_the_inherited_backoff() {
+    let scratch = Scratch::new("supersede-schedule");
+    let db = Db::open(&scratch.0.join("catalog.db")).unwrap();
+    let id = insert_image(&db.conn, &[3; 32], "/lib/shot.cr3");
+    save_edit_with_intent(&db.conn, id, 5, "{}", TIME).unwrap();
+    fail_outbox(&db.conn, id, 1, "disk full", 9_999_999).unwrap();
+    assert!(pending_outbox(&db.conn, 1_000, None, 10)
+        .unwrap()
+        .is_empty());
+
+    save_edit_with_intent(&db.conn, id, 5, "{}", TIME + 1).unwrap();
+    let item = pending_outbox(&db.conn, 1_000, None, 10).unwrap().remove(0);
+    assert_eq!(
+        (item.edit_revision, item.attempts, item.next_attempt_at),
+        (2, 0, 0)
+    );
+    assert_eq!(item.last_error, None);
 }

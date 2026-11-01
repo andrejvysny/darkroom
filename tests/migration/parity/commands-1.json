@@ -115,7 +115,7 @@
     {
       "name": "develop_flush_ack",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Acknowledge quit flush; a failed flush cancels the quit attempt.",
+      "behavior": "Acknowledge a save barrier by barrierId with per-image saved catalog revisions; stale barrier ids are ignored, claimed revisions are verified against edits.revision, and a failed or unverified flush cancels the quit/restart.",
       "target": "core-runtime",
       "task": "DARKROOM-138",
       "test": "e2e/tests/mock/develop-persistence.spec.ts"
@@ -123,7 +123,7 @@
     {
       "name": "develop_set_edit",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Persist non-destructive edits plus the durable sidecar-mirror intent in one transaction (migration 026; restart-retried by the outbox worker, which mirrors the edit to sidecars and retries pending intents after a restart); reject overwriting unreadable data unless explicitly forced; record process version and before/after event.",
+      "behavior": "Persist non-destructive edits plus the durable sidecar-mirror intent in one transaction (migration 026; restart-retried by the outbox worker, which mirrors the edit to sidecars and retries pending intents after a restart); reject overwriting unreadable data unless explicitly forced; record process version and before/after event; return the committed catalog revision (edits.revision) used by save-barrier acks.",
       "target": "core-runtime",
       "task": "DARKROOM-138",
       "test": "crates/core-library/tests/outbox.rs"
@@ -131,7 +131,7 @@
     {
       "name": "prepare_restart",
       "source": "src-tauri/src/commands.rs",
-      "behavior": "Run the quit save barrier for an updater relaunch from a worker thread; resolve true only when the editor confirms every debounced edit is committed, otherwise cancel the restart and announce app:save-barrier.",
+      "behavior": "Run the quit save barrier for an updater relaunch on an off-lane worker thread (never inside the ordered UserCommand lane its flush saves need); resolve true only when the editor confirms every debounced edit is committed, otherwise cancel the restart and announce app:save-barrier.",
       "target": "core-runtime",
       "task": "DARKROOM-138",
       "test": "src-tauri/src/quit.rs"

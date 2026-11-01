@@ -305,7 +305,10 @@ pub struct PreparedImage {
     extra_uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     output: wgpu::Texture,
-    readback: wgpu::Buffer,
+    // CPU-readback staging for `output` (padded `bpr * height`). Created on the first `render()` /
+    // identity `render_view()`; GPU-resident paths (`render_view_into_texture`) never create it.
+    readback_size: u64,
+    readback: std::sync::OnceLock<wgpu::Buffer>,
     // Tone-curve LUT, rewritten per render() from the current params.
     lut: wgpu::Texture,
     // Scene-referred base tone operator: log-exposure LUT + its uniform, rewritten per render().
@@ -323,7 +326,6 @@ pub struct PreparedImage {
     mask_buffer: wgpu::Buffer,
     // Pre-pass uniform (one mask's components), rewritten per mask per render().
     prepass_uniform: wgpu::Buffer,
-    prepass_bind: wgpu::BindGroup,
     // Baked AI (SAM) alpha for the current mask being pre-passed (fixed AI_TEX_EDGE² R8Unorm, valid
     // region top-left). Content rewritten per-mask in the bake loop from `ai_coverages`; the view is
     // bound once in `prepass_bind`.
@@ -333,21 +335,23 @@ pub struct PreparedImage {
     /// mask bake loop. Public so the IPC layer can stash freshly computed coverage on the prepared
     /// image without a re-decode. Mutex keeps `PreparedImage: Sync` for the shared develop caches.
     pub ai_coverages: std::sync::Mutex<Vec<crate::params::AiCoverage>>,
-    // Brush bake: per-mask scratch coverage (R16Float) + the size→uv-radius uniform/bind.
-    brush_tex: wgpu::Texture,
+    // Brush bake size→uv-radius uniform/bind (tiny; the image-sized brush coverage texture lives in
+    // the lazy `mask_res`).
     // Kept alive for the bake bind group.
     _bake_uniform: wgpu::Buffer,
     bake_bind: wgpu::BindGroup,
-    // Mask alpha scratch: pre-pass writes here, then refine (or passthrough) writes the layer.
-    // Two single-layer R16Float targets to ping-pong the separable bilateral.
-    scratch_a: wgpu::Texture,
-    scratch_b: wgpu::Texture,
     refine_uniform: wgpu::Buffer,
     // Kept alive for the bind group's texture views.
     _input: wgpu::Texture,
-    // Mask alpha layers (R16Float, MASK_CAP layers). The pre-pass writes per-mask coverage here;
-    // the develop pass samples it. Kept alive for the bind group's array view + per-layer targets.
-    mask_tex: wgpu::Texture,
+    // 1x1x1 R16Float array bound at @binding(5) in `bind_group` until masks are first needed.
+    // Never sampled with real masks: the shader reads `mask_tex` only inside `for i < M.count`
+    // (count = enabled masks) and when `VIEW.flags.y >= 0` (mask overlay); `ensure_mask_resources`
+    // swaps in the full-size bind group before any render with either condition.
+    placeholder_mask: wgpu::Texture,
+    // Full-resolution mask array + scratch + the bind groups referencing them. Allocated on the
+    // first render that needs masks and kept until the image drops (no shrink). Renders are
+    // serialized by `render_lock`, so creation never races; `OnceLock` keeps `PreparedImage: Sync`.
+    mask_res: std::sync::OnceLock<MaskResources>,
     view_target: std::sync::Mutex<Option<ViewTarget>>,
     // Geometry hash of the mask baked into each `mask_tex` layer (None = stale). Lets `render_to`
     // skip the pre-pass when a mask's coverage is unchanged. `Mutex` (not `RefCell`) keeps
@@ -361,6 +365,221 @@ pub struct PreparedImage {
     // queue write when unchanged, so a pan/zoom frame rewrites ONLY the view uniform and a single
     // slider move rewrites only the buffers it actually feeds. Guarded by `render_lock`.
     write_hashes: std::sync::Mutex<[Option<u64>; WRITE_SLOTS]>,
+}
+
+/// Borrowed resources that make up the develop bind group (everything but the mask array).
+struct DevelopBindSources<'a> {
+    input_view: &'a wgpu::TextureView,
+    lut_view: &'a wgpu::TextureView,
+    base_lut_view: &'a wgpu::TextureView,
+    uniform: &'a wgpu::Buffer,
+    fx_uniform: &'a wgpu::Buffer,
+    mask_buffer: &'a wgpu::Buffer,
+    wb_uniform: &'a wgpu::Buffer,
+    extra_uniform: &'a wgpu::Buffer,
+    tone_op_uniform: &'a wgpu::Buffer,
+    geom_uniform: &'a wgpu::Buffer,
+    view_uniform: &'a wgpu::Buffer,
+    cbrgb_uniform: &'a wgpu::Buffer,
+    chanmix_uniform: &'a wgpu::Buffer,
+}
+
+/// Lazily allocated full-resolution mask state of one [`PreparedImage`].
+struct MaskResources {
+    // Mask alpha layers (R16Float, MASK_CAP layers). The pre-pass writes per-mask coverage here;
+    // the develop pass samples it.
+    mask_tex: wgpu::Texture,
+    // Brush bake: per-mask scratch coverage (R16Float), sampled by the pre-pass.
+    brush_tex: wgpu::Texture,
+    // Mask alpha scratch: pre-pass writes here, then refine (or passthrough) writes the layer.
+    // Two single-layer R16Float targets to ping-pong the separable bilateral.
+    scratch_a: wgpu::Texture,
+    scratch_b: wgpu::Texture,
+    prepass_bind: wgpu::BindGroup,
+    // Develop bind group with `mask_tex` bound at @binding(5) instead of the placeholder.
+    bind_group: wgpu::BindGroup,
+}
+
+/// Nominal GPU allocation bytes held by one [`PreparedImage`], derived from the descriptors of the
+/// resources it created (format bytes-per-texel x dims x layers x mip chain; buffer sizes).
+///
+/// These are allocation arithmetic, NOT measured resident memory: driver padding, tiling and
+/// alignment are not included. No CPU copy of the upload survives `prepare()`, so there is no CPU
+/// term. Mask/scratch/readback fields are 0 until the first render that needs them allocates them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceBytes {
+    /// Rgba32Float source incl. the full mip chain.
+    pub input_texture: u64,
+    /// Rgba8Unorm full-size output target.
+    pub output: u64,
+    /// Uniform/storage buffers, tone + base LUT textures, and the 1x1 placeholder mask array.
+    pub uniforms_and_luts: u64,
+    /// Full-resolution mask alpha array (0 until allocated).
+    pub masks: u64,
+    /// Brush + mask-alpha scratch textures (0 until allocated).
+    pub scratch: u64,
+    /// CPU-readback staging buffer for `output` (0 until the first readback render).
+    pub readback: u64,
+    /// Fixed AI-alpha texture.
+    pub ai_tex: u64,
+    /// Viewport render target + its readback buffer (0 until a non-identity `render_view`).
+    pub view_target: u64,
+}
+
+impl ResourceBytes {
+    pub fn total(&self) -> u64 {
+        self.input_texture
+            + self.output
+            + self.uniforms_and_luts
+            + self.masks
+            + self.scratch
+            + self.readback
+            + self.ai_tex
+            + self.view_target
+    }
+}
+
+/// Nominal bytes of a texture from its descriptor: texel size x dims x layers over the mip chain.
+fn texture_bytes(t: &wgpu::Texture) -> u64 {
+    let texel = u64::from(t.format().block_copy_size(None).unwrap_or(0));
+    let layers = u64::from(t.depth_or_array_layers());
+    (0..t.mip_level_count())
+        .map(|l| {
+            u64::from((t.width() >> l).max(1))
+                * u64::from((t.height() >> l).max(1))
+                * layers
+                * texel
+        })
+        .sum()
+}
+
+fn align4(n: u64) -> u64 {
+    n.div_ceil(4) * 4
+}
+
+fn mip_count_for(w: u32, h: u32) -> u32 {
+    (32 - w.max(h).leading_zeros()).clamp(1, 14)
+}
+
+/// Nominal bytes of an image-sized single-layer texture of `bpp` bytes per texel.
+fn plane_bytes(w: u32, h: u32, layers: u64, bpp: u64) -> u64 {
+    u64::from(w) * u64::from(h) * layers * bpp
+}
+
+/// Sizes of the fixed-size uniform/storage buffers a prepare creates (create_buffer_init aligns to 4).
+fn fixed_buffer_bytes() -> u64 {
+    use crate::params as p;
+    [
+        std::mem::size_of::<p::ParamsUniform>(),
+        std::mem::size_of::<p::FxUniform>(),
+        std::mem::size_of::<p::WbUniform>(),
+        std::mem::size_of::<p::ExtraUniform>(),
+        std::mem::size_of::<p::ToneOpUniform>(),
+        std::mem::size_of::<p::GeomUniform>(),
+        std::mem::size_of::<p::ViewUniform>(),
+        std::mem::size_of::<p::CbRgbUniform>(),
+        std::mem::size_of::<p::ChanMixUniform>(),
+        std::mem::size_of::<p::MaskBufferUniform>(),
+        std::mem::size_of::<crate::mask::PrepassUniform>(),
+        std::mem::size_of::<crate::mask::RefineUniform>(),
+        std::mem::size_of::<crate::mask::BakeUniform>(),
+    ]
+    .into_iter()
+    .map(|n| align4(n as u64))
+    .sum()
+}
+
+/// Tone-curve LUT (Rgba8Unorm, LUT_SIZE x 1) + base-curve LUT (R32Float, BASE_LUT_SIZE x 1) +
+/// 1x1x1 R16Float placeholder mask array.
+fn fixed_texture_bytes() -> u64 {
+    crate::curve::LUT_SIZE as u64 * 4 + crate::params::BASE_LUT_SIZE as u64 * 4 + 2
+}
+
+/// NOMINAL bytes [`DevelopPipeline::prepare`] allocates eagerly for a `width x height` image:
+/// source + mip chain, output, uniforms/LUTs, placeholder mask and the AI-alpha texture. Equals
+/// `PreparedImage::resident_bytes().total()` right after `prepare`. Pure; no device. Allocation
+/// arithmetic, not measured memory.
+pub fn estimate_prepare_bytes(width: u32, height: u32) -> u64 {
+    estimate_input_bytes(width, height)
+        + plane_bytes(width, height, 1, 4)
+        + fixed_buffer_bytes()
+        + fixed_texture_bytes()
+        + plane_bytes(AI_TEX_EDGE, AI_TEX_EDGE, 1, 1)
+}
+
+/// NOMINAL extra bytes the first masked render allocates (`MASK_CAP`-layer R16Float array, brush
+/// scratch and two mask-alpha scratch planes). Does not include the CPU-readback buffer
+/// ([`estimate_readback_bytes`]).
+pub fn estimate_mask_bytes(width: u32, height: u32) -> u64 {
+    plane_bytes(width, height, crate::params::MASK_CAP as u64, 2)
+        + estimate_mask_scratch_bytes(width, height)
+}
+
+fn estimate_mask_scratch_bytes(width: u32, height: u32) -> u64 {
+    plane_bytes(width, height, 3, 2)
+}
+
+/// NOMINAL bytes of the lazily created CPU-readback buffer (rows padded to the copy alignment).
+pub fn estimate_readback_bytes(width: u32, height: u32) -> u64 {
+    let a = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    (u64::from(width) * 4).div_ceil(a) * a * u64::from(height)
+}
+
+fn estimate_input_bytes(width: u32, height: u32) -> u64 {
+    (0..mip_count_for(width, height))
+        .map(|l| plane_bytes((width >> l).max(1), (height >> l).max(1), 1, 16))
+        .sum()
+}
+
+impl PreparedImage {
+    /// Nominal GPU allocation bytes this image holds right now, from the actual resource
+    /// descriptors (see [`ResourceBytes`]). Lazy parts (masks, scratch, readback, viewport target)
+    /// are 0 until a render allocates them.
+    pub fn resident_bytes(&self) -> ResourceBytes {
+        let buffers = [
+            &self.uniform,
+            &self.fx_uniform,
+            &self.wb_uniform,
+            &self.extra_uniform,
+            &self.tone_op_uniform,
+            &self.geom_uniform,
+            &self.view_uniform,
+            &self.cbrgb_uniform,
+            &self.chanmix_uniform,
+            &self.mask_buffer,
+            &self.prepass_uniform,
+            &self._bake_uniform,
+            &self.refine_uniform,
+        ];
+        let uniforms_and_luts = buffers.iter().map(|b| b.size()).sum::<u64>()
+            + texture_bytes(&self.lut)
+            + texture_bytes(&self.base_lut)
+            + texture_bytes(&self.placeholder_mask);
+        let (masks, scratch) = self.mask_res.get().map_or((0, 0), |m| {
+            (
+                texture_bytes(&m.mask_tex),
+                texture_bytes(&m.brush_tex)
+                    + texture_bytes(&m.scratch_a)
+                    + texture_bytes(&m.scratch_b),
+            )
+        });
+        let view_target = self
+            .view_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |t| texture_bytes(&t.texture) + t.readback.size());
+        ResourceBytes {
+            input_texture: texture_bytes(&self._input),
+            output: texture_bytes(&self.output),
+            uniforms_and_luts,
+            masks,
+            scratch,
+            readback: self.readback.get().map_or(0, |b| b.size()),
+            ai_tex: texture_bytes(&self.ai_tex),
+            view_target,
+        }
+    }
 }
 
 /// Indices into `PreparedImage::write_hashes`.
@@ -882,6 +1101,214 @@ impl DevelopPipeline {
         }
     }
 
+    /// The develop pass bind group (bindings 0-15) with `mask_view` at @binding(5).
+    fn develop_bind_group(
+        &self,
+        device: &wgpu::Device,
+        s: &DevelopBindSources<'_>,
+        mask_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        fn buf(binding: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: b.as_entire_binding(),
+            }
+        }
+        fn tex(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::TextureView(v),
+            }
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("develop-bg"),
+            layout: &self.bind_layout,
+            entries: &[
+                tex(0, s.input_view),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                buf(2, s.uniform),
+                tex(3, s.lut_view),
+                buf(4, s.fx_uniform),
+                tex(5, mask_view),
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
+                },
+                buf(7, s.mask_buffer),
+                buf(8, s.wb_uniform),
+                buf(9, s.extra_uniform),
+                buf(10, s.tone_op_uniform),
+                tex(11, s.base_lut_view),
+                buf(12, s.geom_uniform),
+                buf(13, s.view_uniform),
+                buf(14, s.cbrgb_uniform),
+                buf(15, s.chanmix_uniform),
+            ],
+        })
+    }
+
+    /// Allocate (once) the full-resolution mask array, brush/mask scratch and the bind groups that
+    /// reference them. Called by `encode_develop` before any render with >=1 enabled mask or a mask
+    /// overlay. Caller holds `prepared.render_lock`, so there is no creation race. Never shrinks.
+    fn ensure_mask_resources<'a>(
+        &self,
+        ctx: &GpuContext,
+        prepared: &'a PreparedImage,
+    ) -> Result<&'a MaskResources, PipelineError> {
+        if let Some(res) = prepared.mask_res.get() {
+            return Ok(res);
+        }
+        let device = &ctx.device;
+        let (w, h) = (prepared.width, prepared.height);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        // Mask alpha layers: R16Float, MASK_CAP layers, same size as the image. Zero-initialised by
+        // wgpu; the pre-pass writes real coverage via RENDER_ATTACHMENT (fragment-to-texture —
+        // R16Float is not storage-bindable on Metal).
+        let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("develop-mask-alpha"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: crate::params::MASK_CAP as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Single-layer image-sized R16Float: brush coverage + the pre-pass/refine ping-pong pair.
+        let r16_plane = |label: &str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        };
+        let brush_tex = r16_plane("develop-brush-scratch");
+        let scratch_a = r16_plane("mask-scratch-a");
+        let scratch_b = r16_plane("mask-scratch-b");
+
+        let input_view = prepared
+            ._input
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let ai_tex_view = prepared
+            .ai_tex
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let brush_scratch_view = brush_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let prepass_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("develop-prepass-bg"),
+            layout: &self.prepass.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: prepared.prepass_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&brush_scratch_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&input_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&ai_tex_view),
+                },
+            ],
+        });
+        let lut_view = prepared
+            .lut
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let base_lut_view = prepared
+            .base_lut
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("develop-mask-view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let bind_group = self.develop_bind_group(
+            device,
+            &DevelopBindSources {
+                input_view: &input_view,
+                lut_view: &lut_view,
+                base_lut_view: &base_lut_view,
+                uniform: &prepared.uniform,
+                fx_uniform: &prepared.fx_uniform,
+                mask_buffer: &prepared.mask_buffer,
+                wb_uniform: &prepared.wb_uniform,
+                extra_uniform: &prepared.extra_uniform,
+                tone_op_uniform: &prepared.tone_op_uniform,
+                geom_uniform: &prepared.geom_uniform,
+                view_uniform: &prepared.view_uniform,
+                cbrgb_uniform: &prepared.cbrgb_uniform,
+                chanmix_uniform: &prepared.chanmix_uniform,
+            },
+            &mask_view,
+        );
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(PipelineError::Device(format!(
+                "GPU mask allocation failed: {err}"
+            )));
+        }
+        // Serialized by render_lock: the set cannot lose a race; if it somehow did, use the winner.
+        let _ = prepared.mask_res.set(MaskResources {
+            mask_tex,
+            brush_tex,
+            scratch_a,
+            scratch_b,
+            prepass_bind,
+            bind_group,
+        });
+        Ok(prepared.mask_res.get().expect("mask resources just set"))
+    }
+
+    /// The CPU-readback buffer for `prepared.output`, created on first use.
+    fn readback_buffer<'a>(
+        &self,
+        ctx: &GpuContext,
+        prepared: &'a PreparedImage,
+    ) -> Result<&'a wgpu::Buffer, PipelineError> {
+        if let Some(b) = prepared.readback.get() {
+            return Ok(b);
+        }
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("develop-readback"),
+            size: prepared.readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(PipelineError::Device(format!(
+                "GPU readback allocation failed: {err}"
+            )));
+        }
+        let _ = prepared.readback.set(buffer);
+        Ok(prepared.readback.get().expect("readback just set"))
+    }
     /// Upload `img` (linear RGB) and allocate per-image GPU resources.
     /// Returns an error (rather than panicking) if a GPU allocation fails — e.g. a full-resolution
     /// export texture that exceeds device memory.
@@ -931,8 +1358,7 @@ impl DevelopPipeline {
         // mip. Level 0 is the exact source; the shader picks level 0 for identity/legacy renders, so
         // goldens are untouched. Build the FULL chain (down to 1×1) so the coarse local-contrast band
         // has headroom even in a minified fit-view preview (the extra levels are ~⅓ more memory, cheap).
-        let full_chain = 32 - w.max(h).leading_zeros();
-        let mip_count = full_chain.clamp(1, 14);
+        let mip_count = mip_count_for(w, h);
         let input = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("develop-input"),
             size,
@@ -1079,23 +1505,20 @@ impl DevelopPipeline {
         });
         write_base_lut(ctx, &base_lut, &DevelopParams::default().base_curve_lut());
 
-        // Mask alpha layers: R16Float, MASK_CAP layers, same size as the image. Zero-initialised by
-        // wgpu; the mask pre-pass (later phase) writes real coverage via RENDER_ATTACHMENT
-        // (fragment-to-texture — R16Float is not storage-bindable on Metal).
-        let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("develop-mask-alpha"),
+        // Placeholder mask array (1x1, 1 layer) satisfying the bind layout until a render needs masks;
+        // the full MASK_CAP-layer image-sized array is allocated lazily (`ensure_mask_resources`).
+        let placeholder_mask = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("develop-mask-placeholder"),
             size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: crate::params::MASK_CAP as u32,
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
 
@@ -1116,23 +1539,6 @@ impl DevelopPipeline {
             mapped_at_creation: false,
         });
 
-        // Brush coverage scratch (R16Float, image-sized) — baked per brush mask, sampled by prepass.
-        let brush_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("develop-brush-scratch"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let brush_scratch_view = brush_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
         // AI (SAM) alpha for the current mask: fixed AI_TEX_EDGE² R8Unorm, valid region top-left. The
         // baked mask (≤ AI_TEX_EDGE longest side, same aspect as the image) is uploaded per-mask in the
         // bake loop and sampled by normalized UV (GPU-upscaled). Fixed size ⇒ the view stays valid in
@@ -1151,28 +1557,7 @@ impl DevelopPipeline {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let ai_tex_view = ai_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Mask-alpha scratch ping-pong (single-layer R16Float) for the pre-pass + refine.
-        let r16_scratch = |label: &str| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R16Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
-        };
-        let scratch_a = r16_scratch("mask-scratch-a");
-        let scratch_b = r16_scratch("mask-scratch-b");
         let refine_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mask-refine-uniform"),
             size: std::mem::size_of::<crate::mask::RefineUniform>() as u64,
@@ -1193,117 +1578,32 @@ impl DevelopPipeline {
             }],
         });
 
-        let prepass_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("develop-prepass-bg"),
-            layout: &self.prepass.bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: prepass_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&brush_scratch_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&input_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&ai_tex_view),
-                },
-            ],
-        });
-
         let lut_view = lut.create_view(&wgpu::TextureViewDescriptor::default());
         let base_lut_view = base_lut.create_view(&wgpu::TextureViewDescriptor::default());
-        let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("develop-mask-view"),
+        let mask_view = placeholder_mask.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("develop-mask-placeholder-view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("develop-bg"),
-            layout: &self.bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&input_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&lut_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: fx_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&mask_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: mask_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wb_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: extra_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: tone_op_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: wgpu::BindingResource::TextureView(&base_lut_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: geom_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: view_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 14,
-                    resource: cbrgb_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 15,
-                    resource: chanmix_uniform.as_entire_binding(),
-                },
-            ],
-        });
-
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("develop-readback"),
-            size: readback_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let bind_group = self.develop_bind_group(
+            device,
+            &DevelopBindSources {
+                input_view: &input_view,
+                lut_view: &lut_view,
+                base_lut_view: &base_lut_view,
+                uniform: &uniform,
+                fx_uniform: &fx_uniform,
+                mask_buffer: &mask_buffer,
+                wb_uniform: &wb_uniform,
+                extra_uniform: &extra_uniform,
+                tone_op_uniform: &tone_op_uniform,
+                geom_uniform: &geom_uniform,
+                view_uniform: &view_uniform,
+                cbrgb_uniform: &cbrgb_uniform,
+                chanmix_uniform: &chanmix_uniform,
+            },
+            &mask_view,
+        );
 
         if let Some(err) = pollster::block_on(scope.pop()) {
             return Err(PipelineError::Device(format!(
@@ -1320,7 +1620,8 @@ impl DevelopPipeline {
             extra_uniform,
             bind_group,
             output,
-            readback,
+            readback_size,
+            readback: std::sync::OnceLock::new(),
             lut,
             base_lut,
             tone_op_uniform,
@@ -1330,17 +1631,14 @@ impl DevelopPipeline {
             chanmix_uniform,
             mask_buffer,
             prepass_uniform,
-            prepass_bind,
             ai_tex,
             ai_coverages: std::sync::Mutex::new(Vec::new()),
-            brush_tex,
             _bake_uniform: bake_uniform,
             bake_bind,
-            scratch_a,
-            scratch_b,
             refine_uniform,
             _input: input,
-            mask_tex,
+            placeholder_mask,
+            mask_res: std::sync::OnceLock::new(),
             view_target: std::sync::Mutex::new(None),
             mask_layer_hash: std::sync::Mutex::new(vec![None; crate::params::MASK_CAP]),
             render_lock: std::sync::Mutex::new(()),
@@ -1551,6 +1849,16 @@ impl DevelopPipeline {
                 .as_slice()
         });
         crate::validation::ai_coverages(ai_covs)?;
+        // Full-res mask state is allocated only when the shader would sample `mask_tex`: the
+        // `for i < M.count` loops (count = enabled masks, capped) or the mask overlay
+        // (`VIEW.flags.y >= 0`). Otherwise the placeholder bind group is used and the placeholder
+        // is never sampled.
+        let needs_masks = view.overlay_layer >= 0 || params.masks.iter().any(|m| m.enabled);
+        let mres = if needs_masks {
+            Some(self.ensure_mask_resources(ctx, prepared)?)
+        } else {
+            None
+        };
         let mut enabled_count = 0usize;
         for (layer, mask) in params
             .masks
@@ -1566,9 +1874,11 @@ impl DevelopPipeline {
             }
             layer_hashes[layer] = Some(geom_hash);
 
+            // Enabled masks exist here, so `needs_masks` held and `mres` is populated.
+            let mres = mres.expect("mask resources allocated for enabled masks");
             // Bake this mask's brush strokes (if any) into the brush scratch before its pre-pass.
             if crate::mask::mask_has_brush(mask) {
-                self.bake_brush(ctx, prepared, mask);
+                self.bake_brush(ctx, prepared, mres, mask);
             }
 
             let mut pre = crate::mask::PrepassUniform::from_mask(mask);
@@ -1611,7 +1921,7 @@ impl DevelopPipeline {
             }
             ctx.queue
                 .write_buffer(&prepared.prepass_uniform, 0, bytemuck::bytes_of(&pre));
-            let layer_view = prepared.mask_tex.create_view(&wgpu::TextureViewDescriptor {
+            let layer_view = mres.mask_tex.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("mask-layer-view"),
                 dimension: Some(wgpu::TextureViewDimension::D2),
                 base_array_layer: layer as u32,
@@ -1619,7 +1929,7 @@ impl DevelopPipeline {
                 ..Default::default()
             });
             // Pre-pass writes the composited alpha into scratch_a.
-            let scratch_a_view = prepared
+            let scratch_a_view = mres
                 .scratch_a
                 .create_view(&wgpu::TextureViewDescriptor::default());
             let mut penc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1643,7 +1953,7 @@ impl DevelopPipeline {
                     multiview_mask: None,
                 });
                 pass.set_pipeline(&self.prepass.pipeline);
-                pass.set_bind_group(0, &prepared.prepass_bind, &[]);
+                pass.set_bind_group(0, &mres.prepass_bind, &[]);
                 pass.draw(0..3, 0..1);
             }
             ctx.queue.submit(Some(penc.finish()));
@@ -1655,7 +1965,7 @@ impl DevelopPipeline {
             let luma_sigma = 0.10f32;
             if crate::mask::mask_feathered(mask) {
                 let sigma_px = (0.006 * l).max(1.0);
-                let scratch_b_view = prepared
+                let scratch_b_view = mres
                     .scratch_b
                     .create_view(&wgpu::TextureViewDescriptor::default());
                 self.refine_pass(
@@ -1720,7 +2030,7 @@ impl DevelopPipeline {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &prepared.bind_group, &[]);
+            pass.set_bind_group(0, mres.map_or(&prepared.bind_group, |r| &r.bind_group), &[]);
             pass.draw(0..3, 0..1);
         }
         Ok(enc)
@@ -1778,6 +2088,7 @@ impl DevelopPipeline {
         params: &DevelopParams,
     ) -> Result<Vec<u8>, PipelineError> {
         let view = crate::params::ViewParams::full(prepared.width, prepared.height);
+        let readback = self.readback_buffer(ctx, prepared)?;
         self.render_to(
             ctx,
             prepared,
@@ -1785,7 +2096,7 @@ impl DevelopPipeline {
             &view,
             None,
             &prepared.output,
-            &prepared.readback,
+            readback,
             prepared.bpr,
             prepared.width,
             prepared.height,
@@ -1842,6 +2153,7 @@ impl DevelopPipeline {
             limits.max_buffer_size,
         )?;
         if !view.active && view.overlay_layer < 0 && ow == prepared.width && oh == prepared.height {
+            let readback = self.readback_buffer(ctx, prepared)?;
             return self.render_to(
                 ctx,
                 prepared,
@@ -1849,7 +2161,7 @@ impl DevelopPipeline {
                 view,
                 ai_coverages,
                 &prepared.output,
-                &prepared.readback,
+                readback,
                 prepared.bpr,
                 ow,
                 oh,
@@ -2006,11 +2318,17 @@ impl DevelopPipeline {
 
     /// Bake a mask's brush strokes into the per-image brush scratch texture. Clears first, then
     /// draws each stroke's instanced dabs in order (paint = MAX blend, erase = multiply).
-    fn bake_brush(&self, ctx: &GpuContext, prepared: &PreparedImage, mask: &crate::params::Mask) {
+    fn bake_brush(
+        &self,
+        ctx: &GpuContext,
+        prepared: &PreparedImage,
+        mres: &MaskResources,
+        mask: &crate::params::Mask,
+    ) {
         let device = &ctx.device;
         let strokes = crate::mask::mask_brush_strokes(mask);
         let batches = crate::mask::flatten_strokes(&strokes);
-        let view = prepared
+        let view = mres
             .brush_tex
             .create_view(&wgpu::TextureViewDescriptor::default());
 

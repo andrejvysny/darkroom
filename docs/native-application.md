@@ -45,4 +45,49 @@ Validation:
 - `cargo xtask layers` and `cargo xtask parity`
 - With the explicit isolated baseline host and test bridge running: `DARKROOM_NATIVE_CATALOG=1 npx playwright test tests/native/catalog-wiring.spec.ts --project=tauri` from `e2e/`.
 
-The runtime/catalog tests use copied temporary catalogs and deterministic channel-controlled replacement races. Native platform builds still require the codec environment documented in `docs/native-platform-builds.md`. The catalog UI is the first application slice; it does not yet provide photo presentation, editing, import or export.
+The runtime/catalog tests use copied temporary catalogs and deterministic channel-controlled replacement races. Native platform builds still require the codec environment documented in `docs/native-platform-builds.md`. The native host presents the selected photo (SDR) and edits Exposure with undo/redo and durable autosave (below); it does not yet provide other Develop controls, import or export.
+
+## Crate roles in the native host
+
+`crates/ui-egui` owns panels, the Develop panel, stable widget IDs and transient input state (e.g. an active slider gesture); it emits `core_app::workflow::Command`s and never owns authoritative edit state, persistence or retries. It may depend only on `egui`, `core-app` and `core-model`; `cargo xtask layers` rejects runtime, SQL, engine, renderer, wgpu/winit/egui-* and Tauri dependencies (metadata cannot detect direct `std::fs` use; review covers that). `apps/darkroom` owns the winit loop, surface/device/queue, the photo worker and platform services.
+
+## Photo presentation
+
+`apps/darkroom/src/photo_view.rs` reconciles every frame against the snapshot subject (catalog epoch, image, editor session, selection generation) before accepting worker results or building UI: a different subject, a non-renderable document (Loading, Unsupported, Corrupt, Error, missing row, AI-only features) or a closed catalog retires the presented frame immediately. Worker failures are keyed to their own `FrameKey`, shown only while that request is still wanted, and resubmitted only by an explicit Retry. `render_wgpu::Presenter` retires (never drops) replaced leases and rejects every frame while nothing is wanted, so a late result after close cannot present. Retired egui texture registrations and leases are released only after the frame's draw list has been submitted (`after_submit`); later pool reuse is ordered behind it on the same queue. `--photo-probe` reads back the composited egui target and requires a mean absolute difference ≤ 2/255 against the developed frame (measured 0 on the committed CR3).
+
+The photo worker supervises itself: start failure, panic (caught and reported as `WorkerDied`), channel disconnection and join failure are surfaced to the panel instead of an endless spinner. It checks stop/supersession between decode, develop, prepare and render stages and during render-target waits; an in-progress native decode or GPU submission is not interrupted.
+
+## Host scheduling and recovery
+
+Surface acquisition is gated by a retry-not-before instant set by every retry-class surface action; unrelated input/egui redraw requests cannot acquire early (`SurfaceState::schedule`, fake-clock tested). Surface reconfiguration no longer requests a repaint by itself. Occluded/zero-size windows suspend acquisition until visibility or a resize. The host also folds `NativeApplication::next_deadline()` (autosave debounce/backoff, barrier timeout) into its wake schedule.
+
+## Resource bounds
+
+`PreparedImage` allocates its full-resolution mask array, mask scratch and readback buffer lazily (only when masks are enabled, the mask overlay is shown, or a CPU readback is requested); shader behaviour and pixel output are unchanged. `resident_bytes()` and `estimate_prepare_bytes`/`estimate_mask_bytes`/`estimate_readback_bytes` report nominal allocation arithmetic, not measured residency. The photo worker's prepared cache is bounded by a 3 GiB nominal budget (and two entries) and evicts least-recently-used images before an expensive prepare; one image larger than the budget (≈60 MP with masks, large panoramas) opens alone with `over_budget` set. Measured on the 32 MP R7 fixture probe: peak memory footprint 6.15 GB → 5.01 GB; max RSS unchanged at 4.13 GB (CPU decode intermediates dominate and are not yet bounded).
+
+## Legacy host persistence changes (schema 027)
+
+Migration 027 adds `sidecar_outbox.next_attempt_at`. The outbox drains only due intents with keyset paging, so unavailable or failing rows no longer starve healthy ones; failures and missing sources are deferred, never deleted; relink/remount and worker start reset the schedule; a superseding save is due immediately. Sidecars are staged to a unique hidden temp file with no lock held and published by a single identity-checked rename under the publication gate. The updater-restart save barrier no longer occupies the ordered UserCommand lane; acks carry the barrier ID and per-image catalog revisions verified against `edits.revision`, and a timeout never counts as saved. HDR and panorama merges read every source field and capture their publication tokens from one immutable snapshot. Native settings parse the `schema` envelope first, so a newer build's file is left untouched (read-only) instead of being quarantined.
+
+## Known limitations
+
+- The native host does not drain the sidecar outbox; mirror status stays `Pending`.
+- No grace-discard on native quit: a permanently failing save keeps the app open until the user discards it.
+- A crash between staging and publishing a sidecar can leave a hidden `.<name>.<pid>-<n>.tmp` file beside the photo; nothing sweeps them yet.
+- Rating/flag/keyword sidecar marks for a temporarily missing source are not re-applied on remount (pre-existing).
+- Native display is SDR only; display colour management, HDR output and GPU-device recovery are separate acceptance gates.
+- Only Exposure is editable natively; drags render at Settled quality (no interactive tier).
+
+## Editing and durable saves
+
+`Command::Edit(EditIntent)` (`BeginGesture`, `UpdateGesture`, `CommitGesture`, `CancelGesture`, `Undo`, `Redo`, `SetExposure`) drives the authoritative editor. The session supplies the live `EditorSession`; a command is refused with a typed `AppError::EditRefused` when there is no Ready document, the stored edit is Unsupported/Corrupt/Error, or the selected image's row (hence its content hash) has not loaded. Nothing is ever defaulted. `ActionId::{Undo, Redo, Exposure}` carry enabled conditions from `EnabledContext { editable, can_undo, can_redo }`; `DocumentView` exposes `can_undo`/`can_redo`.
+
+Every editor `Changed` event is recorded into `core_app::autosave::Autosave`, keyed by `SaveKey { catalog_epoch, image_id, content_hash }` and ordered by the coordinator's own never-reset `SaveSeq`. Editor revisions restart at 1 in every `EditorSession`, so they only travel as an `EditOrigin` used to decide whether an acknowledgement still concerns the live document: a delayed completion from an earlier session never marks a newer session saved, and at most one save per key is in flight across editor reopen. Reselecting an image whose key still has dirty or in-flight state restores that unsaved state (dirty) instead of the older stored document. Undo history is per session and is not restored; the restored document's single undo step returns to the stored state.
+
+`ApplicationSession::tick(now_ms)` turns due saves into `Operation::SaveEdit { key, seq, params, process_version }` effects and `next_deadline()` reports when to wake. `AsyncCatalogWorkflow::pump` ticks with its `Clock`; hosts schedule a wake from `AsyncCatalogWorkflow::next_deadline()`. `SaveEdit` runs on the ordered catalog lane: one transaction verifies `images.content_hash` equals the key's hash (else `source changed — not saved`) and commits the edit plus the sidecar outbox intent (`save_edit_expecting_source`). The outcome carries the durable `CatalogRevision` and a `MirrorStatus` read in the same call.
+
+`snapshot.editor.save` (`SaveStatus`) reports `dirty`, `saving`, `saved_catalog_revision`, `last_error` and `mirror` separately; a catalog save never implies a mirrored sidecar. The native host does not run the sidecar outbox drain worker (it lives in `src-tauri`), so `mirror` stays `Pending { owed_revision }` honestly until a drain runs.
+
+`CloseCatalog`, `OpenCatalog` (replacement) and `RequestShutdown` first run a flush barrier: shutdown stops autosave admission, due saves are issued immediately and the operation proceeds only when every captured seq is acknowledged. While a barrier is pending edits and selection are refused. If a save fails the operation is cancelled, admission reopens, `snapshot.error` becomes `AppError::SaveFailed { image, message }` ("Couldn't save your edits to <file>. Darkroom stayed open so nothing is lost.") and the editor stays usable; a second request retries the barrier. There is deliberately no grace-discard in the native host yet. `saved_catalog_revision` is only known after a save in this epoch (it is not read at load). The synchronous `CatalogWorkflow` executes barrier saves inline but has no timer, so it never autosaves on a debounce.
+
+Barrier hardening: `RequestShutdown` is sticky (a pending shutdown refuses `CloseCatalog`/`OpenCatalog` with `EditRefused("Darkroom is quitting")`); autosave admission is derived from barrier kind in one place. A reset (close/replace) is refused with `SaveFailed` while the editor or autosave still holds unsaved work, and `Autosave::retain_epoch` never drops dirty or in-flight entries. A barrier gives up after `BARRIER_TIMEOUT_MS` (30 s, session clock, driven by `tick`) with `SaveFailed`; a timeout never counts as flushed. `AppError::SourceChanged` (the image content hash changed) blocks that autosave entry permanently: it is never retried, a close or quit is cancelled with a `SaveFailed` naming the file, and only `Command::DiscardUnsavedEdits(ImageId)` clears it (refused while that image save is in flight; an open document reloads from the catalog).

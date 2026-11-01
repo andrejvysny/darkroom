@@ -44,7 +44,8 @@ pub fn paint(
 }
 
 /// Offscreen paint target for the headless probes (`--gpu-probe`, `--photo-probe`): a plain
-/// `RENDER_ATTACHMENT` texture of `size` the probes render one egui frame into.
+/// `RENDER_ATTACHMENT | COPY_SRC` texture of `size` the probes render one egui frame into
+/// (`COPY_SRC` so `--photo-probe` can read the composited result back).
 pub fn probe_target(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -61,7 +62,7 @@ pub fn probe_target(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }

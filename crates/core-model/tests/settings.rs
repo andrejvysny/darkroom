@@ -448,6 +448,28 @@ fn parse_settings_schema_and_corruption() {
 }
 
 #[test]
+fn future_schema_with_incompatible_shapes_is_future_not_corrupt() {
+    let future = format!(
+        r#"{{"schema": {}, "bootstrapped": 5, "autoUpdateCheck": "yes", "exportDir": 5}}"#,
+        SETTINGS_SCHEMA + 1
+    );
+    assert_eq!(
+        parse_settings(&future),
+        Err(SettingsError::FutureSchema(SETTINGS_SCHEMA + 1))
+    );
+    // Same bad shapes under the current schema stay Corrupt.
+    let current = format!(r#"{{"schema": {SETTINGS_SCHEMA}, "bootstrapped": 5}}"#);
+    assert!(matches!(
+        parse_settings(&current),
+        Err(SettingsError::Corrupt(_))
+    ));
+    assert!(matches!(
+        parse_settings("[99]"),
+        Err(SettingsError::Corrupt(_))
+    ));
+}
+
+#[test]
 fn parse_web_snapshot_envelope_checks() {
     let ok = r#"{"format":"darkroom-web-settings","version":1,"capturedAtMs":5,"values":{}}"#;
     assert!(parse_web_snapshot(ok).is_ok());

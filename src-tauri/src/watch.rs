@@ -351,6 +351,9 @@ fn apply_status_updates(
             // Read the identity inside the transaction: if the commit later fails, these keys
             // never reached the catalog and the gate must not learn about them.
             let key = if new == "present" {
+                // Back on disk: a sidecar intent parked while the source was missing is due now.
+                // Best-effort — a failure only delays the write until the worker restarts.
+                let _ = core_library::reset_outbox_schedule(tx, Some(*id));
                 Some(identity(tx, *id)?)
             } else {
                 None

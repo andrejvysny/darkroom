@@ -23,6 +23,7 @@ struct Active {
 /// Owns application state on the caller thread; catalog effects execute serially on workers.
 pub struct AsyncCatalogWorkflow {
     session: ApplicationSession,
+    clock: Arc<dyn Clock>,
     paths: RuntimePaths,
     catalog: Arc<CatalogAdapter>,
     executor: Arc<dyn EffectExecutor>,
@@ -65,7 +66,8 @@ impl AsyncCatalogWorkflow {
         });
         let supervisor = Supervisor::new(config, notify).map_err(job_error)?;
         Ok(Self {
-            session: ApplicationSession::new(clock, events, renderer),
+            session: ApplicationSession::new(clock.clone(), events, renderer),
+            clock,
             paths,
             catalog: Arc::new(CatalogAdapter::default()),
             executor,
@@ -131,6 +133,7 @@ impl AsyncCatalogWorkflow {
                 | Command::CloseCatalog
                 | Command::RequestShutdown
                 | Command::SelectImage(None)
+                | Command::Edit(_)
         ) {
             return true;
         }
@@ -163,7 +166,7 @@ impl AsyncCatalogWorkflow {
         };
         let durable = matches!(
             effect.operation,
-            Operation::OpenCatalog(_) | Operation::CloseCatalog
+            Operation::OpenCatalog(_) | Operation::CloseCatalog | Operation::SaveEdit { .. }
         );
         let spec = JobSpec {
             owner: JobOwner {
@@ -203,6 +206,7 @@ impl AsyncCatalogWorkflow {
     /// Processes only completed work; never waits for catalog IO or worker shutdown.
     pub fn pump(&mut self) -> Result<bool, AppError> {
         self.wake_pending.store(false, Ordering::Release);
+        self.tick_autosave()?;
         let Some(result) = self
             .active
             .as_ref()
@@ -227,6 +231,18 @@ impl AsyncCatalogWorkflow {
         self.start_next()?;
         self.refresh_jobs()?;
         Ok(true)
+    }
+
+    /// Earliest clock time (ms, the injected `Clock`'s axis) at which `pump` would issue an
+    /// autosave; the host schedules a wake for it. `None` when nothing is waiting on the debounce.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.session.next_deadline()
+    }
+
+    fn tick_autosave(&mut self) -> Result<(), AppError> {
+        let effects = self.session.tick(self.clock.now_millis())?;
+        self.pending.extend(effects);
+        Ok(())
     }
 
     /// Blocks the calling thread until all effects complete; intended for headless hosts.

@@ -29,7 +29,12 @@ pub fn register_presented_frame(
 /// Paint one egui frame showing the developed lease through the exact registration and paint
 /// path the window uses, inside a Validation error scope: any wgpu validation error is
 /// returned as `Err` (the probe maps it to `ProbeError::Render`, exit 6) instead of aborting.
-pub fn paint_probe_frame(gpu: &Gpu, lease: &FrameLease) -> Result<(), String> {
+///
+/// The composited target is then read back and compared with the developed lease (read back the
+/// same way): the probe panel has no margin and the target equals the frame size, so the photo
+/// fills the target 1:1 and any binding/format/sampling bug shows as a pixel difference. Returns
+/// the mean absolute per-channel difference (0..255 scale).
+pub fn paint_probe_frame(gpu: &Gpu, lease: &FrameLease) -> Result<f64, String> {
     let (width, height) = lease.key().viewport_px;
     let size = egui::vec2(width as f32, height as f32);
     let scope = gpu
@@ -47,9 +52,11 @@ pub fn paint_probe_frame(gpu: &Gpu, lease: &FrameLease) -> Result<(), String> {
         ..Default::default()
     };
     let output = egui.run_ui(input, |root| {
-        egui::CentralPanel::default().show(root, |ui| {
-            ui.image((texture_id, size));
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(root, |ui| {
+                ui.image((texture_id, size));
+            });
     });
     paint::paint(
         &gpu.context,
@@ -68,5 +75,44 @@ pub fn paint_probe_frame(gpu: &Gpu, lease: &FrameLease) -> Result<(), String> {
             "egui presentation of the developed frame failed: {error}"
         ));
     }
-    Ok(())
+    composited_diff(gpu, &target, lease)
+}
+
+/// Max tolerated mean absolute per-channel difference between the composited egui target and
+/// the developed frame (8-bit scale): 1:1 bilinear sampling should be exact; 2 allows rounding.
+const COMPOSITE_TOLERANCE: f64 = 2.0;
+
+fn composited_diff(gpu: &Gpu, target: &wgpu::Texture, lease: &FrameLease) -> Result<f64, String> {
+    let read = |texture: &wgpu::Texture| {
+        gpu.pipeline
+            .read_back_texture(&gpu.context, texture)
+            .map_err(|e| format!("probe readback failed: {e}"))
+    };
+    let composited = read(target)?;
+    let developed = read(lease.texture())?;
+    if composited.len() != developed.len() || composited.is_empty() {
+        return Err(format!(
+            "composited target ({} bytes) and developed frame ({} bytes) differ in size",
+            composited.len(),
+            developed.len()
+        ));
+    }
+    let first = &composited[..3];
+    if composited.chunks_exact(4).all(|px| &px[..3] == first) {
+        return Err(
+            "composited photo region is uniform background: the frame was not drawn".into(),
+        );
+    }
+    let mut sum = 0u64;
+    for (a, b) in composited.chunks_exact(4).zip(developed.chunks_exact(4)) {
+        sum += (0..3).map(|c| u64::from(a[c].abs_diff(b[c]))).sum::<u64>();
+    }
+    let diff = sum as f64 / (composited.len() / 4 * 3) as f64;
+    if diff > COMPOSITE_TOLERANCE {
+        return Err(format!(
+            "composited egui output differs from the developed frame: mean abs diff \
+             {diff:.3}/255 per channel exceeds {COMPOSITE_TOLERANCE}"
+        ));
+    }
+    Ok(diff)
 }

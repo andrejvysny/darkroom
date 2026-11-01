@@ -38,7 +38,7 @@
       "target": "core-runtime",
       "task": "DARKROOM-138",
       "test": "coverage gap: event parity test not yet identified",
-      "behavior": "Publishes app:flush-edits event; see producer for payload."
+      "behavior": "Publishes app:flush-edits with { barrierId }; the editor flushes and answers develop_flush_ack with that id."
     },
     {
       "kind": "event",

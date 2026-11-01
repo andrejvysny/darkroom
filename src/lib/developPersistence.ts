@@ -36,7 +36,13 @@ type SaveFn = (
   imageId: number,
   params: DevelopParams,
   touchCount: number,
-) => Promise<void>;
+) => Promise<number>;
+
+/** The committed revision of one image's edit, as acknowledged by the backend. */
+export interface SavedRevision {
+  imageId: number;
+  revision: number;
+}
 
 interface Entry {
   latest: DevelopParams;
@@ -57,6 +63,8 @@ export class DevelopPersistence {
   private entries = new Map<number, Entry>();
   /** Pending idle thumbnail refreshes, keyed by image id (see `THUMB_IDLE_MS`). */
   private thumbTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** Latest revision the backend acknowledged per image (the return of `develop_set_edit`). */
+  private revisions = new Map<number, number>();
 
   constructor(
     private readonly save: SaveFn,
@@ -137,11 +145,29 @@ export class DevelopPersistence {
     await Promise.all([...this.entries.keys()].map((id) => this.flush(id)));
   }
 
+  /**
+   * `flushAll()` for the quit barrier: also reports the acknowledged revision of every image that
+   * had pending work when the flush started, so the backend can check the claim against the
+   * catalog. A failed save records no new revision and leaves `hasPending()` true, so the caller
+   * must still send `ok = false` for it.
+   */
+  async flushAllWithRevisions(): Promise<SavedRevision[]> {
+    const pending = [...this.entries.keys()].filter((id) => this.isDirty(id));
+    await this.flushAll();
+    const saved: SavedRevision[] = [];
+    for (const imageId of pending) {
+      const revision = this.revisions.get(imageId);
+      if (revision !== undefined) saved.push({ imageId, revision });
+    }
+    return saved;
+  }
+
   /** Drop pending state for an image without saving — only for an explicit discard. */
   forget(imageId: number): void {
     const e = this.entries.get(imageId);
     if (e) this.clearTimer(e);
     this.entries.delete(imageId);
+    this.revisions.delete(imageId);
     this.cancelThumb(imageId);
   }
 
@@ -198,7 +224,8 @@ export class DevelopPersistence {
     const params = e.latest;
     const touches = e.touchCount;
     const p = this.save(imageId, params, touches)
-      .then(() => {
+      .then((revision) => {
+        this.revisions.set(imageId, revision);
         e.savedGen = gen;
         // Touches that arrived while this save was in flight belong to the next one.
         e.touchCount = Math.max(0, e.touchCount - touches);
@@ -214,7 +241,9 @@ export class DevelopPersistence {
           ...log.errorSummary(err),
         });
         if (e.failures > RETRY_BACKOFF_MS.length) {
-          this.onError("Changes haven't been saved. Darkroom will keep trying.");
+          this.onError(
+            "Changes haven't been saved. Darkroom will keep trying.",
+          );
         }
       })
       .finally(() => {

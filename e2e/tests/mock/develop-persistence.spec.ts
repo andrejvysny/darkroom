@@ -14,7 +14,9 @@ import { test, expect } from "@playwright/test";
 const DEBOUNCE_MS = 500;
 
 /** `develop_set_edit` image ids seen so far, in call order. */
-async function savedIds(page: import("@playwright/test").Page): Promise<number[]> {
+async function savedIds(
+  page: import("@playwright/test").Page,
+): Promise<number[]> {
   return page.evaluate(
     `(window.__darkroomIpcLog ?? [])
        .filter((c) => c.cmd === "develop_set_edit")
@@ -51,7 +53,10 @@ test("editing A then switching to B inside the debounce still persists A", async
   await page.evaluate("window.__darkroomIpcLog.length = 0");
 
   await exposure.click({ position: { x: 140, y: 7 } }); // edit A
-  expect(await savedIds(page), "A must still be pending before switching").toEqual([]);
+  expect(
+    await savedIds(page),
+    "A must still be pending before switching",
+  ).toEqual([]);
   await page.click(`[data-image-id="${b}"]`); // switch before A's save fires
   await exposure.click({ position: { x: 40, y: 7 } }); // edit B
 
@@ -62,7 +67,10 @@ test("editing A then switching to B inside the debounce still persists A", async
   await page.clock.runFor(DEBOUNCE_MS * 4);
 
   const saved = await savedIds(page);
-  expect(saved, `develop_set_edit image ids: ${JSON.stringify(saved)}`).toContain(a);
+  expect(
+    saved,
+    `develop_set_edit image ids: ${JSON.stringify(saved)}`,
+  ).toContain(a);
   expect(saved).toContain(b);
 });
 
@@ -127,7 +135,9 @@ test("the quit barrier's flush request saves and is acknowledged", async ({
 
   // Edit, then immediately do what ⌘Q does: the backend holds the exit and asks for a flush.
   await exposure.click({ position: { x: 100, y: 7 } });
-  await page.evaluate(`window.__darkroomEmit("app:flush-edits")`);
+  await page.evaluate(
+    `window.__darkroomEmit("app:flush-edits", { barrierId: 42 })`,
+  );
   await page.waitForFunction(
     `(window.__darkroomIpcLog ?? []).some((c) => c.cmd === "develop_flush_ack")`,
   );
@@ -135,6 +145,19 @@ test("the quit barrier's flush request saves and is acknowledged", async ({
   const ack = await page.evaluate(
     `(window.__darkroomIpcLog ?? []).filter((c) => c.cmd === "develop_flush_ack").pop()`,
   );
-  expect((ack as { payload?: { ok?: boolean } }).payload?.ok).toBe(true);
+  const payload = (
+    ack as {
+      payload?: {
+        barrierId?: number;
+        ok?: boolean;
+        saved?: { imageId: number; revision: number }[];
+      };
+    }
+  ).payload;
+  expect(payload?.ok).toBe(true);
+  // The ack echoes the barrier and names the committed revision of what it saved.
+  expect(payload?.barrierId).toBe(42);
+  expect(payload?.saved?.length).toBeGreaterThan(0);
+  expect(payload?.saved?.[0].revision).toBeGreaterThan(0);
   expect((await savedIds(page)).length).toBeGreaterThan(0);
 });

@@ -51,6 +51,9 @@ revision!(ViewportRevision);
 revision!(DisplayRevision);
 revision!(DeviceEpoch);
 revision!(CatalogEpoch);
+// Durable `edits.revision` save counter owned by the catalog. A different axis than `EditRevision`
+// (editor-local, restarts at 1 every session): never compare the two.
+identity!(CatalogRevision, i64);
 
 /// The catalog epoch must change whenever a catalog is reset or replaced.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

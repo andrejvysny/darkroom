@@ -64,8 +64,7 @@ function makeRows(n: number): ImageRow[] {
   return Array.from({ length: n }, (_, i): ImageRow => {
     const num = String(i + 1).padStart(4, "0");
     const flag = FLAGS[i % FLAGS.length];
-    const suggested =
-      flag === "none" ? SUGGESTED[i % SUGGESTED.length] : null;
+    const suggested = flag === "none" ? SUGGESTED[i % SUGGESTED.length] : null;
     return {
       id: i + 1,
       contentHash: `mockhash${num}`,
@@ -175,7 +174,11 @@ const PANO_GROUPS: PanoGroupRow[] = [
     detectedAt: Math.floor(Date.UTC(2026, 6, 18, 9, 0) / 1000),
     mergedImageId: null,
     allRaw: true,
-    members: [panoMember(rows[0], 0), panoMember(rows[1], 1), panoMember(rows[2], 2)],
+    members: [
+      panoMember(rows[0], 0),
+      panoMember(rows[1], 1),
+      panoMember(rows[2], 2),
+    ],
   },
   {
     id: 2,
@@ -416,6 +419,9 @@ const STATS = {
   failed: 0,
 };
 
+/** Per-image committed edit revision, as the real `edits.revision` column would report. */
+const mockEditRevisions = new Map<number, number>();
+
 const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   // Library
   library_query: (p) => queryRows(getParams(p)),
@@ -484,7 +490,9 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
         // Fast list is metadata-only → always pending; import_dedup resolves the real status.
         status: "pending",
         kind: ext === "CR3" ? "raw" : "jpeg",
-        pairKey: pairRole ? `/Volumes/SD_CARD/DCIM/${stem.toLowerCase()}` : null,
+        pairKey: pairRole
+          ? `/Volumes/SD_CARD/DCIM/${stem.toLowerCase()}`
+          : null,
         pairRole,
       };
     };
@@ -556,7 +564,8 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
     running: false,
     suggested: PANO_GROUPS.filter((g) => g.status === "suggested").length,
   }),
-  pano_detect_run: () => PANO_GROUPS.filter((g) => g.status === "suggested").length,
+  pano_detect_run: () =>
+    PANO_GROUPS.filter((g) => g.status === "suggested").length,
   pano_detect_cancel: () => undefined,
   pano_detect_groups: (p) => {
     const includeDismissed = Boolean(p.includeDismissed);
@@ -652,7 +661,11 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   // is) can never widen the set beyond rejects. The fixture has no pairs, so companions are always 0.
   cull_rejected_summary: (p) => {
     const hit = rejectedRows(p);
-    return { images: hit.length, companions: 0, bytes: hit.length * 24_000_000 };
+    return {
+      images: hit.length,
+      companions: 0,
+      bytes: hit.length * 24_000_000,
+    };
   },
   cull_delete_rejected: (p) => {
     const hit = rejectedRows(p);
@@ -703,7 +716,13 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
 
   // Develop
   develop_get_edit: () => structuredClone(DEFAULT_PARAMS),
-  develop_set_edit: () => undefined,
+  // Returns the committed revision, incrementing per image like the real catalog.
+  develop_set_edit: (p) => {
+    const id = Number(p.imageId);
+    const next = (mockEditRevisions.get(id) ?? 0) + 1;
+    mockEditRevisions.set(id, next);
+    return next;
+  },
   // New viewport model: returns [outW u32 LE][outH u32 LE][flags u8][rgba8 outW*outH*4]
   develop_render: (p) => makeDevelopRgba(p),
   develop_preview_jpeg: () => makeDevelopJpeg(undefined),
@@ -858,12 +877,48 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   image_scan_state: () => ({
     lastScanAt: null,
     stages: [
-      { id: "object_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
-      { id: "animal_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
-      { id: "face_detection", status: "pending", attemptedAt: null, modelVersion: null, error: null },
-      { id: "caption", status: "pending", attemptedAt: null, modelVersion: null, error: null },
-      { id: "clip_embedding", status: "pending", attemptedAt: null, modelVersion: null, error: null },
-      { id: "panorama", status: "pending", attemptedAt: null, modelVersion: null, error: null },
+      {
+        id: "object_detection",
+        status: "pending",
+        attemptedAt: null,
+        modelVersion: null,
+        error: null,
+      },
+      {
+        id: "animal_detection",
+        status: "pending",
+        attemptedAt: null,
+        modelVersion: null,
+        error: null,
+      },
+      {
+        id: "face_detection",
+        status: "pending",
+        attemptedAt: null,
+        modelVersion: null,
+        error: null,
+      },
+      {
+        id: "caption",
+        status: "pending",
+        attemptedAt: null,
+        modelVersion: null,
+        error: null,
+      },
+      {
+        id: "clip_embedding",
+        status: "pending",
+        attemptedAt: null,
+        modelVersion: null,
+        error: null,
+      },
+      {
+        id: "panorama",
+        status: "pending",
+        attemptedAt: null,
+        modelVersion: null,
+        error: null,
+      },
     ],
   }),
   features_backfill: () => 0,

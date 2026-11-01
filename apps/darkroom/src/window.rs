@@ -1,13 +1,11 @@
 use crate::{
     gpu::Gpu,
     paint,
-    photo_worker::{self, PhotoRequest, PhotoResult, PhotoWorker},
-    present,
-    surface_state::{AcquireEvent, Action, SurfaceFailure, SurfaceState},
+    photo_view::{EguiRegistry, PhotoView},
+    photo_worker::{PhotoWorker, WorkerStatus},
+    surface_state::{AcquireEvent, Action, Schedule, SurfaceFailure, SurfaceState},
 };
-use core_app::state::{ApplicationSnapshot, DocumentStatus};
-use core_model::identity::{DeviceEpoch, FrameKey};
-use render_wgpu::{Offer, Presenter};
+use core_model::identity::DeviceEpoch;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::{
@@ -33,7 +31,11 @@ pub fn run_with_catalog(catalog_path: Option<std::path::PathBuf>) -> Result<(), 
         proxy: event_loop.create_proxy(),
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
-    app.error.map_or(Ok(()), Err)
+    let photo_error = app
+        .state
+        .as_mut()
+        .and_then(|state| state.shutdown_photo().err());
+    app.error.or(photo_error).map_or(Ok(()), Err)
 }
 
 struct App {
@@ -65,21 +67,13 @@ struct State {
     fatal: Option<String>,
     /// Whether the terminal shutdown has already been requested.
     shutdown_requested: bool,
-    /// Decode/develop worker on the shared device (joined when `State` drops).
-    photo: PhotoWorker,
-    /// Device epoch the worker's renderer (and every wanted key) was built on.
-    device_epoch: DeviceEpoch,
-    /// Owner of "the frame on screen" — holds the presented lease's texture alive.
-    presenter: Presenter,
-    /// egui registration of the presented frame, kept together with the lease's handle: the
-    /// texture can never be recycled by the pool while egui may still sample it, because the
-    /// presenter holds the lease until it is replaced (and we free the id the moment the
-    /// presenter no longer holds the matching lease).
-    photo_frame: Option<(egui::TextureId, render_wgpu::FrameHandle, [u32; 2])>,
-    /// Last frame key submitted to the presenter/worker.
-    last_wanted: Option<FrameKey>,
-    /// Last worker failure for the wanted key; shown as a label with the filename.
-    photo_error: Option<(FrameKey, String)>,
+    /// Decode/develop worker on the shared device; `None` when it could not be started (the
+    /// photo panel then says so) — never fatal for the window.
+    photo: Option<PhotoWorker>,
+    /// Presented frame, its egui registration and the failure state (see `photo_view.rs`).
+    photo_view: PhotoView,
+    /// Transient develop input state (drag in flight, dismissed banner).
+    develop_ui: ui_egui::DevelopUi,
 }
 
 fn sdr_config(
@@ -157,14 +151,21 @@ impl State {
             .map_err(|e| e.to_string())?;
         let photo_proxy = proxy;
         let device_epoch = DeviceEpoch(1);
-        let photo = PhotoWorker::start(
+        let mut photo_view = PhotoView::new(device_epoch);
+        let photo = match PhotoWorker::start(
             &gpu.context,
             Arc::clone(&gpu.pipeline),
             device_epoch,
             Arc::new(move || {
                 let _ = photo_proxy.send_event(Some(Instant::now()));
             }),
-        );
+        ) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                photo_view.set_unavailable(format!("Photo rendering is unavailable: {error}"));
+                None
+            }
+        };
         Ok(Self {
             application,
             settings,
@@ -181,24 +182,31 @@ impl State {
             fatal: None,
             shutdown_requested: false,
             photo,
-            device_epoch,
-            presenter: Presenter::new(),
-            photo_frame: None,
-            last_wanted: None,
-            photo_error: None,
+            photo_view,
+            develop_ui: ui_egui::DevelopUi::default(),
         })
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.size = size;
-        if size.width == 0 || size.height == 0 {
+        self.configure_surface();
+        self.window.request_redraw();
+    }
+
+    /// (Re)configure the surface for `self.size`. Never requests a repaint: retries are paced by
+    /// the surface state's retry instant, not by this call.
+    fn configure_surface(&mut self) {
+        if self.size.width == 0 || self.size.height == 0 {
             return;
         }
-        self.config.width = size.width;
-        self.config.height = size.height;
+        self.config.width = self.size.width;
+        self.config.height = self.size.height;
         self.surface
             .configure(&self.gpu.context.device, &self.config);
-        self.window.request_redraw();
+    }
+
+    fn shutdown_photo(&mut self) -> Result<(), String> {
+        self.photo.as_mut().map_or(Ok(()), PhotoWorker::shutdown)
     }
 
     fn recover_surface(&mut self) -> Result<(), String> {
@@ -216,7 +224,7 @@ impl State {
             return Err("recreated surface does not support selected SDR format".into());
         }
         self.surface = surface;
-        self.resize(self.size);
+        self.configure_surface();
         Ok(())
     }
 
@@ -253,23 +261,29 @@ impl State {
             self.fail(SurfaceFailure::UncapturedGpu(message));
             return Duration::MAX;
         }
+        let now = Instant::now();
         if self.size.width == 0 || self.size.height == 0 {
-            self.surface_state.on_event(AcquireEvent::ZeroSize);
+            self.surface_state.on_event(AcquireEvent::ZeroSize, now);
             return Duration::MAX;
         }
+        // Input/egui may request redraws at any rate; none of them may pull an acquisition
+        // ahead of a scheduled retry instant.
+        if let Err(remaining) = self.surface_state.may_acquire(now) {
+            return remaining;
+        }
         let (event, frame, suboptimal) = self.acquire();
-        match self.surface_state.on_event(event) {
+        match self.surface_state.on_event(event, now) {
             Action::Present => self.present(
                 frame.expect("Presented/Suboptimal always carry a frame"),
                 suboptimal,
             ),
             Action::Reconfigure { after } => {
-                self.resize(self.size);
+                self.configure_surface();
                 after
             }
             Action::RecreateSurface { after } => match self.recover_surface() {
                 Ok(()) => after,
-                Err(message) => match self.surface_state.on_recreate_failed(message) {
+                Err(message) => match self.surface_state.on_recreate_failed(message, now) {
                     Action::Fatal(failure) => {
                         self.fail(failure);
                         Duration::MAX
@@ -287,175 +301,59 @@ impl State {
         }
     }
 
-    /// Publish finished worker frames: `offer` through the presenter, registering the lease's
-    /// texture with egui through the shared [`present::register_presented_frame`] (immediately
-    /// freed for a lease the presenter rejects); on `Presented` the previous registration is
-    /// freed afterwards, so a frame is never unregistered while it (or its successor) is on
-    /// screen.
-    fn drain_photo_results(&mut self) {
-        for result in self.photo.drain_results() {
-            match result {
-                PhotoResult::Frame(lease) => {
-                    let handle = lease.handle();
-                    // Same registration helper `--photo-probe` runs; a lease the presenter
-                    // rejects (stale key) hands its id straight back.
-                    let (texture, size) = present::register_presented_frame(
-                        &self.gpu.context.device,
-                        &mut self.renderer,
-                        &lease,
-                    );
-                    if self.presenter.offer(lease, self.device_epoch) == Offer::Presented {
-                        if let Some((previous, _, _)) =
-                            self.photo_frame.replace((texture, handle, size))
-                        {
-                            self.renderer.free_texture(&previous);
-                        }
-                    } else {
-                        self.renderer.free_texture(&texture);
-                    }
-                    // Stale leases drop here: the texture returns to the pool.
-                }
-                PhotoResult::Failed { key, message } => {
-                    if self.last_wanted == Some(key) {
-                        self.photo_error = Some((key, message));
-                    }
-                }
-            }
-        }
-    }
-
-    /// The presenter may drop the current frame outside `offer` (subject change in `want`,
-    /// device-loss `clear`): the egui registration must go with it, or egui could sample a
-    /// texture the pool has handed to a new render.
-    fn sync_photo_frame(&mut self) {
-        let presented = self.presenter.current().map(|lease| lease.handle());
-        if self
-            .photo_frame
-            .is_some_and(|(_, handle, _)| Some(handle) != presented)
-        {
-            if let Some((id, _, _)) = self.photo_frame.take() {
-                self.renderer.free_texture(&id);
-            }
-        }
-    }
-
-    /// Snapshot + photo bookkeeping → the central panel's presentation state.
-    fn photo_ui(&self, snapshot: &ApplicationSnapshot) -> crate::application::PhotoUi {
-        let mut message = None;
-        let mut loading = false;
-        if let Some(image) = snapshot.editor.image.as_ref() {
-            let document = &snapshot.editor.document;
-            match &document.status {
-                DocumentStatus::Ready => {
-                    let params_missing = document.params.is_none();
-                    if let Some(params) = &document.params {
-                        if let Some(feature) = photo_worker::unsupported_reason(params) {
-                            message = Some(format!(
-                                "Darkroom can't render this photo yet: {feature} is not \
-                                 supported by this build — nothing was changed."
-                            ));
-                        } else if let Some((key, error)) = &self.photo_error {
-                            if self.last_wanted == Some(*key) {
-                                message = Some(format!("{error} — {}", image.filename));
-                            }
-                        }
-                    }
-                    if message.is_none() {
-                        let presented = self.presenter.current().map(|lease| lease.key());
-                        let matches = self
-                            .last_wanted
-                            .as_ref()
-                            .is_some_and(|wanted| Some(wanted) == presented);
-                        loading = params_missing || !matches;
-                    }
-                }
-                DocumentStatus::Loading => loading = true,
-                DocumentStatus::Unsupported(reason) => {
-                    message = Some(format!(
-                        "Darkroom can't read this photo's saved adjustments ({reason}) — \
-                     nothing was changed."
-                    ))
-                }
-                DocumentStatus::Corrupt => {
-                    message = Some(
-                        "Darkroom can't read this photo's saved adjustments — the saved edit is \
-                     not readable. Nothing was changed."
-                            .to_string(),
-                    )
-                }
-                DocumentStatus::Error(error) => {
-                    message = Some(format!(
-                        "Darkroom could not load this photo's adjustments: {error}. \
-                     Nothing was changed."
-                    ))
-                }
-                DocumentStatus::Empty => {}
-            }
-        }
-        crate::application::PhotoUi {
-            texture: self.photo_frame.as_ref().map(|(id, _, size)| (*id, *size)),
-            message,
-            loading,
-            device_epoch: self.device_epoch,
-            plan: None,
-        }
-    }
-
     /// Render the acquired frame; returns the delay until the next redraw.
     fn present(&mut self, frame: wgpu::SurfaceTexture, suboptimal: bool) -> Duration {
         let input = self.input.take_egui_input(&self.window);
-        let output = if self.application.is_some() {
-            self.drain_photo_results();
-            let (snapshot, reopen) = {
-                let application = self
-                    .application
-                    .as_mut()
-                    .expect("checked by the branch above");
-                (application.snapshot(), application.reopen_command())
-            };
-            let mut photo_view = self.photo_ui(&snapshot);
+        let output = if let Some(application) = self.application.as_mut() {
+            let (snapshot, reopen) = (application.snapshot(), application.reopen_command());
+            self.photo_view.reconcile(&snapshot);
+            let results = self
+                .photo
+                .as_mut()
+                .map_or_else(Vec::new, PhotoWorker::drain_results);
+            if let Some(WorkerStatus::Stopped(reason)) =
+                self.photo.as_mut().map(PhotoWorker::status)
+            {
+                self.photo_view.set_unavailable(format!(
+                    "Photo rendering stopped: {reason}. Restart Darkroom."
+                ));
+            }
+            self.photo_view.accept_results(
+                results,
+                &mut EguiRegistry {
+                    device: &self.gpu.context.device,
+                    renderer: &mut self.renderer,
+                },
+            );
+            let mut photo_ui = self.photo_view.ui_state(&snapshot);
             let mut commands = Vec::new();
             let mut command_error = self.last_command_error.take();
             // Taken out and put back, like `command_error`: the closure needs `&mut` while
             // `self.egui` is borrowed.
             let mut settings_notices = std::mem::take(&mut self.settings.notices);
             let output = self.egui.run_ui(input, |root| {
-                commands = crate::application::ui(
+                commands = ui_egui::root(
                     root,
                     &snapshot,
                     &reopen,
                     &mut command_error,
-                    &mut photo_view,
+                    &mut photo_ui,
                     &mut settings_notices,
+                    &mut self.develop_ui,
                 );
             });
             self.settings.notices = settings_notices;
-            if let Some(plan) = photo_view.plan {
-                if Some(plan.key) != self.last_wanted {
-                    self.last_wanted = Some(plan.key);
-                    self.photo_error = None;
-                    self.presenter.want(plan.key);
-                    self.photo.request(PhotoRequest {
-                        key: plan.key,
-                        path: plan.path,
-                        content_hash: plan.content_hash,
-                        params: plan.params,
-                        view: plan.view,
-                    });
-                    // Repaint once the loading state is visible even with no other input.
-                    self.window.request_redraw();
-                }
+            let submitted = self.photo_view.submit(photo_ui.plan.take(), photo_ui.retry);
+            if let (Some(request), Some(worker)) = (submitted, self.photo.as_ref()) {
+                worker.request(request);
+                // Repaint once the loading state is visible even with no other input.
+                self.window.request_redraw();
             }
-            self.sync_photo_frame();
             self.last_command_error = command_error;
             if !commands.is_empty() {
                 self.window.request_redraw();
             }
             for command in commands {
-                let application = self
-                    .application
-                    .as_mut()
-                    .expect("checked by the branch above");
                 match application.dispatch(command) {
                     Ok(()) => self.last_command_error = None,
                     Err(error) => {
@@ -469,7 +367,7 @@ impl State {
             // just as visible here.
             let mut settings_notices = std::mem::take(&mut self.settings.notices);
             let output = self.egui.run_ui(input, |root| {
-                crate::application::settings_notice_strip(root, &mut settings_notices);
+                ui_egui::settings_notice_strip(root, &mut settings_notices);
                 paint::ui(root);
             });
             self.settings.notices = settings_notices;
@@ -489,9 +387,13 @@ impl State {
             &self.egui,
             [self.size.width, self.size.height],
         );
+        self.photo_view.after_submit(&mut EguiRegistry {
+            device: &self.gpu.context.device,
+            renderer: &mut self.renderer,
+        });
         self.gpu.context.queue.present(frame);
         if suboptimal {
-            self.resize(self.size);
+            self.configure_surface();
         }
         delay
     }
@@ -501,32 +403,11 @@ impl State {
     fn fail(&mut self, failure: SurfaceFailure) {
         // Device/surface death: the presented lease's texture belongs to a dead context —
         // drop it and the egui registration together (the pool never sees these textures again).
-        self.presenter.clear();
-        self.sync_photo_frame();
-        let streak = self.surface_state.streak();
-        self.fatal = Some(match failure {
-            SurfaceFailure::RetriesExhausted { last, attempts } => format!(
-                "GPU surface acquisition failed {attempts} times in a row (last failure: {last}). \
-                 Restart Darkroom; if this persists, check the display connection and GPU drivers."
-            ),
-            SurfaceFailure::Validation => "GPU surface validation error. \
-                 Restart Darkroom; if this persists, check the display connection."
-                .to_string(),
-            SurfaceFailure::UncapturedGpu(message) => format!(
-                "The GPU reported an error and Darkroom stopped rendering: {message}. \
-                 Restart Darkroom; if this persists, check the display connection and GPU drivers."
-            ),
-            SurfaceFailure::RecreateFailed(message) => format!(
-                "Failed to recreate the GPU surface after {streak} consecutive failures: \
-                 {message}. Restart Darkroom; if this persists, check the display connection."
-            ),
-            SurfaceFailure::DeviceLost => format!(
-                "GPU surface was lost {streak} times without ever presenting; this indicates a \
-                 device-level GPU loss, which Darkroom cannot recover from at runtime. Restart \
-                 Darkroom; if this persists, check the display connection and GPU drivers."
-            )
-            .to_string(),
+        self.photo_view.retire_for_device_loss(&mut EguiRegistry {
+            device: &self.gpu.context.device,
+            renderer: &mut self.renderer,
         });
+        self.fatal = Some(failure.message(self.surface_state.streak()));
     }
 }
 
@@ -562,6 +443,9 @@ impl ApplicationHandler<Option<Instant>> for App {
                 if application.snapshot().revision != revision {
                     state.window.request_redraw();
                 }
+                // Autosave debounce / retry backoff / barrier timeout fire with no input.
+                let deadline = application.next_deadline();
+                self.schedule(deadline);
             }
         }
         if self
@@ -605,9 +489,12 @@ impl ApplicationHandler<Option<Instant>> for App {
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(application) = &mut state.application {
-                    if let Err(error) = application.shutdown() {
-                        self.error = Some(error.to_string());
-                    }
+                    // A refused or later-failing quit keeps the window open: the error is
+                    // shown in the UI (command error / save banner) and a second close retries.
+                    state.last_command_error = application
+                        .shutdown()
+                        .err()
+                        .map(|error| (error.to_string(), Instant::now()));
                 }
                 if state.application.is_none() {
                     event_loop.exit();
@@ -627,7 +514,15 @@ impl ApplicationHandler<Option<Instant>> for App {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                let delay = state.redraw();
+                let delay =
+                    match state
+                        .surface_state
+                        .schedule(Instant::now(), self.next_repaint, true)
+                    {
+                        Schedule::AcquireNow => state.redraw(),
+                        Schedule::WaitUntil(at) => at.saturating_duration_since(Instant::now()),
+                        Schedule::Idle => Duration::MAX,
+                    };
                 if let Some(message) = state.fatal.clone() {
                     if !state.shutdown_requested {
                         state.shutdown_requested = true;

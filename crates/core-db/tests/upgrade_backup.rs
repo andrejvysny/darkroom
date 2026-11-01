@@ -136,7 +136,7 @@ fn upgrading_a_v25_catalog_snapshots_it_before_migrating() {
     // Named after the version it upgrades TO, so the set of pre-upgrade copies is self-describing.
     let name = snapshot.file_name().unwrap().to_str().unwrap().to_string();
     assert!(
-        name.starts_with("catalog-pre-v26-") && name.ends_with(".db"),
+        name.starts_with("catalog-pre-v27-") && name.ends_with(".db"),
         "unexpected pre-upgrade backup name: {name}"
     );
     assert!(snapshot.is_file(), "the snapshot must exist on disk");
@@ -159,7 +159,7 @@ fn upgrading_a_v25_catalog_snapshots_it_before_migrating() {
 
     // The migrated catalog: current schema, 026 objects present, existing row at revision 0.
     let conn = &db.conn;
-    assert_eq!(user_version(conn), 26);
+    assert_eq!(user_version(conn), 27);
     assert!(table_exists(conn, "sidecar_outbox"));
     assert!(column_exists(conn, "edits", "revision"));
     assert!(column_exists(conn, "edits", "mirrored_revision"));
@@ -209,14 +209,14 @@ fn no_backup_for_a_new_or_already_current_catalog() {
     // A brand-new catalog has nothing to lose.
     let (db, snapshot) = Db::open_with_upgrade_backup(&fresh, &backups_dir).unwrap();
     assert!(snapshot.is_none(), "a created catalog needs no snapshot");
-    assert_eq!(user_version(&db.conn), 26);
+    assert_eq!(user_version(&db.conn), 27);
     drop(db);
 
     // An already-current catalog is not rewritten, so it gets no snapshot either.
     let (db, snapshot) = Db::open_with_upgrade_backup(&fresh, &backups_dir).unwrap();
     assert!(
         snapshot.is_none(),
-        "reopening a schema-26 catalog must not create a backup"
+        "reopening a schema-27 catalog must not create a backup"
     );
     assert!(
         backup::backups(&backups_dir).is_empty(),
@@ -295,7 +295,7 @@ fn a_newer_schema_is_still_refused_without_touching_anything() {
             err,
             DbError::SchemaTooNew {
                 found: 99,
-                supported: 26
+                supported: 27
             }
         ),
         "expected SchemaTooNew, got {err:?}"
@@ -310,4 +310,64 @@ fn a_newer_schema_is_still_refused_without_touching_anything() {
         Db::open(&catalog),
         Err(DbError::SchemaTooNew { .. })
     ));
+}
+
+/// Migration 027 (outbox schedule) on a schema-26 catalog that already holds a queued intent: the
+/// pre-upgrade snapshot is taken (still schema 26, no schedule column), the upgrade lands on 27, and
+/// the existing row arrives due immediately (`next_attempt_at = 0`) with its attempts preserved.
+#[test]
+fn upgrading_a_v26_catalog_snapshots_it_and_marks_queued_rows_due() {
+    let scratch = Scratch::new("upgrade_v26");
+    let catalog = scratch.path("catalog.db");
+    let backups_dir = scratch.path("backups");
+    {
+        let mut conn = Connection::open(&catalog).unwrap();
+        let sql: Vec<&str> = MIGRATIONS_V25
+            .iter()
+            .copied()
+            .chain([include_str!("../migrations/026_sidecar_outbox.sql")])
+            .collect();
+        Migrations::new(sql.into_iter().map(M::up).collect())
+            .to_latest(&mut conn)
+            .unwrap();
+        assert_eq!(user_version(&conn), 26);
+        conn.execute(
+            "INSERT INTO images(content_hash, file_size, path, original_filename, status, imported_at)
+             VALUES (?1, 1, '/lib/shot.cr3', 'shot.cr3', 'present', 0)",
+            params![vec![0xcdu8; 32]],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO sidecar_outbox(image_id, edit_revision, content_hash, path, enqueued_at, attempts, last_error)
+             VALUES (?1, 3, ?2, '/lib/shot.cr3', 10, 4, 'disk full')",
+            params![id, vec![0xcdu8; 32]],
+        )
+        .unwrap();
+    }
+
+    let (db, snapshot) = Db::open_with_upgrade_backup(&catalog, &backups_dir).unwrap();
+    let snapshot = snapshot.expect("a v26 -> v27 upgrade must snapshot first");
+    assert!(snapshot
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("catalog-pre-v27-"));
+    let copied = Connection::open(&snapshot).unwrap();
+    assert_eq!(user_version(&copied), 26);
+    assert!(!column_exists(&copied, "sidecar_outbox", "next_attempt_at"));
+    drop(copied);
+
+    assert_eq!(user_version(&db.conn), 27);
+    assert!(column_exists(&db.conn, "sidecar_outbox", "next_attempt_at"));
+    let (next, attempts): (i64, i64) = db
+        .conn
+        .query_row(
+            "SELECT next_attempt_at, attempts FROM sidecar_outbox",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((next, attempts), (0, 4), "existing intents are due now");
 }

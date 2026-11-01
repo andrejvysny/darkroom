@@ -351,6 +351,8 @@ fn selection_opens_a_fresh_session_and_asks_for_the_stored_edit() {
             revision: None,
             process_version: None,
             dirty: false,
+            can_undo: false,
+            can_redo: false,
         }
     );
     // A→B→A still yields a new session every time.

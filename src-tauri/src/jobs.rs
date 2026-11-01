@@ -44,7 +44,7 @@ where
 pub async fn viewport_render<R: Runtime, T: Send + 'static>(
     app: AppHandle<R>,
     image_id: i64,
-    task: impl FnOnce(u64) -> T + Send + 'static,
+    task: impl FnOnce(u64) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let host = app.clone();
     match execute(
@@ -62,13 +62,13 @@ pub async fn viewport_render<R: Runtime, T: Send + 'static>(
                 id,
                 image_id,
             )?;
-            Ok(Ok::<T, std::convert::Infallible>(task(id)))
+            // A render error is the job's domain result so the supervisor records Failed.
+            Ok(task(id))
         },
     )
     .await
     {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(unreachable)) => match unreachable {},
+        Ok(rendered) => rendered,
         Err(error) => Err(error),
     }
 }
@@ -336,5 +336,43 @@ mod tests {
         let ok = pool.submit(spec, |_| Ok(5)).unwrap();
         assert_eq!(ok.wait(), Ok(5));
         assert_eq!(ok.status().unwrap().state, JobState::Succeeded);
+    }
+
+    #[test]
+    fn viewport_render_error_is_recorded_failed() {
+        use core_app::jobs::JobState;
+        let pool = core_runtime::jobs::Supervisor::new(
+            core_runtime::jobs::Config {
+                max_jobs: 4,
+                max_bytes: 40,
+                max_terminal_records: 4,
+                workers: 2,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let gate = Arc::new(core_runtime::publication::PublicationGate::default());
+        let latest = Arc::new(AtomicU64::new(0));
+        let current = Arc::new(AtomicI64::new(0));
+        let spec = JobSpec {
+            owner: JobOwner {
+                catalog_epoch: gate.epoch(),
+                editor_session: None,
+            },
+            class: JobClass::Viewport,
+            policy: QueuePolicy::Latest { key: 1 },
+            estimated_bytes: 10,
+            durable: false,
+        };
+        // Same shape as viewport_render: claim, then the render result is the domain result.
+        let render = |_: u64| Err::<(), String>("GPU develop unavailable".into());
+        let job = pool
+            .submit_fallible(spec, move |context| {
+                claim_viewport(&gate, &latest, &current, context.id().0, 5)?;
+                Ok(render(context.id().0))
+            })
+            .unwrap();
+        assert_eq!(job.wait(), Ok(Err("GPU develop unavailable".to_string())));
+        assert_eq!(job.status().unwrap().state, JobState::Failed);
     }
 }

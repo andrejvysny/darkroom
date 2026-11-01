@@ -50,6 +50,15 @@ impl EditDocument {
     }
 }
 
+/// Serialize params exactly as the catalog stores them, refusing non-finite values (a NaN would
+/// otherwise serialize as `null` and silently corrupt the stored edit).
+pub fn params_to_json(params: &DevelopParams) -> Result<String, String> {
+    if !validate_finite(params) {
+        return Err("edit parameters contain a non-finite value".into());
+    }
+    serde_json::to_string(params).map_err(|e| e.to_string())
+}
+
 fn read_preview(raw: &str, version: i64) -> (ReadStatus, Option<DevelopParams>) {
     if !(1..=6).contains(&version) {
         return (ReadStatus::UnsupportedVersion, None);

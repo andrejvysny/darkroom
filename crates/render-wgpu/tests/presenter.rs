@@ -258,9 +258,9 @@ fn resize_stales_old_viewport_frames() {
     assert_eq!(p.offer(h.lease(&moved), DeviceEpoch(1)), Offer::Presented);
 }
 
-// Device epoch bump retires every frame rendered on the old device; clear() drops the current.
+// Device epoch bump retires every frame rendered on the old device; retire_all() retires the current.
 #[test]
-fn device_retirement_rejects_and_clear_drops() {
+fn device_retirement_rejects_and_retire_all_retires() {
     let Some(h) = harness() else { return };
     let mut p = Presenter::new();
     p.want(KeySpec::default().key());
@@ -289,9 +289,9 @@ fn device_retirement_rejects_and_clear_drops() {
         Offer::Stale(StaleReason::DeviceRetired)
     );
 
-    p.clear();
+    p.retire_all();
     assert!(p.current().is_none());
-    // After clear, once the UI wants the new epoch's frame, it presents again.
+    // After retire_all, once the UI wants the new epoch's frame, it presents again.
     p.want(new_device_key.key());
     assert_eq!(
         p.offer(h.lease_on(&new_device, &new_device_key), DeviceEpoch(2)),
@@ -299,15 +299,88 @@ fn device_retirement_rejects_and_clear_drops() {
     );
 }
 
-// With no wanted frame yet, any current-device frame may present (first paint).
+// With nothing wanted (never asked, or retired by close) every frame is rejected: a render that
+// finishes after the catalog closed must never present.
 #[test]
-fn no_wanted_yet_presents_any_current_frame() {
+fn nothing_wanted_rejects_frames() {
     let Some(h) = harness() else { return };
     let mut p = Presenter::new();
     assert_eq!(
         p.offer(h.lease(&KeySpec::default()), DeviceEpoch(1)),
-        Offer::Presented
+        Offer::Stale(StaleReason::NotWanted)
     );
+    assert!(p.current().is_none());
+}
+
+fn live(h: &Harness) -> usize {
+    h.renderer
+        .pool()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .live_count((64, 48))
+}
+
+// Retired leases are handed back, not dropped: the pool keeps them live until the host drops them.
+#[test]
+fn retired_on_subject_change_is_returned_not_dropped() {
+    let Some(h) = harness() else { return };
+    let a = KeySpec::default();
+    let b = KeySpec {
+        image_id: 1,
+        ..Default::default()
+    };
+    let mut p = Presenter::new();
+    p.want(a.key());
+    assert_eq!(p.offer(h.lease(&a), DeviceEpoch(1)), Offer::Presented);
+    p.want(b.key());
+    assert!(p.current().is_none());
+    assert_eq!(live(&h), 1, "retired lease must stay checked out");
+    let retired = p.take_retired();
+    assert_eq!(retired.len(), 1);
+    assert_eq!(*retired[0].key(), a.key());
+    assert!(p.take_retired().is_empty());
+    drop(retired);
+    assert_eq!(live(&h), 0);
+}
+
+#[test]
+fn retired_on_offer_replace_is_returned() {
+    let Some(h) = harness() else { return };
+    let r1 = KeySpec {
+        edit_revision: 1,
+        ..Default::default()
+    };
+    let r2 = KeySpec {
+        edit_revision: 2,
+        ..Default::default()
+    };
+    let mut p = Presenter::new();
+    p.want(r2.key());
+    assert_eq!(p.offer(h.lease(&r1), DeviceEpoch(1)), Offer::Presented);
+    assert_eq!(p.offer(h.lease(&r2), DeviceEpoch(1)), Offer::Presented);
+    assert_eq!(live(&h), 2);
+    let retired = p.take_retired();
+    assert_eq!(retired.len(), 1);
+    assert_eq!(*retired[0].key(), r1.key());
+    drop(retired);
+    assert_eq!(live(&h), 1);
+}
+
+#[test]
+fn retire_all_returns_current_and_rejects_late_frames() {
+    let Some(h) = harness() else { return };
+    let a = KeySpec::default();
+    let mut p = Presenter::new();
+    p.want(a.key());
+    assert_eq!(p.offer(h.lease(&a), DeviceEpoch(1)), Offer::Presented);
+    p.retire_all();
+    assert!(p.current().is_none());
+    assert_eq!(p.take_retired().len(), 1);
+    assert_eq!(
+        p.offer(h.lease(&a), DeviceEpoch(1)),
+        Offer::Stale(StaleReason::NotWanted)
+    );
+    assert_eq!(live(&h), 0, "rejected lease dropped immediately");
 }
 
 // A Settled frame for a revision other than the wanted one is NotWanted.

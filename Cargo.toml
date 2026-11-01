@@ -12,6 +12,7 @@ members = [
     "crates/core-model",
     "crates/core-app",
     "crates/core-runtime",
+    "crates/ui-egui",
     "crates/core-dedup",
     "crates/core-import",
     "crates/core-analyze",

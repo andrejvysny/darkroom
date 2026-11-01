@@ -44,6 +44,7 @@ const MIGRATION_SQL: &[&str] = &[
     include_str!("../migrations/024_suggestions.sql"),
     include_str!("../migrations/025_decode_failure.sql"),
     include_str!("../migrations/026_sidecar_outbox.sql"),
+    include_str!("../migrations/027_sidecar_outbox_schedule.sql"),
 ];
 
 /// Highest schema version this build understands (= number of migrations). A catalog whose
@@ -184,7 +185,7 @@ mod tests {
     #[test]
     fn migration_017_adds_format_column() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 26, "expected 26 migrations");
+        assert_eq!(LATEST_SCHEMA_VERSION, 27, "expected 27 migrations");
         let has_format: bool = db
             .conn
             .prepare("SELECT 1 FROM pragma_table_info('images') WHERE name = 'format'")

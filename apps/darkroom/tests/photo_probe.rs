@@ -148,6 +148,25 @@ fn default_edit_is_byte_identical() {
         json["egui_presented"], true,
         "the produced frame must survive egui registration + sampling: {json}"
     );
+    let composited = json["composited_mean_abs_diff"].as_f64().unwrap();
+    eprintln!("composited_mean_abs_diff = {composited}");
+    assert!(
+        composited <= 2.0,
+        "composited egui output must match the developed frame: {json}"
+    );
+    let resources = &json["resources"];
+    eprintln!("resources = {resources}");
+    assert!(
+        resources["prepared_gpu_bytes"].as_u64().unwrap() > 0,
+        "prepared bytes reported: {json}"
+    );
+    assert_eq!(resources["prepared_count"], 1, "{json}");
+    assert!(resources["pool_bytes"].as_u64().unwrap() > 0, "{json}");
+    assert!(
+        resources["last_decode_cpu_bytes"].as_u64().unwrap() > 0,
+        "{json}"
+    );
+    assert_eq!(resources["over_budget"], false, "{json}");
     let width = json["width"].as_u64().unwrap();
     let height = json["height"].as_u64().unwrap();
     assert!(width > 0, "framed width: {json}");

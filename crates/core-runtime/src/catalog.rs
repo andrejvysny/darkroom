@@ -1,7 +1,13 @@
-use core_app::{error::ErrorSource, ports::CatalogPort, AppError};
+use core_app::{
+    error::ErrorSource,
+    ports::{CatalogPort, SaveReceipt},
+    state::MirrorStatus,
+    AppError,
+};
 use core_db::{rusqlite, Db, DbError};
-use core_library::LibError;
+use core_library::{LibError, MirrorState};
 use core_model::catalog::{DateTreeYear, FolderRow, ImageRow, QueryParams};
+use core_model::identity::CatalogRevision;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -128,6 +134,49 @@ impl CatalogPort for CatalogAdapter {
     }
     fn edit(&self, image_id: i64) -> Result<Option<(String, i64)>, AppError> {
         self.read(|db| core_library::get_edit_with_process_version(&db.conn, image_id))
+    }
+    fn save_edit(
+        &self,
+        image_id: i64,
+        content_hash: &str,
+        process_version: i64,
+        params_json: &str,
+    ) -> Result<SaveReceipt, AppError> {
+        self.read(|db| {
+            let revision = match core_library::edits::save_edit_expecting_source(
+                &db.conn,
+                image_id,
+                content_hash,
+                process_version,
+                params_json,
+                core_library::now_epoch(),
+            ) {
+                Ok(revision) => revision,
+                Err(core_library::edits::SaveError::SourceChanged) => {
+                    return Ok(Err(AppError::SourceChanged));
+                }
+                Err(core_library::edits::SaveError::Lib(error)) => return Err(error),
+            };
+            let mirror = match core_library::mirror_state(&db.conn, image_id)? {
+                Some(state) if state.mirrored_revision >= state.revision => {
+                    MirrorStatus::Mirrored {
+                        revision: CatalogRevision(state.revision),
+                    }
+                }
+                Some(MirrorState {
+                    last_error: Some(error),
+                    ..
+                }) => MirrorStatus::Failing { error },
+                Some(state) => MirrorStatus::Pending {
+                    owed_revision: CatalogRevision(state.revision),
+                },
+                None => MirrorStatus::Unknown,
+            };
+            Ok(Ok(SaveReceipt {
+                catalog_revision: CatalogRevision(revision),
+                mirror,
+            }))
+        })?
     }
 }
 
