@@ -394,6 +394,10 @@ export type ImportStats = {
   /** Source files this build can never decode. A strict subset of `failed`; each was recorded and
    *  left on the card — an unreadable body is never copied into the library. */
   unsupported: number;
+  /** The run stopped early on request; all counted files are committed. */
+  interrupted: boolean;
+  /** Selected files never reached because the run stopped. */
+  notProcessed: number;
 };
 
 /** Content-hash dedup status of a source file (matches Rust `SourceStatus`). "pending" = not yet
@@ -880,6 +884,8 @@ export type RejectDeleteResult = {
   failed: number;
   /** Of `trashed`, how many were camera companions. */
   companions: number;
+  /** Trashed file whose row was repointed or replaced before finalize; the row was left untouched. */
+  changed: number;
 };
 
 /** Read-only count/size of the rejects matching `params` (the reject flag is forced backend-side). */
@@ -1329,6 +1335,15 @@ export function developSetEdit(
     touchCount,
     force,
   });
+}
+
+/** Run the quit-grade save barrier before an updater relaunch. The updater's own restart never
+ *  raises a quit the backend can hold, so the frontend has to ask. Resolves `true` only when every
+ *  debounced Develop edit is committed (`false` if the barrier declined); rejects with the
+ *  backend's reason when the save failed or the editor never acknowledged it — in both of those
+ *  cases the app must stay running and the message belongs in the updater's error path. */
+export function prepareRestart(): Promise<boolean> {
+  return invoke<boolean>("prepare_restart", {});
 }
 
 /** Per-channel 256-bin histogram from the rendered buffer. */
@@ -2451,4 +2466,31 @@ export function faceCropStyle(
     backgroundSize: `${100 / cw}% ${100 / ch}%`,
     backgroundPosition: `${posX}% ${posY}%`,
   };
+}
+
+// ── Settings bridge (legacy → native) ────────────────────────────────────────
+
+/** Raw `localStorage` dump of the bridged preferences (mirrors Rust `WebSnapshot`). Every value
+ *  is the stored string verbatim — `null` for keys never written — so the native parser sees
+ *  exactly what the browser stored. */
+export type WebSnapshot = {
+  format: "darkroom-web-settings";
+  version: 1;
+  /** Wall-clock ms when the values were captured. */
+  capturedAtMs: number;
+  values: Record<string, string | null>;
+};
+
+/** Persist a snapshot to the bridge file the native settings store ingests. The backend keeps
+ *  the newest capture: an at-or-older snapshot is a no-op. See `lib/settingsBridge.ts`. */
+export function settingsBridgeWrite(snapshot: WebSnapshot): Promise<void> {
+  return invoke<void>("settings_bridge_write", { snapshot });
+}
+
+/** Write a snapshot to a user-chosen file ("Export settings…"), overwriting it. */
+export function settingsBridgeExport(
+  path: string,
+  snapshot: WebSnapshot,
+): Promise<void> {
+  return invoke<void>("settings_bridge_export", { path, snapshot });
 }

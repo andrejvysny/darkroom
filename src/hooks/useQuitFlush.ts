@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { developPersistence } from "../lib/developPersistence";
+import { useAppStore } from "../store/app";
 
 /**
  * Keeps a normal quit from dropping an edit that is still only in memory.
@@ -37,9 +38,18 @@ export function useQuitFlush() {
         /* the barrier's timeout is the backstop */
       }
     });
+    // A barrier that didn't reach disk (quit or updater-restart cancelled) must say why —
+    // the user just pressed quit and nothing happened. (Payload mirrors Rust `SaveBarrierReport`.)
+    const unBarrier = listen<{ reason: string; message: string }>(
+      "app:save-barrier",
+      (ev) => {
+        if (active) useAppStore.getState().setToast(ev.payload.message);
+      },
+    );
     return () => {
       active = false;
       void unFlush.then((fn) => fn());
+      void unBarrier.then((fn) => fn());
     };
   }, []);
 }

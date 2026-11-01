@@ -6,6 +6,7 @@ import {
   runExportBatch,
   type ExportFormat,
 } from "../../lib/export";
+import { setPref } from "../../lib/settingsBridge";
 
 interface Preset {
   name: string;
@@ -157,7 +158,7 @@ export default function ExportModal() {
       { name, template },
     ];
     setSaved(next);
-    localStorage.setItem(LS_PRESETS, JSON.stringify(next));
+    setPref(LS_PRESETS, JSON.stringify(next));
     setPresetSel(name);
     setNewName("");
   };
@@ -166,7 +167,7 @@ export default function ExportModal() {
     if (!isSavedName(presetSel)) return;
     const next = saved.filter((p) => p.name !== presetSel);
     setSaved(next);
-    localStorage.setItem(LS_PRESETS, JSON.stringify(next));
+    setPref(LS_PRESETS, JSON.stringify(next));
     setPresetSel("");
   };
 
@@ -175,11 +176,8 @@ export default function ExportModal() {
   const doExport = async () => {
     if (!dir || !canExport) return;
     setBusy(true);
-    localStorage.setItem(LS_DIR, dir);
-    localStorage.setItem(
-      LS_LAST,
-      JSON.stringify({ template, format, quality }),
-    );
+    setPref(LS_DIR, dir);
+    setPref(LS_LAST, JSON.stringify({ template, format, quality }));
     await runExportBatch(targets, { dir, template, format, quality });
     close();
   };

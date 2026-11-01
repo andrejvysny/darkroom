@@ -20,6 +20,7 @@ import {
   type CollectionRow,
   type IndexStats,
 } from "./ipc";
+import { setPref } from "./settingsBridge";
 
 export type IndexingState = { done: number; total: number };
 
@@ -429,7 +430,7 @@ export function useLibrary(): LibraryState & LibraryActions {
         ]);
         setKeywords(kws);
         setCollections(cols);
-        localStorage.setItem("darkroom.bootstrapped", "1");
+        setPref("darkroom.bootstrapped", "1");
 
         if (firstLaunch && (flds.length === 0 || cnt === 0)) {
           const defaultPath = await appDefaultLibrary();

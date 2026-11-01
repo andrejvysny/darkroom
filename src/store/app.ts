@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { ImageRow, PanoGroupRow, SuggestStatus } from "../lib/ipc";
 import type { ExportTarget } from "../lib/export";
+import { setPref } from "../lib/settingsBridge";
 
 /** localStorage key backing `showSuggestions` (default ON). */
 const SHOW_SUGGESTIONS_KEY = "darkroom.suggestions.show";
@@ -184,11 +185,7 @@ export const useAppStore = create<AppState>((set) => ({
   setSuggest: (patch) => set((s) => ({ suggest: { ...s.suggest, ...patch } })),
   showSuggestions: readShowSuggestions(),
   setShowSuggestions: (b) => {
-    try {
-      localStorage.setItem(SHOW_SUGGESTIONS_KEY, b ? "1" : "0");
-    } catch {
-      /* private mode / storage disabled — the toggle just won't persist */
-    }
+    setPref(SHOW_SUGGESTIONS_KEY, b ? "1" : "0");
     set({ showSuggestions: b });
   },
   modelManagerOpen: false,

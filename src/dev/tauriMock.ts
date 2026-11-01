@@ -1010,6 +1010,12 @@ const HANDLERS: Record<string, (p: Record<string, unknown>) => unknown> = {
   face_reject: () => undefined,
   face_assign: () => undefined,
   faces_delete_all: () => undefined,
+  // Settings bridge (legacy → native): resolve as accepted; every invocation lands in
+  // __darkroomIpcLog, which is what the migration spec asserts against.
+  settings_bridge_write: () => undefined,
+  settings_bridge_export: () => undefined,
+  // Quit-grade save barrier before an updater relaunch: no pending edits in the mock.
+  prepare_restart: () => true,
 };
 
 // Cap the dev invocation log — a slider drag issues ~50 render calls a second, each carrying a
@@ -1026,6 +1032,8 @@ function handle(cmd: string, payload?: InvokeArgs): unknown {
   if (h) return h((payload ?? {}) as Record<string, unknown>);
   // Folder picker: return a fake source so the staged-import flow is drivable in the mock browser.
   if (cmd === "plugin:dialog|open") return "/Volumes/SD_CARD/DCIM";
+  // Save picker: same, for the "Export settings…" / preset-export flows.
+  if (cmd === "plugin:dialog|save") return "/tmp/darkroom-settings.json";
   // Updater flow: report a pending update so the banner (available → download → ready → restart)
   // is drivable in the mock browser. download_and_install / restart resolve as no-ops.
   if (cmd === "plugin:app|version") return "0.4.0";

@@ -3,5 +3,6 @@ pub mod async_workflow;
 pub mod catalog;
 pub mod jobs;
 pub mod publication;
+pub mod settings_store;
 pub mod workers;
 pub mod workflow;

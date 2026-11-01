@@ -5,6 +5,7 @@ import { useEditSync } from "./hooks/useEditSync";
 import { useQuitFlush } from "./hooks/useQuitFlush";
 import { useModelDownloadListeners } from "./lib/useModelDownloads";
 import { useUpdaterStartup } from "./lib/useUpdater";
+import { scheduleBridgeWrite } from "./lib/settingsBridge";
 import { effectivePreviewEdge } from "./lib/ipc";
 import TopBar from "./components/TopBar";
 import CommandPalette from "./components/CommandPalette";
@@ -32,6 +33,11 @@ export default function App() {
   // queue starts rendering previews at the right size before the first loupe open.
   useEffect(() => {
     void effectivePreviewEdge();
+  }, []);
+  // Mirror the bridged preferences into the native settings bridge once at startup, so a user
+  // who never touches a preference still gets their existing choices imported (debounced write).
+  useEffect(() => {
+    scheduleBridgeWrite();
   }, []);
   const view = useAppStore((s) => s.view);
 
