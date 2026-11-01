@@ -1,3 +1,4 @@
+use core_app::workflow::{ColorLabel, CullChange};
 use core_app::{
     error::ErrorSource,
     ports::{CatalogPort, SaveReceipt},
@@ -134,6 +135,19 @@ impl CatalogPort for CatalogAdapter {
     }
     fn edit(&self, image_id: i64) -> Result<Option<(String, i64)>, AppError> {
         self.read(|db| core_library::get_edit_with_process_version(&db.conn, image_id))
+    }
+    fn set_cull(&self, image_id: i64, change: CullChange) -> Result<(), AppError> {
+        // No sidecar/outbox write: the native host has no metadata-sidecar drain yet (legacy keeps
+        // an in-memory queue), so cull marks are catalog-only here.
+        self.read(|db| match change {
+            CullChange::Rating(stars) => {
+                core_library::set_rating(&db.conn, image_id, i64::from(stars))
+            }
+            CullChange::Flag(flag) => core_library::set_flag(&db.conn, image_id, flag.as_str()),
+            CullChange::Label(label) => {
+                core_library::set_label(&db.conn, image_id, label.map(ColorLabel::as_str))
+            }
+        })
     }
     fn save_edit(
         &self,

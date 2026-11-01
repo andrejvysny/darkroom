@@ -166,7 +166,10 @@ impl AsyncCatalogWorkflow {
         };
         let durable = matches!(
             effect.operation,
-            Operation::OpenCatalog(_) | Operation::CloseCatalog | Operation::SaveEdit { .. }
+            Operation::OpenCatalog(_)
+                | Operation::CloseCatalog
+                | Operation::SaveEdit { .. }
+                | Operation::SetCull { .. }
         );
         let spec = JobSpec {
             owner: JobOwner {

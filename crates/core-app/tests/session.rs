@@ -535,3 +535,95 @@ fn closing_the_catalog_closes_the_document() {
     let (_image, _load) = load_edit_effects(&mut s, 1);
     assert_eq!(s.snapshot().editor.editor_session.0, 2);
 }
+
+#[test]
+fn set_cull_runs_one_effect_and_patches_rows_on_completion() {
+    use core_app::workflow::{ColorLabel, CullChange, CullFlag};
+    let mut s = session();
+    let effects = open(&mut s);
+    let query = effects
+        .iter()
+        .find(|e| matches!(e.operation, Operation::QueryLibrary(_)))
+        .unwrap();
+    let row = |id: i64| ImageRow {
+        id,
+        content_hash: "00".repeat(32),
+        filename: format!("{id}.cr3"),
+        ..Default::default()
+    };
+    finish(
+        &mut s,
+        query,
+        Ok(Outcome::Library {
+            rows: vec![row(1), row(2)],
+            count: 2,
+        }),
+    )
+    .unwrap();
+    let (image, _load) = select(&mut s, 1);
+    finish(&mut s, &image, Ok(Outcome::Image(Some(Box::new(row(1)))))).unwrap();
+
+    for change in [
+        CullChange::Rating(4),
+        CullChange::Flag(CullFlag::Pick),
+        CullChange::Label(Some(ColorLabel::Blue)),
+    ] {
+        let mut effects = s
+            .dispatch(Command::SetCull {
+                image: ImageId(1),
+                change,
+            })
+            .unwrap();
+        assert_eq!(effects.len(), 1);
+        let effect = effects.remove(0);
+        assert_eq!(
+            effect.operation,
+            Operation::SetCull {
+                image_id: ImageId(1),
+                change
+            }
+        );
+        finish(
+            &mut s,
+            &effect,
+            Ok(Outcome::CullApplied {
+                image_id: ImageId(1),
+                change,
+            }),
+        )
+        .unwrap();
+    }
+    let snap = s.snapshot();
+    let patched = &snap.library.rows[0];
+    assert_eq!(patched.stars, 4);
+    assert_eq!(patched.flag, "pick");
+    assert_eq!(patched.color_label.as_deref(), Some("blue"));
+    assert_eq!(snap.editor.image.as_ref().unwrap().stars, 4);
+    assert_eq!(snap.library.rows[1].stars, 0, "other rows untouched");
+
+    // Failure lands in the application error and leaves rows alone.
+    let effect = s
+        .dispatch(Command::SetCull {
+            image: ImageId(2),
+            change: CullChange::Rating(1),
+        })
+        .unwrap()
+        .remove(0);
+    finish(&mut s, &effect, Err(AppError::Catalog("disk full".into()))).unwrap();
+    assert!(s.snapshot().error.is_some());
+    assert_eq!(s.snapshot().library.rows[1].stars, 0);
+}
+
+#[test]
+fn set_cull_rating_above_five_is_refused() {
+    use core_app::workflow::CullChange;
+    let mut s = session();
+    open(&mut s);
+    assert!(matches!(
+        s.dispatch(Command::SetCull {
+            image: ImageId(1),
+            change: CullChange::Rating(6),
+        }),
+        Err(AppError::InvalidCommand(_))
+    ));
+}

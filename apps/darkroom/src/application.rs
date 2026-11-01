@@ -374,7 +374,8 @@ pub fn photo_probe(
                     Err(ProbeError::Render { error: message })
                 }
                 photo_worker::PhotoResult::WorkerDied(error) => Err(ProbeError::Render { error }),
-                photo_worker::PhotoResult::Abandoned(_) => continue,
+                photo_worker::PhotoResult::Abandoned(_)
+                | photo_worker::PhotoResult::Histogram { .. } => continue,
             });
             if outcome.is_some() {
                 break;

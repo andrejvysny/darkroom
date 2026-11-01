@@ -24,6 +24,72 @@ pub enum EditIntent {
     Redo,
     /// Discrete exposure edit (EV stops); coalesces with neighbouring discrete edits.
     SetExposure(f32),
+    /// Discrete full-params edit (any control); same path and coalescing as `SetExposure`.
+    Apply(Box<DevelopParams>),
+}
+
+/// Pick/reject flag as stored in `ratings_flags.flag`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CullFlag {
+    Pick,
+    Reject,
+    None,
+}
+impl CullFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pick => "pick",
+            Self::Reject => "reject",
+            Self::None => "none",
+        }
+    }
+    /// Unknown stored strings read as `None`, matching the catalog's own normalisation.
+    pub fn from_row(value: &str) -> Self {
+        match value {
+            "pick" => Self::Pick,
+            "reject" => Self::Reject,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ColorLabel {
+    Red,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+}
+impl ColorLabel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Red => "red",
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+        }
+    }
+    pub fn from_row(value: &str) -> Option<Self> {
+        match value {
+            "red" => Some(Self::Red),
+            "yellow" => Some(Self::Yellow),
+            "green" => Some(Self::Green),
+            "blue" => Some(Self::Blue),
+            "purple" => Some(Self::Purple),
+            _ => None,
+        }
+    }
+}
+
+/// One culling mark change for one image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CullChange {
+    /// Stars 0..=5; anything larger is refused at dispatch.
+    Rating(u8),
+    Flag(CullFlag),
+    Label(Option<ColorLabel>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +105,11 @@ pub enum Command {
     Edit(EditIntent),
     /// Explicit user decision: drop the image's unsaved edits (never one that is saving).
     DiscardUnsavedEdits(ImageId),
+    /// Rate / flag / label one image; runs on the ordered catalog lane.
+    SetCull {
+        image: ImageId,
+        change: CullChange,
+    },
 }
 impl Command {
     pub fn action(&self) -> ActionId {
@@ -52,10 +123,11 @@ impl Command {
             Self::LoadDates => ActionId::LoadDates,
             Self::RequestShutdown => ActionId::RequestShutdown,
             Self::DiscardUnsavedEdits(_) => ActionId::DiscardUnsavedEdits,
+            Self::SetCull { .. } => ActionId::SetCull,
             Self::Edit(intent) => match intent {
                 EditIntent::Undo => ActionId::Undo,
                 EditIntent::Redo => ActionId::Redo,
-                _ => ActionId::Exposure,
+                _ => ActionId::Edit,
             },
         }
     }
@@ -93,13 +165,18 @@ pub enum Operation {
     },
     /// Commit `params` for `key` on the ordered catalog lane. The executor verifies the source's
     /// content hash and commits the edit plus the sidecar intent in one transaction. The seq is
-    /// echoed back so the completion is acknowledged exactly. Shares the `Exposure` action: it is
+    /// echoed back so the completion is acknowledged exactly. Shares the `Edit` action: it is
     /// a consequence of editing, not a user-facing command.
     SaveEdit {
         key: SaveKey,
         seq: SaveSeq,
         params: Arc<DevelopParams>,
         process_version: ProcessVersion,
+    },
+    /// Persist one culling mark change on the ordered catalog lane.
+    SetCull {
+        image_id: ImageId,
+        change: CullChange,
     },
 }
 impl Operation {
@@ -111,7 +188,8 @@ impl Operation {
             Self::LoadFolders => ActionId::LoadFolders,
             Self::LoadDates => ActionId::LoadDates,
             Self::SelectImage { .. } | Self::LoadEdit { .. } => ActionId::SelectImage,
-            Self::SaveEdit { .. } => ActionId::Exposure,
+            Self::SaveEdit { .. } => ActionId::Edit,
+            Self::SetCull { .. } => ActionId::SetCull,
         }
     }
 }
@@ -144,5 +222,10 @@ pub enum Outcome {
     Saved {
         catalog_revision: CatalogRevision,
         mirror: MirrorStatus,
+    },
+    /// A `SetCull` committed; the session patches the matching snapshot rows.
+    CullApplied {
+        image_id: ImageId,
+        change: CullChange,
     },
 }

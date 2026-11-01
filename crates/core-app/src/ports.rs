@@ -27,6 +27,8 @@ pub trait CatalogPort: Send + Sync {
         process_version: i64,
         params_json: &str,
     ) -> Result<SaveReceipt, AppError>;
+    /// Persist one rating / flag / colour-label change for `image_id`.
+    fn set_cull(&self, image_id: i64, change: crate::workflow::CullChange) -> Result<(), AppError>;
 }
 
 /// What the catalog committed for one `save_edit`.

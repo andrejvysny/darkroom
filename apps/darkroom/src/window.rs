@@ -1,9 +1,11 @@
 use crate::{
+    chrome,
     gpu::Gpu,
     paint,
     photo_view::{EguiRegistry, PhotoView},
     photo_worker::{PhotoWorker, WorkerStatus},
     surface_state::{AcquireEvent, Action, Schedule, SurfaceFailure, SurfaceState},
+    thumbs::ThumbStore,
 };
 use core_model::identity::DeviceEpoch;
 use std::sync::Arc;
@@ -73,7 +75,10 @@ struct State {
     /// Presented frame, its egui registration and the failure state (see `photo_view.rs`).
     photo_view: PhotoView,
     /// Transient develop input state (drag in flight, dismissed banner).
-    develop_ui: ui_egui::DevelopUi,
+    ui_state: ui_egui::UiState,
+    /// Asynchronous thumbnail service; `None` without a catalog or when it could not start (the
+    /// grid then shows placeholders).
+    thumbs: Option<ThumbStore>,
 }
 
 fn sdr_config(
@@ -110,13 +115,7 @@ impl State {
     ) -> Result<Self, String> {
         let window = Arc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes().with_title(if catalog_path.is_some() {
-                        "Darkroom — Catalog"
-                    } else {
-                        "Darkroom — Native stack qualification"
-                    }),
-                )
+                .create_window(chrome::window_attributes())
                 .map_err(|e| e.to_string())?,
         );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -131,12 +130,32 @@ impl State {
             surface.configure(&gpu.context.device, &config);
         }
         let (egui, input) = egui_input(event_loop, &window, &gpu.context, proxy.clone());
+        chrome::install_fonts(&egui);
         let renderer =
             egui_wgpu::Renderer::new(&gpu.context.device, config.format, Default::default());
         // Settings load before the catalog: preferences are the host's, not the catalog's, and a
         // failure there must never stop the window from opening.
         let settings = crate::settings::SettingsState::load(catalog_path.as_deref());
         let wake_workflow = proxy.clone();
+        // Thumbnails live next to the catalog (`<dir>/catalog.db`, `<dir>/thumbs/`).
+        let thumbs = catalog_path.as_deref().and_then(|path| {
+            let wake_thumbs = proxy.clone();
+            let root = path.parent()?.join("thumbs");
+            match ThumbStore::new(
+                egui.clone(),
+                root,
+                core_model::identity::CURRENT_PROCESS_VERSION.0,
+                Arc::new(move || {
+                    let _ = wake_thumbs.send_event(Some(Instant::now()));
+                }),
+            ) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    eprintln!("thumbnails unavailable: {error}");
+                    None
+                }
+            }
+        });
         let application = catalog_path
             .map(|path| {
                 crate::application::NativeApplication::new(
@@ -183,7 +202,11 @@ impl State {
             shutdown_requested: false,
             photo,
             photo_view,
-            develop_ui: ui_egui::DevelopUi::default(),
+            ui_state: ui_egui::UiState {
+                chrome_inset_left: chrome::chrome_inset_left(),
+                ..ui_egui::UiState::default()
+            },
+            thumbs,
         })
     }
 
@@ -206,7 +229,9 @@ impl State {
     }
 
     fn shutdown_photo(&mut self) -> Result<(), String> {
-        self.photo.as_mut().map_or(Ok(()), PhotoWorker::shutdown)
+        let thumbs = self.thumbs.as_mut().map_or(Ok(()), ThumbStore::shutdown);
+        let photo = self.photo.as_mut().map_or(Ok(()), PhotoWorker::shutdown);
+        photo.and(thumbs)
     }
 
     fn recover_surface(&mut self) -> Result<(), String> {
@@ -326,6 +351,15 @@ impl State {
                 },
             );
             let mut photo_ui = self.photo_view.ui_state(&snapshot);
+            let histogram = self.photo_view.histogram(&snapshot);
+            let mut no_thumbs = ui_egui::NoThumbs;
+            let thumbs: &mut dyn ui_egui::ThumbSource = match self.thumbs.as_mut() {
+                Some(store) => {
+                    store.begin_frame(snapshot.catalog_epoch.0);
+                    store
+                }
+                None => &mut no_thumbs,
+            };
             let mut commands = Vec::new();
             let mut command_error = self.last_command_error.take();
             // Taken out and put back, like `command_error`: the closure needs `&mut` while
@@ -334,15 +368,22 @@ impl State {
             let output = self.egui.run_ui(input, |root| {
                 commands = ui_egui::root(
                     root,
-                    &snapshot,
-                    &reopen,
-                    &mut command_error,
-                    &mut photo_ui,
-                    &mut settings_notices,
-                    &mut self.develop_ui,
+                    ui_egui::Frame {
+                        snapshot: &snapshot,
+                        reopen: &reopen,
+                        command_error: &mut command_error,
+                        photo: &mut photo_ui,
+                        settings_notices: &mut settings_notices,
+                        thumbs: &mut *thumbs,
+                        histogram,
+                    },
+                    &mut self.ui_state,
                 );
             });
             self.settings.notices = settings_notices;
+            if let Some(store) = self.thumbs.as_mut() {
+                store.end_frame();
+            }
             let submitted = self.photo_view.submit(photo_ui.plan.take(), photo_ui.retry);
             if let (Some(request), Some(worker)) = (submitted, self.photo.as_ref()) {
                 worker.request(request);

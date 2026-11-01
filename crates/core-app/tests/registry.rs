@@ -14,7 +14,7 @@ fn descriptors_have_unique_ids_routes_and_shortcuts() {
         }
         assert_eq!(action(descriptor.route), descriptor);
     }
-    assert_eq!(ACTIONS.len(), 12);
+    assert_eq!(ACTIONS.len(), 13);
 }
 
 #[test]

@@ -515,3 +515,53 @@ fn retry_resubmits_once_and_only_on_request() {
     let (ui, request) = frame(&mut view, &mut reg, a, &ready(a), vec![], false);
     assert!(ui.failure.is_none() && request.is_none());
 }
+
+fn histogram_for(sel: Sel) -> PhotoResult {
+    PhotoResult::Histogram {
+        key: key(sel, 1),
+        r: vec![1; 256],
+        g: vec![2; 256],
+        b: vec![3; 256],
+    }
+}
+
+#[test]
+fn histogram_of_old_subject_is_never_exposed() {
+    let (a, b) = (sel(1, 1), sel(2, 2));
+    let mut view = PhotoView::new(DeviceEpoch(1));
+    let mut reg = FakeRegistry::default();
+    frame(&mut view, &mut reg, a, &ready(a), vec![], false);
+    frame(
+        &mut view,
+        &mut reg,
+        a,
+        &ready(a),
+        vec![histogram_for(a)],
+        false,
+    );
+    assert_eq!(view.histogram(&ready(a)).map(|h| h.image), Some(ImageId(1)));
+    // Selection moves on: the old distribution is dropped, and a late one is not stored.
+    frame(&mut view, &mut reg, b, &ready(b), vec![], false);
+    assert!(view.histogram(&ready(b)).is_none());
+    frame(
+        &mut view,
+        &mut reg,
+        b,
+        &ready(b),
+        vec![histogram_for(a)],
+        false,
+    );
+    assert!(view.histogram(&ready(b)).is_none());
+    // The new subject's own histogram is exposed, and never under another snapshot.
+    frame(
+        &mut view,
+        &mut reg,
+        b,
+        &ready(b),
+        vec![histogram_for(b)],
+        false,
+    );
+    assert_eq!(view.histogram(&ready(b)).map(|h| h.image), Some(ImageId(2)));
+    assert!(view.histogram(&ready(a)).is_none());
+    assert!(view.histogram(&closed()).is_none());
+}

@@ -1,5 +1,6 @@
 //! The application state owner. Split by concern: `edit` (editor commands, autosave bridge and the
 //! close/shutdown flush barrier), `view` (snapshot projections), `tests` (unit tests).
+mod cull;
 mod edit;
 #[cfg(test)]
 mod tests;
@@ -293,6 +294,7 @@ impl ApplicationSession {
             Command::RequestShutdown => return self.begin_replace(BarrierKind::Shutdown),
             Command::Edit(intent) => return self.edit(intent),
             Command::DiscardUnsavedEdits(image) => return self.discard_unsaved(image),
+            Command::SetCull { image, change } => return self.set_cull(image, change),
             Command::QueryLibrary(query) => {
                 let library = &mut Arc::make_mut(&mut self.snapshot).library;
                 library.query = *query.clone();
@@ -458,6 +460,10 @@ impl ApplicationSession {
             Outcome::Closed | Outcome::Edit(_) | Outcome::Saved { .. } | Outcome::Image(_) => {
                 Vec::new()
             }
+            Outcome::CullApplied { image_id, change } => {
+                self.cull_applied(image_id, change);
+                Vec::new()
+            }
             Outcome::Library { rows, count } => {
                 let library = &mut Arc::make_mut(&mut self.snapshot).library;
                 library.rows = Arc::new(rows);
@@ -486,5 +492,6 @@ fn matches_outcome(operation: &Operation, outcome: &Outcome) -> bool {
             | (Operation::SelectImage { .. }, Outcome::Image(_))
             | (Operation::LoadEdit { .. }, Outcome::Edit(_))
             | (Operation::SaveEdit { .. }, Outcome::Saved { .. })
+            | (Operation::SetCull { .. }, Outcome::CullApplied { .. })
     )
 }

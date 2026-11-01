@@ -432,3 +432,36 @@ fn a_corrupt_stored_edit_refuses_editing_and_writes_nothing() {
     assert_eq!(rig.stored(6), before);
     assert!(!rig.snap().editor.document.dirty);
 }
+
+#[test]
+fn set_cull_persists_through_the_adapter_and_patches_the_snapshot() {
+    use core_app::workflow::{ColorLabel, CullChange, CullFlag};
+    let mut rig = rig();
+    let id = rig.snap().library.rows[0].id;
+    for change in [
+        CullChange::Rating(5),
+        CullChange::Flag(CullFlag::Reject),
+        CullChange::Label(Some(ColorLabel::Green)),
+    ] {
+        rig.wf
+            .dispatch(Command::SetCull {
+                image: ImageId(id),
+                change,
+            })
+            .unwrap();
+    }
+    rig.wf.wait_idle().unwrap();
+    let conn = Connection::open(&rig.catalog).unwrap();
+    let stored: (i64, String, Option<String>) = conn
+        .query_row(
+            "SELECT stars, flag, color_label FROM ratings_flags WHERE image_id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (5, "reject".into(), Some("green".into())));
+    let snap = rig.snap();
+    let row = snap.library.rows.iter().find(|r| r.id == id).unwrap();
+    assert_eq!((row.stars, row.flag.as_str()), (5, "reject"));
+    assert_eq!(row.color_label.as_deref(), Some("green"));
+}

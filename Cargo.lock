@@ -1263,6 +1263,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "image",
  "pollster",
  "render-wgpu",
  "serde_json",

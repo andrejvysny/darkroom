@@ -15,7 +15,7 @@ use core_model::identity::{
     CatalogEpoch, DeviceEpoch, EditorSession, FrameHandle, FrameKey, ImageId, SelectionGeneration,
 };
 use render_wgpu::{FrameLease, Offer, Presenter};
-use ui_egui::{PhotoRequestPlan, PhotoUi};
+use ui_egui::{HistogramData, PhotoRequestPlan, PhotoUi};
 
 #[cfg(test)]
 mod tests;
@@ -112,6 +112,8 @@ pub struct PhotoView {
     pending_free: Vec<egui::TextureId>,
     pending_leases: Vec<FrameLease>,
     device_epoch: DeviceEpoch,
+    /// Newest histogram of the wanted subject; dropped whenever the subject is retired.
+    histogram: Option<HistogramData>,
 }
 
 impl PhotoView {
@@ -146,6 +148,19 @@ impl PhotoView {
         for result in results {
             match result {
                 PhotoResult::Frame(lease) => self.accept_frame(lease, reg),
+                PhotoResult::Histogram { key, r, g, b } => {
+                    // Only a histogram of the subject still wanted is kept (the newest wins).
+                    if self.wanted.as_ref().map(PhotoSubject::of_key)
+                        == Some(PhotoSubject::of_key(&key))
+                    {
+                        self.histogram = Some(HistogramData {
+                            image: key.identity.source.image_id,
+                            r,
+                            g,
+                            b,
+                        });
+                    }
+                }
                 // Worker death is handled by the host (`WorkerStatus`).
                 PhotoResult::WorkerDied(_) => {}
                 // Normally superseded (wanted already moved on). If it is still wanted, forget
@@ -228,6 +243,14 @@ impl PhotoView {
         }
     }
 
+    /// Histogram of the presented subject, or `None` (never another photo's distribution).
+    pub fn histogram(&self, snapshot: &ApplicationSnapshot) -> Option<&HistogramData> {
+        let subject = PhotoSubject::of_snapshot(snapshot)?;
+        let histogram = self.histogram.as_ref()?;
+        let wanted = self.wanted.as_ref().map(PhotoSubject::of_key)?;
+        (wanted == subject && histogram.image == subject.image_id).then_some(histogram)
+    }
+
     /// After `run_ui`: turn the UI's plan/retry into a worker request (or nothing). A failed key
     /// is never resubmitted automatically; only an explicit retry does.
     pub fn submit(&mut self, plan: Option<PhotoRequestPlan>, retry: bool) -> Option<PhotoRequest> {
@@ -275,6 +298,7 @@ impl PhotoView {
         self.presenter.retire_all();
         self.wanted = None;
         self.failure = None;
+        self.histogram = None;
         self.sync_registration();
         self.collect();
     }

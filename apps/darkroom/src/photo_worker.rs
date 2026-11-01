@@ -49,6 +49,14 @@ pub enum PhotoResult {
     Failed { key: FrameKey, message: String },
     /// The request was superseded (or shutdown began) at a stage boundary; the host ignores it.
     Abandoned(FrameKey),
+    /// 256-bin histogram of the same prepared image + params as the `Frame` with this `key`
+    /// (whole crop, small fixed render). Sent right after that frame; never sent on failure.
+    Histogram {
+        key: FrameKey,
+        r: Vec<u32>,
+        g: Vec<u32>,
+        b: Vec<u32>,
+    },
     /// Terminal: the worker thread panicked. No further results will arrive.
     WorkerDied(String),
 }
@@ -133,6 +141,8 @@ pub(crate) struct PreparedCache<V = PreparedImage> {
     over_budget: bool,
     last_decode_cpu_bytes: u64,
     peak_decode_cpu_bytes: u64,
+    /// Results the runner wants delivered right after the one it returns (a frame's histogram).
+    follow_ups: Vec<PhotoResult>,
 }
 
 impl<V> PreparedCache<V> {
@@ -149,6 +159,7 @@ impl<V> PreparedCache<V> {
             over_budget: false,
             last_decode_cpu_bytes: 0,
             peak_decode_cpu_bytes: 0,
+            follow_ups: Vec::new(),
         }
     }
 
@@ -416,7 +427,7 @@ impl Drop for PhotoWorker {
     }
 }
 
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_string())
@@ -463,6 +474,11 @@ fn worker_loop(
                 let silent = matches!(result, PhotoResult::Abandoned(_));
                 if tx.send(result).is_err() {
                     return; // host gone; stop rather than develop into a dead channel
+                }
+                for follow_up in cache.follow_ups.drain(..) {
+                    if tx.send(follow_up).is_err() {
+                        return;
+                    }
                 }
                 // The frame or its message only becomes visible on a redraw; wake the loop.
                 if !silent {
@@ -562,6 +578,47 @@ fn prepare_image(
     Ok(Some(prepared))
 }
 
+/// Edge of the square render the histogram is counted over (legacy used 384; 256 is plenty for
+/// 256 bins and keeps the extra readback tiny).
+const HIST_RENDER_EDGE: u32 = 256;
+
+/// Whole-crop histogram of the frame just rendered. Failure is silent: the histogram is a
+/// readout, never a reason to fail the frame.
+fn histogram_result(
+    ctx: &GpuContext,
+    pipeline: &DevelopPipeline,
+    key: FrameKey,
+    prepared: &PreparedImage,
+    params: &DevelopParams,
+) -> Option<PhotoResult> {
+    let view = ViewParams {
+        origin: [0.0, 0.0],
+        size: [1.0, 1.0],
+        out_w: HIST_RENDER_EDGE,
+        out_h: HIST_RENDER_EDGE,
+        active: true,
+        overlay_layer: -1,
+        overlay_color: [0.0, 0.0, 0.0],
+        overlay_strength: 0.0,
+        crop_preview: false,
+    };
+    match pipeline.render_view(ctx, prepared, params, &view) {
+        Ok(rgba) => {
+            let h = core_pipeline::histogram(&rgba);
+            Some(PhotoResult::Histogram {
+                key,
+                r: h.r,
+                g: h.g,
+                b: h.b,
+            })
+        }
+        Err(error) => {
+            eprintln!("histogram render failed: {error}");
+            None
+        }
+    }
+}
+
 /// Decode (or reuse the cached upload) + develop into a leased target. Worker thread only.
 fn develop(
     ctx: &GpuContext,
@@ -596,7 +653,14 @@ fn develop(
         renderer.render(key, &prepared, &params, &request.view)
     });
     match rendered {
-        Ok(lease) => Some(PhotoResult::Frame(lease)),
+        Ok(lease) => {
+            if !abandon() {
+                cache
+                    .follow_ups
+                    .extend(histogram_result(ctx, pipeline, key, &prepared, &params));
+            }
+            Some(PhotoResult::Frame(lease))
+        }
         Err(RenderStop::Abandoned) => Some(PhotoResult::Abandoned(key)),
         Err(RenderStop::Busy) => failed("GPU render targets are busy; try again".into()),
         Err(RenderStop::Failed(message)) => failed(message),

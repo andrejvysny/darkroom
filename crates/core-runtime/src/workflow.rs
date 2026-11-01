@@ -47,6 +47,9 @@ impl EffectExecutor for InlineExecutor {
                     catalog_revision: receipt.catalog_revision,
                     mirror: receipt.mirror,
                 }),
+            Operation::SetCull { image_id, change } => catalog
+                .set_cull(image_id.0, change)
+                .map(|()| Outcome::CullApplied { image_id, change }),
         };
         Completion {
             token: effect.token,

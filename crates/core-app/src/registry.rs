@@ -12,9 +12,10 @@ pub enum ActionId {
     RequestShutdown,
     Undo,
     Redo,
-    /// Exposure edits (discrete and gesture); other develop controls will share the requirement.
-    Exposure,
+    /// Develop edits (discrete and gesture) and their saves.
+    Edit,
     DiscardUnsavedEdits,
+    SetCull,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,11 +146,11 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         enabled: EnabledRequirement::CanRedo,
     },
     ActionDescriptor {
-        id: "exposure",
-        label: "Exposure",
+        id: "edit",
+        label: "Edit",
         shortcut: None,
         menu: None,
-        route: ActionId::Exposure,
+        route: ActionId::Edit,
         enabled: EnabledRequirement::Editable,
     },
     ActionDescriptor {
@@ -158,6 +159,14 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         shortcut: None,
         menu: None,
         route: ActionId::DiscardUnsavedEdits,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "set_cull",
+        label: "Rate / flag",
+        shortcut: None,
+        menu: None,
+        route: ActionId::SetCull,
         enabled: EnabledRequirement::CatalogReady,
     },
 ];

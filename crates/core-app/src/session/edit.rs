@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// Why a close/replace was refused while edits are still unsaved.
 pub(super) const UNSAVED_MESSAGE: &str = "unsaved edits are still pending";
 const TIMEOUT_MESSAGE: &str = "Saving did not finish in time; Darkroom stayed open.";
-const QUITTING: &str = "Darkroom is quitting";
+pub(super) const QUITTING: &str = "Darkroom is quitting";
 
 impl ApplicationSession {
     fn image_label(&self, key: &SaveKey) -> String {
@@ -137,6 +137,14 @@ impl ApplicationSession {
             EditIntent::CancelGesture => EditorCommand::CancelGesture { session },
             EditIntent::Undo => EditorCommand::Undo { session },
             EditIntent::Redo => EditorCommand::Redo { session },
+            EditIntent::Apply(params) => {
+                require_finite(&params)?;
+                EditorCommand::Apply {
+                    session,
+                    params: *params,
+                    at_ms: self.clock.now_millis(),
+                }
+            }
             EditIntent::SetExposure(ev) => {
                 let mut params = (*doc.params).clone();
                 params.exposure = ev;

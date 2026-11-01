@@ -12,7 +12,7 @@ use core_model::identity::{CatalogRevision, EditRevision, ImageId, ProcessVersio
 use core_model::DevelopParams;
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect};
 use std::sync::Arc;
-use ui_egui::{DevelopUi, PhotoUi};
+use ui_egui::{Mode, PhotoUi, UiState};
 
 fn snapshot(can_undo: bool, can_redo: bool) -> ApplicationSnapshot {
     let image = ImageRow {
@@ -49,7 +49,7 @@ fn snapshot(can_undo: bool, can_redo: bool) -> ApplicationSnapshot {
 
 struct Harness {
     ctx: egui::Context,
-    develop: DevelopUi,
+    ui: UiState,
     photo: PhotoUi,
     snapshot: ApplicationSnapshot,
     time: f64,
@@ -59,7 +59,10 @@ impl Harness {
     fn new(snapshot: ApplicationSnapshot) -> Self {
         let mut harness = Self {
             ctx: egui::Context::default(),
-            develop: DevelopUi::default(),
+            ui: UiState {
+                mode: Mode::Develop,
+                ..Default::default()
+            },
             photo: PhotoUi {
                 texture: None,
                 message: None,
@@ -97,12 +100,16 @@ impl Harness {
         let mut output = self.ctx.run_ui(input, |root| {
             commands = ui_egui::root(
                 root,
-                &self.snapshot,
-                &reopen,
-                &mut error,
-                &mut self.photo,
-                &mut notices,
-                &mut self.develop,
+                ui_egui::Frame {
+                    snapshot: &self.snapshot,
+                    reopen: &reopen,
+                    command_error: &mut error,
+                    photo: &mut self.photo,
+                    settings_notices: &mut notices,
+                    thumbs: &mut ui_egui::NoThumbs,
+                    histogram: None,
+                },
+                &mut self.ui,
             );
         });
         output.textures_delta.clear();
@@ -110,7 +117,7 @@ impl Harness {
     }
 
     fn slider(&self) -> Rect {
-        self.develop.exposure_rect.expect("slider laid out")
+        self.ui.develop.exposure_rect.expect("slider laid out")
     }
 }
 
@@ -287,12 +294,16 @@ fn save_failure_banner_offers_discard_and_dismiss() {
             let mut notices = Vec::new();
             ui_egui::root(
                 root,
-                &h.snapshot,
-                &Command::RefreshLibrary,
-                &mut error,
-                &mut h.photo,
-                &mut notices,
-                &mut h.develop,
+                ui_egui::Frame {
+                    snapshot: &h.snapshot,
+                    reopen: &Command::RefreshLibrary,
+                    command_error: &mut error,
+                    photo: &mut h.photo,
+                    settings_notices: &mut notices,
+                    thumbs: &mut ui_egui::NoThumbs,
+                    histogram: None,
+                },
+                &mut h.ui,
             );
         },
     );

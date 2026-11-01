@@ -1,4 +1,5 @@
 mod application;
+mod chrome;
 mod gpu;
 mod native_app;
 mod paint;
@@ -7,6 +8,7 @@ mod photo_worker;
 mod present;
 mod settings;
 mod surface_state;
+mod thumbs;
 mod window;
 
 /// Exit-code table for `--catalog-probe` (the JSON body on stdout carries `kind` + `error`):

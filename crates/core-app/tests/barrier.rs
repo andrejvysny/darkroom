@@ -273,3 +273,47 @@ fn restored_pending_state_uses_the_pending_process_version() {
         "saves as the pending entry's version, not the stored document's 5"
     );
 }
+
+#[test]
+fn apply_intent_changes_params_and_is_undoable() {
+    let (mut s, _) = ready();
+    let mut params = (**s.snapshot().editor.document.params.as_ref().unwrap()).clone();
+    params.contrast = 25.0;
+    s.dispatch(Command::Edit(EditIntent::Apply(Box::new(params))))
+        .unwrap();
+    let doc = s.snapshot().editor.document.clone();
+    assert_eq!(doc.params.as_ref().unwrap().contrast, 25.0);
+    assert!(doc.dirty && doc.can_undo);
+    s.dispatch(Command::Edit(EditIntent::Undo)).unwrap();
+    assert_eq!(
+        s.snapshot()
+            .editor
+            .document
+            .params
+            .as_ref()
+            .unwrap()
+            .contrast,
+        0.0
+    );
+
+    let mut bad = (**s.snapshot().editor.document.params.as_ref().unwrap()).clone();
+    bad.contrast = f32::NAN;
+    assert!(matches!(
+        s.dispatch(Command::Edit(EditIntent::Apply(Box::new(bad)))),
+        Err(AppError::EditRefused(_))
+    ));
+}
+
+#[test]
+fn set_cull_is_refused_while_shutdown_is_pending() {
+    let (mut s, _) = ready();
+    expose(&mut s, 1.0).unwrap();
+    s.dispatch(Command::RequestShutdown).unwrap();
+    assert_eq!(
+        s.dispatch(Command::SetCull {
+            image: ImageId(1),
+            change: core_app::workflow::CullChange::Rating(3),
+        }),
+        Err(AppError::EditRefused("Darkroom is quitting".into()))
+    );
+}

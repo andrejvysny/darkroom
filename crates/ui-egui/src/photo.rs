@@ -107,7 +107,7 @@ pub fn viewport_revision(width: u32, height: u32) -> ViewportRevision {
 /// renderable (no selection, document not `Ready`). Protection (denoise/AI masks, corrupt,
 /// unreadable) is enforced by the host through `PhotoUi::message` + the worker's own check; a
 /// plan is only ever produced for params the worker accepts.
-fn photo_plan(
+pub(crate) fn photo_plan(
     snapshot: &ApplicationSnapshot,
     rect: egui::Rect,
     ppp: f32,
@@ -162,73 +162,6 @@ fn photo_plan(
         params,
         viewport_px: (width, height),
     })
-}
-
-/// The central panel: error label, Retry strip, the presented frame (or its state label) and
-/// the out-param plan for this frame's panel rect.
-pub(crate) fn central_panel(
-    root: &mut egui::Ui,
-    snapshot: &ApplicationSnapshot,
-    photo: &mut PhotoUi,
-) {
-    egui::CentralPanel::default().show(root, |ui| {
-        // Save failures have their own banner with Discard/Dismiss (see `develop`).
-        if let Some(error) = snapshot
-            .error
-            .as_ref()
-            .filter(|error| !crate::develop::is_save_error(error))
-        {
-            ui.label(error.to_string());
-        }
-        // The panel rect in points is only known here; the plan carries it as physical pixels.
-        let rect = ui.available_rect_before_wrap();
-        photo.plan = if photo.message.is_some() {
-            None
-        } else {
-            photo_plan(
-                snapshot,
-                rect,
-                ui.ctx().pixels_per_point(),
-                photo.device_epoch,
-            )
-        };
-        if let Some(failure) = &photo.failure {
-            ui.horizontal(|ui| {
-                ui.label(failure);
-                if ui.button("Retry").clicked() {
-                    photo.retry = true;
-                }
-            });
-        }
-        if let Some(message) = &photo.message {
-            // A protected/unsupported/failed state names itself; never show a stale render
-            // of another state under it.
-            ui.label(message);
-        } else if let Some((texture, size)) = photo.texture {
-            // The frame was developed at the aspect-correct fitted size: draw it at exactly
-            // that size (points = px / pixels_per_point) centered in the panel; the rest of the
-            // panel stays the background color. The rect is never resized here — `ui.put`
-            // stretches the texture to the given rect — so a stale frame from a larger previous
-            // panel merely overflows, hidden by the panel's clip until the refit lands.
-            let ppp = ui.ctx().pixels_per_point().max(f32::EPSILON);
-            let size_points = egui::vec2(size[0].max(1) as f32 / ppp, size[1].max(1) as f32 / ppp);
-            let draw_rect = egui::Rect::from_center_size(rect.center(), size_points);
-            let image =
-                egui::Image::from_texture(egui::load::SizedTexture::new(texture, size_points))
-                    .fit_to_exact_size(size_points);
-            ui.put(draw_rect, image);
-            if photo.loading {
-                ui.spinner();
-            }
-        } else if photo.loading {
-            ui.spinner();
-            ui.label("Loading photo…");
-        } else if snapshot.editor.image.is_none() {
-            ui.label("Select a photo");
-        }
-        // Claim the panel area for this frame's layout regardless of what was drawn in it.
-        ui.allocate_rect(rect, egui::Sense::hover());
-    });
 }
 
 #[cfg(test)]
