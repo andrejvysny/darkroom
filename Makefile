@@ -1,4 +1,8 @@
-.PHONY: init run
+.PHONY: init dev build run
+
+# Catalog opened by dev/run (path to catalog.db). Default = same catalog the Tauri app uses.
+# Override: make dev CATALOG=/path/to/catalog.db
+CATALOG ?= $(HOME)/Library/Application Support/com.andrejvysny.darkroom/catalog.db
 
 # Install deps: libheif (HEIF decode, macOS/Linux), npm packages, pinned Rust toolchain + crates.
 # macOS: stage dylibs into src-tauri/frameworks (tauri-build validates them at compile time).
@@ -15,5 +19,14 @@ init:
 	cargo fetch --locked
 	bash scripts/macos-bundle-dylibs.sh stage
 
+# Dev: native Rust UI app (apps/darkroom, egui/wgpu), debug build, with catalog.
+dev:
+	cargo run -p darkroom-native -- --catalog "$(CATALOG)"
+
+# Release binary -> target/release/darkroom-native
+build:
+	cargo build --release -p darkroom-native
+
+# Run the binary produced by `make build`, with catalog.
 run:
-	npm run tauri dev
+	./target/release/darkroom-native --catalog "$(CATALOG)"
