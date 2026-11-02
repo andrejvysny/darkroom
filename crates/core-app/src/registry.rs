@@ -16,6 +16,12 @@ pub enum ActionId {
     Edit,
     DiscardUnsavedEdits,
     SetCull,
+    LoadKeywords,
+    LoadCollections,
+    LoadImageTags,
+    LoadRejectSummary,
+    /// Durable catalog mutations (batch cull, keywords, collections, pairs, delete rejected).
+    Mutate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +173,46 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         shortcut: None,
         menu: None,
         route: ActionId::SetCull,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "load_keywords",
+        label: "Load Keywords",
+        shortcut: None,
+        menu: None,
+        route: ActionId::LoadKeywords,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "load_collections",
+        label: "Load Collections",
+        shortcut: None,
+        menu: None,
+        route: ActionId::LoadCollections,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "load_image_tags",
+        label: "Load Image Tags",
+        shortcut: None,
+        menu: None,
+        route: ActionId::LoadImageTags,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "load_reject_summary",
+        label: "Rejected Summary",
+        shortcut: None,
+        menu: None,
+        route: ActionId::LoadRejectSummary,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "mutate",
+        label: "Change Catalog",
+        shortcut: None,
+        menu: None,
+        route: ActionId::Mutate,
         enabled: EnabledRequirement::CatalogReady,
     },
 ];

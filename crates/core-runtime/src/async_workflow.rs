@@ -90,6 +90,10 @@ impl AsyncCatalogWorkflow {
         self.refresh_jobs()?;
         Ok(cancelled)
     }
+    /// The catalog adapter, for host services that run outside the ordered lane (import).
+    pub fn catalog(&self) -> Arc<CatalogAdapter> {
+        Arc::clone(&self.catalog)
+    }
     pub fn snapshot(&self) -> Arc<core_app::state::ApplicationSnapshot> {
         self.session.snapshot()
     }
@@ -143,6 +147,12 @@ impl AsyncCatalogWorkflow {
             }
             Command::LoadFolders => matches!(effect.operation, Operation::LoadFolders),
             Command::LoadDates => matches!(effect.operation, Operation::LoadDates),
+            Command::LoadKeywords => matches!(effect.operation, Operation::LoadKeywords),
+            Command::LoadCollections => matches!(effect.operation, Operation::LoadCollections),
+            Command::LoadImageTags(_) => matches!(effect.operation, Operation::LoadImageTags(_)),
+            Command::LoadRejectSummary(_) => {
+                matches!(effect.operation, Operation::LoadRejectSummary(_))
+            }
             Command::SelectImage(Some(_)) => {
                 matches!(effect.operation, Operation::SelectImage { .. })
             }
@@ -170,6 +180,7 @@ impl AsyncCatalogWorkflow {
                 | Operation::CloseCatalog
                 | Operation::SaveEdit { .. }
                 | Operation::SetCull { .. }
+                | Operation::Mutate(_)
         );
         let spec = JobSpec {
             owner: JobOwner {

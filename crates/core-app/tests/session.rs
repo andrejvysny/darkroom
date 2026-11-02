@@ -126,7 +126,7 @@ fn reset_failure_and_subscriptions() {
     let first = open(&mut s);
     assert_eq!(
         sub.take_latest().unwrap().snapshot.jobs.active_effect_count,
-        3
+        5
     );
     let close = s.dispatch(Command::CloseCatalog).unwrap().remove(0);
     assert_eq!(

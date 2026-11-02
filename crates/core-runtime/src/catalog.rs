@@ -1,20 +1,25 @@
-use core_app::workflow::{ColorLabel, CullChange};
+use core_app::workflow::{ColorLabel, CullChange, Mutation, MutationReport};
 use core_app::{
     error::ErrorSource,
     ports::{CatalogPort, SaveReceipt},
-    state::MirrorStatus,
+    state::{ImageTags, MirrorStatus},
     AppError,
 };
 use core_db::{rusqlite, Db, DbError};
 use core_library::{LibError, MirrorState};
-use core_model::catalog::{DateTreeYear, FolderRow, ImageRow, QueryParams};
-use core_model::identity::CatalogRevision;
+use core_model::catalog::{
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, QueryParams, RejectSummary,
+};
+use core_model::identity::{CatalogRevision, ImageId};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
 
-type SharedDb = Arc<Mutex<Db>>;
+pub type SharedDb = Arc<Mutex<Db>>;
+
+/// Moves one file to the OS Trash; `true` when the file is gone.
+pub type TrashRemover = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
 #[derive(Default)]
 struct Slot {
@@ -25,6 +30,8 @@ struct Slot {
 #[derive(Default)]
 pub struct CatalogAdapter {
     slot: Mutex<Slot>,
+    /// Test seam: replaces the OS Trash for `Mutation::DeleteRejected`.
+    trash: Option<TrashRemover>,
 }
 
 /// Open the catalog for any host — the legacy one that shares the connection, and `CatalogPort::open`
@@ -50,7 +57,36 @@ impl CatalogAdapter {
                 generation: 0,
                 database: Some(database),
             }),
+            trash: None,
         }
+    }
+
+    /// Route delete-rejected file removal through `remove` instead of the OS Trash.
+    pub fn with_trash(mut self, remove: TrashRemover) -> Self {
+        self.trash = Some(remove);
+        self
+    }
+
+    /// The open connection and its generation, for long-running services (import) that lock it
+    /// in short chunks themselves. Hold the `Arc` only for the run; check
+    /// [`Self::is_current`] between chunks and stop when the catalog was closed or replaced.
+    pub fn shared(&self) -> Result<(u64, SharedDb), AppError> {
+        let slot = self
+            .slot
+            .lock()
+            .map_err(|e| AppError::Catalog(e.to_string().into()))?;
+        Ok((
+            slot.generation,
+            slot.database.clone().ok_or(AppError::NotOpen)?,
+        ))
+    }
+
+    /// Whether `generation` (from [`Self::shared`]) still names the open catalog.
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.slot
+            .lock()
+            .map(|slot| slot.generation == generation && slot.database.is_some())
+            .unwrap_or(false)
     }
 
     fn reserve(&self) -> Result<u64, AppError> {
@@ -83,6 +119,11 @@ impl CatalogAdapter {
     }
 
     fn read<T>(&self, query: impl FnOnce(&Db) -> Result<T, LibError>) -> Result<T, AppError> {
+        self.write(|db| query(db))
+    }
+
+    /// Like [`Self::read`] with exclusive access to the connection (batch transactions).
+    fn write<T>(&self, query: impl FnOnce(&mut Db) -> Result<T, LibError>) -> Result<T, AppError> {
         let (generation, database) = {
             let slot = self
                 .slot
@@ -94,10 +135,10 @@ impl CatalogAdapter {
             )
         };
         let result = {
-            let db = database
+            let mut db = database
                 .lock()
                 .map_err(|e| AppError::Catalog(e.to_string().into()))?;
-            query(&db).map_err(library_error)
+            query(&mut db).map_err(library_error)
         };
         let slot = self
             .slot
@@ -149,6 +190,40 @@ impl CatalogPort for CatalogAdapter {
             }
         })
     }
+    fn keywords(&self) -> Result<Vec<KeywordRow>, AppError> {
+        self.read(|db| core_library::list_keywords(&db.conn))
+    }
+    fn collections(&self) -> Result<Vec<CollectionRow>, AppError> {
+        self.read(|db| core_library::list_collections(&db.conn))
+    }
+    fn image_tags(&self, image_id: i64) -> Result<ImageTags, AppError> {
+        self.read(|db| {
+            Ok(ImageTags {
+                image: ImageId(image_id),
+                keywords: core_library::keywords_for_image(&db.conn, image_id)?,
+                collections: core_library::collections_for_image(&db.conn, image_id)?,
+                pair: core_library::pair_info(&db.conn, image_id)?,
+            })
+        })
+    }
+    fn reject_summary(&self, params: &QueryParams) -> Result<RejectSummary, AppError> {
+        self.read(|db| core_library::summarize_rejected(&db.conn, params))
+    }
+    fn mutate(&self, mutation: &Mutation) -> Result<MutationReport, AppError> {
+        match mutation {
+            Mutation::DeleteRejected(params) => self.delete_rejected(params),
+            Mutation::CreateCollection {
+                name,
+                smart,
+                images,
+            } => self
+                .write(|db| create_collection(db, name, smart.as_deref(), images))
+                .map(MutationReport::CollectionCreated),
+            other => self
+                .write(|db| apply(db, other))
+                .map(|()| MutationReport::Done),
+        }
+    }
     fn save_edit(
         &self,
         image_id: i64,
@@ -191,6 +266,116 @@ impl CatalogPort for CatalogAdapter {
                 mirror,
             }))
         })?
+    }
+}
+
+impl CatalogAdapter {
+    /// Plan under the lock, trash with NO lock held, then finalize under the lock — unless the
+    /// catalog was closed or replaced meanwhile, in which case the new catalog is left untouched
+    /// (files already in the Trash stay recoverable). Thumbnail GC is not done here.
+    fn delete_rejected(&self, params: &QueryParams) -> Result<MutationReport, AppError> {
+        let (generation, database) = self.shared()?;
+        let plan = {
+            let db = database
+                .lock()
+                .map_err(|e| AppError::Catalog(e.to_string().into()))?;
+            core_library::plan_delete_rejected(&db.conn, params).map_err(library_error)?
+        };
+        let (gone, failed) = match &self.trash {
+            Some(remove) => core_library::trash::trash_files(&plan.targets, remove.as_ref()),
+            None => {
+                let ctx = core_library::trash::make_trash_ctx();
+                core_library::trash::trash_files(&plan.targets, &move |p| ctx.delete(p).is_ok())
+            }
+        };
+        if !self.is_current(generation) {
+            return Err(AppError::Stale);
+        }
+        let result = {
+            let db = database
+                .lock()
+                .map_err(|e| AppError::Catalog(e.to_string().into()))?;
+            core_library::finalize_delete_rejected(&db.conn, &plan, &gone, failed)
+                .map_err(library_error)?
+        };
+        Ok(MutationReport::RejectedDeleted(result))
+    }
+}
+
+fn ids(images: &[ImageId]) -> Vec<i64> {
+    images.iter().map(|id| id.0).collect()
+}
+
+fn create_collection(
+    db: &mut Db,
+    name: &str,
+    smart: Option<&QueryParams>,
+    images: &[ImageId],
+) -> Result<i64, LibError> {
+    let tx = db.conn.transaction()?;
+    let id = match smart {
+        Some(query) => {
+            let json = serde_json::to_string(query).map_err(|e| LibError::Other(e.to_string()))?;
+            core_library::create_collection(&tx, name, true, Some(&json))?
+        }
+        None => {
+            let id = core_library::create_collection(&tx, name, false, None)?;
+            core_library::add_images_to_collection(&tx, id, &ids(images))?;
+            id
+        }
+    };
+    tx.commit()?;
+    Ok(id)
+}
+
+fn apply(db: &mut Db, mutation: &Mutation) -> Result<(), LibError> {
+    match mutation {
+        // Catalog-only, like the single `set_cull`: the native host drains no sidecars yet.
+        Mutation::Cull { images, change } => {
+            let images = ids(images);
+            match change {
+                CullChange::Rating(stars) => {
+                    core_library::set_rating_many(&mut db.conn, &images, i64::from(*stars))
+                }
+                CullChange::Flag(flag) => {
+                    core_library::set_flag_many(&mut db.conn, &images, flag.as_str())
+                }
+                CullChange::Label(label) => core_library::set_label_many(
+                    &mut db.conn,
+                    &images,
+                    label.map(ColorLabel::as_str),
+                ),
+            }
+        }
+        Mutation::AddKeyword { images, name } => {
+            let tx = db.conn.transaction()?;
+            core_library::add_keyword_to_images(&tx, &ids(images), name.trim())?;
+            tx.commit()?;
+            Ok(())
+        }
+        Mutation::RemoveKeyword { images, keyword_id } => {
+            let tx = db.conn.transaction()?;
+            for image in images {
+                core_library::remove_keyword_from_image(&tx, image.0, *keyword_id)?;
+            }
+            tx.commit()?;
+            Ok(())
+        }
+        Mutation::DeleteKeyword(id) => core_library::delete_keyword(&db.conn, *id),
+        Mutation::RenameCollection { id, name } => {
+            core_library::rename_collection(&db.conn, *id, name)
+        }
+        Mutation::DeleteCollection(id) => core_library::delete_collection(&db.conn, *id),
+        Mutation::AddToCollection { id, images } => {
+            core_library::add_images_to_collection(&db.conn, *id, &ids(images)).map(|_| ())
+        }
+        Mutation::RemoveFromCollection { id, images } => {
+            core_library::remove_images_from_collection(&db.conn, *id, &ids(images)).map(|_| ())
+        }
+        Mutation::UnlinkPair { secondary } => core_library::unlink_pair(&db.conn, secondary.0),
+        Mutation::CreateCollection { .. } | Mutation::DeleteRejected(_) => Err(LibError::Other(
+            "mutation is handled before the generic path".into(),
+        )),
     }
 }
 

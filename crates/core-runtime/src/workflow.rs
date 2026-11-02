@@ -50,6 +50,15 @@ impl EffectExecutor for InlineExecutor {
             Operation::SetCull { image_id, change } => catalog
                 .set_cull(image_id.0, change)
                 .map(|()| Outcome::CullApplied { image_id, change }),
+            Operation::LoadKeywords => catalog.keywords().map(Outcome::Keywords),
+            Operation::LoadCollections => catalog.collections().map(Outcome::Collections),
+            Operation::LoadImageTags(image) => catalog
+                .image_tags(image.0)
+                .map(|tags| Outcome::ImageTags(Box::new(tags))),
+            Operation::LoadRejectSummary(params) => {
+                catalog.reject_summary(&params).map(Outcome::RejectSummary)
+            }
+            Operation::Mutate(mutation) => catalog.mutate(&mutation).map(Outcome::Mutated),
         };
         Completion {
             token: effect.token,

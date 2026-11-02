@@ -1,5 +1,6 @@
 //! The application state owner. Split by concern: `edit` (editor commands, autosave bridge and the
 //! close/shutdown flush barrier), `view` (snapshot projections), `tests` (unit tests).
+mod catalog_ops;
 mod cull;
 mod edit;
 #[cfg(test)]
@@ -295,6 +296,11 @@ impl ApplicationSession {
             Command::Edit(intent) => return self.edit(intent),
             Command::DiscardUnsavedEdits(image) => return self.discard_unsaved(image),
             Command::SetCull { image, change } => return self.set_cull(image, change),
+            Command::Mutate(mutation) => return self.mutate(mutation),
+            Command::LoadImageTags(image) => return self.load_image_tags(image),
+            Command::LoadRejectSummary(query) => return self.load_reject_summary(query),
+            Command::LoadKeywords => Some(self.replace(Operation::LoadKeywords)),
+            Command::LoadCollections => Some(self.replace(Operation::LoadCollections)),
             Command::QueryLibrary(query) => {
                 let library = &mut Arc::make_mut(&mut self.snapshot).library;
                 library.query = *query.clone();
@@ -394,7 +400,9 @@ impl ApplicationSession {
             result: completion.result.as_ref().map(|_| ()).map_err(Clone::clone),
         };
         // A save completion may issue follow-up saves and the deferred close/open (+1).
-        let requests = u64::from(matches!(completion.result, Ok(Outcome::Opened))) * 3
+        let requests = u64::from(matches!(completion.result, Ok(Outcome::Opened))) * 5
+            + u64::from(matches!(completion.result, Ok(Outcome::Mutated(_))))
+                * catalog_ops::MAX_FOLLOW_UPS
             + if matches!(operation, Operation::SaveEdit { .. }) {
                 self.autosave.len() as u64 + 1
             } else {
@@ -422,6 +430,20 @@ impl ApplicationSession {
                 Vec::new()
             }
             (Operation::SaveEdit { key, seq, .. }, result) => self.save_completed(key, seq, result),
+            (Operation::Mutate(mutation), Ok(Outcome::Mutated(report))) => {
+                self.mutated(mutation, report)
+            }
+            (Operation::LoadImageTags(image), Ok(Outcome::ImageTags(tags))) => {
+                // Mismatched tags never reach the snapshot; the completion still settles.
+                if let Err(error) = self.tags_loaded(image, *tags) {
+                    Arc::make_mut(&mut self.snapshot).error = Some(error);
+                }
+                Vec::new()
+            }
+            (Operation::LoadRejectSummary(query), Ok(Outcome::RejectSummary(summary))) => {
+                self.reject_summary_loaded(*query, summary);
+                Vec::new()
+            }
             // A failed load is a document-level failure, not an application error: the user keeps
             // the library and the selection, and the editor shows why this image has no params.
             (Operation::LoadEdit { editor_session, .. }, Err(error)) => {
@@ -453,11 +475,27 @@ impl ApplicationSession {
                     ))),
                     self.replace(Operation::LoadFolders),
                     self.replace(Operation::LoadDates),
+                    self.replace(Operation::LoadKeywords),
+                    self.replace(Operation::LoadCollections),
                 ]
             }
             // `Closed` needs no follow-up work, and `Edit` never reaches here: its result is
             // consumed in `complete`, where the issuing operation's editor session is known.
-            Outcome::Closed | Outcome::Edit(_) | Outcome::Saved { .. } | Outcome::Image(_) => {
+            // `Edit`, `ImageTags`, `RejectSummary` and `Mutated` are consumed in `complete`, where
+            // the issuing operation is known.
+            Outcome::Closed
+            | Outcome::Edit(_)
+            | Outcome::Saved { .. }
+            | Outcome::Image(_)
+            | Outcome::ImageTags(_)
+            | Outcome::RejectSummary(_)
+            | Outcome::Mutated(_) => Vec::new(),
+            Outcome::Keywords(rows) => {
+                Arc::make_mut(&mut self.snapshot).library.keywords = Arc::new(rows);
+                Vec::new()
+            }
+            Outcome::Collections(rows) => {
+                Arc::make_mut(&mut self.snapshot).library.collections = Arc::new(rows);
                 Vec::new()
             }
             Outcome::CullApplied { image_id, change } => {
@@ -493,5 +531,10 @@ fn matches_outcome(operation: &Operation, outcome: &Outcome) -> bool {
             | (Operation::LoadEdit { .. }, Outcome::Edit(_))
             | (Operation::SaveEdit { .. }, Outcome::Saved { .. })
             | (Operation::SetCull { .. }, Outcome::CullApplied { .. })
+            | (Operation::LoadKeywords, Outcome::Keywords(_))
+            | (Operation::LoadCollections, Outcome::Collections(_))
+            | (Operation::LoadImageTags(_), Outcome::ImageTags(_))
+            | (Operation::LoadRejectSummary(_), Outcome::RejectSummary(_))
+            | (Operation::Mutate(_), Outcome::Mutated(_))
     )
 }

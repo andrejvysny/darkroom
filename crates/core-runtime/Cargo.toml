@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json = "1"
 core-app = { path = "../core-app" }
 core-model = { path = "../core-model" }
 core-db = { path = "../core-db" }

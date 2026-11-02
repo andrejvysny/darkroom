@@ -1,7 +1,10 @@
 use core_app::jobs::JobState;
 use core_app::ports::{CatalogPort, Clock, EffectExecutor, EventSink, RenderBackend};
+use core_app::state::ImageTags;
 use core_app::subscription::SnapshotUpdate;
-use core_app::workflow::{Command, Completion, Effect, Operation, Outcome};
+use core_app::workflow::{
+    Command, Completion, Effect, Mutation, MutationReport, Operation, Outcome,
+};
 use core_app::AppError;
 use core_model::catalog::QueryParams;
 use core_runtime::async_workflow::AsyncCatalogWorkflow;
@@ -64,6 +67,14 @@ impl EffectExecutor for Executor {
             Operation::SaveEdit { .. } | Operation::SetCull { .. } => {
                 unreachable!("no edits in this test")
             }
+            Operation::LoadKeywords => Outcome::Keywords(vec![]),
+            Operation::LoadCollections => Outcome::Collections(vec![]),
+            Operation::LoadImageTags(image) => Outcome::ImageTags(Box::new(ImageTags {
+                image: *image,
+                ..Default::default()
+            })),
+            Operation::LoadRejectSummary(_) => Outcome::RejectSummary(Default::default()),
+            Operation::Mutate(_) => Outcome::Mutated(MutationReport::Done),
         };
         Completion {
             token: effect.token,
@@ -279,4 +290,27 @@ fn failed_open_is_failed_job_and_keeps_typed_error() {
         .job_snapshots()
         .iter()
         .any(|job| job.state == JobState::Succeeded));
+}
+
+#[test]
+fn mutation_and_catalog_reads_complete_on_the_ordered_lane() {
+    let (executor, _rx, _release) = executor(false, false);
+    let mut workflow = workflow(executor);
+    workflow.open_initial().unwrap();
+    workflow.wait_idle().unwrap();
+    for _ in 0..20 {
+        workflow.dispatch(Command::LoadKeywords).unwrap();
+        workflow.dispatch(Command::LoadCollections).unwrap();
+    }
+    workflow
+        .dispatch(Command::LoadRejectSummary(Box::default()))
+        .unwrap();
+    workflow
+        .dispatch(Command::Mutate(Mutation::DeleteKeyword(1)))
+        .unwrap();
+    workflow.wait_idle().unwrap();
+    let snapshot = workflow.snapshot();
+    assert_eq!(snapshot.library.last_report, Some(MutationReport::Done));
+    assert_eq!(snapshot.library.tags_revision, 1);
+    assert!(snapshot.error.is_none());
 }

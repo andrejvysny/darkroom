@@ -1,8 +1,12 @@
 use crate::autosave::{SaveKey, SaveSeq};
 use crate::registry::ActionId;
+use crate::state::ImageTags;
 use crate::state::MirrorStatus;
 use crate::AppError;
-use core_model::catalog::{DateTreeYear, FolderRow, ImageRow, QueryParams};
+use core_model::catalog::{
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, QueryParams, RejectDeleteResult,
+    RejectSummary,
+};
 use core_model::document::EditDocument;
 use core_model::identity::{
     CatalogEpoch, CatalogRevision, EditorSession, ImageId, ProcessVersion, SelectionGeneration,
@@ -92,6 +96,64 @@ pub enum CullChange {
     Label(Option<ColorLabel>),
 }
 
+/// A durable catalog change on the ordered lane. Every target is an explicit image id captured
+/// by the UI at the moment of the gesture — never an index into a list that may have changed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mutation {
+    /// Batch rating / flag / label; one transaction.
+    Cull {
+        images: Vec<ImageId>,
+        change: CullChange,
+    },
+    /// Create-or-get keyword `name` (case-insensitive) and tag every image with it.
+    AddKeyword {
+        images: Vec<ImageId>,
+        name: String,
+    },
+    RemoveKeyword {
+        images: Vec<ImageId>,
+        keyword_id: i64,
+    },
+    /// Delete a keyword everywhere.
+    DeleteKeyword(i64),
+    /// Static collection (with initial members) when `smart` is `None`; smart collection
+    /// (predicate only, no members) otherwise.
+    CreateCollection {
+        name: String,
+        smart: Option<Box<QueryParams>>,
+        images: Vec<ImageId>,
+    },
+    RenameCollection {
+        id: i64,
+        name: String,
+    },
+    DeleteCollection(i64),
+    AddToCollection {
+        id: i64,
+        images: Vec<ImageId>,
+    },
+    RemoveFromCollection {
+        id: i64,
+        images: Vec<ImageId>,
+    },
+    /// Break the pair containing companion `secondary`; it returns to the grid standalone.
+    UnlinkPair {
+        secondary: ImageId,
+    },
+    /// Send every rejected photo matching the filter (plus a rejected RAW's companions) to the OS
+    /// Trash and drop its rows. The target set is re-derived in the catalog with the reject flag
+    /// forced on; the caller never supplies ids.
+    DeleteRejected(Box<QueryParams>),
+}
+
+/// What a committed [`Mutation`] reports back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MutationReport {
+    Done,
+    CollectionCreated(i64),
+    RejectedDeleted(RejectDeleteResult),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     OpenCatalog(PathBuf),
@@ -110,6 +172,13 @@ pub enum Command {
         image: ImageId,
         change: CullChange,
     },
+    LoadKeywords,
+    LoadCollections,
+    /// Keywords, collection membership and pair info of one image (the info panel).
+    LoadImageTags(ImageId),
+    /// Counts for the delete-rejected confirmation, for exactly this filter.
+    LoadRejectSummary(Box<QueryParams>),
+    Mutate(Mutation),
 }
 impl Command {
     pub fn action(&self) -> ActionId {
@@ -124,6 +193,11 @@ impl Command {
             Self::RequestShutdown => ActionId::RequestShutdown,
             Self::DiscardUnsavedEdits(_) => ActionId::DiscardUnsavedEdits,
             Self::SetCull { .. } => ActionId::SetCull,
+            Self::LoadKeywords => ActionId::LoadKeywords,
+            Self::LoadCollections => ActionId::LoadCollections,
+            Self::LoadImageTags(_) => ActionId::LoadImageTags,
+            Self::LoadRejectSummary(_) => ActionId::LoadRejectSummary,
+            Self::Mutate(_) => ActionId::Mutate,
             Self::Edit(intent) => match intent {
                 EditIntent::Undo => ActionId::Undo,
                 EditIntent::Redo => ActionId::Redo,
@@ -178,6 +252,11 @@ pub enum Operation {
         image_id: ImageId,
         change: CullChange,
     },
+    LoadKeywords,
+    LoadCollections,
+    LoadImageTags(ImageId),
+    LoadRejectSummary(Box<QueryParams>),
+    Mutate(Mutation),
 }
 impl Operation {
     pub fn action(&self) -> ActionId {
@@ -190,6 +269,11 @@ impl Operation {
             Self::SelectImage { .. } | Self::LoadEdit { .. } => ActionId::SelectImage,
             Self::SaveEdit { .. } => ActionId::Edit,
             Self::SetCull { .. } => ActionId::SetCull,
+            Self::LoadKeywords => ActionId::LoadKeywords,
+            Self::LoadCollections => ActionId::LoadCollections,
+            Self::LoadImageTags(_) => ActionId::LoadImageTags,
+            Self::LoadRejectSummary(_) => ActionId::LoadRejectSummary,
+            Self::Mutate(_) => ActionId::Mutate,
         }
     }
 }
@@ -228,4 +312,9 @@ pub enum Outcome {
         image_id: ImageId,
         change: CullChange,
     },
+    Keywords(Vec<KeywordRow>),
+    Collections(Vec<CollectionRow>),
+    ImageTags(Box<ImageTags>),
+    RejectSummary(RejectSummary),
+    Mutated(MutationReport),
 }

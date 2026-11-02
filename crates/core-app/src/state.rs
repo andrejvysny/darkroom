@@ -1,5 +1,8 @@
 use crate::AppError;
-use core_model::catalog::{DateTreeYear, FolderRow, ImageRow, QueryParams};
+use core_model::catalog::{
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, PairInfo, QueryParams,
+    RejectSummary,
+};
 use core_model::identity::{
     CatalogEpoch, CatalogRevision, EditRevision, EditorSession, ImageId, ProcessVersion,
     SelectionGeneration,
@@ -26,6 +29,26 @@ pub struct LibrarySnapshot {
     pub count: i64,
     pub folders: Arc<Vec<FolderRow>>,
     pub dates: Arc<Vec<DateTreeYear>>,
+    pub keywords: Arc<Vec<KeywordRow>>,
+    pub collections: Arc<Vec<CollectionRow>>,
+    /// Tags of one image (normally the selection); the UI re-requests when `image` differs.
+    pub tags: Option<Arc<ImageTags>>,
+    /// Delete-rejected counts for exactly `.0` (the filter the dialog was opened on).
+    pub reject_summary: Option<(QueryParams, RejectSummary)>,
+    /// Last committed mutation's report (e.g. delete-rejected counts), for a result toast.
+    pub last_report: Option<crate::workflow::MutationReport>,
+    /// Advances on every committed mutation that can change tags, collections or keywords, so
+    /// views keyed on it re-request their data.
+    pub tags_revision: u64,
+}
+
+/// Keywords, static-collection membership and pair info of one image.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImageTags {
+    pub image: ImageId,
+    pub keywords: Vec<KeywordRow>,
+    pub collections: Vec<CollectionRow>,
+    pub pair: Option<PairInfo>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum DocumentStatus {

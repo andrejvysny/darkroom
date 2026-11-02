@@ -1,6 +1,8 @@
 use crate::state::MirrorStatus;
 use crate::AppError;
-use core_model::catalog::{DateTreeYear, FolderRow, ImageRow, QueryParams};
+use core_model::catalog::{
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, QueryParams, RejectSummary,
+};
 use core_model::identity::CatalogRevision;
 use std::path::Path;
 
@@ -29,6 +31,18 @@ pub trait CatalogPort: Send + Sync {
     ) -> Result<SaveReceipt, AppError>;
     /// Persist one rating / flag / colour-label change for `image_id`.
     fn set_cull(&self, image_id: i64, change: crate::workflow::CullChange) -> Result<(), AppError>;
+    fn keywords(&self) -> Result<Vec<KeywordRow>, AppError>;
+    fn collections(&self) -> Result<Vec<CollectionRow>, AppError>;
+    /// Keywords, static collections containing the image, and its pair (from either member).
+    fn image_tags(&self, image_id: i64) -> Result<crate::state::ImageTags, AppError>;
+    /// Counts for deleting the rejected photos matching `params` (reject flag forced on).
+    fn reject_summary(&self, params: &QueryParams) -> Result<RejectSummary, AppError>;
+    /// Apply one durable mutation. `DeleteRejected` moves files to the OS Trash with the catalog
+    /// lock released between plan and finalize.
+    fn mutate(
+        &self,
+        mutation: &crate::workflow::Mutation,
+    ) -> Result<crate::workflow::MutationReport, AppError>;
 }
 
 /// What the catalog committed for one `save_edit`.
