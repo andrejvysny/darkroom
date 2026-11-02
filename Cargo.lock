@@ -1074,11 +1074,13 @@ version = "0.1.2"
 dependencies = [
  "core-app",
  "core-db",
+ "core-import",
  "core-library",
  "core-model",
  "image",
  "rusqlite_migration",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
