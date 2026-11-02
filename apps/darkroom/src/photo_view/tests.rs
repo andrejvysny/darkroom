@@ -212,6 +212,7 @@ fn plan(sel: Sel, snap: &ApplicationSnapshot) -> Option<PhotoRequestPlan> {
         viewport_px: VIEWPORT,
         display_px: VIEWPORT,
         window: None,
+        crop_preview: false,
     })
 }
 
@@ -566,4 +567,17 @@ fn histogram_of_old_subject_is_never_exposed() {
     assert_eq!(view.histogram(&ready(b)).map(|h| h.image), Some(ImageId(2)));
     assert!(view.histogram(&ready(a)).is_none());
     assert!(view.histogram(&closed()).is_none());
+}
+
+#[test]
+fn the_crop_preview_flag_reaches_the_render_view() {
+    let a = sel(1, 1);
+    let snap = ready(a);
+    for flag in [false, true] {
+        let mut view = PhotoView::new(DeviceEpoch(1));
+        let mut wanted = plan(a, &snap).expect("a ready snapshot plans");
+        wanted.crop_preview = flag;
+        let request = view.submit(Some(wanted), false).expect("a new key submits");
+        assert_eq!(request.view.crop_preview, flag);
+    }
 }

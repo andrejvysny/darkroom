@@ -144,6 +144,7 @@ fn barrier_times_out_with_save_failed_and_the_late_save_still_completes() {
         Ok(Outcome::Saved {
             catalog_revision: core_model::identity::CatalogRevision(1),
             mirror: core_app::state::MirrorStatus::Unknown,
+            edited_at: 0,
         }),
     );
     assert!(!s.snapshot().editor.document.dirty);

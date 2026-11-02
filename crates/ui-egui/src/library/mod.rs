@@ -60,6 +60,9 @@ pub struct LibraryUi {
     /// `add_photos`.
     pub button_rects: Vec<(&'static str, egui::Rect)>,
     pub selected: BTreeSet<i64>,
+    /// Photos a Library gesture (selection bar, grid menu) wants exported; the root turns it into
+    /// an `ExportRequest::Open`.
+    pub(crate) export_open: Option<Vec<ImageId>>,
     /// Shift-range anchor.
     pub(crate) anchor: Option<i64>,
     /// Primary seen last frame; a change to an id outside `selected` collapses the set.
@@ -103,6 +106,7 @@ impl Default for LibraryUi {
             cell_rects: Vec::new(),
             button_rects: Vec::new(),
             selected: BTreeSet::new(),
+            export_open: None,
             anchor: None,
             last_primary: None,
             loupe: false,

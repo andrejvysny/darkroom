@@ -72,6 +72,9 @@ pub struct ReadyDoc {
     pub process_version: ProcessVersion,
     /// Current edit parameters.
     pub params: Arc<DevelopParams>,
+    /// The params this document had when it was loaded for its session (what "revert to opened"
+    /// returns to); never changes.
+    opened: Arc<DevelopParams>,
     /// Advances on EVERY visible change, never goes back.
     pub revision: EditRevision,
     /// Revision last acknowledged persisted, if any.
@@ -97,6 +100,7 @@ impl ReadyDoc {
             image,
             session,
             process_version,
+            opened: params.clone(),
             params,
             revision: EditRevision(1),
             saved_revision: None,
@@ -111,6 +115,11 @@ impl ReadyDoc {
     /// Read-only view of the undo/redo stacks (tests, snapshot building).
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// The params the document had when it was opened for this session.
+    pub fn opened(&self) -> &Arc<DevelopParams> {
+        &self.opened
     }
 
     /// Unsaved-changes predicate: an untouched default/stored doc is clean.

@@ -14,6 +14,7 @@ use core_app::state::{ApplicationSnapshot, DocumentStatus};
 use core_model::identity::{
     CatalogEpoch, DeviceEpoch, EditorSession, FrameHandle, FrameKey, ImageId, SelectionGeneration,
 };
+use core_pipeline::ViewParams;
 use render_wgpu::{FrameLease, Offer, Presenter};
 use ui_egui::{HistogramData, PhotoRequestPlan, PhotoUi};
 
@@ -275,11 +276,17 @@ impl PhotoView {
             path: plan.path,
             content_hash: plan.content_hash,
             params: plan.params,
-            view: match plan.window {
-                Some((origin, size)) => {
-                    photo_worker::window_view(origin, size, plan.viewport_px.0, plan.viewport_px.1)
+            view: ViewParams {
+                crop_preview: plan.crop_preview,
+                ..match plan.window {
+                    Some((origin, size)) => photo_worker::window_view(
+                        origin,
+                        size,
+                        plan.viewport_px.0,
+                        plan.viewport_px.1,
+                    ),
+                    None => photo_worker::fit_view(plan.viewport_px.0, plan.viewport_px.1),
                 }
-                None => photo_worker::fit_view(plan.viewport_px.0, plan.viewport_px.1),
             },
         })
     }

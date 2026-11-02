@@ -56,6 +56,7 @@ fn open_ready() -> ApplicationSession {
             Operation::LoadDates => Outcome::Dates(vec![]),
             Operation::LoadKeywords => Outcome::Keywords(vec![]),
             Operation::LoadCollections => Outcome::Collections(vec![]),
+            Operation::LoadPresets => Outcome::Presets(vec![]),
             other => panic!("unexpected follow-up {other:?}"),
         };
         finish(&mut s, &effect, Ok(outcome)).unwrap();

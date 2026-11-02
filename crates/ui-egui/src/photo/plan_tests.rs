@@ -85,7 +85,7 @@ fn cropped_aspect_uses_crop_dims_including_rot90() {
 
 use super::{
     interactive_render_px, photo_plan, viewport_revision, DevelopParams, PhotoRequestPlan,
-    QualityTier,
+    QualityTier, StageVariant,
 };
 use core_app::state::{
     ApplicationSnapshot, DocumentStatus, DocumentView, EditorSnapshot, JobsSnapshot,
@@ -157,6 +157,7 @@ fn planned(
         DeviceEpoch(1),
         view,
         interacting,
+        StageVariant::Edited,
     )
     .expect("a Ready document with params plans a frame")
 }
@@ -331,8 +332,116 @@ fn a_photo_without_catalog_dims_never_plans_a_window() {
             center: [0.3, 0.7],
         },
         false,
+        StageVariant::Edited,
     )
     .expect("a Ready document with params plans a frame");
     assert_eq!(plan.window, None);
     assert_eq!(plan.display_px, plan.viewport_px);
+}
+
+fn planned_variant(
+    snap: &ApplicationSnapshot,
+    view: ViewState,
+    variant: StageVariant,
+) -> PhotoRequestPlan {
+    photo_plan(snap, panel(), 1.0, DeviceEpoch(1), view, false, variant)
+        .expect("a Ready document with params plans a frame")
+}
+
+fn edited_snapshot() -> ApplicationSnapshot {
+    let mut snap = ready_with(HASH, false);
+    snap.editor.document.params = Some(Arc::new(DevelopParams {
+        exposure: 1.5,
+        crop: Crop {
+            hw: 0.25,
+            angle: 3.0,
+            rot90: 1,
+            ..Crop::default()
+        },
+        ..Default::default()
+    }));
+    snap
+}
+
+#[test]
+fn the_edited_variant_is_the_historical_plan() {
+    let snap = edited_snapshot();
+    let edited = planned_variant(&snap, ViewState::default(), StageVariant::Edited);
+    assert_eq!(edited.params, snap.editor.document.params.clone().unwrap());
+    assert!(!edited.crop_preview);
+    assert_eq!(
+        edited.key.identity.viewport_revision,
+        viewport_revision(edited.viewport_px.0, edited.viewport_px.1, None),
+        "Edited keys must hash exactly the historical two fields"
+    );
+}
+
+#[test]
+fn the_before_plan_uses_default_params_under_its_own_key() {
+    let snap = edited_snapshot();
+    let edited = planned_variant(&snap, ViewState::default(), StageVariant::Edited);
+    let before = planned_variant(&snap, ViewState::default(), StageVariant::Before);
+    assert_eq!(*before.params, DevelopParams::default());
+    assert!(!before.crop_preview);
+    assert_ne!(before.key, edited.key);
+    // Same geometry class: the identity differs only by the viewport revision.
+    let mut same = before.key.identity;
+    same.viewport_revision = edited.key.identity.viewport_revision;
+    assert_eq!(same.edit_revision, edited.key.identity.edit_revision);
+    // The default crop is the full, unrotated frame: its aspect is the catalog's.
+    assert_eq!(before.display_px, (820, 547));
+}
+
+#[test]
+fn the_before_plan_keeps_the_sources_display_referred_flag() {
+    let mut snap = ready_with(HASH, false);
+    snap.editor.document.params = Some(Arc::new(DevelopParams {
+        display_referred: true,
+        exposure: 1.0,
+        ..Default::default()
+    }));
+    let before = planned_variant(&snap, ViewState::default(), StageVariant::Before);
+    assert_eq!(
+        *before.params,
+        DevelopParams {
+            display_referred: true,
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn the_crop_tool_plan_resets_the_crop_but_keeps_rotation_and_ignores_zoom() {
+    let snap = edited_snapshot();
+    let zoomed = ViewState {
+        zoom: 3.0,
+        center: [0.3, 0.6],
+    };
+    let tool = planned_variant(&snap, zoomed, StageVariant::CropTool);
+    assert!(tool.crop_preview);
+    assert_eq!(
+        tool.window, None,
+        "the crop tool always renders the fit view"
+    );
+    assert_eq!(
+        tool.params.crop,
+        Crop {
+            angle: 3.0,
+            rot90: 1,
+            ..Crop::default()
+        }
+    );
+    assert_eq!(tool.params.exposure, 1.5, "only the crop is reset");
+    // rot90 = 1 swaps the full frame to 4640x6960 portrait.
+    assert_eq!(
+        tool.display_px,
+        planned_variant(&snap, ViewState::default(), StageVariant::CropTool).display_px
+    );
+    assert!(tool.display_px.0 < tool.display_px.1);
+    let edited = planned_variant(&snap, ViewState::default(), StageVariant::Edited);
+    assert_ne!(tool.key, edited.key);
+    assert_ne!(
+        tool.key,
+        planned_variant(&snap, ViewState::default(), StageVariant::Before).key
+    );
 }

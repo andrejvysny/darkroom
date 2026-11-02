@@ -124,6 +124,28 @@ pub struct KeywordRow {
     pub count: i64,
 }
 
+/// A preset row without its (potentially large) sparse params blob — for the list panel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetSummary {
+    pub id: i64,
+    pub name: String,
+    pub group_name: String,
+    pub builtin: bool,
+    pub is_favorite: bool,
+    pub field_keys: Vec<String>,
+    pub sort_order: i64,
+}
+
+/// A named develop snapshot without its params blob — for the History panel list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotSummary {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+}
+
 /// A static or smart collection. `query` is the smart predicate JSON (a partial camelCase
 /// `QueryParams`), `None` for static collections.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -77,6 +77,9 @@ impl EffectExecutor for Executor {
             })),
             Operation::LoadRejectSummary(_) => Outcome::RejectSummary(Default::default()),
             Operation::Mutate(_) => Outcome::Mutated(MutationReport::Done),
+            Operation::LoadPresets => Outcome::Presets(vec![]),
+            Operation::LoadSnapshots(_) => Outcome::Snapshots(vec![]),
+            Operation::ResolveSettings { .. } => unreachable!("no settings in this test"),
         };
         Completion {
             token: effect.token,

@@ -145,6 +145,27 @@ pub fn segmented(ui: &mut Ui, labels: &[&str], selected: usize) -> Option<usize>
 
 /// Outlined pill button with an optional leading icon.
 pub fn pill_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: bool) -> Response {
+    pill(ui, icon, label, enabled, None)
+}
+
+/// A pill that reports (and paints) a selected state: toggles and option groups.
+pub fn pill_toggle(
+    ui: &mut Ui,
+    icon: Option<Icon>,
+    label: &str,
+    enabled: bool,
+    selected: bool,
+) -> Response {
+    pill(ui, icon, label, enabled, Some(selected))
+}
+
+fn pill(
+    ui: &mut Ui,
+    icon: Option<Icon>,
+    label: &str,
+    enabled: bool,
+    selected: Option<bool>,
+) -> Response {
     let font = FontId::proportional(12.5);
     let icon_w = if icon.is_some() { 20.0 } else { 0.0 };
     let width = text_width(ui, label, 12.5) + icon_w + 20.0;
@@ -154,23 +175,32 @@ pub fn pill_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: bool) 
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 26.0), sense);
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, label));
+    match selected {
+        Some(on) => describe_selected(&response, egui::accesskit::Role::Button, enabled, on, label),
+        None => response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, label)
+        }),
+    }
     focus_ring(ui, &response, rect, theme::RADIUS_SM);
+    let on = selected == Some(true);
     let hot = enabled && response.hovered();
-    if hot {
+    if on {
+        ui.painter()
+            .rect_filled(rect, theme::RADIUS_SM, theme::ACCENT_DIM);
+    } else if hot {
         ui.painter()
             .rect_filled(rect, theme::RADIUS_SM, theme::HOVER);
     }
+    let line = if on { theme::ACCENT_LINE } else { theme::LINE2 };
     ui.painter().rect_stroke(
         rect,
         theme::RADIUS_SM,
-        Stroke::new(1.0, theme::LINE2),
+        Stroke::new(1.0, line),
         StrokeKind::Inside,
     );
     let color = if !enabled {
         theme::T3
-    } else if hot {
+    } else if on || hot {
         theme::T1
     } else {
         theme::T2

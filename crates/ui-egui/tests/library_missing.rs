@@ -119,6 +119,7 @@ fn render(selected: Option<i64>, report: bool) -> (String, Vec<String>) {
                     thumbs: &mut Thumbs { report },
                     histogram: None,
                     import: &core_app::import::ImportView::default(),
+                    export: &core_app::export::ExportView::default(),
                 },
                 &mut ui_state,
             );

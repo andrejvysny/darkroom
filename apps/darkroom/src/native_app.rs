@@ -191,6 +191,10 @@ impl NativeApplication {
     /// Why the sidecar mirror is not running, if it could not be started. `None` while it is (or
     /// was) running. The host shows this in the status area: edits stay saved in the catalog and
     /// reach the photo folders on the next launch.
+    /// The catalog adapter the workflow owns, for host services that read it directly.
+    pub fn catalog(&self) -> std::sync::Arc<core_runtime::catalog::CatalogAdapter> {
+        self.workflow.catalog()
+    }
     pub fn mirror_error(&self) -> Option<&str> {
         self.mirror_error.as_deref()
     }

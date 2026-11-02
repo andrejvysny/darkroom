@@ -1352,13 +1352,16 @@ dependencies = [
 name = "core-runtime"
 version = "0.1.2"
 dependencies = [
+ "chrono",
  "core-app",
  "core-db",
  "core-import",
  "core-library",
  "core-model",
+ "core-preset",
  "image",
  "rusqlite_migration",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",

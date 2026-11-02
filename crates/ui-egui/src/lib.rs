@@ -4,6 +4,7 @@
 //! reaches the UI only through [`Frame`] (snapshot, presented photo, [`ThumbSource`], histogram).
 
 mod develop;
+mod export_dialog;
 mod histogram;
 pub mod icons;
 mod import_dialog;
@@ -15,12 +16,14 @@ pub mod theme;
 pub mod widgets;
 
 pub use develop::{DevelopUi, DEVELOP_PANEL_ID, EXPOSURE_SLIDER_ID, SAVE_ERROR_ID};
+pub use export_dialog::{ExportUi, EXPORT_DIALOG_ID, EXPORT_DIALOG_LABEL};
 pub use import_dialog::{ImportUi, IMPORT_DIALOG_ID};
 pub use library::{LibraryUi, GRID_SCROLL_ID, INFO_ID, NAV_ID, NOT_YET, TOOLBAR_ID};
 pub use panels::{settings_notice_strip, SETTINGS_NOTICES_ID};
 pub use photo::{cropped_frame_aspect, fit_output, viewport_revision, PhotoRequestPlan, PhotoUi};
 pub use shell::{COMMAND_ERROR_ID, SEARCH_ID, TOP_BAR_ID};
 
+use core_app::export::{ExportRequest, ExportView};
 use core_app::import::{ImportRequest, ImportView};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::Command;
@@ -51,6 +54,9 @@ pub struct UiState {
     pub import: ImportUi,
     /// Import requests emitted this frame; the host drains and executes them.
     pub import_requests: Vec<ImportRequest>,
+    pub export: ExportUi,
+    /// Export requests emitted this frame; the host drains and executes them.
+    pub export_requests: Vec<ExportRequest>,
 }
 
 /// Per-channel 256-bin histogram of the developed frame currently on screen. The host passes it
@@ -130,6 +136,8 @@ pub struct Frame<'a> {
     pub histogram: Option<&'a HistogramData>,
     /// Import service state (dialog, progress, last report).
     pub import: &'a ImportView,
+    /// Export dialog state (targets, destination, progress, last result).
+    pub export: &'a ExportView,
 }
 
 /// The root UI.
@@ -143,6 +151,7 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
         thumbs,
         histogram,
         import,
+        export,
     } = frame;
     theme::ensure(root.ctx());
     // Captured before any widget runs: a single-line TextEdit surrenders focus while handling
@@ -152,7 +161,7 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
     // Modals block pointer input only; their keys must not reach the grid behind them (a culling
     // key under the delete-rejected confirmation would change what the confirm trashes) nor the
     // stage behind them (a bare Z under the import dialog would zoom an unseen photo).
-    let modal_open = import.open || state.library.modal_open();
+    let modal_open = import.open || export.open || state.library.modal_open();
     state.develop.set_typing(typing || modal_open);
     let mut commands = Vec::new();
     if !typing && !modal_open {
@@ -162,12 +171,30 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
             &mut commands,
         );
     }
+    if !typing
+        && !modal_open
+        && snapshot.catalog_ready
+        && root.ctx().input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+                egui::Key::E,
+            )
+        })
+    {
+        let ids = export_dialog::export_ids(snapshot, state.mode, &state.library);
+        if !ids.is_empty() {
+            state.export_requests.push(ExportRequest::Open(ids));
+        }
+    }
     shell::top_bar(root, snapshot, reopen, state, &mut commands);
     shell::command_error_strip(root, command_error);
     settings_notice_strip(root, settings_notices);
     develop::error_banner(root, snapshot, &mut state.develop, &mut commands);
     // The photo plan is only meaningful while the Develop canvas is on screen.
     photo.plan = None;
+    if state.mode != Mode::Develop {
+        state.develop.leave(&mut commands);
+    }
     match state.mode {
         Mode::Library => library::show(
             root,
@@ -192,6 +219,15 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
         }
         Mode::Duplicates => shell::duplicates_placeholder(root),
     }
+    if let Some(ids) = state.library.export_open.take() {
+        state.export_requests.push(ExportRequest::Open(ids));
+    }
+    export_dialog::show(
+        root.ctx(),
+        export,
+        &mut state.export,
+        &mut state.export_requests,
+    );
     import_dialog::show(
         root.ctx(),
         snapshot,

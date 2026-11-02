@@ -9,6 +9,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 core-app = { path = "../core-app" }
@@ -16,6 +17,9 @@ core-model = { path = "../core-model" }
 core-db = { path = "../core-db" }
 core-library = { path = "../core-library" }
 core-import = { path = "../core-import" }
+core-preset = { path = "../core-preset" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+tempfile = "3"
 
 [dev-dependencies]
 serde_json = "1"
@@ -23,4 +27,3 @@ image = "0.25"
 # `tests/catalog.rs` builds a schema-25 catalog with the same pinned migration engine `Db::open`
 # uses (mirrors `core-db`'s dev-dependency), to pin the pre-upgrade backup on the open path.
 rusqlite_migration = "=2.5.0"
-tempfile = "3"

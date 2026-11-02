@@ -109,7 +109,8 @@ impl ApplicationSession {
         AppError::EditRefused(reason)
     }
 
-    pub(super) fn edit(&mut self, intent: EditIntent) -> Result<Vec<Effect>, AppError> {
+    /// The save identity and live session an edit may target, or the reason edits are refused.
+    pub(super) fn edit_target(&self) -> Result<(SaveKey, EditorSession), AppError> {
         if self.barrier.is_some() {
             return Err(AppError::EditRefused("catalog is closing".into()));
         }
@@ -121,6 +122,14 @@ impl ApplicationSession {
         let (Some(key), Some(session)) = (self.key.clone(), self.editor.current_session()) else {
             return Err(AppError::EditRefused("image row not loaded yet".into()));
         };
+        if !matches!(self.editor.state(), EditorState::Ready(_)) {
+            return Err(AppError::EditRefused("no editable document".into()));
+        }
+        Ok((key, session))
+    }
+
+    pub(super) fn edit(&mut self, intent: EditIntent) -> Result<Vec<Effect>, AppError> {
+        let (key, session) = self.edit_target()?;
         let EditorState::Ready(doc) = self.editor.state() else {
             return Err(AppError::EditRefused("no editable document".into()));
         };
@@ -145,6 +154,19 @@ impl ApplicationSession {
                     at_ms: self.clock.now_millis(),
                 }
             }
+            // Paste, not Apply: a preset or revert must stay its own undo step instead of
+            // coalescing into a slider burst, and it ends any open burst.
+            EditIntent::RevertToOpened => EditorCommand::Paste {
+                session,
+                params: (**doc.opened()).clone(),
+            },
+            EditIntent::ResetToDefault => EditorCommand::Paste {
+                session,
+                params: DevelopParams {
+                    display_referred: doc.params.display_referred,
+                    ..Default::default()
+                },
+            },
             EditIntent::SetExposure(ev) => {
                 let mut params = (*doc.params).clone();
                 params.exposure = ev;
@@ -156,6 +178,17 @@ impl ApplicationSession {
                 }
             }
         };
+        self.run_edit(key, session, command)?;
+        Ok(Vec::new())
+    }
+
+    /// Apply one editor command and hand the visible change to autosave.
+    pub(super) fn run_edit(
+        &mut self,
+        key: SaveKey,
+        session: EditorSession,
+        command: EditorCommand,
+    ) -> Result<(), AppError> {
         let event = self.editor.apply(command).map_err(refusal)?;
         if let EditorEvent::Changed { revision, params } = event {
             if let EditorState::Ready(doc) = self.editor.state() {
@@ -171,7 +204,7 @@ impl ApplicationSession {
         }
         self.sync_document();
         self.sync_save();
-        Ok(Vec::new())
+        Ok(())
     }
 
     /// Bind the save identity once the selected image's row (hence content hash) is known.
@@ -332,6 +365,23 @@ impl ApplicationSession {
             .collect()
     }
 
+    /// Monotonic: a late or out-of-order ack never lowers a row's edit version.
+    fn patch_edited_at(&mut self, image_id: i64, edited_at: i64) {
+        let raise = |row: &mut core_model::catalog::ImageRow| {
+            row.edited_at = Some(row.edited_at.unwrap_or(i64::MIN).max(edited_at));
+        };
+        let s = Arc::make_mut(&mut self.snapshot);
+        if s.library.rows.iter().any(|row| row.id == image_id) {
+            Arc::make_mut(&mut s.library.rows)
+                .iter_mut()
+                .filter(|row| row.id == image_id)
+                .for_each(raise);
+        }
+        if let Some(row) = s.editor.image.as_mut().filter(|row| row.id == image_id) {
+            raise(row);
+        }
+    }
+
     pub(super) fn save_completed(
         &mut self,
         key: SaveKey,
@@ -343,11 +393,15 @@ impl ApplicationSession {
             Ok(Outcome::Saved {
                 catalog_revision,
                 mirror,
+                edited_at,
             }) => match self
                 .autosave
                 .completed_outcome(&key, seq, Ok(catalog_revision), now)
             {
                 Completed::Acked(ack) => {
+                    if key.catalog_epoch == self.snapshot.catalog_epoch {
+                        self.patch_edited_at(key.image_id.0, edited_at);
+                    }
                     if self.key.as_ref() == Some(&key) {
                         self.saved_revision = Some(ack.catalog_revision);
                         self.mirror = mirror;
@@ -507,7 +561,7 @@ impl ApplicationSession {
     }
 }
 
-fn require_finite(params: &DevelopParams) -> Result<(), AppError> {
+pub(super) fn require_finite(params: &DevelopParams) -> Result<(), AppError> {
     validate_finite(params)
         .then_some(())
         .ok_or_else(|| AppError::EditRefused("non-finite edit value".into()))

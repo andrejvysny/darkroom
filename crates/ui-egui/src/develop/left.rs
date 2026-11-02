@@ -1,13 +1,12 @@
-//! Left rail: Presets | History tabs (collapsible). Both are honest placeholders — the native app
-//! has neither presets nor an edit-history list yet — so every control is drawn disabled and no
-//! preset is ever listed.
+//! Left rail: Presets | History tabs (collapsible). This file only owns the tab strip and the
+//! collapse state; the tab bodies are `presets_panel` and `history_panel`.
 
-use super::slider::disabled_slider;
-use super::DevelopUi;
-use crate::icons::{icon_button, icon_button_enabled, Icon};
-use crate::widgets::pill_button;
-use crate::{theme, NOT_YET};
-use egui::{Margin, RichText, Sense, Stroke, Ui};
+use super::{history_panel, presets_panel, DevelopUi};
+use crate::icons::{icon_button, Icon};
+use crate::theme;
+use core_app::state::ApplicationSnapshot;
+use core_app::workflow::Command;
+use egui::{Margin, Sense, Stroke, Ui};
 
 pub const LEFT_PANEL_ID: &str = "develop_left";
 
@@ -18,7 +17,12 @@ pub(super) enum Tab {
     History,
 }
 
-pub(super) fn show(root: &mut Ui, st: &mut DevelopUi) {
+pub(super) fn show(
+    root: &mut Ui,
+    snapshot: &ApplicationSnapshot,
+    st: &mut DevelopUi,
+    commands: &mut Vec<Command>,
+) {
     let frame = egui::Frame::new().fill(theme::APP);
     if st.left_collapsed {
         egui::Panel::left("develop_left_collapsed")
@@ -44,9 +48,14 @@ pub(super) fn show(root: &mut Ui, st: &mut DevelopUi) {
             tab_bar(ui, st);
             egui::Frame::new()
                 .inner_margin(Margin::symmetric(12, 4))
-                .show(ui, |ui| match st.left_tab {
-                    Tab::Presets => presets(ui),
-                    Tab::History => note(ui, "History isn't in the native app yet."),
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("develop_left_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match st.left_tab {
+                            Tab::Presets => presets_panel::show(ui, snapshot, st, commands),
+                            Tab::History => history_panel::show(ui, snapshot, st, commands),
+                        });
                 });
         });
 }
@@ -101,32 +110,4 @@ fn tab_bar(ui: &mut Ui, st: &mut DevelopUi) {
     }
     ui.painter()
         .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, theme::LINE));
-}
-
-fn note(ui: &mut Ui, text: &str) {
-    ui.add_space(8.0);
-    ui.add(egui::Label::new(RichText::new(text).italics().size(12.0).color(theme::T3)).wrap());
-}
-
-fn presets(ui: &mut Ui) {
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("PRESETS")
-                .size(10.5)
-                .color(theme::T3)
-                .extra_letter_spacing(1.0),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            icon_button_enabled(ui, Icon::Plus, NOT_YET, false);
-            icon_button_enabled(ui, Icon::Download, NOT_YET, false);
-        });
-    });
-    disabled_slider(ui, "Amount", "100", 1.0, NOT_YET);
-    ui.horizontal_wrapped(|ui| {
-        pill_button(ui, None, "Copy settings", false).on_hover_text(NOT_YET);
-        pill_button(ui, None, "Paste", false).on_hover_text(NOT_YET);
-    });
-    theme::section_heading(ui, "Built-in");
-    note(ui, "Presets aren't in the native app yet.");
 }

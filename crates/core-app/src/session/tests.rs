@@ -126,3 +126,36 @@ fn reset_refuses_while_the_editor_holds_unsaved_work_and_changes_nothing() {
     assert_eq!(s.snapshot.catalog_epoch, epoch);
     assert!(matches!(s.editor.state(), EditorState::Ready(_)));
 }
+
+#[test]
+fn acked_save_from_an_older_catalog_epoch_does_not_patch_rows() {
+    use crate::workflow::{Completion, EditIntent};
+    use core_model::catalog::ImageRow;
+    let mut s = editable_session();
+    let row = ImageRow {
+        id: 1,
+        edited_at: Some(5),
+        ..Default::default()
+    };
+    Arc::make_mut(&mut s.snapshot).library.rows = Arc::new(vec![row]);
+    s.dispatch(Command::Edit(EditIntent::SetExposure(1.0)))
+        .unwrap();
+    let save = s
+        .tick(u64::MAX / 2)
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.operation, Operation::SaveEdit { .. }))
+        .expect("a save is due");
+    // The catalog was replaced while the save was in flight.
+    Arc::make_mut(&mut s.snapshot).catalog_epoch = CatalogEpoch(7);
+    let result = Ok(Outcome::Saved {
+        catalog_revision: CatalogRevision(1),
+        mirror: MirrorStatus::Unknown,
+        edited_at: 99,
+    });
+    let _ = s.complete(Completion {
+        token: save.token,
+        result,
+    });
+    assert_eq!(s.snapshot.library.rows[0].edited_at, Some(5));
+}

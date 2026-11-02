@@ -3,6 +3,7 @@
 mod catalog_ops;
 mod cull;
 mod edit;
+mod settings;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -300,6 +301,13 @@ impl ApplicationSession {
             Command::LoadImageTags(image) => return self.load_image_tags(image),
             Command::RefreshMirrorStatus => return Ok(self.refresh_mirror_status()),
             Command::LoadRejectSummary(query) => return self.load_reject_summary(query),
+            Command::LoadPresets => Some(self.replace(Operation::LoadPresets)),
+            Command::LoadSnapshots(image) => return self.load_snapshots(image),
+            Command::ApplySettings {
+                source,
+                amount,
+                replace_all,
+            } => return self.apply_settings(source, amount, replace_all),
             Command::LoadKeywords => Some(self.replace(Operation::LoadKeywords)),
             Command::LoadCollections => Some(self.replace(Operation::LoadCollections)),
             Command::QueryLibrary(query) => {
@@ -354,6 +362,7 @@ impl ApplicationSession {
             selection_generation: generation,
             document: document_view(self.editor.state()),
             save: SaveStatus::default(),
+            snapshots: Arc::default(),
         };
         let Some(image_id) = id else {
             return Ok(Vec::new());
@@ -396,12 +405,13 @@ impl ApplicationSession {
                 ));
             }
         }
-        let notice = Notice::EffectCompleted {
+        let mut notice = Notice::EffectCompleted {
             action: operation.action(),
             result: completion.result.as_ref().map(|_| ()).map_err(Clone::clone),
         };
         // A save completion may issue follow-up saves and the deferred close/open (+1).
-        let requests = u64::from(matches!(completion.result, Ok(Outcome::Opened))) * 5
+        let requests = u64::from(matches!(completion.result, Ok(Outcome::Opened))) * 6
+            + u64::from(matches!(operation, Operation::SelectImage { .. }))
             + u64::from(matches!(completion.result, Ok(Outcome::Mutated(_))))
                 * catalog_ops::MAX_FOLLOW_UPS
             + if matches!(operation, Operation::SaveEdit { .. }) {
@@ -424,10 +434,29 @@ impl ApplicationSession {
             // The row carries the content hash, hence the save identity; it is bound to the
             // selection's own session so a row can never key another selection's document.
             (Operation::SelectImage { editor_session, .. }, Ok(Outcome::Image(row))) => {
-                if self.editor.current_session() == Some(editor_session) {
+                let current = self.editor.current_session() == Some(editor_session);
+                if current {
                     self.bind_row(row.as_deref());
                 }
+                let loaded = row.as_ref().map(|row| ImageId(row.id));
                 Arc::make_mut(&mut self.snapshot).editor.image = row.map(|row| *row);
+                // The History list belongs to the selection; only the current one asks for it.
+                match loaded.filter(|_| current) {
+                    Some(image) => vec![self.replace(Operation::LoadSnapshots(image))],
+                    None => Vec::new(),
+                }
+            }
+            (Operation::LoadSnapshots(image), Ok(Outcome::Snapshots(rows))) => {
+                // A list for a photo that is no longer selected must not label the new one.
+                if self.snapshot.editor.selected == Some(image) {
+                    Arc::make_mut(&mut self.snapshot).editor.snapshots = Arc::new(rows);
+                }
+                Vec::new()
+            }
+            (Operation::ResolveSettings { fence, .. }, Ok(Outcome::SettingsResolved(params))) => {
+                if !self.settings_resolved(fence, *params) {
+                    notice = Notice::SettingsDropped;
+                }
                 Vec::new()
             }
             (Operation::SaveEdit { key, seq, .. }, result) => self.save_completed(key, seq, result),
@@ -484,6 +513,7 @@ impl ApplicationSession {
                     self.replace(Operation::LoadDates),
                     self.replace(Operation::LoadKeywords),
                     self.replace(Operation::LoadCollections),
+                    self.replace(Operation::LoadPresets),
                 ]
             }
             // `Closed` needs no follow-up work, and `Edit` never reaches here: its result is
@@ -497,9 +527,15 @@ impl ApplicationSession {
             | Outcome::ImageTags(_)
             | Outcome::MirrorStatus(_)
             | Outcome::RejectSummary(_)
-            | Outcome::Mutated(_) => Vec::new(),
+            | Outcome::Mutated(_)
+            | Outcome::Snapshots(_)
+            | Outcome::SettingsResolved(_) => Vec::new(),
             Outcome::Keywords(rows) => {
                 Arc::make_mut(&mut self.snapshot).library.keywords = Arc::new(rows);
+                Vec::new()
+            }
+            Outcome::Presets(rows) => {
+                Arc::make_mut(&mut self.snapshot).library.presets = Arc::new(rows);
                 Vec::new()
             }
             Outcome::Collections(rows) => {
@@ -545,5 +581,11 @@ fn matches_outcome(operation: &Operation, outcome: &Outcome) -> bool {
             | (Operation::LoadMirrorStatus { .. }, Outcome::MirrorStatus(_))
             | (Operation::LoadRejectSummary(_), Outcome::RejectSummary(_))
             | (Operation::Mutate(_), Outcome::Mutated(_))
+            | (Operation::LoadPresets, Outcome::Presets(_))
+            | (Operation::LoadSnapshots(_), Outcome::Snapshots(_))
+            | (
+                Operation::ResolveSettings { .. },
+                Outcome::SettingsResolved(_)
+            )
     )
 }

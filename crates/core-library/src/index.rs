@@ -121,6 +121,14 @@ pub fn existing_paths(conn: &Connection) -> Result<std::collections::HashSet<Str
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+/// Every catalogued source path, failing on any unreadable row: export's overwrite guard must not
+/// run against a partial list.
+pub fn all_image_paths(conn: &Connection) -> Result<Vec<String>, LibError> {
+    let mut stmt = conn.prepare("SELECT path FROM images")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// File modification time as epoch seconds, or `None` if unavailable. Used as the capture-date
 /// fallback when EXIF carries no `DateTimeOriginal` (mirrors core-import's path-routing fallback).
 fn file_mtime_epoch(path: &Path) -> Option<i64> {

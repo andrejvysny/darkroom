@@ -46,6 +46,7 @@ impl EffectExecutor for InlineExecutor {
                 .map(|receipt| Outcome::Saved {
                     catalog_revision: receipt.catalog_revision,
                     mirror: receipt.mirror,
+                    edited_at: receipt.edited_at,
                 }),
             Operation::SetCull { image_id, change } => catalog
                 .set_cull(image_id.0, change)
@@ -62,6 +63,17 @@ impl EffectExecutor for InlineExecutor {
                 catalog.reject_summary(&params).map(Outcome::RejectSummary)
             }
             Operation::Mutate(mutation) => catalog.mutate(&mutation).map(Outcome::Mutated),
+            Operation::LoadPresets => catalog.presets().map(Outcome::Presets),
+            Operation::LoadSnapshots(image) => catalog.snapshots(image.0).map(Outcome::Snapshots),
+            Operation::ResolveSettings {
+                base,
+                source,
+                amount,
+                replace_all,
+                ..
+            } => catalog
+                .resolve_settings(&source, &base, amount, replace_all)
+                .map(|params| Outcome::SettingsResolved(Box::new(params))),
         };
         Completion {
             token: effect.token,

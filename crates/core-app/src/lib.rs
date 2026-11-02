@@ -2,6 +2,7 @@
 pub mod autosave;
 pub mod editor;
 pub mod error;
+pub mod export;
 pub mod import;
 pub mod jobs;
 pub mod ports;

@@ -4,9 +4,9 @@
 
 use super::params::ControlKey as K;
 use super::slider::{develop_slider, disabled_slider, Env};
-use super::{color, curve, DevelopUi};
+use super::{border, color, crop_tool, curve, DevelopUi};
 use crate::icons::{icon_button_enabled, Icon};
-use crate::widgets::pill_button;
+use crate::widgets::{pill_button, pill_toggle};
 use crate::{theme, NOT_YET};
 use core_model::{Border, CbRgb, ChannelMix, Crop, DevelopParams, HslBand, ToneCurve, HSL_BANDS};
 use egui::{Align2, FontId, Id, Margin, Pos2, Rect, Sense, Stroke, Ui};
@@ -104,7 +104,7 @@ pub(super) fn all(ui: &mut Ui, env: &mut Env<'_>, st: &mut DevelopUi) {
         env,
         st,
         Head::new("border", "Border", false, Some(reset_border)),
-        border,
+        border::panel,
     );
 }
 
@@ -404,11 +404,28 @@ fn lens(ui: &mut Ui, env: &mut Env<'_>, st: &mut DevelopUi) {
 }
 
 fn crop(ui: &mut Ui, env: &mut Env<'_>, st: &mut DevelopUi) {
-    pill_button(ui, None, "Adjust crop", false).on_hover_text(NOT_YET);
+    let usable = env.enabled && env.params.is_some() && !st.show_before;
+    let label = if st.crop.active {
+        "Done cropping"
+    } else {
+        "Adjust crop"
+    };
+    if pill_toggle(ui, None, label, usable, st.crop.active).clicked() {
+        st.crop.active = !st.crop.active;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-        for label in ["Full", "1:1", "4:5", "5:4", "3:2", "2:3", "4:3", "16:9"] {
-            pill_button(ui, None, label, false).on_hover_text(NOT_YET);
+        for (label, target) in crop_tool::ASPECTS {
+            if pill_button(ui, None, label, usable).clicked() {
+                // Legacy `setAspect`: one edit, and the tool opens even when the ratio is unknown.
+                if let Some(crop) = env
+                    .params
+                    .and_then(|p| crop_tool::preset_crop(&p.crop, target, env.image_px))
+                {
+                    env.edit(|p| p.crop = crop);
+                }
+                st.crop.active = true;
+            }
         }
     });
     ui.horizontal(|ui| {
@@ -422,25 +439,4 @@ fn crop(ui: &mut Ui, env: &mut Env<'_>, st: &mut DevelopUi) {
         }
     });
     develop_slider(ui, "Straighten", K::CropAngle, env, st);
-}
-
-fn border(ui: &mut Ui, env: &mut Env<'_>, st: &mut DevelopUi) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Color").size(12.0).color(theme::T3));
-        pill_button(ui, None, "White / Black / Custom", false).on_hover_text(NOT_YET);
-    });
-    develop_slider(ui, "Size", K::BorderSize, env, st);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Aspect ratio")
-                .size(12.0)
-                .color(theme::T3),
-        );
-        pill_button(ui, None, "Original", false).on_hover_text(NOT_YET);
-    });
-    ui.label(
-        egui::RichText::new("The border isn't previewed in the native app yet.")
-            .size(11.0)
-            .color(theme::T3),
-    );
 }

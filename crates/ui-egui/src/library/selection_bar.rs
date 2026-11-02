@@ -55,6 +55,9 @@ pub(crate) fn show(
                     }
                     keyword_field(ui, lib, &images, commands);
                     collection_combo(ui, snapshot, &images, commands);
+                    if chip(ui, "Export…", false).clicked() {
+                        lib.export_open = Some(images.clone());
+                    }
                     if chip(ui, "Done", false).clicked() {
                         done = true;
                     }

@@ -75,6 +75,27 @@ pub fn get_edit_with_version(
         .optional()?)
 }
 
+/// Saved params JSON, its `process_version` and its `updated_at` revision in one read, so a
+/// renderer can interpret the document and confirm which edit version it is rendering.
+pub fn get_edit_document_row(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Option<(String, i64, i64)>, LibError> {
+    Ok(conn
+        .query_row(
+            "SELECT params, process_version, updated_at FROM edits WHERE image_id = ?1",
+            params![image_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?)
+}
+
 /// Upsert develop params JSON for an image. `updated_at` is also the cache revision, so ensure it
 /// strictly increases even for saves in the same clock tick or after a wall-clock adjustment.
 /// Readers must use the stored revision rather than assuming it equals the supplied timestamp.

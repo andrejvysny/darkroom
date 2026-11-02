@@ -427,3 +427,115 @@ fn remove_from_library_drops_rows_but_keeps_files() {
         assert!(f.dir.join(name).exists(), "{name}");
     }
 }
+
+#[test]
+fn save_receipt_edited_at_is_the_stored_version_and_strictly_increases() {
+    let f = Fixture::new();
+    let id = f.image(7, "a.cr3");
+    let hash = "07".repeat(32);
+    let stored = |f: &Fixture| {
+        let db = f.db.lock().unwrap();
+        core_library::edits::get_edit_with_version(&db.conn, id)
+            .unwrap()
+            .map(|(_, updated_at)| updated_at)
+    };
+    let first = f.adapter.save_edit(id, &hash, 1, "{}").unwrap();
+    assert_eq!(Some(first.edited_at), stored(&f));
+    let second = f.adapter.save_edit(id, &hash, 1, "{\"a\":1}").unwrap();
+    assert_eq!(Some(second.edited_at), stored(&f));
+    assert!(second.edited_at > first.edited_at);
+}
+
+#[test]
+fn presets_snapshots_and_settings_resolve_through_the_adapter() {
+    use core_app::workflow::SettingsSource;
+    use core_model::DevelopParams;
+
+    let f = Fixture::new();
+    let image = ImageId(f.image(1, "a.cr3"));
+    {
+        let db = f.db.lock().unwrap();
+        core_library::insert_preset(
+            &db.conn,
+            "Bright",
+            "My Presets",
+            false,
+            r#"["exposure"]"#,
+            r#"{"exposure": 2.0}"#,
+            6,
+            0,
+        )
+        .unwrap();
+    }
+    let listed = f.adapter.presets().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "Bright");
+
+    let base = DevelopParams {
+        exposure: 1.0,
+        contrast: 30.0,
+        ..Default::default()
+    };
+    let half = f
+        .adapter
+        .resolve_settings(&SettingsSource::Preset(listed[0].id), &base, 0.5, false)
+        .unwrap();
+    assert!((half.exposure - 1.5).abs() < 1e-5, "got {}", half.exposure);
+    assert_eq!(half.contrast, 30.0);
+    assert_eq!(
+        f.adapter
+            .resolve_settings(&SettingsSource::Preset(999), &base, 1.0, false),
+        Err(AppError::InvalidCommand("preset not found".into()))
+    );
+
+    let create = |name: &str| {
+        f.adapter
+            .mutate(&Mutation::CreateSnapshot {
+                image,
+                name: name.into(),
+                params: Arc::new(base.clone()),
+            })
+            .unwrap()
+    };
+    let MutationReport::SnapshotCreated(id) = create("Look") else {
+        panic!("expected SnapshotCreated");
+    };
+    let MutationReport::SnapshotCreated(second) = create("Look") else {
+        panic!("expected SnapshotCreated");
+    };
+    let names: Vec<_> = f
+        .adapter
+        .snapshots(image.0)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(
+        names,
+        ["Look (2)", "Look"],
+        "unique per image, newest first"
+    );
+
+    // A snapshot restores whole, ignoring amount and replace_all.
+    let restored = f
+        .adapter
+        .resolve_settings(
+            &SettingsSource::Snapshot(id),
+            &DevelopParams::default(),
+            0.1,
+            true,
+        )
+        .unwrap();
+    assert_eq!(restored, base);
+
+    f.adapter
+        .mutate(&Mutation::RenameSnapshot {
+            id,
+            name: "  Renamed ".into(),
+        })
+        .unwrap();
+    f.adapter.mutate(&Mutation::DeleteSnapshot(second)).unwrap();
+    let left = f.adapter.snapshots(image.0).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].name, "Renamed");
+}

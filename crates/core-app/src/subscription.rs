@@ -13,6 +13,9 @@ pub enum Notice {
     BarrierTimedOut,
     /// The user discarded this image's unsaved edits.
     UnsavedEditsDiscarded(ImageId),
+    /// A resolved preset / paste / restore was not applied: the document changed or closed while
+    /// it was being resolved. Not an error; nothing changed.
+    SettingsDropped,
     CommandAccepted(ActionId),
     EffectCompleted {
         action: ActionId,

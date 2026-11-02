@@ -9,15 +9,22 @@
 //! frame uploads it as an egui texture under a byte budget with least-recently-requested
 //! eviction. Failures are remembered (bounded) so they are not retried every frame.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use crate::presence::PresenceStore;
+use crate::thumb_render::{EditedThumbRenderer, RenderDeps, RenderEvent};
 use core_library::{ThumbCache, THUMB_SIZE};
 use ui_egui::{Presence, ThumbSource, ThumbState};
+
+mod previews;
+mod residents;
+use previews::Previews;
+use residents::BoundedKeys;
+pub use residents::Residents;
 
 #[cfg(test)]
 #[path = "thumbs/tests.rs"]
@@ -55,10 +62,14 @@ pub struct ThumbJob {
 pub struct Decoded {
     pub size: [u32; 2],
     pub rgba: Vec<u8>,
+    /// An edited key was served from a non-edited tier (canonical/plain/generated): the edited
+    /// render is still owed.
+    pub provisional: bool,
 }
 
 struct Done {
     key: ThumbKey,
+    path: PathBuf,
     outcome: Result<Decoded, String>,
 }
 
@@ -183,93 +194,13 @@ fn worker_loop(
             });
         let done = Done {
             key: job.key,
+            path: job.path,
             outcome,
         };
         if tx.send(done).is_err() {
             return; // host gone
         }
         wake();
-    }
-}
-
-/// Texture residency under a byte budget. Generic over the payload so tests need no egui.
-pub struct Residents<T> {
-    entries: HashMap<ThumbKey, Entry<T>>,
-    bytes: u64,
-}
-
-struct Entry<T> {
-    value: T,
-    size: [u32; 2],
-    bytes: u64,
-    last_used: u64,
-}
-
-impl<T> Default for Residents<T> {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            bytes: 0,
-        }
-    }
-}
-
-impl<T> Residents<T> {
-    pub fn touch(&mut self, key: &ThumbKey, frame: u64) -> Option<(&T, [u32; 2])> {
-        let entry = self.entries.get_mut(key)?;
-        entry.last_used = frame;
-        Some((&entry.value, entry.size))
-    }
-
-    pub fn insert(&mut self, key: ThumbKey, value: T, size: [u32; 2], frame: u64) {
-        let bytes = 4 * u64::from(size[0]) * u64::from(size[1]);
-        let entry = Entry {
-            value,
-            size,
-            bytes,
-            last_used: frame,
-        };
-        if let Some(old) = self.entries.insert(key, entry) {
-            self.bytes -= old.bytes;
-        }
-        self.bytes += bytes;
-    }
-
-    /// Drop least-recently-requested entries NOT requested in `frame` until under `budget`.
-    pub fn evict(&mut self, frame: u64, budget: u64) {
-        while self.bytes > budget {
-            let victim = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| entry.last_used < frame)
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone());
-            let Some(entry) = victim.and_then(|key| self.entries.remove(&key)) else {
-                break; // everything left is on screen
-            };
-            self.bytes -= entry.bytes;
-        }
-    }
-
-    #[cfg(test)]
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    pub fn contains(&self, key: &ThumbKey) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    /// Any resident texture of the same image bytes under another edit version: shown while the
-    /// current version loads, so an edit never flashes the cell back to a placeholder.
-    pub fn touch_previous(&mut self, key: &ThumbKey, frame: u64) -> Option<(&T, [u32; 2])> {
-        let previous = self
-            .entries
-            .iter()
-            .filter(|(other, _)| other.image_id == key.image_id && other.hash == key.hash)
-            .max_by_key(|(other, _)| other.edited_at)
-            .map(|(other, _)| other.clone())?;
-        self.touch(&previous, frame)
     }
 }
 
@@ -287,20 +218,46 @@ pub struct ThumbStore {
     budget: u64,
     previews: Previews,
     presence: PresenceStore,
+    renderer: Option<EditedThumbRenderer>,
+    /// Edited keys already rendered or refused: a provisional result for one of them is not
+    /// ensured again, so a failing render is never retried every frame.
+    render_seen: BoundedKeys,
 }
 
 impl ThumbStore {
     /// `cache_root` is `<catalog dir>/thumbs`. `wake` redraws the window when a result lands.
+    /// `render` enables producing edited thumbnails; without it edited keys keep showing the
+    /// unedited thumbnail.
     pub fn new(
         ctx: egui::Context,
         cache_root: PathBuf,
         process_version: i64,
         wake: Arc<dyn Fn() + Send + Sync>,
+        render: Option<RenderDeps>,
     ) -> Result<Self, String> {
         let cache = ThumbCache::new(cache_root)
             .map_err(|error| format!("could not open the thumbnail cache: {error}"))?;
+        let renderer = render
+            .map(|deps| {
+                EditedThumbRenderer::production(
+                    deps,
+                    cache.clone(),
+                    process_version,
+                    Arc::clone(&wake),
+                )
+            })
+            .transpose()?;
         let loader: Arc<Loader> = Arc::new(move |job| load(&cache, process_version, job));
-        Self::with_loader(ctx, loader, wake, THUMB_TEXTURE_BUDGET)
+        let mut store = Self::with_loader(ctx, loader, wake, THUMB_TEXTURE_BUDGET)?;
+        store.renderer = renderer;
+        Ok(store)
+    }
+
+    /// Test seam: attach a renderer built around an injected body.
+    #[cfg(test)]
+    pub fn with_renderer(mut self, renderer: EditedThumbRenderer) -> Self {
+        self.renderer = Some(renderer);
+        self
     }
 
     pub fn with_loader(
@@ -324,6 +281,8 @@ impl ThumbStore {
             budget,
             previews: Previews::new(wake_for_previews),
             presence,
+            renderer: None,
+            render_seen: BoundedKeys::new(FAILED_CAP),
         })
     }
 
@@ -334,16 +293,40 @@ impl ThumbStore {
             self.catalog_epoch = Some(catalog_epoch);
             self.failed.clear();
             self.failed_order.clear();
+            self.render_seen.clear();
+            // Provisional textures are re-asked, so they are ensured against the new catalog.
+            self.residents.remove_provisional();
             self.presence.invalidate();
         }
         self.previews.drain(&self.ctx, self.frame);
         while let Ok(done) = self.pool.results.try_recv() {
             lock(&self.pool.shared.0).held.remove(&done.key);
             match done.outcome {
-                Ok(decoded) => self.upload(done.key, decoded),
+                Ok(decoded) => self.upload(done.key, done.path, decoded),
                 Err(error) => {
                     eprintln!("thumbnail {}: {error}", done.key.image_id);
                     self.note_failed(done.key);
+                }
+            }
+        }
+        self.drain_renders();
+    }
+
+    fn drain_renders(&mut self) {
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        for event in renderer.drain() {
+            match event {
+                // The edited tier now exists: forget the provisional texture and any failure so
+                // the next frame asks again and reads it.
+                RenderEvent::Done(key) => {
+                    self.residents.remove(&key);
+                    self.failed.remove(&key);
+                    self.failed_order.retain(|other| other != &key);
+                }
+                RenderEvent::Failed(key, error) => {
+                    eprintln!("edited thumbnail {}: {error}", key.image_id);
                 }
             }
         }
@@ -371,10 +354,14 @@ impl ThumbStore {
     pub fn shutdown(&mut self) -> Result<(), String> {
         self.previews.shutdown();
         let presence = self.presence.shutdown();
-        self.pool.shutdown().and(presence)
+        let renderer = self
+            .renderer
+            .as_mut()
+            .map_or(Ok(()), EditedThumbRenderer::shutdown);
+        self.pool.shutdown().and(presence).and(renderer)
     }
 
-    fn upload(&mut self, key: ThumbKey, decoded: Decoded) {
+    fn upload(&mut self, key: ThumbKey, path: PathBuf, decoded: Decoded) {
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [decoded.size[0] as usize, decoded.size[1] as usize],
             &decoded.rgba,
@@ -383,7 +370,14 @@ impl ThumbStore {
         let handle = self
             .ctx
             .load_texture(name, image, egui::TextureOptions::LINEAR);
-        self.residents.insert(key, handle, decoded.size, self.frame);
+        if decoded.provisional && !self.render_seen.contains(&key) {
+            if let Some(renderer) = &self.renderer {
+                renderer.ensure(key.clone(), path);
+                self.render_seen.insert(key.clone());
+            }
+        }
+        self.residents
+            .insert_with(key, handle, decoded.size, self.frame, decoded.provisional);
     }
 
     fn note_failed(&mut self, key: ThumbKey) {
@@ -414,6 +408,15 @@ impl ThumbSource for ThumbStore {
             hash: image.content_hash.to_ascii_lowercase(),
             edited_at: image.edited_at,
         };
+        if self.residents.is_provisional(&key) {
+            // Keep showing the last settled edit while this one's render is owed.
+            if let Some((handle, size)) = self.residents.touch_settled_previous(&key, self.frame) {
+                return ThumbState::Ready {
+                    texture: handle.id(),
+                    size,
+                };
+            }
+        }
         if let Some((handle, size)) = self.residents.touch(&key, self.frame) {
             return ThumbState::Ready {
                 texture: handle.id(),
@@ -439,180 +442,6 @@ impl ThumbSource for ThumbStore {
     }
 }
 
-enum Preview {
-    Ready {
-        handle: egui::TextureHandle,
-        size: [u32; 2],
-    },
-    Failed,
-}
-
-type PreviewResult = (String, Result<Decoded, String>);
-
-struct PreviewWorker {
-    jobs: Option<Sender<String>>,
-    results: Receiver<PreviewResult>,
-    thread: Option<JoinHandle<()>>,
-}
-
-/// Embedded-preview decodes for not-yet-imported files: one lazily started thread, a small
-/// recency-bounded texture cache keyed by path, no catalog or thumbnail-cache access.
-struct Previews {
-    entries: HashMap<String, (Preview, u64)>,
-    pending: HashSet<String>,
-    worker: Option<PreviewWorker>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl Previews {
-    fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self {
-            entries: HashMap::new(),
-            pending: HashSet::new(),
-            worker: None,
-            wake,
-        }
-    }
-
-    fn ask(&mut self, path: &str, frame: u64) -> ThumbState {
-        if let Some((preview, last_used)) = self.entries.get_mut(path) {
-            *last_used = frame;
-            return match preview {
-                Preview::Ready { handle, size } => ThumbState::Ready {
-                    texture: handle.id(),
-                    size: *size,
-                },
-                Preview::Failed => ThumbState::Failed,
-            };
-        }
-        if self.pending.contains(path) {
-            return ThumbState::Loading;
-        }
-        if self.pending.len() >= PREVIEW_INFLIGHT {
-            return ThumbState::Loading;
-        }
-        match self.send(path) {
-            Ok(()) => {
-                self.pending.insert(path.to_string());
-                ThumbState::Loading
-            }
-            Err(error) => {
-                eprintln!("import preview unavailable: {error}");
-                self.entries
-                    .insert(path.to_string(), (Preview::Failed, frame));
-                self.evict(frame);
-                ThumbState::Failed
-            }
-        }
-    }
-
-    fn send(&mut self, path: &str) -> Result<(), String> {
-        if self.worker.is_none() {
-            let (jobs_tx, jobs_rx) = mpsc::channel::<String>();
-            let (results_tx, results) = mpsc::channel::<PreviewResult>();
-            let wake = Arc::clone(&self.wake);
-            let thread = std::thread::Builder::new()
-                .name("import-preview".into())
-                .spawn(move || {
-                    while let Ok(path) = jobs_rx.recv() {
-                        let outcome = std::panic::catch_unwind(|| decode_file_preview(&path))
-                            .unwrap_or_else(|payload| {
-                                Err(format!(
-                                    "preview worker panicked: {}",
-                                    crate::photo_worker::panic_text(&*payload)
-                                ))
-                            });
-                        if results_tx.send((path, outcome)).is_err() {
-                            return;
-                        }
-                        wake();
-                    }
-                })
-                .map_err(|error| format!("could not start the preview worker: {error}"))?;
-            self.worker = Some(PreviewWorker {
-                jobs: Some(jobs_tx),
-                results,
-                thread: Some(thread),
-            });
-        }
-        self.worker
-            .as_ref()
-            .and_then(|worker| worker.jobs.as_ref())
-            .ok_or_else(|| "preview worker stopped".to_string())?
-            .send(path.to_string())
-            .map_err(|_| "preview worker stopped".to_string())
-    }
-
-    fn drain(&mut self, ctx: &egui::Context, frame: u64) {
-        let Some(worker) = &self.worker else { return };
-        let done: Vec<PreviewResult> = worker.results.try_iter().collect();
-        for (path, outcome) in done {
-            self.pending.remove(&path);
-            let preview = match outcome {
-                Ok(decoded) => {
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [decoded.size[0] as usize, decoded.size[1] as usize],
-                        &decoded.rgba,
-                    );
-                    let handle =
-                        ctx.load_texture("import-preview", image, egui::TextureOptions::LINEAR);
-                    Preview::Ready {
-                        handle,
-                        size: decoded.size,
-                    }
-                }
-                Err(error) => {
-                    eprintln!("import preview {path}: {error}");
-                    Preview::Failed
-                }
-            };
-            self.entries.insert(path, (preview, frame));
-        }
-        self.evict(frame);
-    }
-
-    /// Drop the least recently asked-for entries beyond the cap (never the current frame's).
-    fn evict(&mut self, frame: u64) {
-        while self.entries.len() > PREVIEW_CAP {
-            let victim = self
-                .entries
-                .iter()
-                .filter(|(_, (_, last_used))| *last_used < frame)
-                .min_by_key(|(_, (_, last_used))| *last_used)
-                .map(|(path, _)| path.clone());
-            match victim {
-                Some(path) => self.entries.remove(&path),
-                None => break,
-            };
-        }
-    }
-
-    fn shutdown(&mut self) {
-        if let Some(mut worker) = self.worker.take() {
-            worker.jobs = None; // closes the channel; the thread exits after its current decode
-            if let Some(thread) = worker.thread.take() {
-                let _ = thread.join();
-            }
-        }
-        self.pending.clear();
-    }
-}
-
-impl Drop for Previews {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Decode only the embedded preview of one source file; never writes to disk or the catalog.
-fn decode_file_preview(path: &str) -> Result<Decoded, String> {
-    let source = core_raw::source_from_path(std::path::Path::new(path))
-        .map_err(|error| format!("could not open {path}: {error}"))?;
-    let thumb = core_raw::thumbnail_jpeg(&source, PREVIEW_EDGE, 82)
-        .map_err(|error| format!("could not decode {path}: {error}"))?;
-    decode(&thumb.jpeg)
-}
-
 /// Cache tiers in legacy `protocol.rs` order; an unreadable or undecodable tier is a miss.
 fn read_cached(cache: &ThumbCache, pv: i64, key: &ThumbKey) -> Option<Decoded> {
     let tiers = [
@@ -621,10 +450,12 @@ fn read_cached(cache: &ThumbCache, pv: i64, key: &ThumbKey) -> Option<Decoded> {
         cache.read_canonical(&key.hash, pv).ok(),
         cache.read(&key.hash, THUMB_SIZE).ok(),
     ];
-    tiers
+    let (tier, mut decoded) = tiers
         .into_iter()
-        .flatten()
-        .find_map(|jpeg| decode(&jpeg).ok())
+        .enumerate()
+        .find_map(|(tier, jpeg)| decode(&jpeg?).ok().map(|decoded| (tier, decoded)))?;
+    decoded.provisional = key.edited_at.is_some() && tier != 0;
+    Some(decoded)
 }
 
 fn decode(jpeg: &[u8]) -> Result<Decoded, String> {
@@ -634,6 +465,7 @@ fn decode(jpeg: &[u8]) -> Result<Decoded, String> {
     Ok(Decoded {
         size: [image.width(), image.height()],
         rgba: image.into_raw(),
+        provisional: false,
     })
 }
 
@@ -656,5 +488,7 @@ pub fn load(cache: &ThumbCache, pv: i64, job: &ThumbJob) -> Result<Decoded, Stri
     if let Err(error) = cache.write(&job.key.hash, THUMB_SIZE, &thumb.jpeg) {
         eprintln!("could not cache thumbnail {}: {error}", job.key.hash);
     }
-    decode(&thumb.jpeg)
+    let mut decoded = decode(&thumb.jpeg)?;
+    decoded.provisional = job.key.edited_at.is_some();
+    Ok(decoded)
 }

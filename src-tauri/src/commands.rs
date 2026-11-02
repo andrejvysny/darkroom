@@ -9,6 +9,10 @@ use core_library::{
     QueryParams, UserLabels,
 };
 use core_pipeline::{DevelopParams, Histogram};
+use core_runtime::export_io::{ensure_not_source, write_atomic_with_policy, write_new_export};
+use core_runtime::presets::{
+    self, parse_import, sparse_map, validate_sparse_params, PresetEnvelope,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -1533,34 +1537,6 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     write_atomic_with_policy(dest, bytes, true)
 }
 
-/// Batch photo export has no per-file overwrite confirmation; collisions must preserve both the
-/// existing photograph and any concurrent writer's output. Preset save uses explicit replacement.
-fn write_new_export(dest: &Path, bytes: &[u8]) -> Result<(), String> {
-    write_atomic_with_policy(dest, bytes, false)
-}
-
-fn write_atomic_with_policy(dest: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
-    use std::io::Write;
-    let parent = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut part = tempfile::Builder::new()
-        .prefix(".darkroom-export-")
-        .suffix(".part")
-        .tempfile_in(parent)
-        .map_err(|e| e.to_string())?;
-    part.write_all(bytes).map_err(|e| e.to_string())?;
-    part.as_file().sync_all().map_err(|e| e.to_string())?;
-    (if replace {
-        part.persist(dest)
-    } else {
-        part.persist_noclobber(dest)
-    })
-    .map(|_| ())
-    .map_err(|e| e.error.to_string())
-}
-
 /// Protect every catalog source, including another image or a symlink alias, before publishing an
 /// export. The DB lock covers only path lookup; filesystem resolution happens after it is released.
 fn ensure_export_destination(st: &AppState, dest: &Path) -> Result<(), String> {
@@ -1576,33 +1552,6 @@ fn ensure_export_destination(st: &AppState, dest: &Path) -> Result<(), String> {
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
     };
     ensure_not_source(dest, &sources)
-}
-
-fn ensure_not_source(dest: &Path, sources: &[String]) -> Result<(), String> {
-    // A missing original still owns its catalog path. Resolve its parent so aliases and `..`
-    // cannot publish unrelated pixels under a missing row's old content identity.
-    let resolve = |path: &Path| {
-        path.canonicalize().ok().or_else(|| {
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            Some(parent.canonicalize().ok()?.join(path.file_name()?))
-        })
-    };
-    let resolved = resolve(dest);
-    if sources.iter().any(|source| {
-        let source = Path::new(source);
-        source == dest
-            || resolved
-                .as_ref()
-                .is_some_and(|dest| resolve(source).as_ref() == Some(dest))
-    }) {
-        return Err(
-            "export destination is a catalog source image; choose a different filename".into(),
-        );
-    }
-    Ok(())
 }
 
 /// Export a single image at full resolution through the develop pipeline to `dest`.
@@ -4359,25 +4308,6 @@ pub async fn mask_ai_tier_set(app: AppHandle, tier: String) -> Result<(), String
 
 // ---------- Presets ----------
 
-/// Portable preset file envelope (export/import) and the format of the bundled built-ins. `params` is
-/// the sparse DevelopParams object (only the touched top-level fields). `schema_version` is REQUIRED
-/// for a file to be treated as our native preset on import (its presence disambiguates our envelope
-/// from an arbitrary `.json` that merely happens to have `params`/`fieldKeys`).
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PresetEnvelope {
-    #[serde(default)]
-    schema_version: Option<i64>,
-    name: String,
-    #[serde(default)]
-    group_name: Option<String>,
-    #[serde(default)]
-    field_keys: Vec<String>,
-    #[serde(default)]
-    process_version: Option<i64>,
-    params: serde_json::Value,
-}
-
 /// Result of importing a preset file: the new preset id + an honest conversion report.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4434,26 +4364,6 @@ fn merge_base(
         Some(json) => serde_json::from_str::<serde_json::Value>(&json).map_err(|e| e.to_string()),
         None => serde_json::to_value(DevelopParams::default()).map_err(|e| e.to_string()),
     }
-}
-
-fn sparse_map(params_json: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let v: serde_json::Value = serde_json::from_str(params_json).map_err(|e| e.to_string())?;
-    v.as_object()
-        .cloned()
-        .ok_or_else(|| "preset params must be a JSON object".to_string())
-}
-
-/// Validate that a sparse params object overlays cleanly onto defaults and deserializes into a typed
-/// `DevelopParams` — so a buggy importer / hand-edited preset fails at WRITE time (save/import) with a
-/// clear error, instead of silently storing junk that only blows up later at apply.
-fn validate_sparse_params(
-    sparse: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    let base = serde_json::to_value(DevelopParams::default()).map_err(|e| e.to_string())?;
-    let merged = core_preset::apply_sparse(&base, sparse, 1.0);
-    serde_json::from_value::<DevelopParams>(merged)
-        .map(|_| ())
-        .map_err(|e| format!("preset params are not valid develop settings: {e}"))
 }
 
 /// All presets (summaries) for the panel.
@@ -4660,8 +4570,7 @@ pub async fn presets_apply(
             let preset = core_library::get_preset(&db.conn, preset_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "preset not found".to_string())?;
-            let mut overlay = sparse_map(&preset.params)?;
-            core_preset::migrate_sparse(&mut overlay, preset.process_version);
+            let overlay = presets::preset_overlay(&preset)?;
             let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
             let merged = core_preset::apply_sparse(&base, &overlay, amount.unwrap_or(1.0));
             serde_json::from_value::<DevelopParams>(merged).map_err(|e| e.to_string())
@@ -4688,8 +4597,7 @@ pub async fn develop_apply_settings(
         true,
         "develop_apply_settings",
         move || {
-            let full = serde_json::to_value(&params).map_err(|e| e.to_string())?;
-            let overlay = core_preset::subset(&full, &field_keys);
+            let overlay = presets::copied_overlay(&params, Some(&field_keys))?;
             let st = app.state::<AppState>();
             let db = st.db.lock().map_err(|e| e.to_string())?;
             let base = merge_base(&db.conn, image_id, replace_all.unwrap_or(false))?;
@@ -4736,57 +4644,6 @@ pub async fn presets_export(
     )
     .await
     .map_err(|e| e.to_string())?
-}
-
-/// Parse an import file into `(name, group, field_keys, sparse_params_json, report)`. Tries our native
-/// envelope first, then the external-format registry (Lightroom etc., populated from Phase 3).
-fn parse_import(
-    bytes: &[u8],
-    src_path: &str,
-) -> Result<
-    (
-        String,
-        String,
-        Vec<String>,
-        String,
-        core_preset::ImportReport,
-    ),
-    String,
-> {
-    if let Ok(env) = serde_json::from_slice::<PresetEnvelope>(bytes) {
-        // Require an explicit schemaVersion so an arbitrary `.json` that merely has `params`/`fieldKeys`
-        // isn't mistaken for our native envelope (it falls through to the external-format registry).
-        if env.schema_version.is_some() && env.params.is_object() && !env.field_keys.is_empty() {
-            let mut report = core_preset::ImportReport {
-                source_format: "native-json".into(),
-                ..Default::default()
-            };
-            for k in &env.field_keys {
-                report.mark_clean(k);
-            }
-            let group = env.group_name.unwrap_or_else(|| "Imported".into());
-            let sparse_json = env.params.to_string();
-            return Ok((env.name, group, env.field_keys, sparse_json, report));
-        }
-    }
-    let registry = core_preset::Registry::with_defaults();
-    let parsed = registry
-        .import(bytes, Some(std::path::Path::new(src_path)))
-        .map_err(|e| e.to_string())?;
-    let name = std::path::Path::new(src_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Imported preset")
-        .to_string();
-    let sparse_json = serde_json::to_string(&serde_json::Value::Object(parsed.params))
-        .map_err(|e| e.to_string())?;
-    Ok((
-        name,
-        "Imported".into(),
-        parsed.field_keys,
-        sparse_json,
-        parsed.report,
-    ))
 }
 
 /// Import a preset file (native JSON now; Lightroom `.xmp`/`.lrtemplate` once Phase 3 registers them).
@@ -4910,10 +4767,7 @@ pub async fn snapshot_restore(app: AppHandle, snapshot_id: i64) -> Result<Develo
             let (json, pv) = core_library::get_snapshot_params(&db.conn, snapshot_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "snapshot not found".to_string())?;
-            let mut value: serde_json::Value =
-                serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            core_preset::migrate_full(&mut value, pv);
-            serde_json::from_value::<DevelopParams>(value).map_err(|e| e.to_string())
+            presets::snapshot_params(&json, pv)
         },
     )
     .await

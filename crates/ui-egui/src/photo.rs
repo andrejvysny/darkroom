@@ -36,6 +36,33 @@ pub struct PhotoRequestPlan {
     /// The crop-local window to render — `((origin u, origin v), (size u, size v))` — or `None`
     /// for the fit view, which renders the whole crop (`ViewParams::full`) exactly as before.
     pub window: Option<([f32; 2], [f32; 2])>,
+    /// Render the crop tool's preview: the whole straightened/rotated frame, auto-zoom off,
+    /// out-of-image corners dimmed (`ViewParams::crop_preview`).
+    pub crop_preview: bool,
+}
+
+/// Which picture the stage asks the worker for. Anything but `Edited` is a different image at the
+/// same edit revision, so it folds into the viewport revision (and thereby the frame key).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StageVariant {
+    /// The document as edited (the historical plan).
+    #[default]
+    Edited,
+    /// The unedited picture (the Before half of Before/After).
+    Before,
+    /// The whole frame without the crop, for the interactive crop tool.
+    CropTool,
+}
+
+impl StageVariant {
+    /// Hash discriminant; `Edited` hashes nothing so its keys stay exactly the historical ones.
+    fn tag(self) -> Option<u8> {
+        match self {
+            Self::Edited => None,
+            Self::Before => Some(1),
+            Self::CropTool => Some(2),
+        }
+    }
 }
 
 /// Photo presentation state for the central panel, owned by the host (`window.rs`): the egui
@@ -136,6 +163,15 @@ pub fn viewport_revision(
     height: u32,
     window: Option<([f32; 2], [f32; 2])>,
 ) -> ViewportRevision {
+    variant_revision(width, height, window, StageVariant::Edited)
+}
+
+fn variant_revision(
+    width: u32,
+    height: u32,
+    window: Option<([f32; 2], [f32; 2])>,
+    variant: StageVariant,
+) -> ViewportRevision {
     let mut hasher = DefaultHasher::new();
     width.hash(&mut hasher);
     height.hash(&mut hasher);
@@ -143,6 +179,9 @@ pub fn viewport_revision(
         for value in origin.into_iter().chain(size) {
             value.to_bits().hash(&mut hasher);
         }
+    }
+    if let Some(tag) = variant.tag() {
+        tag.hash(&mut hasher);
     }
     ViewportRevision(hasher.finish())
 }
@@ -199,6 +238,10 @@ fn plan_geometry(
 /// At fit (`view.is_fit()`) or without catalog dims the plan is exactly the historical one: the
 /// whole crop rendered at the fitted size, `window: None`. Zoomed, only the visible window of the
 /// crop is rendered, at the physical size of the visible image area.
+///
+/// `variant` swaps the picture: `Before` renders the unedited params (keeping the source's
+/// intrinsic `display_referred` flag, as Reset does), `CropTool` the full frame with the
+/// crop's straighten/rotation kept, always at fit (the tool maps 1:1 onto the fitted frame).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn photo_plan(
     snapshot: &ApplicationSnapshot,
@@ -207,12 +250,32 @@ pub(crate) fn photo_plan(
     device_epoch: DeviceEpoch,
     view: ViewState,
     interacting: bool,
+    variant: StageVariant,
 ) -> Option<PhotoRequestPlan> {
     let image = snapshot.editor.image.as_ref()?;
     if snapshot.editor.document.status != DocumentStatus::Ready {
         return None;
     }
-    let params = snapshot.editor.document.params.clone()?;
+    let params = match (variant, snapshot.editor.document.params.clone()?) {
+        (StageVariant::Edited, edited) => edited,
+        (StageVariant::Before, edited) => Arc::new(DevelopParams {
+            display_referred: edited.display_referred,
+            ..Default::default()
+        }),
+        (StageVariant::CropTool, edited) => Arc::new(DevelopParams {
+            crop: Crop {
+                angle: edited.crop.angle,
+                rot90: edited.crop.rot90,
+                ..Crop::default()
+            },
+            ..(*edited).clone()
+        }),
+    };
+    let view = if variant == StageVariant::CropTool {
+        ViewState::default()
+    } else {
+        view
+    };
     let revision = snapshot.editor.document.revision?;
     let process_version = snapshot.editor.document.process_version?;
     let panel_w = (rect.width() * ppp).round().max(1.0) as u32;
@@ -248,6 +311,7 @@ pub(crate) fn photo_plan(
         ppp,
         device_epoch,
         window,
+        variant,
     );
     Some(PhotoRequestPlan {
         key,
@@ -258,6 +322,7 @@ pub(crate) fn photo_plan(
         viewport_px,
         display_px,
         window,
+        crop_preview: variant == StageVariant::CropTool,
     })
 }
 
@@ -278,6 +343,7 @@ fn wanted_key(
     ppp: f32,
     device_epoch: DeviceEpoch,
     window: Option<([f32; 2], [f32; 2])>,
+    variant: StageVariant,
 ) -> FrameKey {
     FrameKey {
         identity: RenderIdentity {
@@ -292,7 +358,7 @@ fn wanted_key(
             process_version,
             renderer_version: RendererVersion(1),
             cache_version: CacheVersion(1),
-            viewport_revision: viewport_revision(viewport_px.0, viewport_px.1, window),
+            viewport_revision: variant_revision(viewport_px.0, viewport_px.1, window, variant),
             display_revision: DisplayRevision(0),
             device_epoch,
         },

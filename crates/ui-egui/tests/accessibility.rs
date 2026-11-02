@@ -66,6 +66,7 @@ struct Harness {
     tree: HashMap<NodeId, Node>,
     time: f64,
     import: core_app::import::ImportView,
+    export: core_app::export::ExportView,
 }
 
 impl Harness {
@@ -91,6 +92,7 @@ impl Harness {
             tree: HashMap::new(),
             time: 0.0,
             import: Default::default(),
+            export: Default::default(),
         };
         for _ in 0..4 {
             harness.frame(Vec::new());
@@ -123,6 +125,7 @@ impl Harness {
                     thumbs: &mut thumbs,
                     histogram: None,
                     import: &self.import,
+                    export: &self.export,
                 },
                 &mut self.ui,
             );
@@ -302,4 +305,13 @@ fn import_dialog_is_a_named_dialog() {
     h.frame(Vec::new());
     h.frame(Vec::new());
     h.node(Role::Dialog, "Import photos");
+}
+
+#[test]
+fn export_dialog_is_a_named_dialog() {
+    let mut h = Harness::new(snapshot(DocumentStatus::Ready), Mode::Library);
+    h.export.open = true;
+    h.frame(Vec::new());
+    h.frame(Vec::new());
+    h.node(Role::Dialog, "Export photos");
 }

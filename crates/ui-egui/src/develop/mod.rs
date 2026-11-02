@@ -3,12 +3,16 @@
 //! keeps ([`DevelopUi`]) is transient input state (drag in flight, open modules, selected band),
 //! never the authoritative document.
 
+mod border;
 mod color;
+mod crop_tool;
 mod curve;
 mod filmstrip;
+mod history_panel;
 mod left;
 mod modules;
 mod params;
+mod presets_panel;
 mod slider;
 pub(crate) mod stage;
 pub(crate) mod zoom;
@@ -60,6 +64,8 @@ pub struct DevelopUi {
     curve_grab: Option<curve::Grab>,
     left_collapsed: bool,
     left_tab: left::Tab,
+    presets: presets_panel::PresetsUi,
+    history: history_panel::HistoryUi,
     film_scrolled_to: Option<ImageId>,
     /// The keyboard was busy when the frame's input was read (a text edit owned it, or a modal
     /// is open; the root captures this before any widget runs); the stage's bare-`Z` zoom toggle
@@ -67,6 +73,10 @@ pub struct DevelopUi {
     typing: bool,
     /// Stage zoom/pan (fit by default; reset when the photo changes).
     zoom: zoom::ZoomUi,
+    /// The stage shows the unedited picture (Before/After, `\`). Survives photo changes.
+    show_before: bool,
+    /// Interactive crop tool: mode flag and the drag in flight.
+    crop: crop_tool::CropState,
     /// Screen rect of the Exposure slider track from the last frame (test/automation hook).
     pub exposure_rect: Option<Rect>,
     /// Track / value-text rect of every slider laid out last frame, by `ControlKey::name()`.
@@ -87,6 +97,25 @@ impl DevelopUi {
     /// stage's bare-`Z` zoom toggle yields to a focused text edit or an open modal.
     pub(crate) fn set_typing(&mut self, typing: bool) {
         self.typing = typing;
+    }
+
+    /// Flip Before/After. Showing Before leaves crop mode: the tool edits the edited picture.
+    pub(crate) fn toggle_before(&mut self, commands: &mut Vec<Command>) {
+        self.show_before = !self.show_before;
+        if self.show_before {
+            self.crop.leave(commands);
+        }
+    }
+
+    /// Whether the stage shows the unedited picture.
+    pub(crate) fn before_shown(&self) -> bool {
+        self.show_before
+    }
+
+    /// Develop is not on screen: nothing of its transient input may linger (a half-made crop
+    /// drag would otherwise hold a gesture open under the Library).
+    pub(crate) fn leave(&mut self, commands: &mut Vec<Command>) {
+        self.crop.leave(commands);
     }
 
     /// Screen rect of the photo drawn on the stage last frame, in points (test/automation hook:
@@ -154,10 +183,41 @@ pub(crate) fn show(
     photo: &mut PhotoUi,
     commands: &mut Vec<Command>,
 ) {
+    st.crop.sync(snapshot);
+    if !st.typing
+        && root
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backslash))
+    {
+        st.toggle_before(commands);
+    }
     filmstrip::show(root, snapshot, st, thumbs, commands);
-    left::show(root, st);
+    left::show(root, snapshot, st, commands);
+    presets_panel::toast(root.ctx(), st);
     panel(root, snapshot, st, histogram, commands);
-    stage::central(root, snapshot, photo, Some(&mut st.zoom), st.typing);
+    let typing = st.typing;
+    stage::central(
+        root,
+        snapshot,
+        photo,
+        Some(&mut st.zoom),
+        typing,
+        Some(stage::DevelopStage {
+            before: st.show_before,
+            crop: &mut st.crop,
+            commands,
+        }),
+    );
+}
+
+/// The selected image's catalog dims, when present and non-zero.
+fn image_px(snapshot: &ApplicationSnapshot) -> Option<(u32, u32)> {
+    let image = snapshot.editor.image.as_ref()?;
+    let (w, h) = (
+        u32::try_from(image.width?).ok()?,
+        u32::try_from(image.height?).ok()?,
+    );
+    (w > 0 && h > 0).then_some((w, h))
 }
 
 /// Right-hand instrument panel: undo/redo, histogram, scrolling modules, save status.
@@ -202,6 +262,7 @@ fn panel(
                         params: snapshot.editor.document.params.as_ref(),
                         enabled: can_edit,
                         histogram: histogram.filter(|h| Some(h.image.0) == selected),
+                        image_px: image_px(snapshot),
                         commands,
                     };
                     modules::all(ui, &mut env, st);

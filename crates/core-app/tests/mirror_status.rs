@@ -79,6 +79,7 @@ fn save(s: &mut ApplicationSession, ev: f32, revision: i64, mirror: MirrorStatus
         Ok(Outcome::Saved {
             catalog_revision: rev(revision),
             mirror,
+            edited_at: 0,
         }),
     );
 }
@@ -199,4 +200,90 @@ fn a_failed_read_leaves_the_status_and_error_alone() {
     done(&mut s, &effects[0], Err(AppError::Catalog("busy".into())));
     assert_eq!(mirror(&s), pending(1));
     assert!(s.snapshot().error.is_none());
+}
+
+fn library_row(id: i64, edited_at: Option<i64>) -> ImageRow {
+    ImageRow {
+        id,
+        content_hash: "00".repeat(32),
+        filename: format!("{id}.cr3"),
+        edited_at,
+        ..Default::default()
+    }
+}
+
+fn row_edited_at(s: &ApplicationSession, id: i64) -> Option<i64> {
+    s.snapshot()
+        .library
+        .rows
+        .iter()
+        .find(|row| row.id == id)
+        .and_then(|row| row.edited_at)
+}
+
+/// Load `rows` as the library, select image 1, edit it, and return its due save effect.
+fn library_with_due_save(s: &mut ApplicationSession, rows: Vec<ImageRow>, ev: f32) -> Effect {
+    let effects = s.dispatch(Command::RefreshLibrary).unwrap();
+    let query = effects
+        .iter()
+        .find(|e| matches!(e.operation, Operation::QueryLibrary(_)))
+        .expect("library query");
+    let count = rows.len() as i64;
+    done(s, query, Ok(Outcome::Library { rows, count }));
+    select(s, 1);
+    s.dispatch(Command::Edit(EditIntent::SetExposure(ev)))
+        .unwrap();
+    s.tick(u64::MAX / 2)
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.operation, Operation::SaveEdit { .. }))
+        .expect("a save is due")
+}
+
+fn saved(edited_at: i64) -> Outcome {
+    Outcome::Saved {
+        catalog_revision: rev(1),
+        mirror: MirrorStatus::Unknown,
+        edited_at,
+    }
+}
+
+#[test]
+fn acked_save_patches_library_row_edited_at_and_never_lowers_it() {
+    let mut s = open();
+    let save = library_with_due_save(
+        &mut s,
+        vec![library_row(1, Some(50)), library_row(2, None)],
+        1.0,
+    );
+    done(&mut s, &save, Ok(saved(40)));
+    assert_eq!(row_edited_at(&s, 1), Some(50), "a lower value never lowers");
+    assert_eq!(row_edited_at(&s, 2), None, "other images are untouched");
+
+    let save = library_with_due_save(
+        &mut s,
+        vec![library_row(1, Some(50)), library_row(2, None)],
+        2.0,
+    );
+    done(&mut s, &save, Ok(saved(90)));
+    assert_eq!(row_edited_at(&s, 1), Some(90));
+    assert_eq!(
+        s.snapshot().editor.image.as_ref().unwrap().edited_at,
+        Some(90)
+    );
+}
+
+#[test]
+fn acked_save_of_a_non_selected_image_still_patches_its_row() {
+    let mut s = open();
+    let save = library_with_due_save(
+        &mut s,
+        vec![library_row(1, None), library_row(2, None)],
+        1.0,
+    );
+    // The user moves on before the ack lands.
+    select(&mut s, 2);
+    done(&mut s, &save, Ok(saved(70)));
+    assert_eq!(row_edited_at(&s, 1), Some(70));
+    assert_eq!(row_edited_at(&s, 2), None);
 }

@@ -4,12 +4,13 @@ use crate::state::ImageTags;
 use crate::state::MirrorStatus;
 use crate::AppError;
 use core_model::catalog::{
-    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, QueryParams, RejectDeleteResult,
-    RejectSummary, RemoveResult,
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, PresetSummary, QueryParams,
+    RejectDeleteResult, RejectSummary, RemoveResult, SnapshotSummary,
 };
 use core_model::document::EditDocument;
 use core_model::identity::{
-    CatalogEpoch, CatalogRevision, EditorSession, ImageId, ProcessVersion, SelectionGeneration,
+    CatalogEpoch, CatalogRevision, EditRevision, EditorSession, ImageId, ProcessVersion,
+    SelectionGeneration,
 };
 use core_model::DevelopParams;
 use std::path::PathBuf;
@@ -30,6 +31,35 @@ pub enum EditIntent {
     SetExposure(f32),
     /// Discrete full-params edit (any control); same path and coalescing as `SetExposure`.
     Apply(Box<DevelopParams>),
+    /// Back to the params the document had when it was opened for this editor session; one
+    /// undoable step that never coalesces with neighbouring slider edits.
+    RevertToOpened,
+    /// Every edit back to defaults, keeping the source's intrinsic `display_referred` flag; one
+    /// undoable step that never coalesces.
+    ResetToDefault,
+}
+
+/// Where the settings of an `ApplySettings` come from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SettingsSource {
+    /// A stored preset (sparse overlay), by id.
+    Preset(i64),
+    /// Settings copied from a document; `field_keys` `None` copies every field.
+    Copied {
+        params: Arc<DevelopParams>,
+        field_keys: Option<Vec<String>>,
+    },
+    /// A named snapshot, by id; always restores its full params (no merge).
+    Snapshot(i64),
+}
+
+/// What a resolved-settings result must still match to be applied: the document it was computed
+/// from. Any edit in between moves the revision and the result is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingsFence {
+    pub image: ImageId,
+    pub session: EditorSession,
+    pub revision: EditRevision,
 }
 
 /// Pick/reject flag as stored in `ratings_flags.flag`.
@@ -149,6 +179,17 @@ pub enum Mutation {
     RemoveFromLibrary {
         images: Vec<ImageId>,
     },
+    /// Save `params` as a named snapshot of `image` (the name is made unique per image).
+    CreateSnapshot {
+        image: ImageId,
+        name: String,
+        params: Arc<DevelopParams>,
+    },
+    RenameSnapshot {
+        id: i64,
+        name: String,
+    },
+    DeleteSnapshot(i64),
 }
 
 /// What a committed [`Mutation`] reports back.
@@ -158,6 +199,7 @@ pub enum MutationReport {
     CollectionCreated(i64),
     RejectedDeleted(RejectDeleteResult),
     RemovedFromLibrary(RemoveResult),
+    SnapshotCreated(i64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +229,16 @@ pub enum Command {
     /// Counts for the delete-rejected confirmation, for exactly this filter.
     LoadRejectSummary(Box<QueryParams>),
     Mutate(Mutation),
+    LoadPresets,
+    /// Named snapshots of one image (the History panel).
+    LoadSnapshots(ImageId),
+    /// Resolve `source` against the open document and apply the result as one undoable edit.
+    /// `amount` is 0..=1; `replace_all` starts from defaults instead of the current params.
+    ApplySettings {
+        source: SettingsSource,
+        amount: f32,
+        replace_all: bool,
+    },
 }
 impl Command {
     pub fn action(&self) -> ActionId {
@@ -207,6 +259,9 @@ impl Command {
             Self::RefreshMirrorStatus => ActionId::RefreshMirrorStatus,
             Self::LoadRejectSummary(_) => ActionId::LoadRejectSummary,
             Self::Mutate(_) => ActionId::Mutate,
+            Self::LoadPresets => ActionId::LoadPresets,
+            Self::LoadSnapshots(_) => ActionId::LoadSnapshots,
+            Self::ApplySettings { .. } => ActionId::ApplySettings,
             Self::Edit(intent) => match intent {
                 EditIntent::Undo => ActionId::Undo,
                 EditIntent::Redo => ActionId::Redo,
@@ -272,6 +327,17 @@ pub enum Operation {
     },
     LoadRejectSummary(Box<QueryParams>),
     Mutate(Mutation),
+    LoadPresets,
+    LoadSnapshots(ImageId),
+    /// Turn a settings source into full params against `base` (the document at `fence`). Shares
+    /// the `ApplySettings` action: it is the read half of that command.
+    ResolveSettings {
+        fence: SettingsFence,
+        base: Arc<DevelopParams>,
+        source: SettingsSource,
+        amount: f32,
+        replace_all: bool,
+    },
 }
 impl Operation {
     pub fn action(&self) -> ActionId {
@@ -290,6 +356,9 @@ impl Operation {
             Self::LoadMirrorStatus { .. } => ActionId::RefreshMirrorStatus,
             Self::LoadRejectSummary(_) => ActionId::LoadRejectSummary,
             Self::Mutate(_) => ActionId::Mutate,
+            Self::LoadPresets => ActionId::LoadPresets,
+            Self::LoadSnapshots(_) => ActionId::LoadSnapshots,
+            Self::ResolveSettings { .. } => ActionId::ApplySettings,
         }
     }
 }
@@ -322,6 +391,8 @@ pub enum Outcome {
     Saved {
         catalog_revision: CatalogRevision,
         mirror: MirrorStatus,
+        /// Stored `edits.updated_at` after the save; the library rows' `edited_at`.
+        edited_at: i64,
     },
     /// A `SetCull` committed; the session patches the matching snapshot rows.
     CullApplied {
@@ -334,4 +405,8 @@ pub enum Outcome {
     MirrorStatus(MirrorStatus),
     RejectSummary(RejectSummary),
     Mutated(MutationReport),
+    Presets(Vec<PresetSummary>),
+    Snapshots(Vec<SnapshotSummary>),
+    /// Full params for a `ResolveSettings`; applied only while its fence still holds.
+    SettingsResolved(Box<DevelopParams>),
 }

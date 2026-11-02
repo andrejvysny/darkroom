@@ -1,5 +1,7 @@
 mod application;
 mod chrome;
+mod export_host;
+mod export_worker;
 mod gpu;
 mod import_platform;
 mod input_trace;
@@ -11,6 +13,7 @@ mod presence;
 mod present;
 mod settings;
 mod surface_state;
+mod thumb_render;
 mod thumbs;
 mod window;
 

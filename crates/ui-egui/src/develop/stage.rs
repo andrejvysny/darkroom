@@ -3,12 +3,24 @@
 //! into the panel itself (from the frame's aspect, never its texture size) so that a cheaper,
 //! smaller frame occupies exactly the rect the settled one does.
 
+use super::border;
+use super::crop_tool::{self, CropState};
 use super::zoom::ZoomUi;
-use crate::photo::{fit_output, photo_plan};
+use crate::photo::{fit_output, photo_plan, StageVariant};
 use crate::{theme, PhotoUi};
 use core_app::state::ApplicationSnapshot;
+use core_app::workflow::Command;
 use core_model::viewport::{derive_view, DerivedView, ViewState};
+use core_model::Crop;
 use egui::{Align2, Color32, CursorIcon, FontId, Rect};
+
+/// What only the Develop stage has: the Before view, the crop tool and the commands the tool
+/// emits. The Library loupe passes `None` and gets the plain edited picture.
+pub(crate) struct DevelopStage<'a> {
+    pub before: bool,
+    pub crop: &'a mut CropState,
+    pub commands: &'a mut Vec<Command>,
+}
 
 /// `"10%  •  6960 × 4640  •  sRGB"`; the zoom is the frame's DISPLAYED pixel width over the
 /// output image's pixel width (not the texture's width: an interactive frame is rendered at
@@ -24,8 +36,9 @@ fn footer_text(displayed_w: Option<u32>, dims: (u32, u32)) -> String {
     }
 }
 
-/// Native output size of the selected image (catalog dims through the crop), if known.
-fn output_dims(snapshot: &ApplicationSnapshot) -> Option<(u32, u32)> {
+/// Native output size of the picture the stage shows (catalog dims through that variant's
+/// crop), if known.
+fn output_dims(snapshot: &ApplicationSnapshot, variant: StageVariant) -> Option<(u32, u32)> {
     let image = snapshot.editor.image.as_ref()?;
     let (w, h) = (
         u32::try_from(image.width?).ok()?,
@@ -34,9 +47,15 @@ fn output_dims(snapshot: &ApplicationSnapshot) -> Option<(u32, u32)> {
     if w == 0 || h == 0 {
         return None;
     }
-    Some(match snapshot.editor.document.params.as_ref() {
-        Some(p) => p.crop.output_size(w, h),
-        None => (w, h),
+    Some(match (snapshot.editor.document.params.as_ref(), variant) {
+        (Some(p), StageVariant::Edited) => p.crop.output_size(w, h),
+        (Some(p), StageVariant::CropTool) => Crop {
+            angle: p.crop.angle,
+            rot90: p.crop.rot90,
+            ..Crop::default()
+        }
+        .output_size(w, h),
+        (Some(_), StageVariant::Before) | (None, _) => (w, h),
     })
 }
 
@@ -98,8 +117,9 @@ fn geometry(
     rect: Rect,
     ppp: f32,
     view: ViewState,
+    variant: StageVariant,
 ) -> Option<Geometry> {
-    let frame_px = output_dims(snapshot)?;
+    let frame_px = output_dims(snapshot, variant)?;
     let panel_px = panel_px(rect, ppp);
     Some(Geometry {
         frame_px,
@@ -183,6 +203,21 @@ fn stage_content(
     })
 }
 
+/// "BEFORE" tag over the stage while the unedited picture is shown.
+fn paint_before_badge(ui: &egui::Ui, stage: Rect) {
+    let galley =
+        ui.painter()
+            .layout_no_wrap("BEFORE".to_owned(), FontId::proportional(11.0), theme::T1);
+    let badge = Rect::from_min_size(
+        stage.left_top() + egui::vec2(14.0, 14.0),
+        galley.size() + egui::vec2(16.0, 8.0),
+    );
+    ui.painter()
+        .rect_filled(badge, theme::RADIUS_SM, Color32::from_black_alpha(170));
+    ui.painter()
+        .galley(badge.min + egui::vec2(8.0, 4.0), galley, theme::T1);
+}
+
 /// The stage's pointer target for zoom/pan, registered BEFORE anything is painted: the stage
 /// claims clicks and drags, but a real widget painted later (the retry banner's buttons) stays
 /// on top of it and keeps its clicks.
@@ -203,6 +238,7 @@ pub(crate) fn central(
     photo: &mut PhotoUi,
     mut zoom: Option<&mut ZoomUi>,
     typing: bool,
+    mut develop: Option<DevelopStage<'_>>,
 ) {
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(theme::STAGE_DEV))
@@ -232,20 +268,47 @@ pub(crate) fn central(
                 });
             }
             let ppp = ui.ctx().pixels_per_point();
+            let variant = match develop.as_ref() {
+                Some(d) if d.before => StageVariant::Before,
+                Some(d) if d.crop.active => StageVariant::CropTool,
+                _ => StageVariant::Edited,
+            };
+            // The crop tool maps 1:1 onto the fitted full frame, so it never zooms.
             let view = zoom
                 .as_ref()
+                .filter(|_| variant != StageVariant::CropTool)
                 .map_or_else(ViewState::default, |zoom| zoom.view());
             let interacting = zoom
                 .as_ref()
                 .is_some_and(|zoom| zoom.interacting(ui.input(|i| i.time)));
-            let geo = geometry(snapshot, rect, ppp, view);
+            let geo = geometry(snapshot, rect, ppp, view, variant);
+            // The live border preview: the photo is rendered smaller, inside the margin colour.
+            let params = snapshot.editor.document.params.as_ref();
+            let border_preview = develop
+                .as_ref()
+                .filter(|_| variant == StageVariant::Edited && view.is_fit())
+                .and(params.zip(output_dims(snapshot, variant)))
+                .and_then(|(p, dims)| border::preview(rect, dims, &p.border));
+            let frame_rect = border_preview.as_ref().map_or(rect, |b| b.inner);
             photo.plan = if photo.message.is_some() {
                 None
             } else {
-                photo_plan(snapshot, rect, ppp, photo.device_epoch, view, interacting)
+                photo_plan(
+                    snapshot,
+                    frame_rect,
+                    ppp,
+                    photo.device_epoch,
+                    view,
+                    interacting,
+                    variant,
+                )
             };
-            let drawn = stage_content(ui, snapshot, photo, rect, geo.as_ref());
-            if let Some(dims) = output_dims(snapshot) {
+            if let (Some(preview), Some(p), None) = (&border_preview, params, &photo.message) {
+                ui.painter()
+                    .rect_filled(preview.outer, 0, border::paint_color(&p.border));
+            }
+            let drawn = stage_content(ui, snapshot, photo, frame_rect, geo.as_ref());
+            if let Some(dims) = output_dims(snapshot, variant) {
                 ui.painter().text(
                     rect.left_bottom() + egui::vec2(14.0, -12.0),
                     Align2::LEFT_BOTTOM,
@@ -254,27 +317,37 @@ pub(crate) fn central(
                     theme::T3,
                 );
             }
+            if variant == StageVariant::Before {
+                paint_before_badge(ui, rect);
+            }
             if let (Some(zoom), Some(drawn)) = (zoom.as_mut(), drawn.as_ref()) {
                 zoom.note_drawn(drawn.rect);
+            }
+            if let (Some(d), Some(drawn), Some(params), StageVariant::CropTool) =
+                (develop.as_mut(), drawn.as_ref(), params, variant)
+            {
+                crop_tool::overlay(ui, drawn.rect, params, d.crop, typing, d.commands);
             }
             if let (Some(zoom), Some(drawn), Some(geo), Some(stage)) =
                 (zoom.as_mut(), drawn.as_ref(), geo.as_ref(), stage.as_ref())
             {
-                zoom.handle_input(
-                    ui,
-                    stage,
-                    drawn.rect,
-                    geo.frame_px,
-                    geo.panel_px,
-                    ppp,
-                    typing,
-                );
-                if !view.is_fit() && stage.hovered() {
-                    ui.ctx().set_cursor_icon(if stage.dragged() {
-                        CursorIcon::Grabbing
-                    } else {
-                        CursorIcon::Grab
-                    });
+                if variant != StageVariant::CropTool {
+                    zoom.handle_input(
+                        ui,
+                        stage,
+                        drawn.rect,
+                        geo.frame_px,
+                        geo.panel_px,
+                        ppp,
+                        typing,
+                    );
+                    if !view.is_fit() && stage.hovered() {
+                        ui.ctx().set_cursor_icon(if stage.dragged() {
+                            CursorIcon::Grabbing
+                        } else {
+                            CursorIcon::Grab
+                        });
+                    }
                 }
             }
             // Claim the panel area for this frame's layout regardless of what was drawn in it.

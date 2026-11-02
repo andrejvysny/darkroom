@@ -1,7 +1,8 @@
 use crate::state::MirrorStatus;
 use crate::AppError;
 use core_model::catalog::{
-    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, QueryParams, RejectSummary,
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, PresetSummary, QueryParams,
+    RejectSummary, SnapshotSummary,
 };
 use core_model::identity::CatalogRevision;
 use std::path::Path;
@@ -39,6 +40,19 @@ pub trait CatalogPort: Send + Sync {
     fn image_tags(&self, image_id: i64) -> Result<crate::state::ImageTags, AppError>;
     /// Counts for deleting the rejected photos matching `params` (reject flag forced on).
     fn reject_summary(&self, params: &QueryParams) -> Result<RejectSummary, AppError>;
+    fn presets(&self) -> Result<Vec<PresetSummary>, AppError>;
+    /// Named snapshots of `image_id`, newest first.
+    fn snapshots(&self, image_id: i64) -> Result<Vec<SnapshotSummary>, AppError>;
+    /// Full params for `source` against `base`, blended by `amount` (0..=1) unless the source is a
+    /// snapshot (always its full params). `replace_all` starts from defaults instead of `base`.
+    /// Nothing is persisted.
+    fn resolve_settings(
+        &self,
+        source: &crate::workflow::SettingsSource,
+        base: &core_model::DevelopParams,
+        amount: f32,
+        replace_all: bool,
+    ) -> Result<core_model::DevelopParams, AppError>;
     /// Apply one durable mutation. `DeleteRejected` moves files to the OS Trash with the catalog
     /// lock released between plan and finalize.
     fn mutate(
@@ -52,6 +66,9 @@ pub trait CatalogPort: Send + Sync {
 pub struct SaveReceipt {
     pub catalog_revision: CatalogRevision,
     pub mirror: MirrorStatus,
+    /// The stored `edits.updated_at` after the save (never the supplied timestamp): the edit
+    /// version thumbnails are keyed by.
+    pub edited_at: i64,
 }
 
 pub trait Clock: Send + Sync {

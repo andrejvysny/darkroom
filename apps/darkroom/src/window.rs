@@ -95,6 +95,8 @@ struct State {
     /// Asynchronous thumbnail service; `None` without a catalog or when it could not start (the
     /// grid then shows placeholders).
     thumbs: Option<ThumbStore>,
+    /// Export dialog state and the render worker behind it.
+    export: crate::export_host::ExportHost,
 }
 
 fn sdr_config(
@@ -155,25 +157,7 @@ impl State {
         // failure there must never stop the window from opening.
         let mut settings = crate::settings::SettingsState::load(catalog_path.as_deref());
         let wake_workflow = proxy.clone();
-        // Thumbnails live next to the catalog (`<dir>/catalog.db`, `<dir>/thumbs/`).
-        let thumbs = catalog_path.as_deref().and_then(|path| {
-            let wake_thumbs = proxy.clone();
-            let root = path.parent()?.join("thumbs");
-            match ThumbStore::new(
-                egui.clone(),
-                root,
-                core_model::identity::CURRENT_PROCESS_VERSION.0,
-                Arc::new(move || {
-                    let _ = wake_thumbs.send_event(UserEvent::Wake(Some(Instant::now())));
-                }),
-            ) {
-                Ok(store) => Some(store),
-                Err(error) => {
-                    eprintln!("thumbnails unavailable: {error}");
-                    None
-                }
-            }
-        });
+        let thumbs_root = catalog_path.clone();
         let application = catalog_path
             .map(|path| {
                 crate::application::NativeApplication::new(
@@ -194,6 +178,62 @@ impl State {
                  the catalog and reach the photo folders on the next launch."
             ));
         }
+        // Thumbnails live next to the catalog (`<dir>/catalog.db`, `<dir>/thumbs/`). The edited
+        // renderer shares the host's device and reads edits from the application's catalog.
+        let render = application
+            .as_ref()
+            .map(|app| crate::thumb_render::RenderDeps {
+                catalog: app.catalog(),
+                ctx: core_pipeline::GpuContext {
+                    device: gpu.context.device.clone(),
+                    queue: gpu.context.queue.clone(),
+                    info: gpu.context.info.clone(),
+                    max_texture_dim: gpu.context.max_texture_dim,
+                },
+                pipeline: Arc::clone(&gpu.pipeline),
+            });
+        let export_proxy = proxy.clone();
+        let export_worker = application.as_ref().and_then(|app| {
+            let deps = crate::export_worker::ExportDeps {
+                catalog: app.catalog(),
+                ctx: core_pipeline::GpuContext {
+                    device: gpu.context.device.clone(),
+                    queue: gpu.context.queue.clone(),
+                    info: gpu.context.info.clone(),
+                    max_texture_dim: gpu.context.max_texture_dim,
+                },
+                pipeline: Arc::clone(&gpu.pipeline),
+            };
+            let wake = Arc::new(move || {
+                let _ = export_proxy.send_event(UserEvent::Wake(Some(Instant::now())));
+            });
+            match crate::export_worker::ExportWorker::production(deps, wake) {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    eprintln!("export unavailable: {error}");
+                    None
+                }
+            }
+        });
+        let thumbs = thumbs_root.as_deref().and_then(|path| {
+            let wake_thumbs = proxy.clone();
+            let root = path.parent()?.join("thumbs");
+            match ThumbStore::new(
+                egui.clone(),
+                root,
+                core_model::identity::CURRENT_PROCESS_VERSION.0,
+                Arc::new(move || {
+                    let _ = wake_thumbs.send_event(UserEvent::Wake(Some(Instant::now())));
+                }),
+                render,
+            ) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    eprintln!("thumbnails unavailable: {error}");
+                    None
+                }
+            }
+        });
         let photo_proxy = proxy;
         let device_epoch = DeviceEpoch(1);
         let mut photo_view = PhotoView::new(device_epoch);
@@ -233,7 +273,31 @@ impl State {
                 ..ui_egui::UiState::default()
             },
             thumbs,
+            export: crate::export_host::ExportHost::new(export_worker),
         })
+    }
+
+    /// Run the export requests the last frame produced (between frames, like imports: the folder
+    /// picker is a blocking modal) and fold in worker progress.
+    fn pump_exports(&mut self) {
+        let requests = std::mem::take(&mut self.ui_state.export_requests);
+        let mut changed = !requests.is_empty();
+        if let Some(application) = self.application.as_ref() {
+            let snapshot = application.snapshot();
+            let platform = crate::import_platform::NativePlatform;
+            for request in requests {
+                if let Err(error) =
+                    self.export
+                        .handle(request, &snapshot, &mut self.settings, &platform)
+                {
+                    self.last_command_error = Some((error, Instant::now()));
+                }
+            }
+        }
+        changed |= self.export.pump();
+        if changed {
+            self.window.request_redraw();
+        }
     }
 
     /// Run the import requests the last frame produced. Called between frames (never while a
@@ -293,7 +357,8 @@ impl State {
     fn shutdown_photo(&mut self) -> Result<(), String> {
         let thumbs = self.thumbs.as_mut().map_or(Ok(()), ThumbStore::shutdown);
         let photo = self.photo.as_mut().map_or(Ok(()), PhotoWorker::shutdown);
-        photo.and(thumbs)
+        let export = self.export.shutdown();
+        photo.and(thumbs).and(export)
     }
 
     fn recover_surface(&mut self) -> Result<(), String> {
@@ -441,6 +506,7 @@ impl State {
                         thumbs: &mut *thumbs,
                         histogram,
                         import: &import_view,
+                        export: self.export.view(),
                     },
                     &mut self.ui_state,
                 );
@@ -456,7 +522,10 @@ impl State {
                 self.window.request_redraw();
             }
             self.last_command_error = command_error;
-            if !commands.is_empty() || !self.ui_state.import_requests.is_empty() {
+            if !commands.is_empty()
+                || !self.ui_state.import_requests.is_empty()
+                || !self.ui_state.export_requests.is_empty()
+            {
                 self.window.request_redraw();
             }
             for command in commands {
@@ -560,6 +629,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
             state.pump_imports();
+            state.pump_exports();
             if let Some(application) = &mut state.application {
                 let revision = application.snapshot().revision;
                 if let Err(error) = application.pump() {

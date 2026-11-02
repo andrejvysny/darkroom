@@ -1,7 +1,7 @@
 use crate::AppError;
 use core_model::catalog::{
-    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, PairInfo, QueryParams,
-    RejectSummary,
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, PairInfo, PresetSummary,
+    QueryParams, RejectSummary, SnapshotSummary,
 };
 use core_model::identity::{
     CatalogEpoch, CatalogRevision, EditRevision, EditorSession, ImageId, ProcessVersion,
@@ -31,6 +31,8 @@ pub struct LibrarySnapshot {
     pub dates: Arc<Vec<DateTreeYear>>,
     pub keywords: Arc<Vec<KeywordRow>>,
     pub collections: Arc<Vec<CollectionRow>>,
+    /// Every develop preset, built-ins first (the Presets panel).
+    pub presets: Arc<Vec<PresetSummary>>,
     /// Tags of one image (normally the selection); the UI re-requests when `image` differs.
     pub tags: Option<Arc<ImageTags>>,
     /// Delete-rejected counts for exactly `.0` (the filter the dialog was opened on).
@@ -123,6 +125,8 @@ pub struct EditorSnapshot {
     pub selection_generation: SelectionGeneration,
     pub document: DocumentView,
     pub save: SaveStatus,
+    /// Named snapshots of `selected`, newest first; empty until loaded.
+    pub snapshots: Arc<Vec<SnapshotSummary>>,
 }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobsSnapshot {

@@ -233,7 +233,14 @@ fn loupe(
     photo: &mut PhotoUi,
 ) {
     let typing = root.ctx().text_edit_focused() || lib.modal_open();
-    crate::develop::stage::central(root, snapshot, photo, Some(&mut lib.loupe_zoom), typing);
+    crate::develop::stage::central(
+        root,
+        snapshot,
+        photo,
+        Some(&mut lib.loupe_zoom),
+        typing,
+        None,
+    );
 }
 
 fn empty_state(

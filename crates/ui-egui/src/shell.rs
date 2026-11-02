@@ -2,8 +2,9 @@
 
 use crate::icons::{icon_button, Icon};
 use crate::library::{requery, selected_row, NOT_YET};
-use crate::widgets::{pill_button, segmented};
+use crate::widgets::{pill_button, pill_toggle, segmented};
 use crate::{theme, Mode, UiState};
+use core_app::export::ExportRequest;
 use core_app::import::ImportRequest;
 use core_app::registry::{action, ActionId};
 use core_app::state::ApplicationSnapshot;
@@ -56,14 +57,7 @@ pub(crate) fn top_bar(
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    right_side(
-                        ui,
-                        snapshot,
-                        reopen,
-                        state.mode,
-                        &mut state.import_requests,
-                        commands,
-                    );
+                    right_side(ui, snapshot, reopen, state, commands);
                 });
             });
             if state.mode == Mode::Develop {
@@ -76,10 +70,10 @@ fn right_side(
     ui: &mut egui::Ui,
     snapshot: &ApplicationSnapshot,
     reopen: &Command,
-    mode: Mode,
-    import_requests: &mut Vec<ImportRequest>,
+    state: &mut UiState,
     commands: &mut Vec<Command>,
 ) {
+    let mode = state.mode;
     // Right-to-left: the ⌘K chip first, so it ends up rightmost.
     let chip = pill_button(ui, None, "⌘K", false);
     chip.on_hover_text(NOT_YET);
@@ -112,10 +106,18 @@ fn right_side(
             .clicked()
             && enabled
         {
-            import_requests.push(ImportRequest::Open);
+            state.import_requests.push(ImportRequest::Open);
         }
     }
-    pill_button(ui, Some(Icon::Upload), "Export", false).on_hover_text(NOT_YET);
+    let ids = crate::export_dialog::export_ids(snapshot, mode, &state.library);
+    let can_export = snapshot.catalog_ready && !ids.is_empty();
+    if pill_button(ui, Some(Icon::Upload), "Export", can_export)
+        .on_hover_text("Export the selected photos (⇧⌘E)")
+        .clicked()
+        && can_export
+    {
+        state.export_requests.push(ExportRequest::Open(ids));
+    }
     if mode == Mode::Develop {
         let reset = crate::develop::reset_all_command(snapshot);
         let hover = if reset.is_some() {
@@ -129,7 +131,17 @@ fn right_side(
         if let (true, Some(command)) = (clicked, reset) {
             commands.push(command);
         }
-        pill_button(ui, Some(Icon::Compare), "Before / After", false).on_hover_text(NOT_YET);
+        let compare = pill_toggle(
+            ui,
+            Some(Icon::Compare),
+            "Before / After",
+            snapshot.editor.selected.is_some(),
+            state.develop.before_shown(),
+        )
+        .on_hover_text("Show the unedited photo (\\)");
+        if compare.clicked() {
+            state.develop.toggle_before(commands);
+        }
     }
     if snapshot.jobs.metrics.queued + snapshot.jobs.metrics.running > 0 {
         ui.spinner();

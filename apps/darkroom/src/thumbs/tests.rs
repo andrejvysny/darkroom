@@ -149,6 +149,7 @@ fn pool_delivers_results_and_shuts_down() {
         Ok(Decoded {
             size: [1, 1],
             rgba: vec![0, 0, 0, 255],
+            provisional: false,
         })
     });
     let mut pool = Pool::start(2, loader, Arc::new(|| {})).unwrap();
@@ -175,4 +176,165 @@ fn previous_edit_version_stands_in_until_the_new_one_lands() {
         .expect("same image, older edit");
     assert_eq!(*value, "old");
     assert!(residents.touch_previous(&key(3, None), 2).is_none());
+}
+
+mod provisional {
+    use super::*;
+    use crate::thumb_render::{EditedThumbRenderer, RenderBody, Rendered};
+    use core_model::catalog::ImageRow;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    /// Edited versions whose tier "exists"; the loader answers from it like the cache would.
+    #[derive(Default)]
+    struct Tier {
+        rendered: Mutex<HashSet<i64>>,
+        calls: AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+        hold: std::sync::atomic::AtomicBool,
+    }
+
+    fn pixel(edge: u32, provisional: bool) -> Decoded {
+        Decoded {
+            size: [edge, edge],
+            rgba: vec![0; (4 * edge * edge) as usize],
+            provisional,
+        }
+    }
+
+    fn rig(tier: &Arc<Tier>) -> ThumbStore {
+        let loader: Arc<Loader> = {
+            let tier = Arc::clone(tier);
+            Arc::new(move |job| {
+                let version = job.key.edited_at;
+                let settled = version.is_some_and(|v| tier.rendered.lock().unwrap().contains(&v));
+                Ok(match version {
+                    Some(v) if settled => pixel(4 * v as u32, false),
+                    Some(_) => pixel(2, true),
+                    None => pixel(3, false),
+                })
+            })
+        };
+        let body: Arc<RenderBody> = {
+            let tier = Arc::clone(tier);
+            Arc::new(move |job| {
+                tier.calls.fetch_add(1, Ordering::SeqCst);
+                while tier.hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if tier.fail.load(Ordering::SeqCst) {
+                    return Err("render failed".into());
+                }
+                tier.rendered
+                    .lock()
+                    .unwrap()
+                    .insert(job.key.edited_at.unwrap());
+                Ok(Rendered::Written)
+            })
+        };
+        let renderer = EditedThumbRenderer::start(body, Box::new(|| 0), Arc::new(|| {})).unwrap();
+        ThumbStore::with_loader(egui::Context::default(), loader, Arc::new(|| {}), 1 << 30)
+            .unwrap()
+            .with_renderer(renderer)
+    }
+
+    fn row(edited_at: Option<i64>) -> ImageRow {
+        ImageRow {
+            id: 1,
+            content_hash: format!("{:064x}", 1),
+            path: "/nowhere/1.cr3".into(),
+            edited_at,
+            ..Default::default()
+        }
+    }
+
+    fn frame(store: &mut ThumbStore, row: &ImageRow) -> ThumbState {
+        store.begin_frame(1);
+        let state = store.thumb(row);
+        store.end_frame();
+        state
+    }
+
+    fn edge(state: &ThumbState) -> Option<u32> {
+        match state {
+            ThumbState::Ready { size, .. } => Some(size[0]),
+            _ => None,
+        }
+    }
+
+    fn settle(store: &mut ThumbStore, row: &ImageRow, want: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while edge(&frame(store, row)) != Some(want) {
+            assert!(Instant::now() < deadline, "never reached edge {want}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn provisional_edited_key_is_rendered_once_then_reads_the_edited_tier() {
+        let tier = Arc::new(Tier::default());
+        let mut store = rig(&tier);
+        let row = row(Some(5));
+        settle(&mut store, &row, 2); // provisional texture shows first
+        settle(&mut store, &row, 20); // Done dropped it; the reload read the edited tier
+        assert_eq!(tier.calls.load(Ordering::SeqCst), 1);
+        for _ in 0..5 {
+            assert_eq!(edge(&frame(&mut store, &row)), Some(20));
+        }
+        assert_eq!(tier.calls.load(Ordering::SeqCst), 1);
+        assert!(store.shutdown().is_ok());
+    }
+
+    #[test]
+    fn unedited_keys_never_reach_the_renderer() {
+        let tier = Arc::new(Tier::default());
+        let mut store = rig(&tier);
+        settle(&mut store, &row(None), 3);
+        assert_eq!(tier.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn previous_settled_texture_stays_up_while_the_new_edit_is_provisional() {
+        let tier = Arc::new(Tier::default());
+        let mut store = rig(&tier);
+        settle(&mut store, &row(Some(1)), 2);
+        settle(&mut store, &row(Some(1)), 4);
+        tier.hold.store(true, Ordering::SeqCst);
+        let next = row(Some(2));
+        let mut shown = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // Frames until the provisional result for edit 2 has landed (it is resident).
+        while !store.residents.is_provisional(&ThumbKey {
+            image_id: 1,
+            hash: next.content_hash.clone(),
+            edited_at: Some(2),
+        }) {
+            assert!(Instant::now() < deadline);
+            shown.push(edge(&frame(&mut store, &next)));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        shown.push(edge(&frame(&mut store, &next)));
+        assert!(shown.iter().all(|edge| *edge == Some(4)), "{shown:?}");
+        tier.hold.store(false, Ordering::SeqCst);
+        settle(&mut store, &next, 8);
+    }
+
+    #[test]
+    fn renderer_failure_keeps_the_provisional_texture_and_is_not_retried() {
+        let tier = Arc::new(Tier::default());
+        tier.fail.store(true, Ordering::SeqCst);
+        let mut store = rig(&tier);
+        let row = row(Some(5));
+        settle(&mut store, &row, 2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tier.calls.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..50 {
+            assert_eq!(edge(&frame(&mut store, &row)), Some(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(tier.calls.load(Ordering::SeqCst), 1);
+    }
 }

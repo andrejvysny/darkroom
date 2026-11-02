@@ -15,8 +15,9 @@ fn photos(n: usize) -> String {
     format!("{n} photo{}", if n == 1 { "" } else { "s" })
 }
 
-/// Right-clicking inside the multi-selection acts on all of it; anywhere else, on that row only
-/// (the selection is left alone).
+/// Grid cell context menu ("Export…", "Remove from Library…"). Right-clicking inside the
+/// multi-selection acts on all of it; anywhere else, on that row only (the selection is left
+/// alone).
 pub(crate) fn context_menu(
     response: &egui::Response,
     snapshot: &ApplicationSnapshot,
@@ -24,18 +25,24 @@ pub(crate) fn context_menu(
     row_id: i64,
 ) {
     response.context_menu(|ui| {
+        // Right-clicking inside the multi-selection acts on all of it.
+        let mut group = lib.selected.clone();
+        group.extend(snapshot.editor.selected.map(|p| p.0));
+        let ids: Vec<ImageId> = if group.contains(&row_id) {
+            group.into_iter().map(ImageId).collect()
+        } else {
+            vec![ImageId(row_id)]
+        };
+        let export = ui.button("Export…");
+        lib.button_rects.push(("export_menu_item", export.rect));
+        if export.clicked() {
+            lib.export_open = Some(ids.clone());
+            ui.close();
+        }
         let item = ui.button("Remove from Library…");
         lib.button_rects.push(("remove_menu_item", item.rect));
         if item.clicked() {
-            let mut group = lib.selected.clone();
-            group.extend(snapshot.editor.selected.map(|p| p.0));
-            let ids: Vec<i64> = if group.contains(&row_id) {
-                group.into_iter().collect()
-            } else {
-                vec![row_id]
-            };
-            let images = ids.into_iter().map(ImageId).collect();
-            lib.remove_dialog = Some(RemoveDialog { images });
+            lib.remove_dialog = Some(RemoveDialog { images: ids });
             ui.close();
         }
     });

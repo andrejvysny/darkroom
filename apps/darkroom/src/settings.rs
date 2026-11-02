@@ -171,6 +171,27 @@ impl SettingsState {
         }
     }
 
+    /// The loaded preferences, `None` when no store could be opened.
+    pub fn current(&self) -> Option<&core_model::settings::Settings> {
+        self.store.as_ref().map(SettingsStore::settings)
+    }
+
+    /// Change and persist preferences. `Err` names why nothing was saved (no store, future
+    /// schema, IO); the caller decides how to tell the user.
+    pub fn update(
+        &mut self,
+        change: impl FnOnce(&mut core_model::settings::Settings, u64),
+    ) -> Result<(), String> {
+        let store = self
+            .store
+            .as_mut()
+            .ok_or("preferences are not available this session")?;
+        let now = now_ms();
+        store
+            .update(|settings| change(settings, now))
+            .map_err(|error| format!("could not save preferences: {error}"))
+    }
+
     /// One status-area diagnostic, echoed to stderr. Host startup failures that degrade rather
     /// than kill the session (a mirror that could not start) report here.
     pub fn note(&mut self, message: impl Into<String>) {

@@ -1,5 +1,6 @@
+use crate::presets;
 use crate::publication::PublicationGate;
-use core_app::workflow::{ColorLabel, CullChange, Mutation, MutationReport};
+use core_app::workflow::{ColorLabel, CullChange, Mutation, MutationReport, SettingsSource};
 use core_app::{
     error::ErrorSource,
     ports::{CatalogPort, SaveReceipt},
@@ -9,9 +10,11 @@ use core_app::{
 use core_db::{rusqlite, Db, DbError};
 use core_library::{LibError, MirrorState};
 use core_model::catalog::{
-    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, QueryParams, RejectSummary,
+    CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, PresetSummary, QueryParams,
+    RejectSummary, SnapshotSummary,
 };
-use core_model::identity::{CatalogRevision, ImageId};
+use core_model::identity::{CatalogRevision, ImageId, CURRENT_PROCESS_VERSION};
+use core_model::DevelopParams;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -214,6 +217,41 @@ impl CatalogPort for CatalogAdapter {
     fn collections(&self) -> Result<Vec<CollectionRow>, AppError> {
         self.read(|db| core_library::list_collections(&db.conn))
     }
+    fn presets(&self) -> Result<Vec<PresetSummary>, AppError> {
+        self.read(|db| core_library::list_presets(&db.conn))
+    }
+    fn snapshots(&self, image_id: i64) -> Result<Vec<SnapshotSummary>, AppError> {
+        self.read(|db| core_library::list_snapshots(&db.conn, image_id))
+    }
+    fn resolve_settings(
+        &self,
+        source: &SettingsSource,
+        base: &DevelopParams,
+        amount: f32,
+        replace_all: bool,
+    ) -> Result<DevelopParams, AppError> {
+        let invalid = AppError::InvalidCommand;
+        match source {
+            SettingsSource::Preset(id) => {
+                let preset = self
+                    .read(|db| core_library::get_preset(&db.conn, *id))?
+                    .ok_or_else(|| invalid("preset not found".into()))?;
+                let overlay = presets::preset_overlay(&preset).map_err(invalid)?;
+                presets::resolve(base, &overlay, amount, replace_all)
+            }
+            SettingsSource::Copied { params, field_keys } => {
+                let overlay =
+                    presets::copied_overlay(params, field_keys.as_deref()).map_err(invalid)?;
+                presets::resolve(base, &overlay, amount, replace_all)
+            }
+            SettingsSource::Snapshot(id) => {
+                let (json, process_version) = self
+                    .read(|db| core_library::get_snapshot_params(&db.conn, *id))?
+                    .ok_or_else(|| invalid("snapshot not found".into()))?;
+                presets::snapshot_params(&json, process_version).map_err(invalid)
+            }
+        }
+    }
     fn mirror_status(&self, image_id: i64) -> Result<MirrorStatus, AppError> {
         self.read(|db| mirror_status_of(&db.conn, image_id))
     }
@@ -243,6 +281,15 @@ impl CatalogPort for CatalogAdapter {
                 let _publications = self.publications.mutation_guard();
                 self.write(|db| create_collection(db, name, smart.as_deref(), images))
                     .map(MutationReport::CollectionCreated)
+            }
+            Mutation::CreateSnapshot {
+                image,
+                name,
+                params,
+            } => {
+                let _publications = self.publications.mutation_guard();
+                self.write(|db| create_snapshot(db, *image, name, params))
+                    .map(MutationReport::SnapshotCreated)
             }
             Mutation::RemoveFromLibrary { images } => {
                 let _publications = self.publications.mutation_guard();
@@ -282,9 +329,13 @@ impl CatalogPort for CatalogAdapter {
                 Err(core_library::edits::SaveError::Lib(error)) => return Err(error),
             };
             let mirror = mirror_status_of(&db.conn, image_id)?;
+            let edited_at = core_library::edits::get_edit_with_version(&db.conn, image_id)?
+                .map(|(_, updated_at)| updated_at)
+                .ok_or_else(|| LibError::Other("saved edit row is missing".into()))?;
             Ok(Ok(SaveReceipt {
                 catalog_revision: CatalogRevision(revision),
                 mirror,
+                edited_at,
             }))
         })?
     }
@@ -350,6 +401,25 @@ impl CatalogAdapter {
 
 fn ids(images: &[ImageId]) -> Vec<i64> {
     images.iter().map(|id| id.0).collect()
+}
+
+fn create_snapshot(
+    db: &Db,
+    image: ImageId,
+    name: &str,
+    params: &DevelopParams,
+) -> Result<i64, LibError> {
+    let json =
+        core_model::document::params_to_json(params).map_err(|e| LibError::Other(e.to_string()))?;
+    let name = core_library::unique_snapshot_name(&db.conn, image.0, name)?;
+    core_library::create_snapshot(
+        &db.conn,
+        image.0,
+        &name,
+        &json,
+        CURRENT_PROCESS_VERSION.0,
+        core_library::now_epoch(),
+    )
 }
 
 fn create_collection(
@@ -420,7 +490,12 @@ fn apply(db: &mut Db, mutation: &Mutation) -> Result<(), LibError> {
             core_library::remove_images_from_collection(&db.conn, *id, &ids(images)).map(|_| ())
         }
         Mutation::UnlinkPair { secondary } => core_library::unlink_pair(&db.conn, secondary.0),
+        Mutation::RenameSnapshot { id, name } => {
+            core_library::rename_snapshot(&db.conn, *id, name.trim())
+        }
+        Mutation::DeleteSnapshot(id) => core_library::delete_snapshot(&db.conn, *id),
         Mutation::CreateCollection { .. }
+        | Mutation::CreateSnapshot { .. }
         | Mutation::DeleteRejected(_)
         | Mutation::RemoveFromLibrary { .. } => Err(LibError::Other(
             "mutation is handled before the generic path".into(),

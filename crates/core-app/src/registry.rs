@@ -23,6 +23,10 @@ pub enum ActionId {
     LoadRejectSummary,
     /// Durable catalog mutations (batch cull, keywords, collections, pairs, delete rejected).
     Mutate,
+    LoadPresets,
+    LoadSnapshots,
+    /// Apply a preset, copied settings or a snapshot to the open document.
+    ApplySettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +227,30 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         menu: None,
         route: ActionId::Mutate,
         enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "load_presets",
+        label: "Load Presets",
+        shortcut: None,
+        menu: None,
+        route: ActionId::LoadPresets,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "load_snapshots",
+        label: "Load Snapshots",
+        shortcut: None,
+        menu: None,
+        route: ActionId::LoadSnapshots,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "apply_settings",
+        label: "Apply Settings",
+        shortcut: None,
+        menu: None,
+        route: ActionId::ApplySettings,
+        enabled: EnabledRequirement::Editable,
     },
 ];
 

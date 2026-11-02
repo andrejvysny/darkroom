@@ -110,6 +110,7 @@ impl Harness {
                     thumbs: &mut ui_egui::NoThumbs,
                     histogram: None,
                     import: &core_app::import::ImportView::default(),
+                    export: &core_app::export::ExportView::default(),
                 },
                 &mut self.ui,
             );
@@ -305,6 +306,7 @@ fn save_failure_banner_offers_discard_and_dismiss() {
                     thumbs: &mut ui_egui::NoThumbs,
                     histogram: None,
                     import: &core_app::import::ImportView::default(),
+                    export: &core_app::export::ExportView::default(),
                 },
                 &mut h.ui,
             );

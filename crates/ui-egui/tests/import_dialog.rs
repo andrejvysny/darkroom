@@ -95,6 +95,7 @@ impl Harness {
                     thumbs: &mut thumbs,
                     histogram: None,
                     import: view,
+                    export: &core_app::export::ExportView::default(),
                 },
                 &mut self.ui,
             );

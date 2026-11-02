@@ -33,6 +33,15 @@ fn check_name(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn check_snapshot_name(name: &str) -> Result<(), AppError> {
+    if name.trim().is_empty() {
+        return Err(AppError::EditRefused(
+            "Snapshot name must not be empty.".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn check_id(id: i64) -> Result<(), AppError> {
     if id <= 0 {
         return Err(invalid("id must be positive"));
@@ -84,6 +93,23 @@ pub(super) fn validate(mutation: &Mutation) -> Result<(), AppError> {
         Mutation::UnlinkPair { secondary } => check_id(secondary.0),
         Mutation::DeleteRejected(_) => Ok(()),
         Mutation::RemoveFromLibrary { images } => check_images(images),
+        Mutation::CreateSnapshot {
+            image,
+            name,
+            params,
+        } => {
+            check_id(image.0)?;
+            check_snapshot_name(name)?;
+            if !core_model::document::validate_finite(params) {
+                return Err(AppError::EditRefused("non-finite edit value".into()));
+            }
+            Ok(())
+        }
+        Mutation::RenameSnapshot { id, name } => {
+            check_id(*id)?;
+            check_snapshot_name(name)
+        }
+        Mutation::DeleteSnapshot(id) => check_id(*id),
     }
 }
 
@@ -168,7 +194,7 @@ impl ApplicationSession {
         }
         let library = &mut Arc::make_mut(&mut self.snapshot).library;
         // Cull marks are not tags: bumping here would re-read the info panel on every rating.
-        if !matches!(mutation, Mutation::Cull { .. }) {
+        if !matches!(mutation, Mutation::Cull { .. }) && !is_snapshot_mutation(&mutation) {
             library.tags_revision = library.tags_revision.wrapping_add(1);
         }
         library.last_report = Some(report);
@@ -188,6 +214,11 @@ impl ApplicationSession {
                 library.count = 0;
             }
             effects.push(self.replace(Operation::QueryLibrary(Box::new(query))));
+        }
+        if plan.snapshots {
+            if let Some(image) = self.snapshot.editor.selected {
+                effects.push(self.replace(Operation::LoadSnapshots(image)));
+            }
         }
         if plan.keywords {
             effects.push(self.replace(Operation::LoadKeywords));
@@ -222,6 +253,16 @@ struct FollowUps {
     collections: bool,
     dates: bool,
     tags: bool,
+    snapshots: bool,
+}
+
+fn is_snapshot_mutation(mutation: &Mutation) -> bool {
+    matches!(
+        mutation,
+        Mutation::CreateSnapshot { .. }
+            | Mutation::RenameSnapshot { .. }
+            | Mutation::DeleteSnapshot(_)
+    )
 }
 
 /// Reads a committed mutation invalidates. A filtered grid is re-queried only when the mutation
@@ -275,6 +316,11 @@ fn follow_ups(mutation: &Mutation, query: &QueryParams) -> FollowUps {
         Mutation::UnlinkPair { .. } => {
             plan.tags = true;
             plan.requery = refresh();
+        }
+        Mutation::CreateSnapshot { .. }
+        | Mutation::RenameSnapshot { .. }
+        | Mutation::DeleteSnapshot(_) => {
+            plan.snapshots = true;
         }
         Mutation::DeleteRejected(_) | Mutation::RemoveFromLibrary { .. } => {
             plan.requery = refresh();

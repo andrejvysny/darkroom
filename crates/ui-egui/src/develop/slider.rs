@@ -24,6 +24,8 @@ pub(super) struct Env<'a> {
     /// `ActionId::Edit` is enabled (document Ready with its image row).
     pub enabled: bool,
     pub histogram: Option<&'a HistogramData>,
+    /// The selected image's catalog dims (display orientation), when known.
+    pub image_px: Option<(u32, u32)>,
     pub commands: &'a mut Vec<Command>,
 }
 
