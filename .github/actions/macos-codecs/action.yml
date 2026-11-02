@@ -1,0 +1,47 @@
+name: macOS codec closure
+description: Build pinned codecs for macOS 12 and expose their isolated prefix
+runs:
+  using: composite
+  steps:
+    - name: Select native architecture and prefix
+      id: location
+      shell: bash
+      run: |
+        echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+        echo "prefix=$RUNNER_TEMP/darkroom-codecs" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: ${{ steps.location.outputs.prefix }}
+        key: macos12-codecs-v1-${{ runner.arch }}-${{ hashFiles('scripts/build-macos-codecs.sh', 'scripts/macos-codecs.env') }}
+    - name: Install isolated build requirements
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        brew install cmake ninja nasm pkgconf
+        python3 -m venv "$RUNNER_TEMP/darkroom-codec-tools"
+        "$RUNNER_TEMP/darkroom-codec-tools/bin/pip" install --only-binary=:all: --no-deps meson==1.7.2
+    - name: Build pinned codec closure
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CODEC_ARCH: ${{ steps.location.outputs.arch }}
+        CODEC_PREFIX: ${{ steps.location.outputs.prefix }}
+      run: |
+        MESON="$RUNNER_TEMP/darkroom-codec-tools/bin/meson" \
+          bash scripts/build-macos-codecs.sh --arch "$CODEC_ARCH" --prefix "$CODEC_PREFIX"
+    - name: Verify codec capabilities on this runner
+      shell: bash
+      env:
+        CODEC_PREFIX: ${{ steps.location.outputs.prefix }}
+      run: '"$CODEC_PREFIX/bin/darkroom-codec-probe"'
+    - name: Export codec configuration
+      shell: bash
+      env:
+        CODEC_PREFIX: ${{ steps.location.outputs.prefix }}
+      run: |
+        echo "DARKROOM_CODEC_PREFIX=$CODEC_PREFIX" >> "$GITHUB_ENV"
+        echo "PKG_CONFIG_PATH=$CODEC_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+        echo "PKG_CONFIG_LIBDIR=$CODEC_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+        echo "DYLD_LIBRARY_PATH=$CODEC_PREFIX/lib" >> "$GITHUB_ENV"
+        echo "MACOSX_DEPLOYMENT_TARGET=12.0" >> "$GITHUB_ENV"

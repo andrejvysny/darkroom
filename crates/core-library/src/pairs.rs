@@ -11,22 +11,10 @@
 
 use crate::error::LibError;
 use crate::index::now_epoch;
-use crate::query::{image_by_id, ImageRow};
+use crate::query::image_by_id;
 use core_db::rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
 
-/// One image's place in a pair, for the metadata panel.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PairInfo {
-    /// This image's role: `"primary"` (the RAW) or `"secondary"` (a companion JPEG/HEIF).
-    pub role: String,
-    /// Id of the RAW anchoring the pair (equals the queried id when `role == "primary"`).
-    pub primary_id: i64,
-    /// Every companion in the pair, ordered by filename — including the queried image itself when
-    /// it is a secondary, so the panel can render the whole group from one call.
-    pub secondaries: Vec<ImageRow>,
-}
+pub use core_model::catalog::PairInfo;
 
 /// The primary this image is linked to, or `None` when it is not a companion.
 pub fn primary_of(conn: &Connection, secondary_id: i64) -> Result<Option<i64>, LibError> {

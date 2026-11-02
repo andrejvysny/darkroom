@@ -45,6 +45,43 @@ impl ImportMode {
     }
 }
 
+/// Identity changes made by one catalog commit, reported while the host's fence is held.
+pub trait SourceEvents {
+    /// An image row now describes these bytes at this path (relink of a missing row, or a fresh
+    /// insert). A fresh insert may REUSE a rowid retired by an earlier delete (`images.id` has no
+    /// AUTOINCREMENT), so the host must register the identity before anything publishes against it.
+    fn source_changed(&mut self, image_id: i64, content_hash_hex: &str, path: &str);
+}
+
+/// A [`SourceEvents`] sink that drops everything — the default for hosts without an identity index.
+pub struct NoSourceEvents;
+impl SourceEvents for NoSourceEvents {
+    fn source_changed(&mut self, _image_id: i64, _content_hash_hex: &str, _path: &str) {}
+}
+
+/// Host-supplied cooperative control. Checked only between chunks, never mid-file, so a
+/// file's copy + catalog commit is never split.
+pub trait ImportControl: Sync {
+    /// True when the host wants the run to stop before the next chunk.
+    fn should_stop(&self) -> bool;
+    /// Called once, right after the first catalog row of this run is committed.
+    fn committed(&self) {}
+    /// Run one catalog commit inside the host's publication fence. Return false (without
+    /// calling `commit`) when the catalog this run started on is no longer current.
+    fn commit(&self, commit: &mut dyn FnMut(&mut dyn SourceEvents)) -> bool {
+        commit(&mut NoSourceEvents);
+        true
+    }
+}
+
+/// Never stops; for callers without a host (CLI, benches, tests).
+pub struct RunToEnd;
+impl ImportControl for RunToEnd {
+    fn should_stop(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportStats {
@@ -62,6 +99,11 @@ pub struct ImportStats {
     /// of `failed`; each is recorded in `decode_failure` and, crucially, never copied into the
     /// library — an unreadable body leaves nothing behind.
     pub unsupported: usize,
+    /// The run stopped early at the host's request. Everything counted in
+    /// `added`/`skipped`/`failed` is committed and valid.
+    pub interrupted: bool,
+    /// Selected files never reached because the run stopped.
+    pub not_processed: usize,
 }
 
 /// Content-hash dedup classification of a source file. `Pending` is the listing default; the real
@@ -249,6 +291,7 @@ pub fn import<F>(
     recursive: bool,
     pairing: Pairing,
     progress: F,
+    control: &dyn ImportControl,
 ) -> Result<ImportStats, ImportError>
 where
     F: Fn(usize, usize, Option<&ImageRow>),
@@ -263,6 +306,7 @@ where
         library_root,
         pairing,
         progress,
+        control,
     )
 }
 
@@ -300,6 +344,7 @@ fn worker_count(mode: ImportMode) -> usize {
 /// Run-constant inputs of the catalog step, so the per-file helpers stay short.
 struct CommitCtx<'a> {
     db: &'a Mutex<Db>,
+    control: &'a dyn ImportControl,
     mode: ImportMode,
     folder_id: i64,
     session_id: i64,
@@ -332,6 +377,12 @@ struct RunState {
 /// in parallel across the chunk, then the catalog step replays the chunk's outcomes **in input
 /// order** under brief locks — so row order, progress order, and every dedup rule are exactly what
 /// the old file-at-a-time loop produced.
+///
+/// `control` is polled only between chunks (see [`ImportControl`]); an interrupted run still runs
+/// the pairing pass and finishes the session row over what was actually committed. Every catalog
+/// write after the unlocked phase runs inside [`ImportControl::commit`]; when the fence reports the
+/// catalog gone, the run stops as if interrupted — earlier commits stay valid, `Ok(stats)` is
+/// returned, and the pairing pass is skipped.
 #[allow(clippy::too_many_arguments)]
 pub fn import_files<F>(
     db: &Mutex<Db>,
@@ -342,6 +393,7 @@ pub fn import_files<F>(
     library_root: &Path,
     pairing: Pairing,
     progress: F,
+    control: &dyn ImportControl,
 ) -> Result<ImportStats, ImportError>
 where
     F: Fn(usize, usize, Option<&ImageRow>),
@@ -371,6 +423,7 @@ where
     let trash_ctx = make_trash_ctx();
     let ctx = CommitCtx {
         db,
+        control,
         mode,
         folder_id,
         session_id,
@@ -393,7 +446,17 @@ where
     let claimed: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
 
     let mut done = 0usize;
+    // Set when the host's fence reports the catalog gone; aborts chunks and pairing alike.
+    let mut stale = false;
+    // `committed()` fires once, on the first catalog insert of the run — the host's "something
+    // real happened, don't discard the session" signal.
+    let mut commit_notified = false;
     for chunk in files.chunks(CHUNK) {
+        if control.should_stop() {
+            st.stats.interrupted = true;
+            st.stats.not_processed = total - done;
+            break;
+        }
         // Unlocked + parallel: hash, dedup-check, copy, verify, thumbnail/metadata. A per-file error
         // is recorded below and the import continues (a single bad file must not abort the run).
         let outcomes: Vec<Result<Outcome, ImportError>> = pool.install(|| {
@@ -402,22 +465,76 @@ where
                 .map(|p| process_one_unlocked(thumbs, p, mode, library_root, &st.seen, &claimed))
                 .collect()
         });
-        for (src_path, outcome) in chunk.iter().zip(outcomes) {
-            let row = commit_one(&ctx, &mut st, src_path, outcome);
-            done += 1;
-            progress(done, total, row.as_ref());
+        // `Option` so a stale stop can leave the chunk's untouched outcomes in place: they are
+        // scanned for orphan library copies below. Each outcome is taken exactly once.
+        let mut pending: Vec<Option<Result<Outcome, ImportError>>> =
+            outcomes.into_iter().map(Some).collect();
+        let mut stale_at: Option<usize> = None;
+        for k in 0..pending.len() {
+            let outcome = pending[k].take().expect("import: outcome taken once");
+            match commit_one(&ctx, &mut st, &chunk[k], outcome) {
+                Step::Done(row) => {
+                    if row.is_some() && !commit_notified {
+                        commit_notified = true;
+                        control.committed();
+                    }
+                    done += 1;
+                    progress(done, total, row.as_deref());
+                }
+                Step::Stale => {
+                    stale_at = Some(k);
+                    break;
+                }
+            }
+        }
+        if let Some(k) = stale_at {
+            st.stats.interrupted = true;
+            st.stats.not_processed = total - done; // the stale file itself included
+                                                   // The rest of the chunk was already copied, but its rows can never land — those
+                                                   // copies are orphans no rescan can adopt. Reference mode owns nothing to remove.
+            if !matches!(mode, ImportMode::Reference) {
+                for o in pending.iter().skip(k + 1).filter_map(Option::as_ref) {
+                    if let Ok(Outcome::Ready { processed, .. }) = o {
+                        remove_orphan_copy(Path::new(&processed.path));
+                    }
+                }
+            }
+            stale = true;
+            break;
         }
     }
 
-    if ctx.pairing_on {
-        st.stats.paired = link_detected_pairs(db, files, &st.new_ids, &st.src_hashes);
+    // A stale run skips the pairing pass: its inserts never landed, so there is nothing new to
+    // link (and a link keyed on old paths would be a lie).
+    if ctx.pairing_on && !stale {
+        ctx.control.commit(&mut |_| {
+            st.stats.paired = link_detected_pairs(db, files, &st.new_ids, &st.src_hashes);
+        });
     }
 
     {
-        let guard = db.lock().expect("import: db mutex poisoned");
-        finish_session(&guard.conn, &st.stats)?;
+        // Attempted through the fence even after a stale stop, where it will (harmlessly) not run:
+        // a session row belonging to a discarded catalog must not fail an otherwise valid run.
+        let mut err: Option<ImportError> = None;
+        ctx.control.commit(&mut |_| {
+            let guard = db.lock().expect("import: db mutex poisoned");
+            err = finish_session(&guard.conn, &st.stats).err();
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
     }
     Ok(st.stats)
+}
+
+/// Outcome of cataloguing one file, distinguishing "not added" from "cannot ever be added".
+enum Step {
+    /// File handled — added, skipped, or failed. Carries the freshly inserted row (boxed: it
+    /// dwarfs the other variants) for the live grid update, `None` otherwise.
+    Done(Option<Box<ImageRow>>),
+    /// The host's fence reported this run's catalog reset/replaced: nothing was written for this
+    /// file, and no later commit of this run can land either.
+    Stale,
 }
 
 /// Catalog one file's outcome (brief locks only), advancing `st` in input order. Returns the freshly
@@ -427,7 +544,7 @@ fn commit_one(
     st: &mut RunState,
     src_path: &Path,
     outcome: Result<Outcome, ImportError>,
-) -> Option<ImageRow> {
+) -> Step {
     let outcome = match outcome {
         Ok(o) => o,
         Err(e) => {
@@ -435,7 +552,7 @@ fn commit_one(
             if record_source_failure(ctx.db, src_path, &failure_facts(&e), ctx.imported_at) {
                 st.stats.unsupported += 1;
             }
-            return None;
+            return Step::Done(None);
         }
     };
 
@@ -445,7 +562,7 @@ fn commit_one(
                 st.src_hashes.insert(src_path.to_path_buf(), h);
             }
             st.stats.skipped += 1;
-            None
+            Step::Done(None)
         }
         Outcome::SkipSeen(h) => {
             st.seen.insert(h);
@@ -453,7 +570,7 @@ fn commit_one(
                 st.src_hashes.insert(src_path.to_path_buf(), h);
             }
             st.stats.skipped += 1;
-            None
+            Step::Done(None)
         }
         Outcome::Unsupported(err) => {
             // No copy was made and the source is untouched — only the record is written.
@@ -465,7 +582,7 @@ fn commit_one(
                 &FailureFacts::from_raw(&err),
                 ctx.imported_at,
             );
-            None
+            Step::Done(None)
         }
         Outcome::Ready {
             processed,
@@ -475,7 +592,8 @@ fn commit_one(
     }
 }
 
-/// Catalog a processed file: relink-or-insert, stamp the session, then (Move only) trash the source.
+/// Catalog a processed file: relink-or-insert (inside the host's fence), stamp the session, then
+/// (Move only) trash the source.
 fn commit_ready(
     ctx: &CommitCtx<'_>,
     st: &mut RunState,
@@ -483,7 +601,7 @@ fn commit_ready(
     processed: ProcessedImage,
     src_hash: [u8; 32],
     src_to_trash: Option<PathBuf>,
-) -> Option<ImageRow> {
+) -> Step {
     // An earlier file of the SAME chunk carried identical bytes. The parallel phase saw `seen`
     // before that hash was recorded, so this file was copied+processed anyway; treat it exactly like
     // the pre-copy `Skip` it would have been, and delete the redundant copy. The source is never
@@ -496,11 +614,19 @@ fn commit_ready(
             st.src_hashes.insert(src_path.to_path_buf(), src_hash);
         }
         st.stats.skipped += 1;
-        return None;
+        return Step::Done(None);
     }
 
     match insert_catalog_row(ctx, src_path, &processed) {
-        Ok(Some((id, row))) => {
+        CatalogStep::Stale => {
+            // Never trash the source — its bytes never made it into a catalog. The library copy is
+            // an orphan the moment this run's catalog identity is void.
+            if !matches!(ctx.mode, ImportMode::Reference) {
+                remove_orphan_copy(Path::new(&processed.path));
+            }
+            Step::Stale
+        }
+        CatalogStep::Committed(Ok(Some((id, row)))) => {
             st.stats.added += 1;
             st.seen.insert(src_hash);
             if ctx.pairing_on {
@@ -513,37 +639,95 @@ fn commit_ready(
                     st.stats.source_retained += 1;
                 }
             }
-            row
+            Step::Done(row)
         }
-        Ok(None) => {
+        CatalogStep::Committed(Ok(None)) => {
             // The hash turned out to be in the catalog after all (it was absent from the `present`
             // snapshot this run started from). The copy is an orphan no rescan can adopt.
             if !matches!(ctx.mode, ImportMode::Reference) {
                 remove_orphan_copy(Path::new(&processed.path));
             }
             st.stats.skipped += 1;
-            None
+            Step::Done(None)
         }
-        Err(_) => {
+        CatalogStep::Committed(Err(_)) => {
             st.stats.failed += 1;
-            None
+            Step::Done(None)
         }
     }
 }
 
-/// Brief lock: recover a deleted-then-re-imported file by relinking its `missing` row (keeps id +
-/// edits/keywords), else insert fresh; stamp the session; read the row back for the live grid
-/// update. `Ok(None)` = a byte-identical row is already `present`.
+/// Outcome of the fenced row write: `Ok(None)` = a byte-identical row is already `present`; the
+/// `i64` is the relinked/inserted id and the boxed row its read-back for the live grid update.
+type RowWrite = Result<Option<(i64, Option<Box<ImageRow>>)>, ImportError>;
+
+/// Result of the fenced catalog write for one file.
+enum CatalogStep {
+    /// The fence was held and the write ran (`Ok(None)` = a byte-identical row is already
+    /// `present`).
+    Committed(RowWrite),
+    /// The fence reported this run's catalog no longer current; the write never ran.
+    Stale,
+}
+
+/// Run the catalog write for one file inside the host's publication fence. The catalog lock is
+/// taken INSIDE the fence — that fixed lock order (fence first, then catalog lock) is what makes a
+/// concurrent catalog reset/replacement race-free: the fence holder cannot be overtaken by a stale
+/// writer that already holds the lock.
 fn insert_catalog_row(
     ctx: &CommitCtx<'_>,
     src_path: &Path,
     processed: &ProcessedImage,
-) -> Result<Option<(i64, Option<ImageRow>)>, ImportError> {
-    let guard = ctx.db.lock().expect("import: db mutex poisoned");
-    let conn = &guard.conn;
+) -> CatalogStep {
+    let mut result: Option<RowWrite> = None;
+    let fresh = ctx.control.commit(&mut |events| {
+        let guard = ctx.db.lock().expect("import: db mutex poisoned");
+        result = Some(write_catalog_row(
+            ctx,
+            &guard.conn,
+            events,
+            src_path,
+            processed,
+        ));
+    });
+    if !fresh {
+        return CatalogStep::Stale;
+    }
+    CatalogStep::Committed(result.unwrap_or_else(|| {
+        Err(ImportError::Io(std::io::Error::other(
+            "host commit() returned true without running the commit callback",
+        )))
+    }))
+}
+
+/// Recover a deleted-then-re-imported file by relinking its `missing` row (keeps id +
+/// edits/keywords), else insert fresh; stamp the session; read the row back for the live grid
+/// update. `Ok(None)` = a byte-identical row is already `present`. Runs while the fence is held.
+fn write_catalog_row(
+    ctx: &CommitCtx<'_>,
+    conn: &Connection,
+    events: &mut dyn SourceEvents,
+    src_path: &Path,
+    processed: &ProcessedImage,
+) -> RowWrite {
     let id = match relink_missing_image(conn, ctx.folder_id, ctx.imported_at, processed)? {
-        Some(id) => Some(id),
-        None => insert_image(conn, ctx.folder_id, ctx.imported_at, processed)?,
+        Some(id) => {
+            // The row's source identity just moved to new bytes/path; report it under the fence so
+            // the host drops any work keyed on the old path instead of passing its identity checks.
+            events.source_changed(id, &processed.content_hash_hex, &processed.path);
+            Some(id)
+        }
+        None => {
+            let id = insert_image(conn, ctx.folder_id, ctx.imported_at, processed)?;
+            if let Some(id) = id {
+                // A fresh row — and possibly a REUSED rowid: `images.id` has no AUTOINCREMENT, so
+                // after a delete the next insert can inherit a retired id whose gate entry is still
+                // `None`. Report the new identity under the same fence so the host registers it;
+                // without this, work for the reused id is refused as Stale until restart.
+                events.source_changed(id, &processed.content_hash_hex, &processed.path);
+            }
+            id
+        }
     };
     let Some(id) = id else { return Ok(None) };
     conn.execute(
@@ -558,7 +742,10 @@ fn insert_catalog_row(
     let _ = core_library::clear_decode_failure(conn, &src_path.display().to_string());
     let _ = core_library::clear_decode_failure(conn, &processed.path);
     // Read-back is best-effort: a failure only costs the live update.
-    Ok(Some((id, image_by_id(conn, id).ok().flatten())))
+    Ok(Some((
+        id,
+        image_by_id(conn, id).ok().flatten().map(Box::new),
+    )))
 }
 
 /// Delete a library copy that will never be catalogued, together with the sidecar copied beside it.

@@ -39,6 +39,7 @@ pub fn reconcile(conn: &Connection) -> Result<ReconcileStats, LibError> {
                     "UPDATE images SET status='present' WHERE id=?1",
                     params![id],
                 )?;
+                crate::outbox::reset_outbox_schedule(&tx, Some(id))?;
                 stats.restored += 1;
             }
             _ => {}

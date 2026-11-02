@@ -64,11 +64,12 @@ pub fn status(st: &AppState) -> PanoStatus {
 struct RunGuard<'a> {
     running: &'a AtomicBool,
     cancel: &'a AtomicBool,
+    workers: &'a core_runtime::workers::ManagedWorkers,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.cancel.store(false, Ordering::SeqCst);
+        let _ = self.workers.reset_cancel(self.cancel);
     }
 }
 
@@ -117,6 +118,10 @@ fn validate_ids(ids: &[i64]) -> Result<(), String> {
             "panorama merge needs 2–10 images ({} selected)",
             ids.len()
         ));
+    }
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    if unique.len() != ids.len() {
+        return Err("select distinct source images for a panorama".into());
     }
     Ok(())
 }
@@ -211,13 +216,15 @@ pub fn preview<R: Runtime>(
     }
     let projection = parse_projection(&projection)?;
 
-    // Serialize preview work (and cache access) on one mutex — a second preview waits rather than
-    // duplicating a multi-second decode burst.
-    let mut cache = st
-        .panorama_preview_cache
-        .lock()
-        .map_err(|e| e.to_string())?;
-    if cache.as_ref().map(|c| &c.ids) != Some(&ids) {
+    let sequence = st.publications.sequence();
+    let cached = {
+        let cache = st
+            .panorama_preview_cache
+            .lock()
+            .map_err(|e| e.to_string())?;
+        cache.as_ref().is_some_and(|c| c.ids == ids)
+    };
+    if !cached {
         let paths = resolve_paths(&st, &ids)?;
         let mut frames = Vec::with_capacity(paths.len());
         let mut metas = Vec::with_capacity(paths.len());
@@ -229,13 +236,27 @@ pub fn preview<R: Runtime>(
             metas.push(meta);
         }
         check_same_camera(&metas)?;
-        *cache = Some(PreviewCache {
-            ids: ids.clone(),
-            frames,
-            metas,
-        });
+        st.publications
+            .with_sequence(sequence, || -> Result<(), String> {
+                *st.panorama_preview_cache
+                    .lock()
+                    .map_err(|e| e.to_string())? = Some(PreviewCache {
+                    ids: ids.clone(),
+                    frames,
+                    metas,
+                });
+                Ok(())
+            })
+            .map_err(|_| "panorama preview stale: catalog source changed".to_string())??;
     }
-    let c = cache.as_ref().expect("cache filled above");
+    let cache = st
+        .panorama_preview_cache
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let c = cache
+        .as_ref()
+        .filter(|c| c.ids == ids)
+        .ok_or_else(|| "panorama preview stale: cache changed".to_string())?;
 
     let opt = StitchOptions {
         projection,
@@ -360,6 +381,7 @@ fn pano_dest_path(first_source: &Path) -> Result<PathBuf, String> {
 /// and between blended frames — so a stop request lands within a frame rather than a whole phase.
 pub fn merge<R: Runtime>(
     app: &AppHandle<R>,
+    ctx: &core_runtime::jobs::JobContext,
     ids: Vec<i64>,
     projection: String,
     boundary_warp: f32,
@@ -375,26 +397,34 @@ pub fn merge<R: Runtime>(
     let _guard = RunGuard {
         running: &st.panorama_running,
         cancel: &st.panorama_cancel,
+        workers: &st.workers,
     };
-    st.panorama_cancel.store(false, Ordering::SeqCst);
+    st.workers.reset_cancel(&st.panorama_cancel)?;
+    // Publication and catalog insertion belong to this job. Defer watcher indexing until both
+    // complete, otherwise the watcher can win the insert and make cleanup remove a catalogued DNG.
+    let _watch_guard = crate::watch::ImportGuard::new(app.clone());
 
     // Borrow the flag itself (not the `State` wrapper) so the closure is `Sync` — core-pano polls it
     // from inside its rayon-parallel phases.
     let cancel_flag = &st.panorama_cancel;
-    let cancelled = move || cancel_flag.load(Ordering::SeqCst);
-
-    // Brief lock: resolve paths + the first source's folder (the pano lands in the same folder).
-    let paths = resolve_paths(&st, &ids)?;
-    let folder_id: i64 = {
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        db.conn
-            .query_row(
-                "SELECT folder_id FROM images WHERE id = ?1",
-                [ids[0]],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?
+    let workers = &st.workers;
+    let cancelled = move || {
+        workers.is_stopping() || cancel_flag.load(Ordering::SeqCst) || ctx.is_cancel_requested()
     };
+
+    // ONE snapshot of the source rows: paths, the first source's folder (the pano lands in the same
+    // folder) and the publication tokens all come from it.
+    let snapshot = crate::source_fence::snapshot_sources(&st.publications, &st.db, &ids)?;
+    snapshot.require_present()?;
+    let paths: Vec<String> = snapshot
+        .sources()
+        .iter()
+        .map(|s| s.path.to_string_lossy().into_owned())
+        .collect();
+    let tokens = snapshot.tokens().to_vec();
+    let folder_id: i64 = snapshot.sources()[0]
+        .folder_id
+        .ok_or_else(|| format!("image {} has no folder", ids[0]))?;
 
     // The composite must stay openable in the (tiling-free) GPU develop pipeline.
     let device_cap = st
@@ -439,11 +469,7 @@ pub fn merge<R: Runtime>(
         &result.rgb,
         ref_meta,
     )
-    .map_err(|e| {
-        // write_pano_dng creates the file up front, so a failed write can leave a truncated DNG.
-        let _ = std::fs::remove_file(&dest);
-        e.to_string()
-    })?;
+    .map_err(|e| e.to_string())?;
     if cancelled() {
         let _ = std::fs::remove_file(&dest);
         return Err("cancelled".into());
@@ -455,29 +481,44 @@ pub fn merge<R: Runtime>(
         let _ = std::fs::remove_file(&dest);
         e.to_string()
     })?;
-    let new_id: i64 = (|| -> Result<i64, String> {
-        let db = st.db.lock().map_err(|e| e.to_string())?;
-        let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        let id = core_library::insert_image(&tx, folder_id, core_library::now_epoch(), &processed)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "merged panorama is already in the catalog".to_string())?;
-        // Only link frames the stitcher actually used — registration can drop non-overlapping
-        // frames from `ids`, and a source row for a frame that isn't in the output would lie about
-        // what went into the pano.
-        for (pos, &idx) in result.used_indices.iter().enumerate() {
-            tx.execute(
+    let new_id: i64 = crate::source_fence::publish_owned(
+        &st.publications,
+        &tokens,
+        &dest,
+        |guard| -> Result<i64, String> {
+            let db = st.db.lock().map_err(|e| e.to_string())?;
+            let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            let id =
+                core_library::insert_image(&tx, folder_id, core_library::now_epoch(), &processed)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "merged panorama is already in the catalog".to_string())?;
+            // Only link frames the stitcher actually used — registration can drop non-overlapping
+            // frames from `ids`, and a source row for a frame that isn't in the output would lie about
+            // what went into the pano.
+            for (pos, &idx) in result.used_indices.iter().enumerate() {
+                tx.execute(
                 "INSERT OR IGNORE INTO panorama_sources (pano_image_id, source_image_id, position)
                  VALUES (?1, ?2, ?3)",
                 core_db::rusqlite::params![id, ids[idx], pos as i64],
             )
             .map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(id)
-    })()
-    .inspect_err(|_| {
-        let _ = std::fs::remove_file(&dest);
-    })?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            // Register the committed row's identity while the gate is still held: the rowid may
+            // be one retired by an earlier delete (`images.id` has no AUTOINCREMENT), and an
+            // unregistered reuse would stay Stale until restart.
+            guard.replace_source(
+                core_model::identity::ImageId(id),
+                core_runtime::publication::SourceKey {
+                    hash: processed.content_hash_hex.clone(),
+                    path: processed.path.clone(),
+                },
+            );
+            Ok(id)
+        },
+    )?;
+    // The DNG + catalog row are committed; a later cancel must not retire the published id.
+    ctx.mark_committed();
 
     // Free the dialog's cached preview frames — the merge is done, the memory matters more.
     if let Ok(mut cache) = st.panorama_preview_cache.lock() {

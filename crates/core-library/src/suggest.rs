@@ -484,18 +484,84 @@ fn train_with_grid(
     k: usize,
     lambdas: &[f32],
 ) -> Result<TrainOutcome, LibError> {
+    let snapshot = snapshot_training(conn, embedding_tag)?;
+    let fit = fit_training_with_grid(snapshot, embedding_tag, now_ms, k, lambdas)?;
+    store_training(conn, embedding_tag, now_ms, fit)
+}
+
+/// Catalog inputs captured before fitting without a database lock.
+pub struct TrainingSnapshot {
+    samples: Vec<Sample>,
+    warm: Option<Model>,
+}
+
+/// A fitted model awaiting publication.
+pub struct TrainingFit {
+    model: Model,
+    best_lambda: f32,
+}
+
+pub fn snapshot_training(
+    conn: &Connection,
+    embedding_tag: &str,
+) -> Result<TrainingSnapshot, LibError> {
     let (samples, _) = assemble_samples(conn, embedding_tag)?;
-    // Warm-starting from a model fit on a DIFFERENT encoder would seed garbage: same width, other
-    // space. `core_suggest::train` already guards feature-version/width; the tag is ours to check.
     let warm = current_model(conn)?
         .map(|(_, m)| m)
         .filter(|m| m.embedding_model_tag == embedding_tag);
-    let (model, report) =
-        core_suggest::train(&samples, k, lambdas, warm.as_ref(), embedding_tag, now_ms)
-            .map_err(|e| LibError::Other(e.to_string()))?;
+    Ok(TrainingSnapshot { samples, warm })
+}
 
+pub fn fit_training(
+    snapshot: TrainingSnapshot,
+    embedding_tag: &str,
+    now_ms: i64,
+) -> Result<TrainingFit, LibError> {
+    fit_training_with_grid(snapshot, embedding_tag, now_ms, CV_FOLDS, &[])
+}
+
+fn fit_training_with_grid(
+    snapshot: TrainingSnapshot,
+    embedding_tag: &str,
+    now_ms: i64,
+    k: usize,
+    lambdas: &[f32],
+) -> Result<TrainingFit, LibError> {
+    let (model, report) = core_suggest::train(
+        &snapshot.samples,
+        k,
+        lambdas,
+        snapshot.warm.as_ref(),
+        embedding_tag,
+        now_ms,
+    )
+    .map_err(|e| LibError::Other(e.to_string()))?;
+    Ok(TrainingFit {
+        model,
+        best_lambda: report.best_lambda,
+    })
+}
+
+pub fn store_training(
+    conn: &Connection,
+    embedding_tag: &str,
+    now_ms: i64,
+    fit: TrainingFit,
+) -> Result<TrainOutcome, LibError> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
+    let outcome = store_training_inner(&tx, embedding_tag, now_ms, &fit)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+fn store_training_inner(
+    conn: &Connection,
+    embedding_tag: &str,
+    now_ms: i64,
+    fit: &TrainingFit,
+) -> Result<TrainOutcome, LibError> {
+    let model = &fit.model;
+    conn.execute(
         "INSERT INTO suggestion_model
              (created_at, model_json, feature_version, embedding_model_tag, n_pos, n_neg,
               cv_auc, cv_auprc, top1_agreement)
@@ -512,17 +578,15 @@ fn train_with_grid(
             model.top1_agreement.map(|v| v as f64),
         ],
     )?;
-    let model_id = tx.last_insert_rowid();
-    let promoted = promotable(&tx, model.cv_auprc)?;
+    let model_id = conn.last_insert_rowid();
+    let promoted = promotable(conn, model.cv_auprc)?;
     if promoted {
-        tx.execute(
+        conn.execute(
             "UPDATE suggestion_model SET promoted = 1 WHERE id = ?1",
             params![model_id],
         )?;
-        set_meta(&tx, KEY_CURRENT_MODEL, &model_id.to_string())?;
+        set_meta(conn, KEY_CURRENT_MODEL, &model_id.to_string())?;
     }
-    tx.commit()?;
-
     Ok(TrainOutcome {
         model_id,
         promoted,
@@ -531,7 +595,7 @@ fn train_with_grid(
         cv_auc: model.cv_auc,
         cv_auprc: model.cv_auprc,
         top1_agreement: model.top1_agreement,
-        best_lambda: report.best_lambda,
+        best_lambda: fit.best_lambda,
     })
 }
 
@@ -636,6 +700,160 @@ fn flush_scores(
     }
     tx.commit()?;
     Ok(batch.len())
+}
+
+/// Scoring inputs shared across pages.
+pub struct ScoringSnapshot {
+    model_id: i64,
+    model: Model,
+    hands: HashMap<i64, HandRow>,
+}
+
+pub struct ScoringPage {
+    rows: Vec<(i64, Vec<u8>)>,
+}
+
+pub struct ScoredPage {
+    rows: Vec<(i64, f32)>,
+}
+
+pub fn snapshot_scoring(
+    conn: &Connection,
+    embedding_tag: &str,
+) -> Result<ScoringSnapshot, LibError> {
+    let Some((model_id, model)) = current_model(conn)? else {
+        return Err(LibError::Other("no promoted suggestion model".into()));
+    };
+    if model.feature_version != core_suggest::FEATURE_VERSION {
+        return Err(LibError::Other(format!(
+            "suggestion model {model_id} was fit on feature version {} (runtime {}) — retrain",
+            model.feature_version,
+            core_suggest::FEATURE_VERSION
+        )));
+    }
+    if model.embedding_model_tag != embedding_tag {
+        return Err(LibError::Other(format!(
+            "suggestion model {model_id} was fit on {} embeddings (runtime {embedding_tag}) — retrain",
+            model.embedding_model_tag
+        )));
+    }
+    let hands = load_hand_rows(conn, embedding_tag)?
+        .into_iter()
+        .map(|r| (r.id, r))
+        .collect();
+    Ok(ScoringSnapshot {
+        model_id,
+        model,
+        hands,
+    })
+}
+
+pub fn snapshot_fitted_scoring(
+    conn: &Connection,
+    embedding_tag: &str,
+    fit: &TrainingFit,
+) -> Result<ScoringSnapshot, LibError> {
+    let hands = load_hand_rows(conn, embedding_tag)?
+        .into_iter()
+        .map(|r| (r.id, r))
+        .collect();
+    Ok(ScoringSnapshot {
+        model_id: 0,
+        model: fit.model.clone(),
+        hands,
+    })
+}
+
+pub fn publish_training_and_scores(
+    conn: &Connection,
+    embedding_tag: &str,
+    now_ms: i64,
+    fit: TrainingFit,
+    pages: &[ScoredPage],
+) -> Result<TrainOutcome, LibError> {
+    let tx = conn.unchecked_transaction()?;
+    let outcome = store_training_inner(&tx, embedding_tag, now_ms, &fit)?;
+    if outcome.promoted {
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO image_suggestion (image_id, model_id, score, suggested, withheld, scored_at) VALUES (?1,?2,?3,?4,?5,?6)")?;
+            for page in pages {
+                for &(id, score) in &page.rows {
+                    stmt.execute(params![
+                        id,
+                        outcome.model_id,
+                        score as f64,
+                        suggested_for(&fit.model, score),
+                        withheld(id, outcome.model_id) as i64,
+                        now_ms
+                    ])?;
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM image_suggestion WHERE model_id <> ?1",
+            params![outcome.model_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(outcome)
+}
+
+pub fn scoring_page_len(page: &ScoringPage) -> usize {
+    page.rows.len()
+}
+
+pub fn scored_page_len(page: &ScoredPage) -> usize {
+    page.rows.len()
+}
+
+pub fn scoring_page(
+    conn: &Connection,
+    embedding_tag: &str,
+    after: i64,
+) -> Result<ScoringPage, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT e.image_id, e.vector FROM image_embedding e JOIN images i ON i.id = e.image_id
+         WHERE i.status = 'present' AND e.model_tag = :tag AND e.image_id > :after
+         ORDER BY e.image_id LIMIT :limit",
+    )?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":tag": embedding_tag, ":after": after, ":limit": SCORE_BATCH as i64 },
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ScoringPage { rows })
+}
+
+pub fn score_page(snapshot: &ScoringSnapshot, page: ScoringPage) -> (Option<i64>, ScoredPage) {
+    let last = page.rows.last().map(|(id, _)| *id);
+    let rows = page
+        .rows
+        .into_iter()
+        .filter_map(|(id, blob)| {
+            let row = snapshot.hands.get(&id)?;
+            let score = snapshot.model.score(&f32_from_le(&blob), &row.hand).ok()?;
+            Some((id, score))
+        })
+        .collect();
+    (last, ScoredPage { rows })
+}
+
+pub fn store_scoring_page(
+    conn: &Connection,
+    snapshot: &ScoringSnapshot,
+    page: &ScoredPage,
+    now_ms: i64,
+) -> Result<usize, LibError> {
+    flush_scores(conn, &snapshot.model, snapshot.model_id, &page.rows, now_ms)
+}
+
+pub fn finish_scoring(conn: &Connection, snapshot: &ScoringSnapshot) -> Result<(), LibError> {
+    conn.execute(
+        "DELETE FROM image_suggestion WHERE model_id <> ?1",
+        params![snapshot.model_id],
+    )?;
+    Ok(())
 }
 
 /// Score every present image carrying an embedding from `embedding_tag` with the live model.
@@ -1269,6 +1487,62 @@ mod tests {
         score_all(c, TAG, 1_754_000_200_000).unwrap();
         assert_eq!(before, snapshot(c), "the holdout must not reshuffle");
         assert!(before.iter().filter(|(_, w)| *w == 1).count() < before.len());
+    }
+
+    #[test]
+    fn paged_scoring_matches_existing_pass() {
+        let db = Db::open_in_memory().unwrap();
+        let c = &db.conn;
+        seed_labeled_library(c);
+        train_small(c);
+        score_all(c, TAG, 123).unwrap();
+        let rows = |conn: &Connection| {
+            let mut stmt = conn.prepare("SELECT image_id, model_id, score, suggested, withheld, scored_at FROM image_suggestion ORDER BY image_id").unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let expected = rows(c);
+        c.execute("DELETE FROM image_suggestion", []).unwrap();
+        let snapshot = snapshot_scoring(c, TAG).unwrap();
+        let mut after = i64::MIN;
+        loop {
+            let page = scoring_page(c, TAG, after).unwrap();
+            let (last, scored) = score_page(&snapshot, page);
+            let Some(last) = last else { break };
+            store_scoring_page(c, &snapshot, &scored, 123).unwrap();
+            after = last;
+        }
+        finish_scoring(c, &snapshot).unwrap();
+        assert_eq!(rows(c), expected);
+    }
+
+    #[test]
+    fn atomic_publication_rolls_back_model_when_scoring_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let c = &db.conn;
+        seed_labeled_library(c);
+        let snapshot = snapshot_training(c, TAG).unwrap();
+        let fit = fit_training_with_grid(snapshot, TAG, 123, 2, &[1e-2]).unwrap();
+        let scoring = snapshot_fitted_scoring(c, TAG, &fit).unwrap();
+        let (_, page) = score_page(&scoring, scoring_page(c, TAG, i64::MIN).unwrap());
+        c.execute_batch("CREATE TRIGGER fail_suggestion BEFORE INSERT ON image_suggestion BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        assert!(publish_training_and_scores(c, TAG, 123, fit, &[page]).is_err());
+        assert_eq!(current_model_id(c).unwrap(), None);
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM suggestion_model", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

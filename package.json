@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "e2e:mock": "playwright test --config e2e/playwright.config.ts --project=mock",
+    "e2e:check-native": "tsc --project e2e/tsconfig.native.json",
     "e2e:real": "playwright test --config e2e/playwright.config.ts --project=tauri --workers=1"
   },
   "dependencies": {
@@ -28,6 +29,7 @@
     "@playwright/test": "^1.61.0",
     "@srsholmes/tauri-playwright": "^0.4.0",
     "@tauri-apps/cli": "^2",
+    "@types/node": "20.19.43",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",

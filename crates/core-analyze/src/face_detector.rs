@@ -112,9 +112,9 @@ impl FaceDetector for Scrfd {
             )));
         }
         // Strides correspond to descending row counts (8→largest feature map).
-        scores.sort_by(|a, b| b.0.cmp(&a.0));
-        bboxes.sort_by(|a, b| b.0.cmp(&a.0));
-        kpss.sort_by(|a, b| b.0.cmp(&a.0));
+        scores.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        bboxes.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        kpss.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         let (ow, oh) = (img.width() as f32, img.height() as f32);
         let inv = 1.0 / scale;

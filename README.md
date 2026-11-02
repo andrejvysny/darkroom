@@ -79,8 +79,11 @@ npm run tauri dev                       # run the app
 npm run tauri build -- --bundles dmg    # build a .dmg
 cargo test --workspace                  # run tests
 cargo clippy --workspace                # lint
+cargo xtask parity                     # check the migration compatibility contract
 ```
 
 Architecture, status, and the full spec live in `CLAUDE.md` and the Plane project DARKROOM (Pages + work items).
+
+Reproducible catalog fixtures and browser reference captures: [migration checks](tests/migration/README.md).
 
 </details>

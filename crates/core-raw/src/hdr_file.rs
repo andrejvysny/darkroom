@@ -52,22 +52,28 @@ fn de(e: impl std::fmt::Display) -> RawError {
     RawError::Decode(format!("HDR EXR: {e}"))
 }
 
-/// JSON → EXR Text. EXR text is byte-per-char; `serde_json::to_string` with `escape` handles the
-/// rare non-ASCII (lens names etc.) by \u-escaping, so this never fails in practice — but fall
-/// back to dropping the attribute rather than failing the write.
+/// JSON → EXR Text. EXR text is byte-per-char, so encode non-ASCII as JSON UTF-16 escapes
+/// (including surrogate pairs) rather than losing metadata characters to replacement marks.
 fn json_text<T: Serialize>(value: &T) -> Option<Text> {
+    use std::fmt::Write;
     let json = serde_json::to_string(value).ok()?;
-    let ascii: String = json
-        .chars()
-        .map(|c| if c.is_ascii() { c } else { '?' })
-        .collect();
+    let mut ascii = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c.is_ascii() {
+            ascii.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                write!(&mut ascii, "\\u{unit:04x}").ok()?;
+            }
+        }
+    }
     Text::new_or_none(ascii)
 }
 
 /// Write `img` (linear ProPhoto, scene-referred) as an fp16 ZIP-compressed EXR with embedded
-/// metadata. Durability mirrors core-import: the bytes go to `<path>.part` first, then an atomic
-/// rename — `.part` is never enumerated by the indexer/watcher, so a crash leaves no torn catalog
-/// entry.
+/// metadata. Writes through a unique sibling `.part`, flushes and syncs, then publishes without
+/// overwriting an existing destination. Errors leave any existing destination untouched and
+/// remove this invocation's temporary file.
 pub fn write_hdr_exr(
     path: &Path,
     img: &LinearImage,
@@ -80,7 +86,7 @@ pub fn write_hdr_exr(
     use exr::meta::header::LayerAttributes;
 
     let (w, h) = (img.width as usize, img.height as usize);
-    if img.data.len() != w * h * 3 || w == 0 || h == 0 {
+    if img.data.len() != crate::output::rgb_len(img.width, img.height)? {
         return Err(de("image buffer does not match its dimensions"));
     }
 
@@ -132,23 +138,26 @@ pub fn write_hdr_exr(
             .insert(key, AttributeValue::Text(text));
     }
 
-    let part = path.with_extension("exr.part");
-    {
-        let file = std::fs::File::create(&part).map_err(|e| de(e.to_string()))?;
-        let writer = std::io::BufWriter::new(file);
-        image.write().to_buffered(writer).map_err(de)?;
-    }
-    std::fs::rename(&part, path).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        de(e.to_string())
-    })?;
-    Ok(())
+    crate::output::write_atomically(path, false, |writer| {
+        image.write().to_buffered(writer).map_err(de)
+    })
 }
 
 /// Read EXR bytes → [`LinearImage`]. No color transform — the file is stored in the working format
-/// (linear ProPhoto D50). Negatives are floored (foreign EXRs may contain them; ours never do).
+/// (linear ProPhoto D50). Negatives are floored and non-finite values become zero, matching the
+/// writer's contract; foreign EXRs must not poison downstream interpolation and GPU arithmetic.
 pub fn read_hdr_linear(bytes: &[u8]) -> Result<LinearImage, RawError> {
     use exr::prelude::{ReadChannels, ReadLayers};
+
+    // The exr pixel-constructor callback cannot return a Result. Validate the header layouts
+    // before it can perform unchecked allocation arithmetic, including on 32-bit targets.
+    let metadata =
+        exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false).map_err(de)?;
+    for header in &metadata.headers {
+        let width = u32::try_from(header.layer_size.x()).map_err(de)?;
+        let height = u32::try_from(header.layer_size.y()).map_err(de)?;
+        crate::output::rgb_len(width, height)?;
+    }
 
     struct Px {
         width: usize,
@@ -164,9 +173,10 @@ pub fn read_hdr_linear(bytes: &[u8]) -> Result<LinearImage, RawError> {
             },
             |px: &mut Px, pos: Vec2<usize>, (r, g, b): (f32, f32, f32)| {
                 let i = (pos.y() * px.width + pos.x()) * 3;
-                px.data[i] = r.max(0.0);
-                px.data[i + 1] = g.max(0.0);
-                px.data[i + 2] = b.max(0.0);
+                let finite = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
+                px.data[i] = finite(r);
+                px.data[i + 1] = finite(g);
+                px.data[i + 2] = finite(b);
             },
         )
         .first_valid_layer()

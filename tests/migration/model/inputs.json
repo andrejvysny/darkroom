@@ -1,0 +1,412 @@
+[
+  {
+    "name": "default",
+    "params": {}
+  },
+  {
+    "name": "PV5",
+    "params": {
+      "exposure": 0.5,
+      "crop": {
+        "cx": 0.45,
+        "cy": 0.5,
+        "hw": 0.4,
+        "hh": 0.3,
+        "angle": 2
+      },
+      "masks": [
+        {
+          "name": "Sky",
+          "opacity": 0.7,
+          "enabled": true,
+          "components": [
+            {
+              "kind": {
+                "type": "linear",
+                "p0": [
+                  0,
+                  0
+                ],
+                "p1": [
+                  0,
+                  1
+                ]
+              },
+              "op": "add"
+            }
+          ],
+          "adjust": {
+            "exposure": 0.8
+          }
+        }
+      ],
+      "denoise": {
+        "enabled": true,
+        "amount": 35
+      }
+    }
+  },
+  {
+    "name": "PV6",
+    "params": {
+      "exposure": -0.25,
+      "crop": {
+        "rot90": 1
+      },
+      "masks": [
+        {
+          "name": "Subject",
+          "opacity": 0.8,
+          "components": [
+            {
+              "kind": {
+                "type": "linear",
+                "p0": [
+                  0,
+                  0
+                ],
+                "p1": [
+                  0,
+                  1
+                ]
+              },
+              "op": "add"
+            }
+          ],
+          "adjust": {
+            "exposure": 0.8
+          }
+        }
+      ],
+      "denoise": {
+        "enabled": true,
+        "amount": 60
+      }
+    }
+  },
+  {
+    "name": "all-fields",
+    "params": {
+      "exposure": 1.5,
+      "temp": 0,
+      "tint": 0,
+      "contrast": -25,
+      "saturation": 50,
+      "highlights": -25,
+      "shadows": 50,
+      "blacks": -25,
+      "whites": 50,
+      "sharpen": -25,
+      "nrLuma": 50,
+      "nrColor": -25,
+      "vignette": 50,
+      "distK1": -25,
+      "distK2": 50,
+      "caRed": -25,
+      "caBlue": 50,
+      "clarity": -25,
+      "texture": 50,
+      "dehaze": -25,
+      "toneAmount": 50,
+      "toneCurve": {
+        "rgb": [
+          {
+            "x": 0,
+            "y": 0
+          },
+          {
+            "x": 0.5,
+            "y": 0.6
+          },
+          {
+            "x": 1,
+            "y": 1
+          }
+        ],
+        "r": [],
+        "g": [],
+        "b": []
+      },
+      "hsl": [
+        {
+          "h": 0,
+          "s": 0,
+          "l": 0
+        },
+        {
+          "h": 5,
+          "s": -5,
+          "l": 2
+        },
+        {
+          "h": 10,
+          "s": -10,
+          "l": 4
+        },
+        {
+          "h": 15,
+          "s": -15,
+          "l": 6
+        },
+        {
+          "h": 20,
+          "s": -20,
+          "l": 8
+        },
+        {
+          "h": 25,
+          "s": -25,
+          "l": 10
+        },
+        {
+          "h": 30,
+          "s": -30,
+          "l": 12
+        },
+        {
+          "h": 35,
+          "s": -35,
+          "l": 14
+        }
+      ],
+      "crop": {
+        "cx": 0.4,
+        "cy": 0.6,
+        "hw": 0.25,
+        "hh": 0.3,
+        "angle": 0,
+        "rot90": 3
+      },
+      "cbRgb": {
+        "global": [
+          0.1,
+          -0.2,
+          0.3
+        ],
+        "shadows": [
+          0.2,
+          0,
+          -0.1
+        ],
+        "midtones": [
+          0,
+          0.3,
+          0
+        ],
+        "highlights": [
+          -0.1,
+          0.1,
+          0
+        ],
+        "contrast": 0.2,
+        "saturation": -0.3
+      },
+      "channelMix": {
+        "red": [
+          1,
+          0.2,
+          -0.2
+        ],
+        "green": [
+          0,
+          1,
+          0
+        ],
+        "blue": [
+          0.1,
+          0,
+          0.9
+        ]
+      },
+      "border": {
+        "size": 4,
+        "color": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "aspectW": 3,
+        "aspectH": 2
+      },
+      "denoise": {
+        "enabled": true,
+        "amount": 65
+      },
+      "masks": [
+        {
+          "name": "Mask 0",
+          "components": [
+            {
+              "kind": {
+                "type": "linear",
+                "p0": [
+                  0.2,
+                  0.3
+                ],
+                "p1": [
+                  0.5,
+                  0.6
+                ]
+              },
+              "op": "add",
+              "invert": false,
+              "feather": true
+            }
+          ],
+          "adjust": {
+            "exposure": 0.5,
+            "contrast": 25,
+            "saturation": -25
+          },
+          "opacity": 0.75,
+          "enabled": true
+        },
+        {
+          "name": "Mask 1",
+          "components": [
+            {
+              "kind": {
+                "type": "radial",
+                "center": [
+                  0.4,
+                  0.5
+                ],
+                "radius": [
+                  0.2,
+                  0.3
+                ],
+                "angle": 0.2,
+                "feather": 0.5
+              },
+              "op": "subtract",
+              "invert": true,
+              "feather": true
+            }
+          ],
+          "adjust": {
+            "exposure": 0.5,
+            "contrast": 25,
+            "saturation": -25
+          },
+          "opacity": 0.75,
+          "enabled": true
+        },
+        {
+          "name": "Mask 2",
+          "components": [
+            {
+              "kind": {
+                "type": "brush",
+                "strokes": [
+                  {
+                    "points": [
+                      [
+                        0.2,
+                        0.3
+                      ],
+                      [
+                        0.4,
+                        0.5
+                      ]
+                    ],
+                    "size": 0.1,
+                    "hardness": 0.3,
+                    "flow": 0.4,
+                    "opacity": 0.7,
+                    "isErase": true
+                  }
+                ]
+              },
+              "op": "intersect",
+              "invert": false,
+              "feather": true
+            }
+          ],
+          "adjust": {
+            "exposure": 0.5,
+            "contrast": 25,
+            "saturation": -25
+          },
+          "opacity": 0.75,
+          "enabled": false
+        },
+        {
+          "name": "Mask 3",
+          "components": [
+            {
+              "kind": {
+                "type": "luminanceRange",
+                "lo": 0.2,
+                "hi": 0.8,
+                "feather": 0.1
+              },
+              "op": "add",
+              "invert": true,
+              "feather": true
+            }
+          ],
+          "adjust": {
+            "exposure": 0.5,
+            "contrast": 25,
+            "saturation": -25
+          },
+          "opacity": 0.75,
+          "enabled": true
+        },
+        {
+          "name": "Mask 4",
+          "components": [
+            {
+              "kind": {
+                "type": "colorRange",
+                "hue": 0.3,
+                "sat": 0.4,
+                "tol": 0.2,
+                "feather": 0.1
+              },
+              "op": "subtract",
+              "invert": false,
+              "feather": true
+            }
+          ],
+          "adjust": {
+            "exposure": 0.5,
+            "contrast": 25,
+            "saturation": -25
+          },
+          "opacity": 0.75,
+          "enabled": true
+        },
+        {
+          "name": "Mask 5",
+          "components": [
+            {
+              "kind": {
+                "type": "ai",
+                "model": "sam",
+                "points": [
+                  {
+                    "x": 0.2,
+                    "y": 0.4,
+                    "positive": false
+                  }
+                ],
+                "hash": "fixture"
+              },
+              "op": "intersect",
+              "invert": true,
+              "feather": true
+            }
+          ],
+          "adjust": {
+            "exposure": 0.5,
+            "contrast": 25,
+            "saturation": -25
+          },
+          "opacity": 0.75,
+          "enabled": true
+        }
+      ]
+    }
+  }
+]

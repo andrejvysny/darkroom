@@ -2,10 +2,14 @@
 //! catalog insertion, and idempotent re-import (no duplicates). Skips if `library/2026` is absent.
 
 use core_db::Db;
-use core_import::{dedup_scan, import, list_source, ImportMode, Pairing, SourceStatus};
+use core_import::{
+    dedup_scan, import, import_files, list_source, ImportControl, ImportMode, NoSourceEvents,
+    Pairing, RunToEnd, SourceEvents, SourceStatus,
+};
 use core_library::ThumbCache;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 fn library_files(n: usize) -> Vec<PathBuf> {
@@ -60,6 +64,7 @@ fn copy_import_routes_and_dedupes() {
         true,
         Pairing::Standalone,
         |_, _, _| {},
+        &RunToEnd,
     )
     .unwrap();
     assert_eq!(stats.added, n, "all available files imported");
@@ -91,6 +96,7 @@ fn copy_import_routes_and_dedupes() {
         true,
         Pairing::Standalone,
         |_, _, _| {},
+        &RunToEnd,
     )
     .unwrap();
     assert_eq!(again.added, 0, "idempotent re-import adds nothing");
@@ -134,6 +140,7 @@ fn run_pair_import(card: &std::path::Path, pairing: Pairing) -> (Mutex<Db>, temp
         true,
         pairing,
         |_, _, _| {},
+        &RunToEnd,
     )
     .unwrap();
     assert_eq!(stats.added, 2, "both members of the pair are catalogued");
@@ -298,6 +305,7 @@ fn move_import_trashes_sources_after_catalog() {
         true,
         Pairing::Standalone,
         |_, _, _| {},
+        &RunToEnd,
     )
     .unwrap();
 
@@ -420,6 +428,7 @@ fn parallel_copy_import_keeps_catalog_rules() {
         true,
         Pairing::Standalone,
         |_, _, _| {},
+        &RunToEnd,
     )
     .unwrap();
 
@@ -500,6 +509,7 @@ fn in_chunk_duplicate_is_skipped_and_its_copy_removed() {
         true,
         Pairing::Standalone,
         |_, _, _| {},
+        &RunToEnd,
     )
     .unwrap();
     assert_eq!((stats.added, stats.skipped, stats.failed), (1, 1, 0));
@@ -533,6 +543,7 @@ fn reference_import_reads_in_place() {
         true,
         Pairing::Standalone,
         |_, _, _| {},
+        &RunToEnd,
     )
     .unwrap();
 
@@ -639,4 +650,506 @@ fn process_bytes_matches_process_file() {
         (via_bytes.width, via_bytes.height)
     );
     assert_eq!(via_file.meta.capture_date, via_bytes.meta.capture_date);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cooperative stop seam (`ImportControl`). The chunk boundary is the only stop point, so these
+// pin the contract: nothing half-processed, honest counts, and a finished session row either way.
+// ---------------------------------------------------------------------------------------------
+
+/// `n` byte-distinct JPEGs (the poppies fixture plus a per-file tag), so every file is importable
+/// and unique — each selected file must land in `added`, none deduped.
+fn stage_unique(dir: &Path, n: usize) -> Vec<PathBuf> {
+    let base = poppies();
+    (0..n)
+        .map(|i| {
+            let p = dir.join(format!("u{i:03}.jpg"));
+            std::fs::write(&p, variant(&base, &format!("v{i:03}"))).unwrap();
+            p
+        })
+        .collect()
+}
+
+/// A host that already wants out: the check lands before chunk 1, before anything is processed.
+struct StopAlways;
+impl ImportControl for StopAlways {
+    fn should_stop(&self) -> bool {
+        true
+    }
+}
+
+/// Counts `should_stop` calls and stops the second time it is asked — chunk 1 runs and commits,
+/// chunk 2 never starts. Also counts `committed()` calls to pin the once-only contract.
+struct StopAfterTwoAsks {
+    asks: AtomicUsize,
+    committed: AtomicUsize,
+}
+impl StopAfterTwoAsks {
+    fn new() -> Self {
+        Self {
+            asks: AtomicUsize::new(0),
+            committed: AtomicUsize::new(0),
+        }
+    }
+}
+impl ImportControl for StopAfterTwoAsks {
+    fn should_stop(&self) -> bool {
+        // 1st ask (before chunk 1): let it run. 2nd ask (before chunk 2): stop.
+        self.asks.fetch_add(1, Ordering::SeqCst) + 1 >= 2
+    }
+    fn committed(&self) {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// `(finished_at, file_count, skipped_count)` of the run's session row.
+fn session_row(db: &Mutex<Db>, id: i64) -> (Option<i64>, i64, i64) {
+    let g = db.lock().unwrap();
+    g.conn
+        .query_row(
+            &format!(
+                "SELECT finished_at, file_count, skipped_count FROM import_sessions WHERE id={id}"
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn stop_before_first_chunk_commits_nothing() {
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_unique(card.path(), 5);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    let stats = import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Copy,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &StopAlways,
+    )
+    .unwrap();
+
+    assert_eq!(stats.added, 0, "a stopped-before-start run adds nothing");
+    assert!(stats.interrupted, "the host request is recorded");
+    assert_eq!(stats.not_processed, staged.len(), "nothing was reached");
+    assert!(
+        walk_files(libdir.path()).is_empty(),
+        "no file may enter the library"
+    );
+    let (finished_at, file_count, skipped) = session_row(&db, stats.session_id);
+    assert!(
+        finished_at.is_some(),
+        "the session row exists and is finished"
+    );
+    assert_eq!((file_count, skipped), (0, 0));
+}
+
+#[test]
+fn stop_between_chunks_keeps_committed_rows() {
+    // More than CHUNK (16) unique files: the first chunk runs and commits, the run stops before
+    // the second chunk is ever processed.
+    const CHUNK_FILES: usize = 16;
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_unique(card.path(), CHUNK_FILES + 4);
+    let total = staged.len();
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    let control = StopAfterTwoAsks::new();
+
+    let stats = import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Copy,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &control,
+    )
+    .unwrap();
+
+    assert!(stats.interrupted);
+    assert_eq!(
+        stats.added + stats.skipped + stats.failed,
+        CHUNK_FILES,
+        "exactly one chunk was processed"
+    );
+    assert_eq!(stats.added, CHUNK_FILES, "all contents are distinct");
+    assert_eq!(stats.not_processed, total - CHUNK_FILES);
+    assert_eq!(
+        control.committed.load(Ordering::SeqCst),
+        1,
+        "committed() fires exactly once, on the first catalog insert"
+    );
+
+    let rows = catalog_paths(&db);
+    assert_eq!(rows.len(), stats.added, "DB rows match `added`");
+    for p in &rows {
+        assert!(
+            Path::new(p).exists(),
+            "committed row has its library copy: {p}"
+        );
+    }
+    assert_eq!(
+        walk_files(libdir.path()).len(),
+        stats.added,
+        "the never-started chunk left nothing in the library"
+    );
+}
+
+#[test]
+fn run_to_end_unchanged() {
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_unique(card.path(), 20);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    let stats = import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Copy,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &RunToEnd,
+    )
+    .unwrap();
+
+    assert!(
+        !stats.interrupted,
+        "an uninterrupted run reports no interruption"
+    );
+    assert_eq!(stats.not_processed, 0);
+    assert_eq!(
+        stats.added, 20,
+        "the full run spans >1 chunk and is unaffected"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Publication fence (`ImportControl::commit`). Every catalog write after the unlocked phase runs
+// inside the fence; a false answer means the catalog this run started on is gone — nothing more may
+// be written, nothing may be trashed, and the run reports honestly instead of erroring.
+// ---------------------------------------------------------------------------------------------
+
+/// A host whose catalog was reset the moment this run started: every fence check fails.
+struct StaleAlways;
+impl ImportControl for StaleAlways {
+    fn should_stop(&self) -> bool {
+        false
+    }
+    fn commit(&self, _commit: &mut dyn FnMut(&mut dyn SourceEvents)) -> bool {
+        false
+    }
+}
+
+/// A host whose catalog goes stale after `allowed` commits: the first `allowed` fences pass (and
+/// run the write), every later one refuses without running it.
+struct StaleAfterN {
+    allowed: usize,
+    calls: AtomicUsize,
+}
+impl ImportControl for StaleAfterN {
+    fn should_stop(&self) -> bool {
+        false
+    }
+    fn commit(&self, commit: &mut dyn FnMut(&mut dyn SourceEvents)) -> bool {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < self.allowed {
+            commit(&mut NoSourceEvents);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A host that holds the fence, runs every commit, and records the `source_changed` identity events.
+struct RecordingControl {
+    events: Mutex<Vec<(i64, String, String)>>,
+}
+impl RecordingControl {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+        }
+    }
+}
+struct Recorder<'a> {
+    out: &'a Mutex<Vec<(i64, String, String)>>,
+}
+impl SourceEvents for Recorder<'_> {
+    fn source_changed(&mut self, image_id: i64, content_hash_hex: &str, path: &str) {
+        self.out
+            .lock()
+            .unwrap()
+            .push((image_id, content_hash_hex.to_string(), path.to_string()));
+    }
+}
+impl ImportControl for RecordingControl {
+    fn should_stop(&self) -> bool {
+        false
+    }
+    fn commit(&self, commit: &mut dyn FnMut(&mut dyn SourceEvents)) -> bool {
+        commit(&mut Recorder { out: &self.events });
+        true
+    }
+}
+
+#[test]
+fn stale_catalog_before_commit_writes_nothing_and_keeps_originals() {
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_unique(card.path(), 3);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    let stats = import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Move,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &StaleAlways,
+    )
+    .unwrap();
+
+    assert_eq!(stats.added, 0, "a stale run adds nothing");
+    assert!(stats.interrupted);
+    for src in &staged {
+        assert!(
+            src.exists(),
+            "a Move source is NEVER trashed uncommitted: {src:#?}"
+        );
+    }
+    assert!(
+        walk_files(libdir.path()).is_empty(),
+        "no copy survives in the library: {:?}",
+        walk_files(libdir.path())
+    );
+    let count: i64 = db
+        .lock()
+        .unwrap()
+        .conn
+        .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "the catalog holds nothing from this run");
+}
+
+#[test]
+fn stale_catalog_mid_run_keeps_earlier_commits() {
+    const COMMITTED_BEFORE_STALE: usize = 5;
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_unique(card.path(), 20);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    let control = StaleAfterN {
+        allowed: COMMITTED_BEFORE_STALE,
+        calls: AtomicUsize::new(0),
+    };
+
+    let stats = import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Copy,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &control,
+    )
+    .unwrap();
+
+    assert_eq!(stats.added, COMMITTED_BEFORE_STALE, "earlier commits stand");
+    assert!(stats.interrupted);
+    assert_eq!(stats.not_processed, 20 - COMMITTED_BEFORE_STALE);
+
+    let rows = catalog_paths(&db);
+    assert_eq!(rows.len(), COMMITTED_BEFORE_STALE, "DB rows match `added`");
+    for p in &rows {
+        assert!(
+            Path::new(p).exists(),
+            "committed row has its library copy: {p}"
+        );
+    }
+    assert_eq!(
+        walk_files(libdir.path()).len(),
+        COMMITTED_BEFORE_STALE,
+        "the stale file's copy and the uncommitted rest of its chunk are gone"
+    );
+}
+
+#[test]
+fn relink_reports_source_event() {
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_unique(card.path(), 1);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Copy,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &RunToEnd,
+    )
+    .unwrap();
+    let (row_id, hash_hex): (i64, String) = {
+        let g = db.lock().unwrap();
+        let (id, hash): (i64, Vec<u8>) = g
+            .conn
+            .query_row("SELECT id, content_hash FROM images", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        (id, hash.iter().map(|b| format!("{b:02x}")).collect())
+    };
+    assert_eq!(hash_hex.len(), 64, "lowercase 64-char hex");
+
+    // Externally invalidate the row: reconcile marks it `missing`, then its copy is deleted.
+    let lib_copy = {
+        let g = db.lock().unwrap();
+        g.conn
+            .execute(
+                &format!("UPDATE images SET status = 'missing' WHERE id = {row_id}"),
+                [],
+            )
+            .unwrap();
+        g.conn
+            .query_row(
+                &format!("SELECT path FROM images WHERE id = {row_id}"),
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    std::fs::remove_file(&lib_copy).unwrap();
+
+    // Re-import the same bytes; the missing row must be relinked AND the event reported.
+    let control = RecordingControl::new();
+    let stats = import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Copy,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &control,
+    )
+    .unwrap();
+    assert_eq!(stats.added, 1, "the relink counts as added");
+
+    let events = control.events.into_inner().unwrap();
+    assert_eq!(events.len(), 1, "exactly one relink event");
+    let (event_id, event_hash, event_path) = &events[0];
+    assert_eq!(*event_id, row_id, "the original row id is repointed");
+    assert_eq!(
+        event_hash, &hash_hex,
+        "event carries the row's content-hash hex"
+    );
+    assert_eq!(
+        event_path, &lib_copy,
+        "event reports where the row's bytes live now"
+    );
+    assert!(
+        Path::new(event_path).exists(),
+        "and the file is really there"
+    );
+}
+
+#[test]
+fn fresh_import_reports_one_source_event_per_added_row() {
+    let card = tempfile::tempdir().unwrap();
+    let staged = stage_unique(card.path(), 3);
+
+    let libdir = tempfile::tempdir().unwrap();
+    let thumbdir = tempfile::tempdir().unwrap();
+    let thumbs = ThumbCache::new(thumbdir.path()).unwrap();
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    let control = RecordingControl::new();
+    let stats = import_files(
+        &db,
+        &thumbs,
+        card.path(),
+        &staged,
+        ImportMode::Copy,
+        libdir.path(),
+        Pairing::Standalone,
+        |_, _, _| {},
+        &control,
+    )
+    .unwrap();
+    assert_eq!(stats.added, 3);
+
+    // A fresh insert is a source identity change too: one event per added row, carrying exactly
+    // the (id, hash hex, path) that was committed. Without this, a REUSED rowid (no AUTOINCREMENT)
+    // stays unregistered in the host's gate and every later publication for it goes Stale.
+    let rows: Vec<(i64, String, String)> = {
+        let g = db.lock().unwrap();
+        let mut stmt = g
+            .conn
+            .prepare("SELECT id, content_hash, path FROM images")
+            .unwrap();
+        let mut out: Vec<(i64, String, String)> = stmt
+            .query_map([], |r| {
+                let hash: Vec<u8> = r.get(1)?;
+                Ok((
+                    r.get(0)?,
+                    hash.iter().map(|b| format!("{b:02x}")).collect(),
+                    r.get(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        out.sort();
+        out
+    };
+    let mut events = control.events.into_inner().unwrap();
+    events.sort();
+    assert_eq!(events.len(), 3, "one event per added row");
+    assert_eq!(events, rows, "events match the committed identities");
+    for (_, _, path) in &events {
+        assert!(
+            Path::new(path).exists(),
+            "event path is the live library copy"
+        );
+    }
 }

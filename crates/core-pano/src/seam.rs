@@ -150,7 +150,7 @@ pub(crate) fn build_id_map(
 
     // --- 2. Pairwise DP seams, strongest overlaps first. ---
     let mut order: Vec<&PairMatch> = pairwise.iter().collect();
-    order.sort_by(|a, b| b.n_inliers.cmp(&a.n_inliers));
+    order.sort_by_key(|edge| std::cmp::Reverse(edge.n_inliers));
 
     for pm in order {
         let (Some(&si), Some(&sj)) = (slot_of.get(&pm.i), slot_of.get(&pm.j)) else {

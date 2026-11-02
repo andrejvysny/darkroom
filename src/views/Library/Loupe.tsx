@@ -5,9 +5,9 @@ import {
   developRender,
   effectivePreviewEdge,
 } from "../../lib/ipc";
-import type { DevelopParams, ImageRow, RenderedFrame } from "../../lib/ipc";
+import type { ImageRow, RenderedFrame } from "../../lib/ipc";
 import { useAppStore } from "../../store/app";
-import { freshDefaults } from "../../store/develop";
+import { useSavedEdit } from "../../lib/useSavedEdit";
 import type { DerivedView } from "../../lib/viewport";
 import { useViewport } from "../../lib/useViewport";
 import { paintFrame } from "../../lib/canvasPaint";
@@ -45,7 +45,13 @@ export default function Loupe({ image }: LoupeProps) {
   };
 
   // ── Render state (tier-specific; the viewport machinery lives in useViewport) ───────────────────
-  const savedParamsRef = useRef<DevelopParams | null>(null);
+  // Saved params for deep-zoom `develop_render`, loaded explicitly per image: while loading or
+  // after a failure we keep drawing the (already edit-applied) preview instead of rendering with
+  // defaults — an edited photo must never look unedited at 1:1.
+  const scheduleRenderRef = useRef<() => void>(() => {});
+  const edit = useSavedEdit(image.id, developGetEdit, () =>
+    scheduleRenderRef.current(),
+  );
   const lastFrameRef = useRef<RenderedFrame | null>(null);
   // True while we're in full-res (develop_render) mode — used for zoom hysteresis so a zoom hovering
   // at the threshold doesn't thrash between the preview draw and the GPU decode.
@@ -90,7 +96,7 @@ export default function Loupe({ image }: LoupeProps) {
   } = useViewport<HTMLDivElement>({
     natural,
     resetKey: image.id,
-    render: async (d, canvas) => {
+    render: async (d, canvas, isCurrent) => {
       // Size + draw + publish the matching CSS box as ONE atomic "painted state"; never resize the
       // canvas when nothing will be drawn (that clears it → blink).
       const sizeAndPublish = () => {
@@ -129,16 +135,19 @@ export default function Loupe({ image }: LoupeProps) {
       // no blank flash while the decode runs; swap to the sharp frame when it lands.
       sizeAndPublish();
       drawPreview(d, canvas);
-      const p = savedParamsRef.current ?? freshDefaults();
+      // Without the real saved params, stop at the preview: rendering with defaults would show
+      // an edited photo unedited (or a failed load silently defaulted forever).
+      const editLoad = edit.stateRef.current;
+      if (editLoad.kind !== "ready") return;
       const frame = await developRender(
         image.id,
-        p,
+        editLoad.params,
         d.view,
         d.outW,
         d.outH,
         -1,
       );
-      if (frame) {
+      if (frame && isCurrent()) {
         lastFrameRef.current = frame;
         // The async frame belongs to THIS d — repaint + republish the same box (no-op unless a
         // newer sync paint happened meanwhile; the trailing scheduler then repaints anyway).
@@ -153,6 +162,7 @@ export default function Loupe({ image }: LoupeProps) {
   });
 
   const { visCssW, visCssH } = derived;
+  scheduleRenderRef.current = scheduleRender;
   const boxW = paintedCss?.w ?? visCssW;
   const boxH = paintedCss?.h ?? visCssH;
 
@@ -166,13 +176,6 @@ export default function Loupe({ image }: LoupeProps) {
     setPaintedCss(null);
     decodeModeRef.current = false;
     lastFrameRef.current = null;
-
-    savedParamsRef.current = null;
-    developGetEdit(image.id)
-      .then((p) => {
-        if (!cancelled) savedParamsRef.current = p;
-      })
-      .catch(() => {});
 
     // Bootstrap: the same 512px URL the grid used → served from browser cache, paints near-instantly.
     {
@@ -222,6 +225,7 @@ export default function Loupe({ image }: LoupeProps) {
         alignItems: "center",
         justifyContent: "center",
         userSelect: "none",
+        position: "relative",
       }}
     >
       <canvas
@@ -238,6 +242,44 @@ export default function Loupe({ image }: LoupeProps) {
           cursor: "grab",
         }}
       />
+      {edit.state.kind === "error" && (
+        <div
+          data-testid="loupe-edit-error"
+          role="status"
+          style={{
+            position: "absolute",
+            top: 8,
+            left: "50%",
+            transform: "translateX(-50%)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "6px 10px",
+            fontSize: 12,
+            color: "var(--color-t1)",
+            background: "var(--color-panel)",
+            border: "1px solid var(--color-line-2)",
+            borderRadius: 4,
+          }}
+        >
+          Couldn&apos;t load this photo&apos;s adjustments — showing the preview.
+          <button
+            data-testid="loupe-edit-retry"
+            onClick={edit.retry}
+            style={{
+              fontSize: 12,
+              padding: "2px 8px",
+              color: "var(--color-t1)",
+              background: "var(--color-hover)",
+              border: "1px solid var(--color-line-2)",
+              borderRadius: 3,
+              cursor: "pointer",
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,0 +1,10 @@
+[package]
+name = "ui-egui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-app = { path = "../core-app" }
+core-model = { path = "../core-model" }
+egui.workspace = true

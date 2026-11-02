@@ -49,6 +49,8 @@ library/2026/2026-06-06/*
 /Darktable_SORT/
 /DATA/
 
+testing/
+
 # UI-testing (playwright-cli) session artifacts.
 .playwright-cli/
 src-tauri/frameworks/

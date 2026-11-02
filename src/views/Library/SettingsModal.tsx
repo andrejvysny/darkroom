@@ -28,7 +28,9 @@ import {
   catalogBackupNow,
   catalogBackupStatus,
   type BackupStatus,
+  settingsBridgeExport,
 } from "../../lib/ipc";
+import { buildSnapshot } from "../../lib/settingsBridge";
 import { pickFolder } from "../../lib/importFlow";
 import { useAppStore } from "../../store/app";
 import { useSuggest } from "../../lib/useSuggest";
@@ -251,6 +253,23 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
         showStatus(`Log level set to ${level}`);
       })
       .catch(() => showStatus("Failed to set log level"));
+  };
+
+  const handleExportSettings = async () => {
+    const dest = await save({
+      defaultPath: "darkroom-settings.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!dest) return;
+    try {
+      await settingsBridgeExport(
+        dest,
+        buildSnapshot(localStorage, Date.now()),
+      );
+      showStatus("Settings exported");
+    } catch {
+      showStatus("Failed to export settings");
+    }
   };
 
   const handleExportLogs = async () => {
@@ -538,6 +557,7 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
             >
               <input
                 type="checkbox"
+                data-testid="settings-auto-update"
                 checked={autoCheck}
                 onChange={(e) => {
                   setAutoCheck(e.target.checked);
@@ -554,6 +574,23 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
               }}
             >
               Check for updates
+            </button>
+          </div>
+
+          {/* Preferences (settings bridge → native app) */}
+          <div style={sectionStyle}>
+            <div style={labelStyle}>Preferences</div>
+            <div style={descStyle}>
+              Save these preferences to a file the new Darkroom can import.
+            </div>
+            <button
+              style={btnSecondary}
+              data-testid="settings-export"
+              onClick={() => {
+                void handleExportSettings();
+              }}
+            >
+              Export settings…
             </button>
           </div>
 

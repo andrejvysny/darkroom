@@ -78,6 +78,30 @@ fn no_cancel() -> bool {
     false
 }
 
+#[test]
+fn streaming_blend_rejects_geometry_changed_since_registration() {
+    struct ChangedSource(Vec<Frame>);
+    impl FrameSource for ChangedSource {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn load(&self, i: usize, edge: Option<u32>) -> Result<LoadedFrame, PanoError> {
+            let mut loaded = FrameSource::load(&self.0.as_slice(), i, edge)?;
+            if edge.is_none() {
+                // Simulate a file replaced between the two decode passes. The new buffer is
+                // internally valid, but cannot be sampled with the previously solved camera.
+                loaded.height -= 1;
+                loaded.full_height -= 1;
+                loaded.rgb.truncate(loaded.width * loaded.height * 3);
+            }
+            Ok(loaded)
+        }
+    }
+    let source = ChangedSource(three_frames([1.0, 1.0, 1.0]));
+    let result = stitch_streaming(&source, &opts(2000), &|_| {}, &no_cancel);
+    assert!(matches!(result, Err(PanoError::InvalidInput(_))));
+}
+
 /// Rec.601 luma of an interleaved-RGB pixel.
 #[inline]
 fn luma(rgb: &[f32], i: usize) -> f32 {

@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { log } from "./logger";
+import { beginDevelopRenderObservation } from "./developRenderObservation";
 
 function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -320,7 +321,9 @@ export function libraryFolders(): Promise<FolderRow[]> {
 }
 
 /** Files the catalog could not take, most recently seen first. */
-export function decodeFailuresList(limit?: number): Promise<DecodeFailureRow[]> {
+export function decodeFailuresList(
+  limit?: number,
+): Promise<DecodeFailureRow[]> {
   return invoke<DecodeFailureRow[]>("decode_failures_list", { limit });
 }
 
@@ -393,6 +396,10 @@ export type ImportStats = {
   /** Source files this build can never decode. A strict subset of `failed`; each was recorded and
    *  left on the card — an unreadable body is never copied into the library. */
   unsupported: number;
+  /** The run stopped early on request; all counted files are committed. */
+  interrupted: boolean;
+  /** Selected files never reached because the run stopped. */
+  notProcessed: number;
 };
 
 /** Content-hash dedup status of a source file (matches Rust `SourceStatus`). "pending" = not yet
@@ -700,6 +707,11 @@ const THUMB_BASE =
     ? "http://thumb.localhost"
     : "thumb://localhost";
 
+// A WebView can retain immutable custom-protocol responses across app upgrades. Disk render keys
+// include the backend process version; a new session must also bypass old HTTP responses (including
+// camera placeholders that were served while the generated render was still pending).
+const THUMB_SESSION = Date.now().toString(36);
+
 export function thumbUrl(
   hash: string,
   size = 512,
@@ -711,7 +723,7 @@ export function thumbUrl(
    *  first-paint) instead of the small thumb tier (grid / filmstrip). */
   previewEdge?: number | null,
 ): string {
-  const base = `${THUMB_BASE}/${hash}?size=${size}`;
+  const base = `${THUMB_BASE}/${hash}?size=${size}&session=${THUMB_SESSION}`;
   // `edit=<version>` makes the protocol serve the edited render and changes the URL on each edit.
   // `pv=1&edge=<n>` requests the larger preview tier. `&t=<token>` busts the cache when a fresh
   // render lands for an UNEDITED image (placeholder → canonical swap), where `editedAt` doesn't change.
@@ -874,6 +886,8 @@ export type RejectDeleteResult = {
   failed: number;
   /** Of `trashed`, how many were camera companions. */
   companions: number;
+  /** Trashed file whose row was repointed or replaced before finalize; the row was left untouched. */
+  changed: number;
 };
 
 /** Read-only count/size of the rejects matching `params` (the reject flag is forced backend-side). */
@@ -1309,6 +1323,7 @@ export function developEditUnreadable(imageId: number): Promise<boolean> {
   return invoke<boolean>("develop_edit_status", { imageId });
 }
 
+/** Resolves with the committed edit revision (monotonic per image) — the quit barrier's ack names it. */
 export function developSetEdit(
   imageId: number,
   params: DevelopParams,
@@ -1316,13 +1331,22 @@ export function developSetEdit(
   touchCount?: number,
   /** Force overwrite even an unreadable stored blob (explicit Reset only). */
   force?: boolean,
-): Promise<void> {
-  return invoke<void>("develop_set_edit", {
+): Promise<number> {
+  return invoke<number>("develop_set_edit", {
     imageId,
     params,
     touchCount,
     force,
   });
+}
+
+/** Run the quit-grade save barrier before an updater relaunch. The updater's own restart never
+ *  raises a quit the backend can hold, so the frontend has to ask. Resolves `true` only when every
+ *  debounced Develop edit is committed (`false` if the barrier declined); rejects with the
+ *  backend's reason when the save failed or the editor never acknowledged it — in both of those
+ *  cases the app must stay running and the message belongs in the updater's error path. */
+export function prepareRestart(): Promise<boolean> {
+  return invoke<boolean>("prepare_restart", {});
 }
 
 /** Per-channel 256-bin histogram from the rendered buffer. */
@@ -1362,6 +1386,7 @@ export async function developRender(
   cropPreview = false,
 ): Promise<RenderedFrame | null> {
   const requestId = ++renderRequestSeq;
+  const observe = beginDevelopRenderObservation({ requestId, imageId, params });
   const buf = await invoke<ArrayBuffer>("develop_render", {
     imageId,
     params,
@@ -1372,6 +1397,7 @@ export async function developRender(
     cropPreview,
     requestId,
   });
+  observe(buf);
   if (buf.byteLength === 0) return null; // superseded
   if (buf.byteLength < 9) {
     log.error("develop", "render response too short", {
@@ -1474,7 +1500,13 @@ export function exportImage(
   dest: string,
   quality?: number,
 ): Promise<void> {
-  return invoke<void>("export_image", { imageId, params, format, dest, quality });
+  return invoke<void>("export_image", {
+    imageId,
+    params,
+    format,
+    dest,
+    quality,
+  });
 }
 
 // ── Presets + copy/paste settings ────────────────────────────────────────────
@@ -1703,12 +1735,7 @@ export function analysisCancel(): Promise<void> {
 
 /** A selectable scan stage. Mirrors the Rust `StageId`; the backend rejects anything else. */
 export type StageId =
-  | "objects"
-  | "animals"
-  | "faces"
-  | "captions"
-  | "embeddings"
-  | "panoramas";
+  "objects" | "animals" | "faces" | "captions" | "embeddings" | "panoramas";
 
 /** Stage order + labels for the scan modal and the per-photo readout. */
 export const SCAN_STAGES: { id: StageId; label: string; hint?: string }[] = [
@@ -1744,7 +1771,9 @@ export type ScopeCounts = {
 };
 
 /** Size the scan modal's rows for `scope` (null = whole library). Read-only; loads no models. */
-export function scanScopeCounts(scope: ScanScope | null = null): Promise<ScopeCounts> {
+export function scanScopeCounts(
+  scope: ScanScope | null = null,
+): Promise<ScopeCounts> {
   return invoke<ScopeCounts>("scan_scope_counts", { scope });
 }
 
@@ -2271,10 +2300,7 @@ export function facesDeleteAll(): Promise<void> {
 
 /** Stitch projection surface. "auto" lets the backend pick from the source images' overlap/FOV. */
 export type PanoramaProjection =
-  | "auto"
-  | "spherical"
-  | "cylindrical"
-  | "perspective";
+  "auto" | "spherical" | "cylindrical" | "perspective";
 
 /** Shared option set for `panoramaPreview`/`panoramaMerge` (mirrors the fixed Rust IPC contract —
  *  `panorama_preview`/`panorama_merge` take these fields; Tauri auto-converts the camelCase JS
@@ -2392,7 +2418,9 @@ export function panoDetectStatus(): Promise<PanoDetectStatus> {
 
 /** Detected panorama groups, most-recently-detected first. `includeDismissed` also returns groups
  *  the user has dismissed (still excludes nothing else — merged groups are always included). */
-export function panoDetectGroups(includeDismissed = false): Promise<PanoGroupRow[]> {
+export function panoDetectGroups(
+  includeDismissed = false,
+): Promise<PanoGroupRow[]> {
   return invoke<PanoGroupRow[]>("pano_detect_groups", { includeDismissed });
 }
 
@@ -2443,4 +2471,31 @@ export function faceCropStyle(
     backgroundSize: `${100 / cw}% ${100 / ch}%`,
     backgroundPosition: `${posX}% ${posY}%`,
   };
+}
+
+// ── Settings bridge (legacy → native) ────────────────────────────────────────
+
+/** Raw `localStorage` dump of the bridged preferences (mirrors Rust `WebSnapshot`). Every value
+ *  is the stored string verbatim — `null` for keys never written — so the native parser sees
+ *  exactly what the browser stored. */
+export type WebSnapshot = {
+  format: "darkroom-web-settings";
+  version: 1;
+  /** Wall-clock ms when the values were captured. */
+  capturedAtMs: number;
+  values: Record<string, string | null>;
+};
+
+/** Persist a snapshot to the bridge file the native settings store ingests. The backend keeps
+ *  the newest capture: an at-or-older snapshot is a no-op. See `lib/settingsBridge.ts`. */
+export function settingsBridgeWrite(snapshot: WebSnapshot): Promise<void> {
+  return invoke<void>("settings_bridge_write", { snapshot });
+}
+
+/** Write a snapshot to a user-chosen file ("Export settings…"), overwriting it. */
+export function settingsBridgeExport(
+  path: string,
+  snapshot: WebSnapshot,
+): Promise<void> {
+  return invoke<void>("settings_bridge_export", { path, snapshot });
 }

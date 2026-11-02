@@ -1,0 +1,54 @@
+<!doctype html>
+<html><body><div id="root"></div><script type="module">
+import React, { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { useOwnedPreview, ownedImageId } from "/src/lib/useOwnedPreview.ts";
+
+// Deterministic Image stub: elements only fire onload/onerror when the harness says so.
+const elements = [];
+class FakeImage {
+  constructor() { this.onload = null; this.onerror = null; this._src = ""; this.tag = null; }
+  get src() { return this._src; }
+  set src(v) { this._src = v; if (v !== "") { this.tag = v; elements.push(this); } }
+}
+window.Image = FakeImage;
+
+const fallbackQueue = [];
+function fallback(id) {
+  const { promise, resolve } = Promise.withResolvers();
+  fallbackQueue.push({ id, resolve });
+  return promise;
+}
+
+const revokes = [];
+const origRevoke = URL.revokeObjectURL.bind(URL);
+URL.revokeObjectURL = (u) => { revokes.push(u); origRevoke(u); };
+
+const state = { shown: null, ownerId: null };
+function Prev({ owner, url }) {
+  const img = useOwnedPreview(owner, url, fallback);
+  state.shown = img ? img.tag : null;
+  state.ownerId = ownedImageId(img);
+  return React.createElement("div", null, state.shown ?? "none");
+}
+const root = createRoot(document.getElementById("root"));
+const live = (src) => elements.filter((el) => el.tag === src && el._src === src);
+window.previewHarness = {
+  mount(owner, url) {
+    root.render(React.createElement(StrictMode, null, React.createElement(Prev, { owner, url })));
+  },
+  // Fire onload/onerror only on elements still attached to that src (the live load).
+  resolve(src) { live(src).forEach((el) => el.onload?.()); },
+  reject(src) { live(src).forEach((el) => el.onerror?.()); },
+  // True once the effect has actually started loading `src` (React commits are async).
+  ready(src) { return live(src).length > 0; },
+  // Fire onload even on abandoned elements — exercises the generation guard directly.
+  force(src) { elements.filter((el) => el.tag === src).forEach((el) => el.onload?.()); },
+  resolveFallback(id, url) {
+    const i = fallbackQueue.findIndex((f) => f.id === id);
+    if (i < 0) throw new Error("no pending fallback for " + id);
+    fallbackQueue.splice(i, 1)[0].resolve(url);
+  },
+  state() { return { ...state, revokes: [...revokes] }; },
+};
+</script></body></html>

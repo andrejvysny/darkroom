@@ -1,0 +1,308 @@
+{
+  "commands": [
+    {
+      "name": "library_query",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Library query; inputs: app: AppHandle, params: QueryParams; returns: Result<Vec<ImageRow>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-135",
+      "test": "crates/core-runtime/tests/catalog.rs"
+    },
+    {
+      "name": "library_count",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Library count; inputs: app: AppHandle, params: QueryParams; returns: Result<i64, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-135",
+      "test": "crates/core-runtime/tests/catalog.rs"
+    },
+    {
+      "name": "library_folders",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Library folders; inputs: app: AppHandle; returns: Result<Vec<FolderRow>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-135",
+      "test": "crates/core-runtime/tests/catalog.rs"
+    },
+    {
+      "name": "library_date_tree",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Library date tree; inputs: app: AppHandle; returns: Result<Vec<DateTreeYear>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-135",
+      "test": "crates/core-runtime/tests/catalog.rs"
+    },
+    {
+      "name": "image_meta",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Image meta; inputs: app: AppHandle, id: i64; returns: Result<Option<ImageRow>, String>.",
+      "target": "core-app",
+      "task": "DARKROOM-135",
+      "test": "crates/core-runtime/tests/catalog.rs"
+    },
+    {
+      "name": "gpu_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Gpu status; inputs: app: AppHandle; returns: Option<core_pipeline::GpuAdapterInfo>.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "e2e/tests/native/migration-baseline.spec.ts"
+    },
+    {
+      "name": "library_index_root",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Index (or re-index) a folder as a watched root. Emits `import:progress`/`import:done`.  The DB lock is held only briefly (root upsert + known-path read, then the transactional insert) \u2014 the multi-second parallel decode/hash/thumbnail work runs UNLOCKED so concurrent `library_query` calls stay responsive during indexing.  Cancellable before the commit with nothing written; the insert is a single transaction fenced on the epoch captured before the first lock, and every inserted row's publication identity is registered under that same fence. A commit already made survives later cancellation (the job ends `Interrupted` and still delivers its stats).",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "e2e/tests/native/migration-baseline.spec.ts"
+    },
+    {
+      "name": "decode_failures_list",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "The RAW files the catalog could NOT take, most recently seen first \u2014 what the \"Unsupported\" list renders. These paths have no `images` row by definition, so they are keyed by path.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "decode_failures_counts",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Failure tallies by class, for the sidebar badge (`unsupported` / `corrupt` / `other`).",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "decode_failures_forget",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Forget the recorded failures for `paths` (\"Try again\"), so the next scan decodes them again. Returns how many rows were removed. Touches only bookkeeping \u2014 no file is read or moved.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "database_reset",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Clear catalog and caches without touching source files; leave library empty until import.  Thumbnail eviction runs after the catalog lock and the publication gate are released, so cache IO never holds either lock.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "app_default_library",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Dev convenience: the bundled `library/2026` validation folder, if present on disk. Returns `None` in a packaged app where that path does not exist.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "develop_get_edit",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Return saved parameters or defaults; unreadable saved data remains intact.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "e2e/tests/mock/develop-unreadable-edit.spec.ts"
+    },
+    {
+      "name": "develop_edit_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Report whether the stored edit cannot be parsed.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "src-tauri/src/commands.rs"
+    },
+    {
+      "name": "develop_flush_ack",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Acknowledge a save barrier by barrierId with per-image saved catalog revisions; stale barrier ids are ignored, claimed revisions are verified against edits.revision, and a failed or unverified flush cancels the quit/restart.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "e2e/tests/mock/develop-persistence.spec.ts"
+    },
+    {
+      "name": "develop_set_edit",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Persist non-destructive edits plus the durable sidecar-mirror intent in one transaction (migration 026; restart-retried by the outbox worker, which mirrors the edit to sidecars and retries pending intents after a restart); reject overwriting unreadable data unless explicitly forced; record process version and before/after event; return the committed catalog revision (edits.revision) used by save-barrier acks.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "crates/core-library/tests/outbox.rs"
+    },
+    {
+      "name": "prepare_restart",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Run the quit save barrier for an updater relaunch on an off-lane worker thread (never inside the ordered UserCommand lane its flush saves need); resolve true only when the editor confirms every debounced edit is committed, otherwise cancel the restart and announce app:save-barrier.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "src-tauri/src/quit.rs"
+    },
+    {
+      "name": "settings_bridge_write",
+      "source": "src-tauri/src/settings_bridge.rs",
+      "behavior": "Validate a legacy web snapshot (core_model::settings::parse_web_snapshot) and atomically write it to the settings-store bridge file under the catalog's app-data dir; skip the write when the file on disk already holds a snapshot captured at or after this one.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "src-tauri/src/settings_bridge.rs"
+    },
+    {
+      "name": "settings_bridge_export",
+      "source": "src-tauri/src/settings_bridge.rs",
+      "behavior": "Validate a legacy web snapshot and atomically write it to a user-chosen export path (\"Export settings…\"); always overwrites the chosen file.",
+      "target": "core-runtime",
+      "task": "DARKROOM-139",
+      "test": "src-tauri/src/settings_bridge.rs"
+    },
+    {
+      "name": "develop_render",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Develop render; inputs: app: AppHandle, image_id: i64, mut params: DevelopParams, view: ViewRect, out_w: u32, out_h: u32, overlay_mask_index: i32, crop_preview: bool, request_id: u64,; returns: Result<tauri::ipc::Response, String>.",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "e2e/tests/native/migration-baseline.spec.ts"
+    },
+    {
+      "name": "develop_regen_thumb",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Regenerate the edited thumbnail for an image and notify the frontend so the grid/filmstrip swap to the new versioned `thumb://` URL. Called on edit-settle (after persist). Returns the current edit version, or null when the image has no edit; a superseded render never publishes old state.",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "develop_preview_jpeg",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Demosaic-free instant first paint: the camera's embedded preview JPEG (no GPU, no decode of the sensor data, no cache lock). The frontend shows this within ~tens of ms while `develop_render` produces the color-managed, edit-applied result in the background.",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "thumb_prioritize",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Promote image ids to the front of the canonical-thumbnail backfill queue (the visible grid range and the image about to open in Develop), so they render before the bulk backfill. Cheap; runs synchronously on the main thread (just a queue splice).",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "develop_session",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Mark whether a Develop editing session is active. While active, the background thumbnail worker parks between jobs so interactive renders always win the next GPU slot.",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "develop_prefetch",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Predictively decode the half-res previews of `image_ids` (the frontend's next/prev neighbors) into the CPU linear LRU, so stepping through a collection hits a warm buffer (GPU upload only, ~100 ms) instead of a multi-second decode. CPU-only \u2014 never touches the GPU queue. A newer call REPLACES the previous set rather than adding to it, and one worker runs them, so holding `next` can never leave several speculative decodes competing with the image the user is looking at.",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "develop_get_histogram",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "The histogram of the most recent successful render. A reliable pull-fallback for the fire-and-forget `develop:histogram` event (which can be missed if it fires before the listener is registered). Returns `None` if nothing has rendered yet.",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "develop_histogram",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Compute the histogram of the WHOLE developed crop (not the visible viewport). Renders the full crop-local frame `{0,0,1,1}` at a small fixed size and histograms it, so the Develop panel reflects the entire image regardless of pan/zoom. Stored for pull (`develop_get_histogram`) + emitted on `develop:histogram` for push. Driven by the frontend on param / before-after change (NOT on pan/zoom), so the extra small render is cheap and infrequent.",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "develop_apply_settings",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Apply a copied source edit (subset to `field_keys`) onto an image \u2014 powers Copy/Paste settings. Returns the merged params (not persisted).",
+      "target": "core-app",
+      "task": "DARKROOM-143",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_list",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "All presets (summaries) for the panel.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_get",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "One preset with its sparse params.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_save",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Save the current edit (restricted to the checked `field_keys`) as a new user preset.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_update",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Update a preset's mutable metadata. Built-ins may be favorited/reordered but not renamed/moved.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_delete",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Delete a user preset (built-ins are refused).",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_duplicate",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Duplicate a preset (including a built-in) as a new editable user preset.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_apply",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Apply a preset onto an image's current edit (or onto defaults when `replace_all`), blended by `amount` (0..1, default 1). Returns the merged params \u2014 NOT persisted; the frontend commits.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_export",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Export a preset to a portable JSON file at `dest_path`.",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "presets_import_file",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Import a preset file (native JSON now; Lightroom `.xmp`/`.lrtemplate` once Phase 3 registers them).",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "snapshots_list",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Named snapshots for an image (newest first).",
+      "target": "core-app",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    }
+  ]
+}

@@ -51,3 +51,45 @@ fn a_missing_row_is_none_not_an_error() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn rapid_saves_and_clock_regressions_get_distinct_cache_revisions() {
+    let db = Db::open_in_memory().unwrap();
+    let id = insert_image(&db.conn, &[0xcd; 32], "/tmp/edited.cr3");
+    let time = 1_700_000_000;
+
+    for (timestamp, expected_revision, json) in [
+        (time, time, r#"{"exposure":1}"#),
+        (time, time + 1, r#"{"exposure":2}"#),
+        (time - 60, time + 2, r#"{"exposure":3}"#),
+        (time + 100, time + 100, r#"{"exposure":4}"#),
+    ] {
+        core_library::set_edit(&db.conn, id, 5, json, timestamp).unwrap();
+        let (stored_json, revision) = core_library::get_edit_with_version(&db.conn, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_json, json,
+            "revision handling must not rewrite edits"
+        );
+        assert_eq!(revision, expected_revision);
+        assert_eq!(
+            core_library::thumb_precheck(&db.conn, id)
+                .unwrap()
+                .unwrap()
+                .1,
+            Some(expected_revision)
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT process_version FROM edits WHERE image_id = ?1",
+                    [id],
+                    |r| { r.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            5,
+            "cache revision is separate from saved renderer provenance"
+        );
+    }
+}

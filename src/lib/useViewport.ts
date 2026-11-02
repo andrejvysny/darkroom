@@ -49,7 +49,7 @@ export interface UseViewportOptions {
    * — Stage — has no transparent-resize flash; a sync painter — Loupe's preview tier — sizes then
    * draws immediately). The hook re-schedules a trailing render if dirtied during the await.
    */
-  render: (derived: DerivedView, canvas: HTMLCanvasElement) => Promise<void>;
+  render: (derived: DerivedView, canvas: HTMLCanvasElement, isCurrent: () => boolean) => Promise<void>;
 
   /** Reset view to fit (synchronously, guarded) when this changes — Stage: selectedId, Loupe: image.id. */
   resetKey: unknown;
@@ -192,20 +192,24 @@ export function useViewport<C extends HTMLElement = HTMLElement>(
 
   // Single-flight rAF scheduler with a trailing coalesced render. Re-derives the view at fire time
   // (fresh pan during a drag) from the live ref + transform.
+  const activeRef = useRef(false);
+  const generationRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const inFlightRef = useRef(false);
   const dirtyRef = useRef(false);
   const scheduleRenderRef = useRef<() => void>(() => {});
   const scheduleRender = useCallback(() => {
     dirtyRef.current = true;
-    if (inFlightRef.current || rafRef.current !== null) return;
+    if (!activeRef.current || inFlightRef.current || rafRef.current !== null) return;
+    const generation = generationRef.current;
+    const isCurrent = () => activeRef.current && generationRef.current === generation;
     rafRef.current = requestAnimationFrame(() => {
+      if (!isCurrent()) return;
       rafRef.current = null;
       if (!dirtyRef.current) return;
       const c = canvasRef.current;
       if (!c) {
-        // Canvas not mounted yet — keep dirty and retry next frame (don't drop the render).
-        scheduleRenderRef.current();
+        // A later committed canvas/measurement change schedules the retained intent.
         return;
       }
       dirtyRef.current = false;
@@ -215,7 +219,8 @@ export function useViewport<C extends HTMLElement = HTMLElement>(
       const css = containerCssRef.current;
       const dprNow = clampDpr();
       const d = deriveViewRect(vs.zoom, vs.panNorm, nat, css, dprNow);
-      void renderRef.current(d, c).finally(() => {
+      void renderRef.current(d, c, isCurrent).finally(() => {
+        if (!isCurrent()) return;
         inFlightRef.current = false;
         if (dirtyRef.current) scheduleRenderRef.current();
       });
@@ -223,20 +228,31 @@ export function useViewport<C extends HTMLElement = HTMLElement>(
   }, []);
   scheduleRenderRef.current = scheduleRender;
 
-  // Schedule on view change.
-  const prevDerivedKey = useRef<string>("");
-  const derivedKey = `${derived.outW},${derived.outH},${derived.view.ox.toFixed(6)},${derived.view.oy.toFixed(6)},${derived.view.sx.toFixed(6)},${derived.view.sy.toFixed(6)}`;
-  if (prevDerivedKey.current !== derivedKey) {
-    prevDerivedKey.current = derivedKey;
+  useLayoutEffect(() => {
+    activeRef.current = true;
+    generationRef.current++;
     scheduleRender();
-  }
+    return () => {
+      activeRef.current = false;
+      generationRef.current++;
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      dirtyRef.current = false;
+      inFlightRef.current = false;
+    };
+  }, [scheduleRender, resetKey]);
 
-  // Schedule on external triggers (param/overlay/before-after change → Stage's renderTick).
-  const prevRenderDeps = useRef<unknown[] | undefined>(renderDeps);
-  if (renderDeps && depsChanged(prevRenderDeps.current, renderDeps)) {
-    prevRenderDeps.current = renderDeps;
-    scheduleRender();
-  }
+  const prevDerivedKey = useRef("");
+  const derivedKey = `${derived.outW},${derived.outH},${derived.view.ox.toFixed(6)},${derived.view.oy.toFixed(6)},${derived.view.sx.toFixed(6)},${derived.view.sy.toFixed(6)}`;
+  const prevRenderDeps = useRef<unknown[] | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (prevDerivedKey.current !== derivedKey ||
+        (renderDeps && depsChanged(prevRenderDeps.current, renderDeps))) {
+      prevDerivedKey.current = derivedKey;
+      prevRenderDeps.current = renderDeps;
+      scheduleRender();
+    }
+  });
 
   // Wheel zoom (anchored at cursor). Reads `interactive` through a ref so the stable listener (below)
   // always sees the live value; the listener is (re)attached on canvas-element identity only.
@@ -268,24 +284,26 @@ export function useViewport<C extends HTMLElement = HTMLElement>(
 
   // Attach the wheel listener non-passively (so preventDefault works); re-attach on canvas swap only.
   const wheelTargetRef = useRef<HTMLCanvasElement | null>(null);
-  if (canvasRef.current !== wheelTargetRef.current) {
-    if (wheelTargetRef.current) {
-      wheelTargetRef.current.removeEventListener(
-        "wheel",
-        onWheel as EventListener,
-      );
+  useLayoutEffect(() => {
+    const target = canvasRef.current;
+    if (target !== wheelTargetRef.current) {
+      wheelTargetRef.current?.removeEventListener("wheel", onWheel as EventListener);
+      target?.addEventListener("wheel", onWheel as EventListener, { passive: false });
+      wheelTargetRef.current = target;
+      if (target) scheduleRender();
     }
-    if (canvasRef.current) {
-      canvasRef.current.addEventListener("wheel", onWheel as EventListener, {
-        passive: false,
-      });
-      wheelTargetRef.current = canvasRef.current;
-    }
-  }
+  });
+  const stopDragRef = useRef<(() => void) | null>(null);
+  useLayoutEffect(() => () => {
+    wheelTargetRef.current?.removeEventListener("wheel", onWheel as EventListener);
+    wheelTargetRef.current = null;
+    stopDragRef.current?.();
+  }, [onWheel]);
 
   // Drag pan (clamped so the window stays within [0,1]).
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if (!interactiveRef.current || e.button !== 0) return;
+    stopDragRef.current?.();
     e.preventDefault();
     const startX = e.clientX;
     const startY = e.clientY;
@@ -320,7 +338,9 @@ export function useViewport<C extends HTMLElement = HTMLElement>(
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      stopDragRef.current = null;
     };
+    stopDragRef.current = up;
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   }, []);

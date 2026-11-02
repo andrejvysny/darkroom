@@ -9,7 +9,6 @@
 //! Like the rest of this crate, all rawler calls stay HERE.
 
 use std::collections::HashMap;
-use std::io::BufWriter;
 use std::path::Path;
 
 use rawler::decoders::{Camera, RawMetadata};
@@ -36,19 +35,21 @@ fn de(e: impl std::fmt::Display) -> RawError {
 ///
 /// `img`/`meta` are exactly [`crate::hdr_file::read_hdr_linear`] / [`crate::hdr_file::read_hdr_meta`]'s
 /// output — the caller re-decodes the source `.exr`; this function never touches the catalog (it is
-/// export-only, not an import path). Durability mirrors `hdr_file::write_hdr_exr`: the bytes go to
-/// `<dest>.part` first, then an atomic rename.
+/// export-only, not an import path). Writes through a unique sibling `.part`, flushes and syncs,
+/// then atomically replaces `dest`. Errors preserve the previous destination and clean up the
+/// temporary file; callers must not remove `dest` on an error.
 pub fn write_hdr_dng(dest: &Path, img: &LinearImage, meta: &RawMeta) -> Result<(), RawError> {
     crate::panic::catch_decode_panic("write_hdr_dng", || write_hdr_dng_inner(dest, img, meta))
 }
 
 fn write_hdr_dng_inner(dest: &Path, img: &LinearImage, meta: &RawMeta) -> Result<(), RawError> {
     let (w, h) = (img.width as usize, img.height as usize);
-    if img.data.len() != w * h * 3 || w == 0 || h == 0 {
+    let len = crate::output::rgb_len(img.width, img.height)?;
+    if img.data.len() != len {
         return Err(de(format!(
             "HDR DNG buffer is {} samples but {w}x{h}x3 = {} expected",
             img.data.len(),
-            w * h * 3
+            len
         )));
     }
 
@@ -92,10 +93,8 @@ fn write_hdr_dng_inner(dest: &Path, img: &LinearImage, meta: &RawMeta) -> Result
         false,
     );
 
-    let part = dest.with_extension("dng.part");
-    {
-        let file = std::fs::File::create(&part).map_err(RawError::Io)?;
-        let mut dng = DngWriter::new(BufWriter::new(file), DNG_VERSION_V1_4).map_err(de)?;
+    crate::output::write_atomically(dest, true, |writer| {
+        let mut dng = DngWriter::new(writer, DNG_VERSION_V1_4).map_err(de)?;
 
         let mut raw_frame = dng.subframe(0);
         raw_frame
@@ -138,13 +137,8 @@ fn write_hdr_dng_inner(dest: &Path, img: &LinearImage, meta: &RawMeta) -> Result
         dng.root_ifd_mut()
             .add_tag(rawler::tags::TiffCommonTag::Software, "Darkroom");
 
-        dng.close().map_err(de)?;
-    }
-    std::fs::rename(&part, dest).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        de(e.to_string())
-    })?;
-    Ok(())
+        dng.close().map_err(de)
+    })
 }
 
 /// Best-effort [`RawMetadata`] (rawler's own EXIF container) built from Darkroom's thinner
@@ -290,6 +284,29 @@ mod tests {
         };
         assert!(write_hdr_dng(&path, &img, &meta).is_err());
         assert!(!path.exists() || std::fs::remove_file(&path).is_ok());
+    }
+
+    #[test]
+    fn hdr_export_preserves_destination_on_invalid_input_and_replaces_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.dng");
+        std::fs::write(&path, b"original photograph").unwrap();
+        for (width, height) in [(0, 4), (4, 0), (u32::MAX, u32::MAX)] {
+            let img = LinearImage {
+                width,
+                height,
+                data: vec![],
+            };
+            assert!(matches!(
+                write_hdr_dng(&path, &img, &RawMeta::default()),
+                Err(RawError::Decode(_))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), b"original photograph");
+        }
+        let img = test_image(4, 4);
+        write_hdr_dng(&path, &img, &RawMeta::default()).unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), b"original photograph");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// `parse_shutter` round-trips `meta.rs`'s own formatting for both branches it produces.

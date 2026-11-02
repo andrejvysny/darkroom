@@ -12,8 +12,9 @@ import { usePresets } from "./usePresets";
 import { useHistory } from "./useHistory";
 import { useAppStore } from "../../store/app";
 import { useDevelopStore } from "../../store/develop";
-import { developPreviewJpeg } from "../../lib/ipc";
+import { developPreviewJpeg, imageMeta, type ImageRow } from "../../lib/ipc";
 import { log } from "../../lib/logger";
+import { ownedImageId, useOwnedPreview } from "../../lib/useOwnedPreview";
 
 export default function DevelopView() {
   const selectedId = useAppStore((s) => s.selectedId);
@@ -138,7 +139,17 @@ export default function DevelopView() {
   // Natural sensor dims from the selected ImageRow (drives viewport math + readout). Until the row
   // is available the aspect is unknown — GPU renders are suppressed (dimsKnown) so no wrong-aspect
   // frame is ever issued; the 3:2 placeholder only sizes the empty canvas.
-  const selectedRow = libraryImages.find((r) => r.id === selectedId) ?? null;
+  const libraryRow = libraryImages.find((r) => r.id === selectedId) ?? null;
+  const [loadedRow, setLoadedRow] = useState<ImageRow | null>(null);
+  useEffect(() => {
+    if (selectedId === null || libraryRow) return;
+    let active = true;
+    void imageMeta(selectedId).then(row => { if (active) setLoadedRow(row); })
+      .catch(error => log.warn("develop", "selected photo metadata failed", log.errorSummary(error)));
+    return () => { active = false; };
+  }, [selectedId, libraryRow]);
+  // A newly mounted Library page may still be loading; selection metadata has independent ownership.
+  const selectedRow = libraryRow ?? (loadedRow?.id === selectedId ? loadedRow : null);
   const dimsKnown = (selectedRow?.width ?? 0) > 0;
   const natural = {
     w: selectedRow?.width ?? 3,
@@ -166,43 +177,9 @@ export default function DevelopView() {
     [renderFrame],
   );
 
-  // Embedded preview <img> for instant first paint on the canvas.
-  const [previewImg, setPreviewImg] = useState<HTMLImageElement | null>(null);
-  const previewUrlRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (previewUrl === previewUrlRef.current) return;
-    previewUrlRef.current = previewUrl;
-    if (!previewUrl) {
-      setPreviewImg(null);
-      return;
-    }
-    const img = new Image();
-    img.onload = () => setPreviewImg(img);
-    img.onerror = () => {
-      // thumb:// / object URL failed to load — fall back to the embedded camera JPEG so the
-      // first paint is never silently blank.
-      log.warn("develop", "preview url failed to load", { url: previewUrl });
-      const id = useAppStore.getState().selectedId;
-      if (id === null) return;
-      developPreviewJpeg(id)
-        .then((url) => {
-          const fb = new Image();
-          fb.onload = () => {
-            setPreviewImg(fb);
-            URL.revokeObjectURL(url);
-          };
-          fb.onerror = () => URL.revokeObjectURL(url);
-          fb.src = url;
-        })
-        .catch((e) =>
-          log.warn("develop", "preview jpeg fallback failed", {
-            imageId: id,
-            ...log.errorSummary(e),
-          }),
-        );
-    };
-    img.src = previewUrl;
-  }, [previewUrl]);
+  // Embedded preview <img> for instant first paint on the canvas. Ownership (imageId,
+  // generation) lives in the hook: a slow A load (or its JPEG fallback) can never paint under B.
+  const previewImg = useOwnedPreview(selectedId, previewUrl, developPreviewJpeg);
 
   // Expose develop reset to the TopBar / command palette.
   useEffect(() => {
@@ -306,6 +283,7 @@ export default function DevelopView() {
           renderTick={renderTick}
           renderGate={dimsKnown}
           previewImg={previewImg}
+          previewImageId={ownedImageId(previewImg)}
           renderError={renderError}
           onRetryRender={retryRender}
         />

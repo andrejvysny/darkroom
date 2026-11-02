@@ -8,18 +8,7 @@ use crate::error::LibError;
 use core_db::rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-/// A preset row without its (potentially large) sparse params blob — for the list panel.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PresetSummary {
-    pub id: i64,
-    pub name: String,
-    pub group_name: String,
-    pub builtin: bool,
-    pub is_favorite: bool,
-    pub field_keys: Vec<String>,
-    pub sort_order: i64,
-}
+pub use core_model::catalog::PresetSummary;
 
 /// A full preset row, including its sparse params JSON (opaque string to core-library).
 #[derive(Debug, Clone, Serialize)]

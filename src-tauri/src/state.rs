@@ -1,4 +1,3 @@
-use crate::quit::QuitBarrier;
 use crate::sidecar_queue::SidecarQueue;
 use crate::thumb_queue::ThumbQueue;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
@@ -8,10 +7,12 @@ use core_library::ThumbCache;
 use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
 use core_raw::LinearImage;
+use core_runtime::save_barrier::SaveBarrier;
+use core_runtime::sidecar::OutboxHandle;
 use std::collections::HashSet;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -26,7 +27,11 @@ pub struct GpuRender {
 
 /// Managed application state.
 pub struct AppState {
-    pub db: Mutex<Db>,
+    pub workers: core_runtime::workers::ManagedWorkers,
+    pub jobs: core_runtime::jobs::Supervisor,
+    pub publications: core_runtime::publication::PublicationGate,
+    pub db: Arc<Mutex<Db>>,
+    pub catalog: core_runtime::catalog::CatalogAdapter,
     pub thumbs: ThumbCache,
     pub gpu: Option<GpuRender>,
     /// Background queue that renders canonical develop thumbnails so the grid/filmstrip/loupe match
@@ -35,8 +40,13 @@ pub struct AppState {
     /// Coalescing writer for per-image sidecars. Edits mark an image dirty here instead of writing
     /// the file inline, so the single SQLite connection is never held across an SSD write.
     pub sidecar_queue: SidecarQueue,
+    /// Handle to the durable sidecar-mirroring worker (`sidecar_outbox`, migration 026). Edits queue
+    /// an intent in the catalog inside their own transaction and call [`OutboxHandle::notify`]; the
+    /// worker performs the write and settles the row. Pending intents never block quit — they are
+    /// the reason a crash no longer loses a write.
+    pub outbox: OutboxHandle,
     /// Holds a normal quit open until the frontend has flushed its debounced Develop edits.
-    pub quit: QuitBarrier,
+    pub quit: SaveBarrier,
     /// Single full-resolution prepared image for zoomed (1:1) develop rendering. Bounded to ONE
     /// entry since a full-res texture is large (~0.5 GB for a 32 MP frame); replaced on image change.
     /// `Arc` so renders clone the handle and DROP this lock before the GPU render+readback —
@@ -71,8 +81,8 @@ pub struct AppState {
     pub pano_detect_running: AtomicBool,
     /// Set by `pano_detect_cancel` to abort the running scan (checked between clusters).
     pub pano_detect_cancel: AtomicBool,
-    /// Monotonic id of the latest render request; lets a render skip its expensive decode when a
-    /// newer request has already superseded it.
+    /// Supervisor job ID of the latest claimed viewport owner. Host admission order survives
+    /// client counter restarts and lets older workers skip obsolete decode/publication.
     pub latest_render: AtomicU64,
     /// Monotonic id of the latest whole-crop histogram request; a stale (out-of-order) histogram
     /// result must not overwrite / emit over a newer one.
@@ -108,13 +118,9 @@ pub struct AppState {
     pub last_histogram: Mutex<Option<Histogram>>,
     /// FS watcher kept alive for the app's lifetime; dropping it stops watching. Set after setup.
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
-    /// Number of imports currently in flight. While > 0 the FS watcher defers its reconcile/index
-    /// pass so it can't race an import's unlocked copy/process phase (double-decode / duplicate
-    /// insert). A counter, not a bool, so overlapping imports compose. See `watch::ImportGuard`.
-    pub import_active: AtomicUsize,
-    /// Set by the watcher when it skipped a sync because an import was in flight; the import's
-    /// completion guard then runs exactly one deferred sync to catch any real external change.
-    pub watch_pending: AtomicBool,
+    /// Coordinates import/merge publication with watcher snapshots, including jobs that start and
+    /// finish while the watcher decodes. See `watch::ImportGuard`.
+    pub(crate) publication: crate::watch::PublicationFence,
     /// Directory holding downloaded ML model files (`<app-data>/models`).
     #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub models_dir: PathBuf,
@@ -133,6 +139,7 @@ pub struct AppState {
     /// Guards the `image_features` backfill, which now runs automatically after imports and scans as
     /// well as from Settings — without this the triggers would overlap and decode everything twice.
     pub features_running: AtomicBool,
+    pub features_queue: crate::features::BackfillQueue,
     /// Guards the pick/reject suggestion fit + scoring pass. Both the manual command and the
     /// post-scan trigger go through it, so a scan finishing mid-training queues nothing.
     pub suggest_running: AtomicBool,
@@ -193,6 +200,40 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Caller holds the publication gate so reused row IDs cannot retain another source's caches.
+    pub fn clear_source_caches(&self) {
+        if let Ok(mut cache) = self.full_render_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.preview_render_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.preview_linear_lru.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.denoise_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.panorama_preview_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.display_referred_memo.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.last_histogram.lock() {
+            *cache = None;
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        {
+            if let Ok(mut cache) = self.sam_embedding.lock() {
+                *cache = None;
+            }
+            if let Ok(mut cache) = self.sam_masks.lock() {
+                cache.clear();
+            }
+        }
+    }
+
     pub fn new<R: Runtime>(app: &AppHandle<R>) -> Result<Self, String> {
         let data_dir = app
             .path()
@@ -200,26 +241,17 @@ impl AppState {
             .map_err(|e| format!("app_data_dir: {e}"))?;
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
 
-        // Map catalog-open failures to actionable, user-facing text — this string ends up in the
-        // fatal startup dialog (`fatal_startup_error`), not just a log line.
-        let db = Db::open(&data_dir.join("catalog.db")).map_err(|e| match e {
-            core_db::DbError::SchemaTooNew { found, supported } => format!(
-                "Your photo catalog was last opened by a newer version of Darkroom \
-                 (catalog format v{found}; this version supports up to v{supported}).\n\n\
-                 Install the latest Darkroom release to keep using this catalog. \
-                 Your photos and edits are safe and untouched."
-            ),
-            core_db::DbError::Corrupt(detail) => format!(
-                "The photo catalog failed its integrity check ({detail}).\n\n\
-                 You can restore a recent copy from the \"backups\" folder next to the catalog \
-                 in Application Support, or rebuild the catalog from your library's sidecar files."
-            ),
-            other => format!("The photo catalog could not be opened: {other}"),
-        })?;
+        let db = core_runtime::catalog::open_database(&data_dir.join("catalog.db"))
+            .map_err(crate::catalog_adapter::startup_error)?;
+        let catalog = core_runtime::catalog::CatalogAdapter::from_shared(db.clone());
         let thumbs =
             ThumbCache::new(data_dir.join("thumbs")).map_err(|e| format!("thumb cache: {e}"))?;
         // Bound the cache to the configured cap on startup (best-effort).
-        if let Ok(cap) = core_library::thumb_cache_cap(&db.conn) {
+        let cap = db
+            .lock()
+            .ok()
+            .and_then(|db| core_library::thumb_cache_cap(&db.conn).ok());
+        if let Some(cap) = cap {
             let _ = thumbs.evict_to(cap);
         }
 
@@ -244,14 +276,31 @@ impl AppState {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let session_id = format!("{start_ms:x}-{}", std::process::id());
+        // The mirroring worker reads the same catalog the intents are committed into; it holds only
+        // a handle to it, so a quit can ask it what is still owed without the worker being alive.
+        let outbox = OutboxHandle::new(db.clone());
 
         Ok(Self {
-            db: Mutex::new(db),
+            workers: core_runtime::workers::ManagedWorkers::new(16),
+            jobs: core_runtime::jobs::Supervisor::new(
+                core_runtime::jobs::Config {
+                    workers: 3,
+                    max_jobs: 64,
+                    max_bytes: 2 * 1024 * 1024 * 1024,
+                    max_terminal_records: 256,
+                },
+                Arc::new(|| {}),
+            )
+            .map_err(|e| format!("background executor: {e:?}"))?,
+            publications: core_runtime::publication::PublicationGate::default(),
+            db,
+            catalog,
             thumbs,
             gpu,
             thumb_queue: ThumbQueue::new(),
             sidecar_queue: SidecarQueue::new(),
-            quit: QuitBarrier::new(),
+            outbox,
+            quit: SaveBarrier::new(),
             full_render_cache: Mutex::new(None),
             preview_render_cache: Mutex::new(None),
             denoise_cache: Mutex::new(None),
@@ -277,13 +326,13 @@ impl AppState {
             hdr_cancel: AtomicBool::new(false),
             last_histogram: Mutex::new(None),
             watcher: Mutex::new(None),
-            import_active: AtomicUsize::new(0),
-            watch_pending: AtomicBool::new(false),
+            publication: crate::watch::PublicationFence::default(),
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             models_dir,
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             analyzers: Mutex::new(None),
             features_running: AtomicBool::new(false),
+            features_queue: crate::features::BackfillQueue::default(),
             suggest_running: AtomicBool::new(false),
             analysis_running: AtomicBool::new(false),
             analysis_cancel: AtomicBool::new(false),
