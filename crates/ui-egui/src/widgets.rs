@@ -31,6 +31,17 @@ pub fn label_color(label: ColorLabel) -> Color32 {
     }
 }
 
+/// Capitalised human name of a colour label ("Red").
+pub fn label_name(label: ColorLabel) -> &'static str {
+    match label {
+        ColorLabel::Red => "Red",
+        ColorLabel::Yellow => "Yellow",
+        ColorLabel::Green => "Green",
+        ColorLabel::Blue => "Blue",
+        ColorLabel::Purple => "Purple",
+    }
+}
+
 pub const LABELS: [ColorLabel; 5] = [
     ColorLabel::Red,
     ColorLabel::Yellow,
@@ -38,6 +49,49 @@ pub const LABELS: [ColorLabel; 5] = [
     ColorLabel::Blue,
     ColorLabel::Purple,
 ];
+
+/// Visible keyboard-focus ring; pointer-only widgets never show it.
+pub fn focus_ring(ui: &Ui, response: &Response, rect: Rect, radius: impl Into<egui::CornerRadius>) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.5, theme::ACCENT),
+            StrokeKind::Outside,
+        );
+    }
+}
+
+/// Names a selectable control for assistive technology. egui's `selected` maps to the toggled
+/// state; roles with a native selected state (tab, option, radio) also get that flag.
+pub fn describe_selected(
+    response: &Response,
+    role: egui::accesskit::Role,
+    enabled: bool,
+    selected: bool,
+    label: &str,
+) {
+    response.widget_info(|| egui::WidgetInfo::selected(role, enabled, selected, label));
+    if role != egui::accesskit::Role::Button {
+        response.ctx.accesskit_node_builder(response.id, |node| {
+            node.set_selected(selected);
+        });
+    }
+}
+
+/// Names the enclosing `egui::Modal` dialog node. The dialog role lives on the modal's area
+/// `Ui`, an ancestor of the content `Ui`, so the stack is walked for it.
+pub fn label_dialog(ui: &Ui, label: &str) {
+    let modal = ui
+        .stack()
+        .iter()
+        .find(|node| node.kind() == Some(egui::UiKind::Modal));
+    if let Some(node) = modal {
+        ui.ctx().accesskit_node_builder(node.unique_id, |builder| {
+            builder.set_label(label);
+        });
+    }
+}
 
 fn text_width(ui: &Ui, text: &str, size: f32) -> f32 {
     ui.painter()
@@ -62,6 +116,8 @@ pub fn segmented(ui: &mut Ui, labels: &[&str], selected: usize) -> Option<usize>
                     let (rect, response) =
                         ui.allocate_exact_size(egui::vec2(width, 24.0), Sense::click());
                     let on = i == selected;
+                    describe_selected(&response, egui::accesskit::Role::Tab, true, on, label);
+                    focus_ring(ui, &response, rect, 4);
                     if on || response.hovered() {
                         let fill = if on {
                             theme::HOVER
@@ -98,6 +154,9 @@ pub fn pill_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: bool) 
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 26.0), sense);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, label));
+    focus_ring(ui, &response, rect, theme::RADIUS_SM);
     let hot = enabled && response.hovered();
     if hot {
         ui.painter()
@@ -136,6 +195,14 @@ pub fn pill_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: bool) 
 pub fn chip(ui: &mut Ui, label: &str, active: bool) -> Response {
     let width = text_width(ui, label, 11.5) + 18.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 22.0), Sense::click());
+    describe_selected(
+        &response,
+        egui::accesskit::Role::Button,
+        true,
+        active,
+        label,
+    );
+    focus_ring(ui, &response, rect, theme::RADIUS_SM);
     let (fill, line, text) = if active {
         (theme::ACCENT_DIM, theme::ACCENT_LINE, theme::T1)
     } else if response.hovered() {
@@ -171,6 +238,19 @@ pub fn nav_row(
 ) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::click());
+    describe_selected(
+        &response,
+        egui::accesskit::Role::Button,
+        true,
+        selected,
+        label,
+    );
+    if let Some(count) = count {
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_value(fmt_count(count));
+        });
+    }
+    focus_ring(ui, &response, rect, theme::RADIUS_SM);
     if selected {
         ui.painter()
             .rect_filled(rect, theme::RADIUS_SM, theme::ELEV);
@@ -245,6 +325,15 @@ pub fn star_rating_at(
         };
         if interactive {
             let response = ui.interact(rect.expand(1.0), id.with(n), Sense::click());
+            let name = format!("{n} star{}", if n == 1 { "" } else { "s" });
+            describe_selected(
+                &response,
+                egui::accesskit::Role::Button,
+                true,
+                n <= value,
+                &name,
+            );
+            focus_ring(ui, &response, rect.expand(1.0), 2);
             if response.clicked() {
                 clicked = Some(if n == value { 0 } else { n });
             }
@@ -278,6 +367,10 @@ pub fn color_dots(
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(size + 4.0, size + 4.0), Sense::click());
             let color = label_color(label);
+            let name = format!("{} label", label_name(label));
+            let on = selected == Some(label);
+            describe_selected(&response, egui::accesskit::Role::Button, true, on, &name);
+            focus_ring(ui, &response, rect, 4);
             ui.painter().circle_filled(rect.center(), size * 0.5, color);
             if selected == Some(label) {
                 ui.painter().circle_stroke(

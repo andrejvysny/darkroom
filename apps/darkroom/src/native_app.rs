@@ -5,12 +5,13 @@
 
 use core_app::import::{ImportReport, ImportRequest, ImportView};
 use core_app::ports::{Clock, EventSink, RenderBackend};
-use core_app::state::ApplicationSnapshot;
+use core_app::state::{ApplicationSnapshot, MirrorStatus};
 use core_app::subscription::{Notice, SnapshotUpdate};
 use core_app::workflow::Command;
 use core_app::AppError;
 use core_runtime::async_workflow::AsyncCatalogWorkflow;
 use core_runtime::import::{ImportPlatform, ImportService};
+use core_runtime::sidecar::MirrorService;
 use core_runtime::workflow::{InlineExecutor, RuntimePaths};
 use std::{
     path::PathBuf,
@@ -51,6 +52,10 @@ pub struct NativeApplication {
     catalog_path: PathBuf,
     clock: Arc<dyn Clock>,
     import: ImportService,
+    /// Drains the durable sidecar outbox for the catalog the workflow owns. `None` once quit has
+    /// joined it, or when it could never start (see [`Self::mirror_error`]).
+    mirror: Option<MirrorService>,
+    mirror_error: Option<String>,
 }
 impl NativeApplication {
     pub fn new(
@@ -70,6 +75,7 @@ impl NativeApplication {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, AppError> {
         let import = ImportService::new(Arc::clone(&wake));
+        let mirror_wake = Arc::clone(&wake);
         let mut workflow = AsyncCatalogWorkflow::new(
             RuntimePaths {
                 catalog: path.clone(),
@@ -87,11 +93,23 @@ impl NativeApplication {
             },
         )?;
         workflow.open_initial()?;
+        // The mirror follows the catalog the workflow owns: it parks while nothing is open and
+        // re-binds itself on every open / close / replacement. Failing to start it costs the user
+        // sidecars, not the session, so the error goes to the host's notice path instead of here.
+        let (mirror, mirror_error) = match MirrorService::start(workflow.catalog(), mirror_wake) {
+            Ok(service) => (Some(service), None),
+            Err(error) => {
+                eprintln!("sidecar mirror unavailable: {error}");
+                (None, Some(error))
+            }
+        };
         Ok(Self {
             workflow,
             catalog_path: path,
             clock,
             import,
+            mirror,
+            mirror_error,
         })
     }
     pub fn reopen_command(&self) -> Command {
@@ -133,10 +151,48 @@ impl NativeApplication {
     }
     pub fn pump(&mut self) -> Result<(), AppError> {
         while self.workflow.pump()? {}
+        // Any completion may have been a committed save or cull mark. Cheap enough to do every
+        // time rather than to track which completion applied a commit.
+        if let Some(mirror) = &self.mirror {
+            mirror.notify();
+        }
+        self.refresh_mirror_status()?;
         if self.workflow.needs_join() {
             self.workflow.join_shutdown();
         }
+        // The quit barrier has flushed every save and the catalog workers are joined, and the
+        // workflow only closes the catalog on drop: this is the point where the drain can still
+        // finish its in-hand write against an open catalog.
+        if self.workflow.is_shutdown_complete() {
+            if let Some(mut mirror) = self.mirror.take() {
+                mirror
+                    .shutdown()
+                    .map_err(|error| AppError::Catalog(error.into()))?;
+            }
+        }
         Ok(())
+    }
+    fn refresh_mirror_status(&mut self) -> Result<(), AppError> {
+        let unsettled = matches!(
+            self.workflow.snapshot().editor.save.mirror,
+            MirrorStatus::Pending { .. } | MirrorStatus::Failing { .. }
+        );
+        // Taken only while Pending/Failing is shown, so a signal raised before the save
+        // acknowledgement reaches the session is kept until it can act.
+        if unsettled && self.mirror.as_ref().is_some_and(|m| m.take_progress()) {
+            // A status read refused mid-barrier (quit, catalog replacement) is not fatal to the
+            // session: the next drain progress asks again.
+            if let Err(error) = self.workflow.dispatch(Command::RefreshMirrorStatus) {
+                eprintln!("sidecar status refresh not admitted: {error}");
+            }
+        }
+        Ok(())
+    }
+    /// Why the sidecar mirror is not running, if it could not be started. `None` while it is (or
+    /// was) running. The host shows this in the status area: edits stay saved in the catalog and
+    /// reach the photo folders on the next launch.
+    pub fn mirror_error(&self) -> Option<&str> {
+        self.mirror_error.as_deref()
     }
     pub fn is_shutdown_complete(&self) -> bool {
         self.workflow.is_shutdown_complete()

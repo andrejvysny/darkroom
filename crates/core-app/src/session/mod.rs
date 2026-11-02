@@ -298,6 +298,7 @@ impl ApplicationSession {
             Command::SetCull { image, change } => return self.set_cull(image, change),
             Command::Mutate(mutation) => return self.mutate(mutation),
             Command::LoadImageTags(image) => return self.load_image_tags(image),
+            Command::RefreshMirrorStatus => return Ok(self.refresh_mirror_status()),
             Command::LoadRejectSummary(query) => return self.load_reject_summary(query),
             Command::LoadKeywords => Some(self.replace(Operation::LoadKeywords)),
             Command::LoadCollections => Some(self.replace(Operation::LoadCollections)),
@@ -440,6 +441,10 @@ impl ApplicationSession {
                 }
                 Vec::new()
             }
+            (Operation::LoadMirrorStatus { key, revision }, Ok(Outcome::MirrorStatus(status))) => {
+                self.mirror_loaded(&key, revision, status);
+                Vec::new()
+            }
             (Operation::LoadRejectSummary(query), Ok(Outcome::RejectSummary(summary))) => {
                 self.reject_summary_loaded(*query, summary);
                 Vec::new()
@@ -456,6 +461,8 @@ impl ApplicationSession {
                 }
                 Vec::new()
             }
+            // A failed status read is not actionable; the next progress signal retries.
+            (Operation::LoadMirrorStatus { .. }, Err(_)) => Vec::new(),
             (_, Err(error)) => {
                 Arc::make_mut(&mut self.snapshot).error = Some(error);
                 Vec::new()
@@ -488,6 +495,7 @@ impl ApplicationSession {
             | Outcome::Saved { .. }
             | Outcome::Image(_)
             | Outcome::ImageTags(_)
+            | Outcome::MirrorStatus(_)
             | Outcome::RejectSummary(_)
             | Outcome::Mutated(_) => Vec::new(),
             Outcome::Keywords(rows) => {
@@ -534,6 +542,7 @@ fn matches_outcome(operation: &Operation, outcome: &Outcome) -> bool {
             | (Operation::LoadKeywords, Outcome::Keywords(_))
             | (Operation::LoadCollections, Outcome::Collections(_))
             | (Operation::LoadImageTags(_), Outcome::ImageTags(_))
+            | (Operation::LoadMirrorStatus { .. }, Outcome::MirrorStatus(_))
             | (Operation::LoadRejectSummary(_), Outcome::RejectSummary(_))
             | (Operation::Mutate(_), Outcome::Mutated(_))
     )

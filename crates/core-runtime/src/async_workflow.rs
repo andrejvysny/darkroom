@@ -150,6 +150,9 @@ impl AsyncCatalogWorkflow {
             Command::LoadKeywords => matches!(effect.operation, Operation::LoadKeywords),
             Command::LoadCollections => matches!(effect.operation, Operation::LoadCollections),
             Command::LoadImageTags(_) => matches!(effect.operation, Operation::LoadImageTags(_)),
+            Command::RefreshMirrorStatus => {
+                matches!(effect.operation, Operation::LoadMirrorStatus { .. })
+            }
             Command::LoadRejectSummary(_) => {
                 matches!(effect.operation, Operation::LoadRejectSummary(_))
             }

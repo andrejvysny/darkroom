@@ -77,6 +77,9 @@ fn keyword_field(
             .hint_text("Add keyword…")
             .desired_width(120.0),
     );
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label("Add keyword to selection");
+    });
     let entered = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
     let name = lib.bar_keyword.trim().to_owned();
     if entered && !name.is_empty() {

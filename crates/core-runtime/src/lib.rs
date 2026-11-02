@@ -6,5 +6,6 @@ pub mod jobs;
 pub mod publication;
 pub mod save_barrier;
 pub mod settings_store;
+pub mod sidecar;
 pub mod workers;
 pub mod workflow;

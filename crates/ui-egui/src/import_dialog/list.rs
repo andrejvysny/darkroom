@@ -53,6 +53,15 @@ fn checkbox(painter: &egui::Painter, center: Pos2, on: bool, enabled: bool) {
 fn header_row(ui: &mut Ui, day: &str, count: usize, checked: bool) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::accesskit::Role::CheckBox,
+            true,
+            checked,
+            format!("{day}, {count} files"),
+        )
+    });
+    crate::widgets::focus_ring(ui, &response, rect, 0);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0, theme::ELEV);
     checkbox(
@@ -93,6 +102,14 @@ fn file_row(
 ) -> RowAction {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::click());
+    crate::widgets::describe_selected(
+        &response,
+        egui::accesskit::Role::ListBoxOption,
+        true,
+        selected,
+        &f.filename,
+    );
+    crate::widgets::focus_ring(ui, &response, rect, 0);
     let painter = ui.painter_at(rect);
     if previewed {
         painter.rect_filled(rect, 0, theme::ACCENT_DIM);

@@ -42,6 +42,33 @@ identity!(ProcessVersion, i64);
 /// The legacy host re-exports it as its own `PROCESS_VERSION`; bump it here and nowhere else.
 pub const CURRENT_PROCESS_VERSION: ProcessVersion = ProcessVersion(6);
 revision!(SourceRevision);
+
+impl SourceRevision {
+    /// Revision of a source file's bytes, derived from its hex BLAKE3 content hash so it is
+    /// stable across processes: the first 16 hex digits, or an FNV-1a hash of the whole string
+    /// when the hash is shorter or not hex. Never 0 for a non-empty hash.
+    pub fn from_content_hash(hash: &str) -> Self {
+        if hash.is_empty() {
+            return Self(0);
+        }
+        // `get` rather than indexing: a malformed hash with a multi-byte character must not
+        // panic on a non-char boundary, it just falls through to FNV-1a.
+        let value = hash
+            .get(..16)
+            .and_then(|prefix| u64::from_str_radix(prefix, 16).ok())
+            .unwrap_or_else(|| {
+                let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+                for byte in hash.as_bytes() {
+                    acc ^= u64::from(*byte);
+                    acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                acc
+            });
+        // 0 means "unknown source"; mapping a hash there would reintroduce the stale frame.
+        Self(if value == 0 { 1 } else { value })
+    }
+}
+
 revision!(EditorSession);
 revision!(SelectionGeneration);
 revision!(EditRevision);
@@ -96,4 +123,70 @@ pub struct RenderIdentity {
     pub viewport_revision: ViewportRevision,
     pub display_revision: DisplayRevision,
     pub device_epoch: DeviceEpoch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceRevision;
+
+    #[test]
+    fn a_hex_hash_revises_by_its_first_16_digits() {
+        assert_eq!(
+            SourceRevision::from_content_hash("00000000000000ff0123456789abcdef"),
+            SourceRevision(255)
+        );
+        assert_eq!(
+            SourceRevision::from_content_hash("deadbeefcafebabe0123456789abcdef"),
+            SourceRevision(0xdeadbeefcafebabe)
+        );
+    }
+
+    #[test]
+    fn different_hashes_revise_differently() {
+        let a = SourceRevision::from_content_hash("00000000000000ff0123456789abcdef");
+        let b = SourceRevision::from_content_hash("00000000000000fe0123456789abcdef");
+        let c = SourceRevision::from_content_hash("00000000000000fd0123456789abcdef");
+        assert!(a != b && b != c && a != c);
+    }
+
+    #[test]
+    fn a_short_or_non_hex_hash_revises_by_fnv1a() {
+        assert_eq!(
+            SourceRevision::from_content_hash("nothex"),
+            SourceRevision(0xa0d1_003d_b770_2d33)
+        );
+        assert_eq!(
+            SourceRevision::from_content_hash("nothex"),
+            SourceRevision::from_content_hash("nothex")
+        );
+        assert_ne!(
+            SourceRevision::from_content_hash("nothex"),
+            SourceRevision::from_content_hash("nothexy")
+        );
+        // 15 hex digits: too short for the prefix path, so the whole string hashes instead.
+        assert_eq!(
+            SourceRevision::from_content_hash("00000000000000f"),
+            SourceRevision(0xc873_8c44_d825_90c1)
+        );
+        // Long enough but not hex: the prefix parse fails, so again the whole string.
+        assert_eq!(
+            SourceRevision::from_content_hash("notahexhash00000000"),
+            SourceRevision(0x5d28_ff02_bee3_b3ca)
+        );
+        // A value whose high bit is set survives as-is (no accidental truncation to i64/u32).
+        assert_eq!(
+            SourceRevision::from_content_hash("ffffffffffffffff0000000000000000"),
+            SourceRevision(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn only_an_empty_hash_stays_the_unknown_revision() {
+        assert_eq!(SourceRevision::from_content_hash(""), SourceRevision(0));
+        // An all-zero prefix hashes to 0; it must not be read back as "unknown".
+        assert_ne!(
+            SourceRevision::from_content_hash("00000000000000000123456789abcdef"),
+            SourceRevision(0)
+        );
+    }
 }

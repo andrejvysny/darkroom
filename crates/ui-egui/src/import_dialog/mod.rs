@@ -61,6 +61,7 @@ fn body(
     requests: &mut Vec<ImportRequest>,
 ) {
     ui.set_width(LIST_W + SIDE_W + 24.0);
+    crate::widgets::label_dialog(ui, "Import photos");
     ui.label(RichText::new("Import photos").size(15.0).color(theme::T1));
     let busy = view.busy();
     ui.add_enabled_ui(!busy, |ui| source_row(ui, view, state, requests));

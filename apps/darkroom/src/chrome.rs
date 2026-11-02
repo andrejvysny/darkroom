@@ -17,6 +17,9 @@ pub const fn chrome_inset_left() -> f32 {
 pub fn window_attributes() -> WindowAttributes {
     let attributes = Window::default_attributes()
         .with_title("Darkroom")
+        // AccessKit's adapter must attach before the window is first shown; `State::new`
+        // makes it visible right after.
+        .with_visible(false)
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_min_inner_size(LogicalSize::new(1000.0, 640.0));
     #[cfg(target_os = "macos")]

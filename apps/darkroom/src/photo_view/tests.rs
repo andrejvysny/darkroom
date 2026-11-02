@@ -210,6 +210,8 @@ fn plan(sel: Sel, snap: &ApplicationSnapshot) -> Option<PhotoRequestPlan> {
         content_hash: "h".into(),
         params: snap.editor.document.params.clone()?,
         viewport_px: VIEWPORT,
+        display_px: VIEWPORT,
+        window: None,
     })
 }
 

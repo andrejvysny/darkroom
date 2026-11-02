@@ -64,7 +64,9 @@ impl EffectExecutor for Executor {
             Operation::LoadDates => Outcome::Dates(vec![]),
             Operation::SelectImage { .. } => Outcome::Image(None),
             Operation::LoadEdit { .. } => Outcome::Edit(None),
-            Operation::SaveEdit { .. } | Operation::SetCull { .. } => {
+            Operation::SaveEdit { .. }
+            | Operation::SetCull { .. }
+            | Operation::LoadMirrorStatus { .. } => {
                 unreachable!("no edits in this test")
             }
             Operation::LoadKeywords => Outcome::Keywords(vec![]),

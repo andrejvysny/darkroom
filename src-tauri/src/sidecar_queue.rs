@@ -20,13 +20,13 @@
 //! non-drain while anything is deferred, and [`SidecarQueue::pending_report`] says what is left and
 //! why.
 //! Writing must still never fail or roll back the catalog mutation that scheduled it, so the worker
-//! keeps logging instead. See [`sidecar_write`].
+//! keeps logging instead. See [`core_runtime::sidecar::write`].
 
-use crate::sidecar_write::{production_write, safe_write_error, write_one, SidecarOutcome};
 use crate::state::AppState;
 use core_db::Db;
 use core_library::SidecarWrite;
 use core_runtime::publication::PublicationGate;
+use core_runtime::sidecar::{production_write, safe_write_error, write_one, SidecarOutcome};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
@@ -427,7 +427,7 @@ pub fn spawn_worker(app: AppHandle) {
 
 /// Write one coalesced batch. Per id: lock the catalog *only* long enough to gather the snapshot,
 /// release it, then put the bytes on disk. Nothing short of a poisoned catalog lock ends the batch:
-/// an id that could not be written keeps its dirty mark (see `sidecar_write::SidecarOutcome`).
+/// an id that could not be written keeps its dirty mark (see `core_runtime::sidecar::SidecarOutcome`).
 fn write_batch(app: &AppHandle, ids: &[i64]) -> Result<(), String> {
     let st = app.state::<AppState>();
     write_ids(

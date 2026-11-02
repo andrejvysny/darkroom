@@ -118,6 +118,10 @@ impl ReadyDoc {
         self.revision != self.initial_revision && self.saved_revision != Some(self.revision)
     }
 
+    pub fn gesture_active(&self) -> bool {
+        self.gesture.is_some()
+    }
+
     pub(crate) fn begin_gesture(&mut self) -> Result<EditorEvent, EditorError> {
         if self.gesture.is_some() {
             return Err(EditorError::GestureActive);

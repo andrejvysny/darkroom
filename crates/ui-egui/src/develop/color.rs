@@ -6,9 +6,13 @@ use super::params::{ControlKey as K, HslPart, Zone};
 use super::slider::{develop_slider, Env};
 use super::DevelopUi;
 use crate::theme;
-use crate::widgets::pill_button;
+use crate::widgets::{describe_selected, focus_ring, pill_button};
 use core_model::DevelopParams;
 use egui::{Color32, RichText, Sense, Stroke, Ui};
+
+const BAND_NAMES: [&str; 8] = [
+    "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
+];
 
 /// Band swatches, in `develop.wgsl` `HUE_CENTERS` order: red, orange, yellow, green, aqua, blue,
 /// purple, magenta.
@@ -39,6 +43,14 @@ pub(super) fn mixer(ui: &mut Ui, env: &mut Env<'_>, st: &mut DevelopUi) {
         for (i, color) in BANDS.iter().enumerate() {
             let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::click());
             st.band_dots.push(rect);
+            describe_selected(
+                &response,
+                egui::accesskit::Role::RadioButton,
+                env.enabled,
+                usize::from(st.band) == i,
+                &format!("{} band", BAND_NAMES[i]),
+            );
+            focus_ring(ui, &response, rect, 11);
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 9.0, *color);
             if usize::from(st.band) == i {

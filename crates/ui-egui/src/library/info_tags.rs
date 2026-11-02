@@ -81,6 +81,9 @@ fn keywords(
             .hint_text("Add keyword…")
             .desired_width(ui.available_width()),
     );
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label("Add keyword");
+    });
     let entered = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
     let name = lib.keyword_input.trim().to_owned();
     if entered && !name.is_empty() {

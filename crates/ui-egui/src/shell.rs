@@ -153,6 +153,9 @@ fn search(
         .desired_width(300.0)
         .margin(Margin::symmetric(8, 4));
     let response = ui.add(edit);
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label("Search library");
+    });
     let now = ui.input(|i| i.time);
     if response.changed() {
         lib.search_edited_at = Some(now);

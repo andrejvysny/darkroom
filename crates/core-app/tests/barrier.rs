@@ -3,9 +3,11 @@
 use core_app::ports::{Clock, EventSink, RenderBackend};
 use core_app::session::{ApplicationSession, BARRIER_TIMEOUT_MS};
 use core_app::subscription::SnapshotUpdate;
-use core_app::workflow::{Command, Completion, EditIntent, Effect, Operation, Outcome};
+use core_app::workflow::{
+    Command, Completion, EditIntent, Effect, Mutation, MutationReport, Operation, Outcome,
+};
 use core_app::AppError;
-use core_model::catalog::ImageRow;
+use core_model::catalog::{ImageRow, RemoveResult};
 use core_model::document::EditDocument;
 use core_model::identity::ImageId;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -316,4 +318,58 @@ fn set_cull_is_refused_while_shutdown_is_pending() {
         }),
         Err(AppError::EditRefused("Darkroom is quitting".into()))
     );
+}
+
+fn remove(ids: &[i64]) -> Command {
+    Command::Mutate(Mutation::RemoveFromLibrary {
+        images: ids.iter().map(|i| ImageId(*i)).collect(),
+    })
+}
+
+#[test]
+fn remove_from_library_is_refused_while_edits_are_unsaved_or_saving() {
+    let (mut s, clock) = ready();
+    expose(&mut s, 1.0).unwrap();
+    assert!(matches!(
+        s.dispatch(remove(&[1, 7])),
+        Err(AppError::EditRefused(m)) if m.contains("still being saved")
+    ));
+    clock.0.store(BARRIER_TIMEOUT_MS, Ordering::SeqCst);
+    let due = s.tick(BARRIER_TIMEOUT_MS).unwrap();
+    assert_eq!(saves(&due).len(), 1, "the save is now in flight");
+    assert!(matches!(
+        s.dispatch(remove(&[1])),
+        Err(AppError::EditRefused(_))
+    ));
+    assert!(s.dispatch(remove(&[7])).is_ok(), "other photos are fine");
+}
+
+#[test]
+fn removing_the_open_photo_clears_selection_and_refreshes_reads() {
+    let (mut s, _) = ready();
+    let effect = s.dispatch(remove(&[1])).unwrap().remove(0);
+    let report = MutationReport::RemovedFromLibrary(RemoveResult {
+        removed: 1,
+        companions: 0,
+    });
+    let follow = s
+        .complete(Completion {
+            token: effect.token,
+            result: Ok(Outcome::Mutated(report.clone())),
+        })
+        .unwrap();
+    let snapshot = s.snapshot();
+    assert_eq!(snapshot.editor.selected, None);
+    assert_eq!(snapshot.library.last_report, Some(report));
+    for want in ["query", "keywords", "collections", "dates", "folders"] {
+        let found = follow.iter().any(|e| match e.operation {
+            Operation::QueryLibrary(_) => want == "query",
+            Operation::LoadKeywords => want == "keywords",
+            Operation::LoadCollections => want == "collections",
+            Operation::LoadDates => want == "dates",
+            Operation::LoadFolders => want == "folders",
+            _ => false,
+        });
+        assert!(found, "missing {want}");
+    }
 }

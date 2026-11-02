@@ -4,8 +4,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes the catalog fixture (`sidecar::test_support::Fix`) to host test suites; off by default.
+test-support = []
+
 [dependencies]
 serde_json = "1"
+tracing = "0.1"
 core-app = { path = "../core-app" }
 core-model = { path = "../core-model" }
 core-db = { path = "../core-db" }

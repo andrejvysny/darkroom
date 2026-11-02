@@ -71,6 +71,8 @@ fn tab_bar(ui: &mut Ui, st: &mut DevelopUi) {
             Sense::click(),
         );
         let on = st.left_tab == tab;
+        crate::widgets::describe_selected(&response, egui::accesskit::Role::Tab, true, on, label);
+        crate::widgets::focus_ring(ui, &response, r, 0);
         ui.painter().text(
             r.center(),
             egui::Align2::CENTER_CENTER,

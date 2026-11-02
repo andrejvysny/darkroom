@@ -106,12 +106,71 @@ pub(super) fn paint_track(ui: &Ui, track: Rect, frac: f32, bipolar: bool, active
     painter.circle_filled(Pos2::new(x(frac), y), 4.5, knob);
 }
 
+/// Exposes a develop slider to assistive technology: a named slider with its current value,
+/// bounds and keyboard step, accepting SetValue/Increment/Decrement while `enabled`.
+fn declare_accessible_slider(
+    ui: &Ui,
+    response: &egui::Response,
+    label: &str,
+    spec: &ControlSpec,
+    value: f64,
+    text: &str,
+    enabled: bool,
+) {
+    response.widget_info(|| egui::WidgetInfo::slider(enabled, value, label));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        use egui::accesskit::Action;
+        node.set_min_numeric_value(spec.min);
+        node.set_max_numeric_value(spec.max);
+        node.set_numeric_value_step(keyboard_step(spec));
+        // The formatted text ("+1.25") is what the panel shows; VoiceOver reads it verbatim.
+        node.set_value(text);
+        if !enabled {
+            node.set_disabled();
+            return;
+        }
+        node.add_action(Action::Focus);
+        node.add_action(Action::SetValue);
+        if value < spec.max {
+            node.add_action(Action::Increment);
+        }
+        if value > spec.min {
+            node.add_action(Action::Decrement);
+        }
+    });
+}
+
+/// Target value an assistive-technology request asks for this frame, if any: SetValue wins over
+/// Increment/Decrement steps.
+fn accessible_target(ui: &Ui, id: Id, spec: &ControlSpec, shown: f64) -> Option<f64> {
+    use egui::accesskit::{Action, ActionData};
+    ui.input(|input| {
+        let set = input
+            .accesskit_action_requests(id, Action::SetValue)
+            .filter_map(|request| match request.data {
+                Some(ActionData::NumericValue(v)) if v.is_finite() => Some(v),
+                _ => None,
+            })
+            .last();
+        let steps = input.num_accesskit_action_requests(id, Action::Increment) as f64
+            - input.num_accesskit_action_requests(id, Action::Decrement) as f64;
+        set.or((steps != 0.0).then(|| shown + steps * keyboard_step(spec)))
+    })
+    .map(|v| v.clamp(spec.min, spec.max))
+}
+
 /// A slider that cannot be used (placeholder): label, value text, inert track.
 pub(super) fn disabled_slider(ui: &mut Ui, label: &str, value: &str, frac: f32, hover: &str) {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), LABEL_H + GAP + TRACK_H),
         Sense::hover(),
     );
+    response.widget_info(|| egui::WidgetInfo::slider(false, f64::from(frac), label));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_value(value);
+        node.set_description(hover);
+        node.set_disabled();
+    });
     let top = Rect::from_min_size(rect.min, egui::vec2(rect.width(), LABEL_H));
     let painter = ui.painter();
     painter.text(
@@ -205,11 +264,32 @@ pub(super) fn develop_slider(
             theme::T3,
         );
         paint_track(ui, track, frac, spec.bipolar, false);
+        let inert = ui.interact(track, id, Sense::hover());
+        declare_accessible_slider(
+            ui,
+            &inert,
+            label,
+            spec,
+            shown,
+            &format_value(spec, shown),
+            false,
+        );
         return;
     }
 
     let response = ui.interact(track, id, Sense::click_and_drag());
+    declare_accessible_slider(
+        ui,
+        &response,
+        label,
+        spec,
+        shown,
+        &format_value(spec, shown),
+        true,
+    );
     let label_response = ui.interact(label_rect, id.with("label"), Sense::click());
+    label_response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Label, true, label));
     let editing_here = st.editing.as_ref().is_some_and(|e| e.id == id);
     paint_track(
         ui,
@@ -222,6 +302,13 @@ pub(super) fn develop_slider(
         numeric_entry(ui, id, value_rect, key, env, st);
     } else {
         let value_response = ui.interact(value_rect, id.with("value"), Sense::click());
+        value_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::accesskit::Role::Button,
+                true,
+                format!("Edit {label} value"),
+            )
+        });
         let color = if value_response.hovered() {
             theme::ACCENT
         } else {
@@ -306,12 +393,25 @@ fn track_interaction(
     if response.has_focus() && st.editing.is_none() {
         arrow_step(ui, key, env, shown);
     }
+    // Assistive-technology adjustments are discrete edits like an arrow step.
+    if st.gesture != Some(id) {
+        if let (Some(target), Some(base)) = (accessible_target(ui, id, spec, shown), env.params) {
+            if let Some(next) = key.with_ui(base, target) {
+                env.apply(next);
+            }
+        }
+    }
+}
+
+/// One keyboard (and assistive Increment/Decrement) step: 1/200 of the range.
+fn keyboard_step(spec: &ControlSpec) -> f64 {
+    (spec.max - spec.min) / 200.0
 }
 
 /// Left/Right = (max-min)/200, Shift = x10, as one discrete `Apply`.
 fn arrow_step(ui: &mut Ui, key: ControlKey, env: &mut Env<'_>, shown: f64) {
     let spec = key.spec();
-    let step = (spec.max - spec.min) / 200.0;
+    let step = keyboard_step(spec);
     for (arrow, direction) in [(Key::ArrowLeft, -1.0), (Key::ArrowRight, 1.0)] {
         let factor = ui.input_mut(|i| {
             if i.consume_key(Modifiers::SHIFT, arrow) {

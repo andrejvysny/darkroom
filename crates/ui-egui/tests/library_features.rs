@@ -424,6 +424,94 @@ fn empty_library_offers_add_photos() {
     assert_eq!(h.ui.import_requests, vec![ImportRequest::Open]);
 }
 
+/// A populated catalog whose current query (`narrow`) matched nothing.
+fn no_match(narrow: impl FnOnce(&mut QueryParams)) -> Harness {
+    let mut snapshot = snapshot(0, None);
+    narrow(&mut snapshot.library.query);
+    Harness::new(snapshot)
+}
+
+fn requeried(commands: &[Command]) -> Vec<&QueryParams> {
+    commands
+        .iter()
+        .filter_map(|c| match c {
+            Command::QueryLibrary(q) => Some(&**q),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn search_only_zero_matches_is_not_an_empty_library() {
+    // Regression DARKROOM-168: `any_filter` leaves search out, so a search that matched nothing
+    // used to show the empty-catalog onboarding.
+    let mut h = no_match(|q| q.search = Some("no-match-5px".into()));
+    assert!(!h.text.contains("Your library is empty"), "{}", h.text);
+    assert!(
+        h.text
+            .contains("No photos match \u{201c}no-match-5px\u{201d}."),
+        "{}",
+        h.text
+    );
+    assert!(!h
+        .ui
+        .library
+        .button_rects
+        .iter()
+        .any(|(n, _)| *n == "add_photos" || *n == "clear_filters"));
+    h.ui.library.search = "no-match-5px".into();
+    let seen = h.click_button("clear_search");
+    let queries = requeried(&seen);
+    assert_eq!(queries.len(), 1, "{seen:?}");
+    assert_eq!(queries[0].search, None);
+    assert!(h.ui.library.search.is_empty());
+    assert!(h.ui.import_requests.is_empty());
+}
+
+#[test]
+fn filter_only_zero_matches_offers_clear_filters_not_onboarding() {
+    let mut h = no_match(|q| q.min_stars = Some(5));
+    assert!(
+        h.text.contains("No photos match the current filters."),
+        "{}",
+        h.text
+    );
+    assert!(!h
+        .ui
+        .library
+        .button_rects
+        .iter()
+        .any(|(n, _)| *n == "clear_search"));
+    let seen = h.click_button("clear_filters");
+    let queries = requeried(&seen);
+    assert_eq!(queries.len(), 1, "{seen:?}");
+    assert_eq!(queries[0].min_stars, None);
+}
+
+#[test]
+fn search_and_filter_zero_matches_offers_both_and_keeps_the_other_dimension() {
+    let mut h = no_match(|q| {
+        q.search = Some("sunset".into());
+        q.flag = Some("pick".into());
+    });
+    assert!(
+        h.text
+            .contains("No photos match \u{201c}sunset\u{201d} with the current filters."),
+        "{}",
+        h.text
+    );
+    let seen = h.click_button("clear_search");
+    let queries = requeried(&seen);
+    assert_eq!(
+        (queries[0].search.as_deref(), queries[0].flag.as_deref()),
+        (None, Some("pick"))
+    );
+    let seen = h.click_button("clear_filters");
+    let queries = requeried(&seen);
+    assert_eq!(queries[0].flag, None);
+    assert_eq!(queries[0].search.as_deref(), Some("sunset"));
+}
+
 #[test]
 fn enter_that_ends_a_text_edit_is_not_a_shortcut() {
     // Regression (live QA): the TextEdit surrenders focus while handling Enter, and the global
@@ -467,4 +555,122 @@ fn culling_keys_are_ignored_while_a_modal_is_open() {
         seen.iter().any(|c| matches!(c, Command::SetCull { .. })),
         "control: X culls without a modal: {seen:?}"
     );
+}
+
+impl Harness {
+    fn right_click_cell(&mut self, id: i64) -> Vec<Command> {
+        let r = self
+            .ui
+            .library
+            .cell_rects
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, r)| *r)
+            .expect("cell laid out");
+        let pos = Pos2::new(r.center().x, r.top() + r.width() * 0.5);
+        let modifiers = self.modifiers;
+        let button = move |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers,
+        };
+        let mut seen = self.frame(vec![Event::PointerMoved(pos)]);
+        seen.extend(self.frame(vec![button(true)]));
+        seen.extend(self.frame(vec![button(false)]));
+        seen.extend(self.frame(Vec::new()));
+        seen
+    }
+}
+
+fn remove_cmd(ids: &[i64]) -> Mutation {
+    Mutation::RemoveFromLibrary {
+        images: ids.iter().map(|i| ImageId(*i)).collect(),
+    }
+}
+
+#[test]
+fn remove_from_library_uses_the_selection_or_the_clicked_row() {
+    let mut h = Harness::new(snapshot(20, Some(1)));
+    h.click_cell(1);
+    h.modifiers = Modifiers::COMMAND;
+    h.click_cell(2);
+    h.modifiers = Modifiers::NONE;
+
+    // Right-click inside the multi-selection: the whole selection, nothing sent until confirm.
+    let seen = h.right_click_cell(2);
+    assert!(mutations(&seen).is_empty(), "{seen:?}");
+    let seen = h.click_button("remove_menu_item");
+    assert!(mutations(&seen).is_empty(), "{seen:?}");
+    h.frame(Vec::new());
+    assert!(
+        h.text.contains("Remove 2 photos from the library?"),
+        "{}",
+        h.text
+    );
+    assert!(h.text.contains("The files stay on disk"), "{}", h.text);
+    let seen = h.click_button("remove_confirm");
+    assert_eq!(mutations(&seen), vec![&remove_cmd(&[1, 2])], "{seen:?}");
+    assert!(selected(&h).is_empty(), "{:?}", selected(&h));
+    h.frame(Vec::new());
+    assert!(h
+        .ui
+        .library
+        .button_rects
+        .iter()
+        .all(|(n, _)| *n != "remove_confirm"));
+
+    // Right-click outside the selection: just that row, selection untouched.
+    let mut h = Harness::new(snapshot(20, Some(1)));
+    h.click_cell(1);
+    h.right_click_cell(5);
+    h.click_button("remove_menu_item");
+    h.frame(Vec::new());
+    assert!(
+        h.text.contains("Remove 1 photo from the library?"),
+        "{}",
+        h.text
+    );
+    let seen = h.click_button("remove_confirm");
+    assert_eq!(mutations(&seen), vec![&remove_cmd(&[5])], "{seen:?}");
+    assert_eq!(selected(&h), vec![1]);
+}
+
+#[test]
+fn remove_dialog_cancel_and_escape_emit_nothing_and_block_culling_keys() {
+    let mut h = Harness::new(snapshot(20, Some(2)));
+    h.click_cell(2);
+    h.right_click_cell(2);
+    h.click_button("remove_menu_item");
+    h.frame(Vec::new());
+    let seen = h.frame(key(Key::X));
+    assert!(
+        !seen.iter().any(|c| matches!(
+            c,
+            Command::SetCull { .. } | Command::Mutate(Mutation::Cull { .. })
+        )),
+        "{seen:?}"
+    );
+    let seen = h.click_button("remove_cancel");
+    assert!(mutations(&seen).is_empty(), "{seen:?}");
+    h.frame(Vec::new());
+    assert!(h
+        .ui
+        .library
+        .button_rects
+        .iter()
+        .all(|(n, _)| *n != "remove_confirm"));
+
+    h.right_click_cell(2);
+    h.click_button("remove_menu_item");
+    h.frame(Vec::new());
+    let seen = h.frame(key(Key::Escape));
+    assert!(mutations(&seen).is_empty(), "{seen:?}");
+    h.frame(Vec::new());
+    assert!(h
+        .ui
+        .library
+        .button_rects
+        .iter()
+        .all(|(n, _)| *n != "remove_confirm"));
 }

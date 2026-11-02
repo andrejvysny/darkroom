@@ -114,11 +114,14 @@ pub(super) fn show(
             }
         }
     });
-    ui.add(
+    let response = ui.add(
         egui::TextEdit::singleline(&mut state.keywords_text)
             .hint_text("keywords, comma, separated")
             .desired_width(f32::INFINITY),
     );
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label("Import keywords");
+    });
     collection_combo(ui, snapshot, state);
 }
 
@@ -157,10 +160,13 @@ fn collection_combo(ui: &mut Ui, snapshot: &ApplicationSnapshot, state: &mut Imp
             );
         });
     if state.collection == CollectionChoice::New {
-        ui.add(
+        let response = ui.add(
             egui::TextEdit::singleline(&mut state.new_collection_name)
                 .hint_text("Collection name")
                 .desired_width(f32::INFINITY),
         );
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_label("New collection name");
+        });
     }
 }

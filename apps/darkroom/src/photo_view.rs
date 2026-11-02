@@ -214,8 +214,11 @@ impl PhotoView {
                 self.wanted == Some(*key) && Some(PhotoSubject::of_key(key)) == subject
             })
             .map(|(_, error)| match snapshot.editor.image.as_ref() {
-                Some(image) => format!("{error} — {}", image.filename),
-                None => error.clone(),
+                // The missing-file message already names the path.
+                Some(image) if !error.starts_with(crate::presence::MISSING_SOURCE) => {
+                    format!("{error} — {}", image.filename)
+                }
+                _ => error.clone(),
             });
         let texture = self
             .registration
@@ -272,7 +275,12 @@ impl PhotoView {
             path: plan.path,
             content_hash: plan.content_hash,
             params: plan.params,
-            view: photo_worker::fit_view(plan.viewport_px.0, plan.viewport_px.1),
+            view: match plan.window {
+                Some((origin, size)) => {
+                    photo_worker::window_view(origin, size, plan.viewport_px.0, plan.viewport_px.1)
+                }
+                None => photo_worker::fit_view(plan.viewport_px.0, plan.viewport_px.1),
+            },
         })
     }
 

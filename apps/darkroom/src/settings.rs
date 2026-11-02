@@ -171,7 +171,9 @@ impl SettingsState {
         }
     }
 
-    fn note(&mut self, message: impl Into<String>) {
+    /// One status-area diagnostic, echoed to stderr. Host startup failures that degrade rather
+    /// than kill the session (a mirror that could not start) report here.
+    pub fn note(&mut self, message: impl Into<String>) {
         let message = message.into();
         eprintln!("{message}");
         self.notices.push(message);

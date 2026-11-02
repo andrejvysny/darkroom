@@ -1,6 +1,7 @@
 //! Library catalog reads (keywords, collections, image tags, delete-rejected summary) and durable
 //! mutations: validation, the ordered effects, and the follow-up reads a committed mutation needs.
 use super::{edit::QUITTING, ApplicationSession, BarrierKind};
+use crate::editor::EditorState;
 use crate::state::ImageTags;
 use crate::workflow::{CullChange, Effect, Mutation, MutationReport, Operation};
 use crate::AppError;
@@ -82,6 +83,7 @@ pub(super) fn validate(mutation: &Mutation) -> Result<(), AppError> {
         }
         Mutation::UnlinkPair { secondary } => check_id(secondary.0),
         Mutation::DeleteRejected(_) => Ok(()),
+        Mutation::RemoveFromLibrary { images } => check_images(images),
     }
 }
 
@@ -104,8 +106,41 @@ impl ApplicationSession {
         if matches!(&self.barrier, Some(b) if matches!(b.kind, BarrierKind::Shutdown)) {
             return Err(AppError::EditRefused(QUITTING.into()));
         }
+        if let Mutation::RemoveFromLibrary { images } = &mutation {
+            self.refuse_unsaved_targets(images)?;
+        }
         // Never coalesced or replaced: every mutation is its own ordered, durable effect.
         Ok(vec![self.issue(Operation::Mutate(mutation))])
+    }
+
+    /// A removed photo's unsaved or in-flight edits would be written to a row that no longer
+    /// exists, so removal waits until autosave holds nothing for any target.
+    fn refuse_unsaved_targets(&self, images: &[ImageId]) -> Result<(), AppError> {
+        let epoch = self.snapshot.catalog_epoch;
+        let open_dirty = matches!(self.editor.state(), EditorState::Ready(d) if d.is_dirty());
+        let busy = images.iter().any(|image| {
+            !self.autosave.keys_for_image(epoch, *image).is_empty()
+                || (open_dirty && self.key.as_ref().is_some_and(|k| k.image_id == *image))
+        });
+        if busy {
+            return Err(AppError::EditRefused(
+                "Edits to a selected photo are still being saved; try again in a moment.".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Never leave Develop showing a photo whose row is gone.
+    fn clear_removed_selection(&mut self, images: &[ImageId]) {
+        if self
+            .snapshot
+            .editor
+            .selected
+            .is_some_and(|selected| images.contains(&selected))
+        {
+            // Only fails while a flush barrier is pending; that path closes the editor anyway.
+            let _ = self.select(None);
+        }
     }
 
     pub(super) fn tags_loaded(
@@ -139,6 +174,9 @@ impl ApplicationSession {
         library.last_report = Some(report);
         if matches!(mutation, Mutation::DeleteRejected(_)) {
             library.reject_summary = None;
+        }
+        if let Mutation::RemoveFromLibrary { images } = &mutation {
+            self.clear_removed_selection(images);
         }
         let plan = follow_ups(&mutation, &self.snapshot.library.query);
         let mut effects = Vec::new();
@@ -238,7 +276,7 @@ fn follow_ups(mutation: &Mutation, query: &QueryParams) -> FollowUps {
             plan.tags = true;
             plan.requery = refresh();
         }
-        Mutation::DeleteRejected(_) => {
+        Mutation::DeleteRejected(_) | Mutation::RemoveFromLibrary { .. } => {
             plan.requery = refresh();
             plan.keywords = true;
             plan.collections = true;

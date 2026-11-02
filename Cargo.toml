@@ -31,7 +31,7 @@ authors = ["Andrej Vysny"]
 [workspace.dependencies]
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "dx12", "vulkan", "gles", "wgsl"] }
 egui = { version = "=0.37.0", features = ["default_fonts"] }
-egui-winit = { version = "=0.37.0", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui-winit = { version = "=0.37.0", default-features = false, features = ["accesskit", "clipboard", "links", "wayland", "x11"] }
 egui-wgpu = { version = "=0.37.0", default-features = false }
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland"] }
 

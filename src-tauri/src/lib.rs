@@ -16,7 +16,6 @@ mod quit;
 mod scan;
 mod settings_bridge;
 mod sidecar_queue;
-mod sidecar_write;
 mod source_fence;
 mod state;
 mod suggest;

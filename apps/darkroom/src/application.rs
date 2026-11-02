@@ -317,7 +317,7 @@ pub fn photo_probe(
             source: SourceIdentity {
                 catalog_epoch: snapshot.catalog_epoch,
                 image_id: id,
-                source_revision: SourceRevision(0),
+                source_revision: SourceRevision::from_content_hash(&image.content_hash),
             },
             editor_session: snapshot.editor.editor_session,
             selection_generation: snapshot.editor.selection_generation,
@@ -325,7 +325,7 @@ pub fn photo_probe(
             process_version,
             renderer_version: RendererVersion(1),
             cache_version: CacheVersion(1),
-            viewport_revision: viewport_revision(width, height),
+            viewport_revision: viewport_revision(width, height, None),
             display_revision: DisplayRevision(0),
             device_epoch,
         },
@@ -490,6 +490,14 @@ pub fn photo_probe(
             "last_decode_cpu_bytes": resources.last_decode_cpu_bytes,
             "peak_decode_cpu_bytes": resources.peak_decode_cpu_bytes,
             "over_budget": resources.over_budget,
+        },
+        "timings": {
+            "read_ms": resources.last_timings.read_ms,
+            "develop_ms": resources.last_timings.develop_ms,
+            "prepare_ms": resources.last_timings.prepare_ms,
+            "render_ms": resources.last_timings.render_ms,
+            "histogram_ms": resources.last_timings.histogram_ms,
+            "prepared_cache_hit": resources.last_timings.prepared_cache_hit,
         },
     }))
 }

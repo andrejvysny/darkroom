@@ -12,13 +12,13 @@
 use super::{ApplicationSession, Barrier, BarrierKind, BARRIER_TIMEOUT_MS};
 use crate::autosave::{Completed, EditOrigin, SaveFailure, SaveKey, SaveRequest, SaveSeq};
 use crate::editor::{EditorCommand, EditorError, EditorEvent, EditorState};
-use crate::state::SaveStatus;
+use crate::state::{MirrorStatus, SaveStatus};
 use crate::subscription::Notice;
 use crate::workflow::{Command, EditIntent, Effect, Operation, Outcome};
 use crate::AppError;
 use core_model::catalog::ImageRow;
 use core_model::document::{validate_finite, EditDocument, ReadStatus};
-use core_model::identity::EditorSession;
+use core_model::identity::{CatalogRevision, EditorSession};
 use core_model::DevelopParams;
 use std::sync::Arc;
 
@@ -231,6 +231,43 @@ impl ApplicationSession {
         let editor = &mut Arc::make_mut(&mut self.snapshot).editor;
         if editor.save != save {
             editor.save = save;
+        }
+    }
+
+    /// Ask for a fresh mirror state, only while the saved edit's mirror is still unsettled.
+    pub(super) fn refresh_mirror_status(&mut self) -> Vec<Effect> {
+        let (Some(key), Some(revision)) = (self.key.clone(), self.saved_revision) else {
+            return Vec::new();
+        };
+        if !matches!(
+            self.mirror,
+            MirrorStatus::Pending { .. } | MirrorStatus::Failing { .. }
+        ) {
+            return Vec::new();
+        }
+        vec![self.replace(Operation::LoadMirrorStatus { key, revision })]
+    }
+
+    /// Apply a mirror read only if it is for the live save identity and not older than the
+    /// revision it was requested for.
+    pub(super) fn mirror_loaded(
+        &mut self,
+        key: &SaveKey,
+        revision: CatalogRevision,
+        status: MirrorStatus,
+    ) {
+        if self.key.as_ref() != Some(key) || self.saved_revision != Some(revision) {
+            return;
+        }
+        let fresh = match &status {
+            MirrorStatus::Mirrored { revision: m } => *m >= revision,
+            MirrorStatus::Pending { owed_revision } => *owed_revision >= revision,
+            MirrorStatus::Failing { .. } => true,
+            MirrorStatus::Unknown => false,
+        };
+        if fresh {
+            self.mirror = status;
+            self.sync_save();
         }
     }
 

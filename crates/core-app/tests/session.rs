@@ -2,7 +2,7 @@ use core_app::ports::{Clock, EventSink, RenderBackend};
 use core_app::session::ApplicationSession;
 use core_app::state::DocumentStatus;
 use core_app::subscription::SnapshotUpdate;
-use core_app::workflow::{Command, Completion, Effect, Operation, Outcome};
+use core_app::workflow::{Command, Completion, EditIntent, Effect, Operation, Outcome};
 use core_app::AppError;
 use core_model::catalog::{ImageRow, QueryParams};
 use core_model::document::EditDocument;
@@ -351,6 +351,7 @@ fn selection_opens_a_fresh_session_and_asks_for_the_stored_edit() {
             revision: None,
             process_version: None,
             dirty: false,
+            gesture_active: false,
             can_undo: false,
             can_redo: false,
         }
@@ -410,6 +411,35 @@ fn missing_edit_becomes_a_ready_default_document_at_the_current_version() {
     assert_eq!(view.params.as_deref(), Some(&DevelopParams::default()));
     assert_eq!(view.process_version, Some(CURRENT_PROCESS_VERSION));
     assert!(!view.dirty);
+}
+
+#[test]
+fn gesture_flag_tracks_the_live_gesture() {
+    let mut s = session();
+    open(&mut s);
+    let (image, load) = load_edit_effects(&mut s, 7);
+    finish(
+        &mut s,
+        &image,
+        Ok(Outcome::Image(Some(Box::new(ImageRow {
+            id: 7,
+            ..Default::default()
+        })))),
+    )
+    .unwrap();
+    finish_load(&mut s, &load, Ok(Outcome::Edit(None)));
+    assert!(!s.snapshot().editor.document.gesture_active);
+    s.dispatch(Command::Edit(EditIntent::BeginGesture)).unwrap();
+    assert!(
+        s.snapshot().editor.document.gesture_active,
+        "an in-flight drag is visible to renderers"
+    );
+    s.dispatch(Command::Edit(EditIntent::CommitGesture))
+        .unwrap();
+    assert!(
+        !s.snapshot().editor.document.gesture_active,
+        "the flag clears once the gesture is committed"
+    );
 }
 
 #[test]

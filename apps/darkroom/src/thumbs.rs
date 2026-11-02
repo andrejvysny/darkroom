@@ -15,8 +15,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
+use crate::presence::PresenceStore;
 use core_library::{ThumbCache, THUMB_SIZE};
-use ui_egui::{ThumbSource, ThumbState};
+use ui_egui::{Presence, ThumbSource, ThumbState};
 
 #[cfg(test)]
 #[path = "thumbs/tests.rs"]
@@ -285,6 +286,7 @@ pub struct ThumbStore {
     asked_keys: HashSet<ThumbKey>,
     budget: u64,
     previews: Previews,
+    presence: PresenceStore,
 }
 
 impl ThumbStore {
@@ -308,6 +310,7 @@ impl ThumbStore {
         budget: u64,
     ) -> Result<Self, String> {
         let wake_for_previews = Arc::clone(&wake);
+        let presence = PresenceStore::new(Arc::clone(&wake))?;
         Ok(Self {
             ctx,
             pool: Pool::start(WORKERS, loader, wake)?,
@@ -320,6 +323,7 @@ impl ThumbStore {
             asked_keys: HashSet::new(),
             budget,
             previews: Previews::new(wake_for_previews),
+            presence,
         })
     }
 
@@ -330,6 +334,7 @@ impl ThumbStore {
             self.catalog_epoch = Some(catalog_epoch);
             self.failed.clear();
             self.failed_order.clear();
+            self.presence.invalidate();
         }
         self.previews.drain(&self.ctx, self.frame);
         while let Ok(done) = self.pool.results.try_recv() {
@@ -357,10 +362,16 @@ impl ThumbStore {
         self.residents.evict(self.frame, self.budget);
     }
 
+    /// Files may have come or gone while the window was in the background.
+    pub fn invalidate_presence(&self) {
+        self.presence.invalidate();
+    }
+
     /// Stop and join the workers. Idempotent.
     pub fn shutdown(&mut self) -> Result<(), String> {
         self.previews.shutdown();
-        self.pool.shutdown()
+        let presence = self.presence.shutdown();
+        self.pool.shutdown().and(presence)
     }
 
     fn upload(&mut self, key: ThumbKey, decoded: Decoded) {
@@ -389,6 +400,10 @@ impl ThumbStore {
 }
 
 impl ThumbSource for ThumbStore {
+    fn presence(&mut self, image: &core_model::catalog::ImageRow) -> Presence {
+        self.presence.ask(image.id, &image.path)
+    }
+
     fn file_preview(&mut self, path: &str) -> ThumbState {
         self.previews.ask(path, self.frame)
     }

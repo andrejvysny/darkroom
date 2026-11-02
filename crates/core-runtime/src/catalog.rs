@@ -1,3 +1,4 @@
+use crate::publication::PublicationGate;
 use core_app::workflow::{ColorLabel, CullChange, Mutation, MutationReport};
 use core_app::{
     error::ErrorSource,
@@ -30,6 +31,10 @@ struct Slot {
 #[derive(Default)]
 pub struct CatalogAdapter {
     slot: Mutex<Slot>,
+    /// The fence every write this adapter makes takes BEFORE the catalog mutex, and the same one
+    /// the host's sidecar drain fences its publication against. It is per adapter, not per slot:
+    /// a closed catalog has no identities to fence, and a re-opened one starts empty anyway.
+    publications: Arc<PublicationGate>,
     /// Test seam: replaces the OS Trash for `Mutation::DeleteRejected`.
     trash: Option<TrashRemover>,
 }
@@ -57,8 +62,16 @@ impl CatalogAdapter {
                 generation: 0,
                 database: Some(database),
             }),
+            publications: Arc::new(PublicationGate::default()),
             trash: None,
         }
+    }
+
+    /// The fence the host's sidecar drain (see [`crate::sidecar::MirrorService`]) publishes under:
+    /// every catalog write this adapter makes holds it across its transaction, so a drain can never
+    /// land a sidecar that contradicts a commit in flight.
+    pub fn publications(&self) -> Arc<PublicationGate> {
+        Arc::clone(&self.publications)
     }
 
     /// Route delete-rejected file removal through `remove` instead of the OS Trash.
@@ -90,6 +103,9 @@ impl CatalogAdapter {
     }
 
     fn reserve(&self) -> Result<u64, AppError> {
+        // Gate before slot, and held across the swap: a drain that captured an identity from the
+        // outgoing catalog must already be fenced out when the slot changes.
+        let _publications = self.publications.invalidate_all_guard();
         let (generation, old) = {
             let mut slot = self
                 .slot
@@ -105,6 +121,7 @@ impl CatalogAdapter {
     fn open_with(&self, open: impl FnOnce() -> Result<SharedDb, AppError>) -> Result<(), AppError> {
         let generation = self.reserve()?;
         let result = open();
+        let _publications = self.publications.invalidate_all_guard();
         let mut slot = self
             .slot
             .lock()
@@ -178,8 +195,9 @@ impl CatalogPort for CatalogAdapter {
         self.read(|db| core_library::get_edit_with_process_version(&db.conn, image_id))
     }
     fn set_cull(&self, image_id: i64, change: CullChange) -> Result<(), AppError> {
-        // No sidecar/outbox write: the native host has no metadata-sidecar drain yet (legacy keeps
-        // an in-memory queue), so cull marks are catalog-only here.
+        // Fenced, but no `sidecar_outbox` intent: the rating/flag/label half of a sidecar rides in
+        // the row the next edit save enqueues, so a drain must not publish across this commit.
+        let _publications = self.publications.mutation_guard();
         self.read(|db| match change {
             CullChange::Rating(stars) => {
                 core_library::set_rating(&db.conn, image_id, i64::from(stars))
@@ -196,6 +214,9 @@ impl CatalogPort for CatalogAdapter {
     fn collections(&self) -> Result<Vec<CollectionRow>, AppError> {
         self.read(|db| core_library::list_collections(&db.conn))
     }
+    fn mirror_status(&self, image_id: i64) -> Result<MirrorStatus, AppError> {
+        self.read(|db| mirror_status_of(&db.conn, image_id))
+    }
     fn image_tags(&self, image_id: i64) -> Result<ImageTags, AppError> {
         self.read(|db| {
             Ok(ImageTags {
@@ -211,17 +232,28 @@ impl CatalogPort for CatalogAdapter {
     }
     fn mutate(&self, mutation: &Mutation) -> Result<MutationReport, AppError> {
         match mutation {
+            // Takes the fence twice, around the plan and the finalize: the Trash step between
+            // them holds neither the gate nor the catalog lock.
             Mutation::DeleteRejected(params) => self.delete_rejected(params),
             Mutation::CreateCollection {
                 name,
                 smart,
                 images,
-            } => self
-                .write(|db| create_collection(db, name, smart.as_deref(), images))
-                .map(MutationReport::CollectionCreated),
-            other => self
-                .write(|db| apply(db, other))
-                .map(|()| MutationReport::Done),
+            } => {
+                let _publications = self.publications.mutation_guard();
+                self.write(|db| create_collection(db, name, smart.as_deref(), images))
+                    .map(MutationReport::CollectionCreated)
+            }
+            Mutation::RemoveFromLibrary { images } => {
+                let _publications = self.publications.mutation_guard();
+                self.write(|db| core_library::remove_from_catalog(&db.conn, &ids(images)))
+                    .map(MutationReport::RemovedFromLibrary)
+            }
+            other => {
+                let _publications = self.publications.mutation_guard();
+                self.write(|db| apply(db, other))
+                    .map(|()| MutationReport::Done)
+            }
         }
     }
     fn save_edit(
@@ -231,6 +263,9 @@ impl CatalogPort for CatalogAdapter {
         process_version: i64,
         params_json: &str,
     ) -> Result<SaveReceipt, AppError> {
+        // The commit that enqueues the mirror intent, so it is fenced: the drain either sees the
+        // new revision or not at all, never a half-committed edit.
+        let _publications = self.publications.mutation_guard();
         self.read(|db| {
             let revision = match core_library::edits::save_edit_expecting_source(
                 &db.conn,
@@ -246,21 +281,7 @@ impl CatalogPort for CatalogAdapter {
                 }
                 Err(core_library::edits::SaveError::Lib(error)) => return Err(error),
             };
-            let mirror = match core_library::mirror_state(&db.conn, image_id)? {
-                Some(state) if state.mirrored_revision >= state.revision => {
-                    MirrorStatus::Mirrored {
-                        revision: CatalogRevision(state.revision),
-                    }
-                }
-                Some(MirrorState {
-                    last_error: Some(error),
-                    ..
-                }) => MirrorStatus::Failing { error },
-                Some(state) => MirrorStatus::Pending {
-                    owed_revision: CatalogRevision(state.revision),
-                },
-                None => MirrorStatus::Unknown,
-            };
+            let mirror = mirror_status_of(&db.conn, image_id)?;
             Ok(Ok(SaveReceipt {
                 catalog_revision: CatalogRevision(revision),
                 mirror,
@@ -269,13 +290,37 @@ impl CatalogPort for CatalogAdapter {
     }
 }
 
+/// The sidecar mirror state of one image's saved edit, as the application layer sees it.
+pub(crate) fn mirror_status_of(
+    conn: &rusqlite::Connection,
+    image_id: i64,
+) -> Result<MirrorStatus, LibError> {
+    Ok(match core_library::mirror_state(conn, image_id)? {
+        Some(state) if state.mirrored_revision >= state.revision => MirrorStatus::Mirrored {
+            revision: CatalogRevision(state.revision),
+        },
+        Some(MirrorState {
+            last_error: Some(error),
+            ..
+        }) => MirrorStatus::Failing { error },
+        Some(state) => MirrorStatus::Pending {
+            owed_revision: CatalogRevision(state.revision),
+        },
+        None => MirrorStatus::Unknown,
+    })
+}
+
 impl CatalogAdapter {
     /// Plan under the lock, trash with NO lock held, then finalize under the lock — unless the
     /// catalog was closed or replaced meanwhile, in which case the new catalog is left untouched
     /// (files already in the Trash stay recoverable). Thumbnail GC is not done here.
+    ///
+    /// The publication fence is taken with each lock, never across the Trash call: holding a gate
+    /// over filesystem work would let a slow Trash operation block every sidecar publication.
     fn delete_rejected(&self, params: &QueryParams) -> Result<MutationReport, AppError> {
         let (generation, database) = self.shared()?;
         let plan = {
+            let _publications = self.publications.mutation_guard();
             let db = database
                 .lock()
                 .map_err(|e| AppError::Catalog(e.to_string().into()))?;
@@ -292,6 +337,7 @@ impl CatalogAdapter {
             return Err(AppError::Stale);
         }
         let result = {
+            let _publications = self.publications.mutation_guard();
             let db = database
                 .lock()
                 .map_err(|e| AppError::Catalog(e.to_string().into()))?;
@@ -330,7 +376,8 @@ fn create_collection(
 
 fn apply(db: &mut Db, mutation: &Mutation) -> Result<(), LibError> {
     match mutation {
-        // Catalog-only, like the single `set_cull`: the native host drains no sidecars yet.
+        // Catalog-only, like the single `set_cull`: no `sidecar_outbox` intent is queued for a
+        // cull mark, so the next edit save is what carries rating/flag/label to the sidecar.
         Mutation::Cull { images, change } => {
             let images = ids(images);
             match change {
@@ -373,7 +420,9 @@ fn apply(db: &mut Db, mutation: &Mutation) -> Result<(), LibError> {
             core_library::remove_images_from_collection(&db.conn, *id, &ids(images)).map(|_| ())
         }
         Mutation::UnlinkPair { secondary } => core_library::unlink_pair(&db.conn, secondary.0),
-        Mutation::CreateCollection { .. } | Mutation::DeleteRejected(_) => Err(LibError::Other(
+        Mutation::CreateCollection { .. }
+        | Mutation::DeleteRejected(_)
+        | Mutation::RemoveFromLibrary { .. } => Err(LibError::Other(
             "mutation is handled before the generic path".into(),
         )),
     }

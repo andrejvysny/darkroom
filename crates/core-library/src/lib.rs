@@ -21,6 +21,7 @@ pub mod presets;
 pub mod query;
 pub mod reconcile;
 pub mod reject;
+pub mod remove;
 pub mod settings;
 pub mod sidecar;
 pub mod snapshots;
@@ -99,6 +100,7 @@ pub use reject::{
     delete_rejected, delete_rejected_with, finalize_delete_rejected, plan_delete_rejected,
     summarize_rejected, RejectDeleteResult, RejectPlan, RejectSummary,
 };
+pub use remove::{remove_from_catalog, RemoveResult};
 pub use settings::{
     animal_detector_size, default_scan_stages, face_stage_enabled, get_meta, library_root,
     mask_ai_tier, preview_edge, scan_stages, set_animal_detector_size, set_face_stage_enabled,

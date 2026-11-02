@@ -19,6 +19,7 @@ pub(super) fn document_view(state: &EditorState) -> DocumentView {
             revision: Some(doc.revision),
             process_version: Some(doc.process_version),
             dirty: doc.is_dirty(),
+            gesture_active: doc.gesture_active(),
             can_undo: doc.history().undo_len() > 0,
             can_redo: doc.history().redo_len() > 0,
         },

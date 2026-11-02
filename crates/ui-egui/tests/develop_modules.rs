@@ -35,6 +35,7 @@ fn snapshot(params: DevelopParams) -> ApplicationSnapshot {
                 revision: Some(EditRevision(1)),
                 process_version: Some(ProcessVersion(6)),
                 dirty: false,
+                gesture_active: false,
                 can_undo: false,
                 can_redo: false,
             },

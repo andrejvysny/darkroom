@@ -26,6 +26,9 @@ fn inline_edit(ui: &mut egui::Ui, id: egui::Id, text: &mut String, hint: &str) -
             .hint_text(hint)
             .desired_width(ui.available_width()),
     );
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label(hint);
+    });
     let first = ui.data_mut(|d| d.get_temp::<bool>(id).is_none());
     if first {
         response.request_focus();

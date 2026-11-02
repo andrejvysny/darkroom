@@ -78,6 +78,8 @@ pub struct DocumentView {
     pub revision: Option<EditRevision>,
     pub process_version: Option<ProcessVersion>,
     pub dirty: bool,
+    /// An edit gesture (e.g. slider drag) is in flight; renderers may use a cheaper tier.
+    pub gesture_active: bool,
     /// History availability for menus; always false unless `Ready`.
     pub can_undo: bool,
     pub can_redo: bool,

@@ -59,3 +59,7 @@ tempfile = "3"
 
 [target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
 core-analyze = { path = "../crates/core-analyze" }
+
+[dev-dependencies]
+# Catalog fixture (`sidecar::test_support::Fix`) for the sidecar_queue/outbox-mapping tests.
+core-runtime = { path = "../crates/core-runtime", features = ["test-support"] }

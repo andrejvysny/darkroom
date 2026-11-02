@@ -11,6 +11,7 @@ mod modules;
 mod params;
 mod slider;
 pub(crate) mod stage;
+pub(crate) mod zoom;
 
 use crate::icons::{icon_button_enabled, Icon};
 use crate::{theme, HistogramData, PhotoUi, ThumbSource};
@@ -60,6 +61,12 @@ pub struct DevelopUi {
     left_collapsed: bool,
     left_tab: left::Tab,
     film_scrolled_to: Option<ImageId>,
+    /// The keyboard was busy when the frame's input was read (a text edit owned it, or a modal
+    /// is open; the root captures this before any widget runs); the stage's bare-`Z` zoom toggle
+    /// must stay out of the way.
+    typing: bool,
+    /// Stage zoom/pan (fit by default; reset when the photo changes).
+    zoom: zoom::ZoomUi,
     /// Screen rect of the Exposure slider track from the last frame (test/automation hook).
     pub exposure_rect: Option<Rect>,
     /// Track / value-text rect of every slider laid out last frame, by `ControlKey::name()`.
@@ -73,6 +80,20 @@ pub struct DevelopUi {
     pub curve_rect: Option<Rect>,
     /// Screen rect of every filmstrip cell laid out last frame, `(image id, rect)`.
     pub film_rects: Vec<(i64, Rect)>,
+}
+
+impl DevelopUi {
+    /// Record whether the keyboard was busy this frame (see [`crate::root`]'s capture), so the
+    /// stage's bare-`Z` zoom toggle yields to a focused text edit or an open modal.
+    pub(crate) fn set_typing(&mut self, typing: bool) {
+        self.typing = typing;
+    }
+
+    /// Screen rect of the photo drawn on the stage last frame, in points (test/automation hook:
+    /// the point a zoom gesture has to land on).
+    pub fn stage_image_rect(&self) -> Option<Rect> {
+        self.zoom.image_rect()
+    }
 }
 
 /// Which actions the current snapshot enables (the registry decides; this only derives facts).
@@ -136,7 +157,7 @@ pub(crate) fn show(
     filmstrip::show(root, snapshot, st, thumbs, commands);
     left::show(root, st);
     panel(root, snapshot, st, histogram, commands);
-    stage::central(root, snapshot, photo);
+    stage::central(root, snapshot, photo, Some(&mut st.zoom), st.typing);
 }
 
 /// Right-hand instrument panel: undo/redo, histogram, scrolling modules, save status.

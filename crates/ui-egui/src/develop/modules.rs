@@ -218,6 +218,11 @@ fn module(
         Id::unique(("develop_module", id)),
         Sense::click(),
     );
+    header.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, title));
+    ui.ctx().accesskit_node_builder(header.id, |node| {
+        node.set_expanded(open);
+    });
+    crate::widgets::focus_ring(ui, &header, head_rect, 0);
     if header.hovered() {
         ui.painter()
             .rect_filled(rect, 0, theme::HOVER.gamma_multiply(0.25));
@@ -254,6 +259,14 @@ fn module(
         };
         let r = ui.interact(reset_rect, Id::unique(("develop_module_reset", id)), sense);
         st.module_resets.insert(id, reset_rect);
+        r.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::accesskit::Role::Button,
+                env.enabled,
+                format!("Reset {title}"),
+            )
+        });
+        crate::widgets::focus_ring(ui, &r, reset_rect, 2);
         let color = if env.enabled && r.hovered() {
             theme::T1
         } else {

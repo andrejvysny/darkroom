@@ -8,6 +8,7 @@ use crate::{histogram, theme};
 use core_app::workflow::EditIntent;
 use core_model::curve::build_lut;
 use core_model::{CurvePoint, DevelopParams, ToneCurve};
+use egui::accesskit::Role;
 use egui::{Align2, Color32, CursorIcon, FontId, Id, Key, Pos2, Rect, Sense, Stroke, Ui};
 
 const PAD: f32 = 10.0;
@@ -221,6 +222,11 @@ pub(super) fn tone_curve(ui: &mut Ui, env: &mut Env<'_>, st: &mut DevelopUi) {
         Sense::hover()
     };
     let (outer, response) = ui.allocate_exact_size(egui::vec2(side, side), sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(Role::Image, live, "Tone curve"));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_description("Click to add a point, drag to move, double-click to remove");
+    });
+    crate::widgets::focus_ring(ui, &response, outer, theme::RADIUS_SM);
     ui.painter()
         .rect_filled(outer, theme::RADIUS_SM, theme::STAGE_DEV);
     ui.painter().rect_stroke(
@@ -351,6 +357,8 @@ fn tabs(ui: &mut Ui, st: &mut DevelopUi) {
         for (i, label) in TABS.iter().enumerate() {
             let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 22.0), Sense::click());
             let on = st.curve_channel == i;
+            crate::widgets::describe_selected(&response, Role::Tab, true, on, label);
+            crate::widgets::focus_ring(ui, &response, rect, 4);
             if on {
                 ui.painter().rect_filled(rect, 4, theme::ELEV);
             } else if response.hovered() {

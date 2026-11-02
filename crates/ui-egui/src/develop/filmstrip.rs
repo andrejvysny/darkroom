@@ -4,7 +4,7 @@
 use super::DevelopUi;
 use crate::library::{cull_enabled, selected_row};
 use crate::widgets::star_rating;
-use crate::{theme, ThumbSource, ThumbState};
+use crate::{theme, Presence, ThumbSource, ThumbState};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::{Command, CullChange};
 use core_model::identity::ImageId;
@@ -121,14 +121,27 @@ fn cell(
     active: bool,
     thumbs: &mut dyn ThumbSource,
 ) -> bool {
+    let missing = thumbs.presence(row) == Presence::Missing;
     let response = ui.interact(
         rect,
         Id::unique(("develop_film_cell", row.id)),
         Sense::click(),
     );
+    crate::widgets::describe_selected(
+        &response,
+        egui::accesskit::Role::ListBoxOption,
+        true,
+        active,
+        &crate::library::cell_name(row, missing),
+    );
+    crate::widgets::focus_ring(ui, &response, rect, 4);
     let painter = ui.painter();
     painter.rect_filled(rect, 4, Color32::from_rgb(0x1a, 0x1a, 0x1a));
-    let fade = if row.flag == "reject" { 0.45 } else { 1.0 };
+    let fade = if row.flag == "reject" || missing {
+        0.45
+    } else {
+        1.0
+    };
     match thumbs.thumb(row) {
         ThumbState::Ready { texture, size } => {
             let (w, h) = (size[0].max(1) as f32, size[1].max(1) as f32);
@@ -148,6 +161,15 @@ fn cell(
                 theme::T3,
             );
         }
+    }
+    if missing {
+        painter.text(
+            rect.right_bottom() - egui::vec2(6.0, 4.0),
+            Align2::RIGHT_BOTTOM,
+            "!",
+            FontId::proportional(14.0),
+            theme::REJECT,
+        );
     }
     let (width, color) = if active {
         (2.0, theme::ACCENT)

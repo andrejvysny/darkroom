@@ -5,7 +5,7 @@ use crate::state::MirrorStatus;
 use crate::AppError;
 use core_model::catalog::{
     CollectionRow, DateTreeYear, FolderRow, ImageRow, KeywordRow, QueryParams, RejectDeleteResult,
-    RejectSummary,
+    RejectSummary, RemoveResult,
 };
 use core_model::document::EditDocument;
 use core_model::identity::{
@@ -144,6 +144,11 @@ pub enum Mutation {
     /// Trash and drop its rows. The target set is re-derived in the catalog with the reject flag
     /// forced on; the caller never supplies ids.
     DeleteRejected(Box<QueryParams>),
+    /// Drop the catalog rows of these photos (plus a RAW's companions). Files and sidecars are
+    /// never touched.
+    RemoveFromLibrary {
+        images: Vec<ImageId>,
+    },
 }
 
 /// What a committed [`Mutation`] reports back.
@@ -152,6 +157,7 @@ pub enum MutationReport {
     Done,
     CollectionCreated(i64),
     RejectedDeleted(RejectDeleteResult),
+    RemovedFromLibrary(RemoveResult),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,6 +182,8 @@ pub enum Command {
     LoadCollections,
     /// Keywords, collection membership and pair info of one image (the info panel).
     LoadImageTags(ImageId),
+    /// The sidecar mirror made progress; re-read the selected image's mirror state.
+    RefreshMirrorStatus,
     /// Counts for the delete-rejected confirmation, for exactly this filter.
     LoadRejectSummary(Box<QueryParams>),
     Mutate(Mutation),
@@ -196,6 +204,7 @@ impl Command {
             Self::LoadKeywords => ActionId::LoadKeywords,
             Self::LoadCollections => ActionId::LoadCollections,
             Self::LoadImageTags(_) => ActionId::LoadImageTags,
+            Self::RefreshMirrorStatus => ActionId::RefreshMirrorStatus,
             Self::LoadRejectSummary(_) => ActionId::LoadRejectSummary,
             Self::Mutate(_) => ActionId::Mutate,
             Self::Edit(intent) => match intent {
@@ -255,6 +264,12 @@ pub enum Operation {
     LoadKeywords,
     LoadCollections,
     LoadImageTags(ImageId),
+    /// Re-read the mirror state of `key`'s image; `revision` is the saved revision it was asked
+    /// for, so a result older than that is never applied.
+    LoadMirrorStatus {
+        key: SaveKey,
+        revision: CatalogRevision,
+    },
     LoadRejectSummary(Box<QueryParams>),
     Mutate(Mutation),
 }
@@ -272,6 +287,7 @@ impl Operation {
             Self::LoadKeywords => ActionId::LoadKeywords,
             Self::LoadCollections => ActionId::LoadCollections,
             Self::LoadImageTags(_) => ActionId::LoadImageTags,
+            Self::LoadMirrorStatus { .. } => ActionId::RefreshMirrorStatus,
             Self::LoadRejectSummary(_) => ActionId::LoadRejectSummary,
             Self::Mutate(_) => ActionId::Mutate,
         }
@@ -315,6 +331,7 @@ pub enum Outcome {
     Keywords(Vec<KeywordRow>),
     Collections(Vec<CollectionRow>),
     ImageTags(Box<ImageTags>),
+    MirrorStatus(MirrorStatus),
     RejectSummary(RejectSummary),
     Mutated(MutationReport),
 }

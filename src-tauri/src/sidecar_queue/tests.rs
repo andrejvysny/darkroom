@@ -58,7 +58,7 @@ fn take_dirty(queue: &SidecarQueue) -> Vec<i64> {
 /// dirty set and the queue refuses to report a drain.
 #[test]
 fn failed_sidecar_write_keeps_the_dirty_mark() {
-    let f = crate::sidecar_write::tests::Fix::new("queue-failed-write");
+    let f = core_runtime::sidecar::test_support::Fix::new("queue-failed-write");
     let id = f.insert_image(30, "a.cr3");
     let queue = SidecarQueue::new();
     queue.mark_dirty(id);
@@ -86,7 +86,7 @@ fn failed_sidecar_write_keeps_the_dirty_mark() {
 /// The other half: a written image and a row that no longer exists both finish their marks.
 #[test]
 fn written_and_gone_ids_finish_their_marks() {
-    let f = crate::sidecar_write::tests::Fix::new("queue-written-gone");
+    let f = core_runtime::sidecar::test_support::Fix::new("queue-written-gone");
     let id = f.insert_image(31, "a.cr3");
     let queue = SidecarQueue::new();
     queue.mark_dirty(id);
@@ -192,7 +192,7 @@ fn drain_with_deferred_is_not_success() {
 
 #[test]
 fn success_clears_deferred() {
-    let f = crate::sidecar_write::tests::Fix::new("queue-deferred-success");
+    let f = core_runtime::sidecar::test_support::Fix::new("queue-deferred-success");
     let id = f.insert_image(32, "a.cr3");
     let (queue, tick, t0) = queued();
     queue.mark_dirty(id);

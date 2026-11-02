@@ -402,3 +402,28 @@ fn mutations_on_a_closed_catalog_report_not_open() {
         Err(AppError::NotOpen)
     );
 }
+
+#[test]
+fn remove_from_library_drops_rows_but_keeps_files() {
+    let f = Fixture::new();
+    let (keep, gone) = (f.image(1, "keep.cr3"), f.image(2, "gone.cr3"));
+    let companion = f.image(3, "gone.jpg");
+    {
+        let db = f.db.lock().unwrap();
+        assert!(core_library::link_pair(&db.conn, gone, companion).unwrap());
+    }
+    let MutationReport::RemovedFromLibrary(result) = f
+        .adapter
+        .mutate(&Mutation::RemoveFromLibrary {
+            images: ids(&[gone]),
+        })
+        .unwrap()
+    else {
+        panic!("expected RemovedFromLibrary");
+    };
+    assert_eq!((result.removed, result.companions), (2, 1));
+    assert_eq!(f.present(), vec![keep]);
+    for name in ["keep.cr3", "gone.cr3", "gone.jpg"] {
+        assert!(f.dir.join(name).exists(), "{name}");
+    }
+}

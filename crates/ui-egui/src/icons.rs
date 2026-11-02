@@ -303,7 +303,13 @@ pub fn icon_button_enabled(
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), sense);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, tooltip));
+    crate::widgets::focus_ring(ui, &response, rect, theme::RADIUS_SM);
     if !enabled {
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_disabled();
+        });
         paint(
             ui.painter(),
             Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0)),

@@ -11,6 +11,7 @@ mod masks;
 pub mod settings;
 mod ui_numeric;
 mod view;
+pub mod viewport;
 
 pub use adjustments::*;
 pub use crop::*;

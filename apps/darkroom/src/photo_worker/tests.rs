@@ -237,6 +237,27 @@ fn report_keeps_prepared_and_pool_separate() {
     assert!(!report.over_budget);
 }
 
+/// `report` copies the in-flight `timings` into `last_timings` (default before any request).
+#[test]
+fn report_publishes_last_request_timings() {
+    let mut cache = PreparedCache::<Stub>::with_limits(100, 2);
+    let pool = render_wgpu::ResourceReport {
+        pool_bytes: 0,
+        pool_limit_bytes: 0,
+    };
+    assert_eq!(cache.report(pool).last_timings, StageTimings::default());
+    let timings = StageTimings {
+        read_ms: 120,
+        develop_ms: 340,
+        prepare_ms: 15,
+        render_ms: 8,
+        histogram_ms: 4,
+        prepared_cache_hit: true,
+    };
+    cache.timings = timings;
+    assert_eq!(cache.report(pool).last_timings, timings);
+}
+
 #[test]
 fn unsupported_reason_names_the_feature() {
     assert_eq!(unsupported_reason(&DevelopParams::default()), None);

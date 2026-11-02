@@ -35,6 +35,7 @@ fn snapshot(can_undo: bool, can_redo: bool) -> ApplicationSnapshot {
                 revision: Some(EditRevision(1)),
                 process_version: Some(ProcessVersion(6)),
                 dirty: false,
+                gesture_active: false,
                 can_undo,
                 can_redo,
             },

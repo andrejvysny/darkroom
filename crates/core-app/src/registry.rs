@@ -19,6 +19,7 @@ pub enum ActionId {
     LoadKeywords,
     LoadCollections,
     LoadImageTags,
+    RefreshMirrorStatus,
     LoadRejectSummary,
     /// Durable catalog mutations (batch cull, keywords, collections, pairs, delete rejected).
     Mutate,
@@ -197,6 +198,14 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         shortcut: None,
         menu: None,
         route: ActionId::LoadImageTags,
+        enabled: EnabledRequirement::CatalogReady,
+    },
+    ActionDescriptor {
+        id: "refresh_mirror_status",
+        label: "Refresh Sidecar Status",
+        shortcut: None,
+        menu: None,
+        route: ActionId::RefreshMirrorStatus,
         enabled: EnabledRequirement::CatalogReady,
     },
     ActionDescriptor {

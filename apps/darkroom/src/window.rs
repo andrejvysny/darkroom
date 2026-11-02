@@ -18,12 +18,27 @@ use winit::{
     window::{Window, WindowId},
 };
 
+/// Event-loop wakeups delivered through the proxy.
+#[derive(Debug)]
+enum UserEvent {
+    /// Repaint no later than this instant (`None`: only re-run `about_to_wait`).
+    Wake(Option<Instant>),
+    /// The OS accessibility service asked for the tree, an action or deactivation.
+    AccessKit(egui_winit::accesskit_winit::Event),
+}
+
+impl From<egui_winit::accesskit_winit::Event> for UserEvent {
+    fn from(event: egui_winit::accesskit_winit::Event) -> Self {
+        Self::AccessKit(event)
+    }
+}
+
 pub fn run() -> Result<(), String> {
     run_with_catalog(None)
 }
 
 pub fn run_with_catalog(catalog_path: Option<std::path::PathBuf>) -> Result<(), String> {
-    let event_loop = EventLoop::<Option<Instant>>::with_user_event()
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|e| e.to_string())?;
     let mut app = App {
@@ -46,7 +61,7 @@ struct App {
     state: Option<State>,
     error: Option<String>,
     next_repaint: Option<Instant>,
-    proxy: EventLoopProxy<Option<Instant>>,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 struct State {
@@ -111,7 +126,7 @@ fn sdr_config(
 impl State {
     fn new(
         event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Option<Instant>>,
+        proxy: EventLoopProxy<UserEvent>,
         catalog_path: Option<std::path::PathBuf>,
     ) -> Result<Self, String> {
         let window = Arc::new(
@@ -131,12 +146,14 @@ impl State {
             surface.configure(&gpu.context.device, &config);
         }
         let (egui, input) = egui_input(event_loop, &window, &gpu.context, proxy.clone());
+        // Shown only now: the AccessKit adapter `egui_input` attached refuses a visible window.
+        window.set_visible(true);
         chrome::install_fonts(&egui);
         let renderer =
             egui_wgpu::Renderer::new(&gpu.context.device, config.format, Default::default());
         // Settings load before the catalog: preferences are the host's, not the catalog's, and a
         // failure there must never stop the window from opening.
-        let settings = crate::settings::SettingsState::load(catalog_path.as_deref());
+        let mut settings = crate::settings::SettingsState::load(catalog_path.as_deref());
         let wake_workflow = proxy.clone();
         // Thumbnails live next to the catalog (`<dir>/catalog.db`, `<dir>/thumbs/`).
         let thumbs = catalog_path.as_deref().and_then(|path| {
@@ -147,7 +164,7 @@ impl State {
                 root,
                 core_model::identity::CURRENT_PROCESS_VERSION.0,
                 Arc::new(move || {
-                    let _ = wake_thumbs.send_event(Some(Instant::now()));
+                    let _ = wake_thumbs.send_event(UserEvent::Wake(Some(Instant::now())));
                 }),
             ) {
                 Ok(store) => Some(store),
@@ -163,12 +180,20 @@ impl State {
                     path,
                     true,
                     Arc::new(move || {
-                        let _ = wake_workflow.send_event(Some(Instant::now()));
+                        let _ = wake_workflow.send_event(UserEvent::Wake(Some(Instant::now())));
                     }),
                 )
             })
             .transpose()
             .map_err(|e| e.to_string())?;
+        // A mirror that could not start costs the session its sidecars, not the window: same
+        // status-area notice path as the settings diagnostics, never a failed launch.
+        if let Some(error) = application.as_ref().and_then(|a| a.mirror_error()) {
+            settings.note(format!(
+                "Darkroom could not start its sidecar mirror ({error}); your edits are saved in \
+                 the catalog and reach the photo folders on the next launch."
+            ));
+        }
         let photo_proxy = proxy;
         let device_epoch = DeviceEpoch(1);
         let mut photo_view = PhotoView::new(device_epoch);
@@ -177,7 +202,7 @@ impl State {
             Arc::clone(&gpu.pipeline),
             device_epoch,
             Arc::new(move || {
-                let _ = photo_proxy.send_event(Some(Instant::now()));
+                let _ = photo_proxy.send_event(UserEvent::Wake(Some(Instant::now())));
             }),
         ) {
             Ok(worker) => Some(worker),
@@ -366,6 +391,7 @@ impl State {
     /// Render the acquired frame; returns the delay until the next redraw.
     fn present(&mut self, frame: wgpu::SurfaceTexture, suboptimal: bool) -> Duration {
         let input = self.input.take_egui_input(&self.window);
+        crate::input_trace::egui_input(&input);
         let output = if let Some(application) = self.application.as_mut() {
             let (snapshot, reopen) = (application.snapshot(), application.reopen_command());
             self.photo_view.reconcile(&snapshot);
@@ -491,6 +517,23 @@ impl State {
     }
 }
 
+impl State {
+    /// Route an OS accessibility request into egui. The tree is only built while an assistive
+    /// client (VoiceOver, Accessibility Inspector, automation) is attached.
+    fn on_accesskit(&mut self, event: egui_winit::accesskit_winit::Event) {
+        use egui_winit::accesskit_winit::WindowEvent as Ax;
+        if event.window_id != self.window.id() {
+            return;
+        }
+        match event.window_event {
+            Ax::InitialTreeRequested => self.egui.enable_accesskit(),
+            Ax::ActionRequested(request) => self.input.on_accesskit_action_request(request),
+            Ax::AccessibilityDeactivated => self.egui.disable_accesskit(),
+        }
+        self.window.request_redraw();
+    }
+}
+
 impl App {
     fn schedule(&mut self, deadline: Option<Instant>) {
         if let Some(deadline) = deadline {
@@ -502,9 +545,16 @@ impl App {
     }
 }
 
-impl ApplicationHandler<Option<Instant>> for App {
-    fn user_event(&mut self, _: &ActiveEventLoop, deadline: Option<Instant>) {
-        self.schedule(deadline);
+impl ApplicationHandler<UserEvent> for App {
+    fn user_event(&mut self, _: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Wake(deadline) => self.schedule(deadline),
+            UserEvent::AccessKit(event) => {
+                if let Some(state) = self.state.as_mut() {
+                    state.on_accesskit(event);
+                }
+            }
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -563,6 +613,7 @@ impl ApplicationHandler<Option<Instant>> for App {
         let Some(state) = self.state.as_mut().filter(|state| state.window.id() == id) else {
             return;
         };
+        crate::input_trace::winit_event(&event);
         let response = state.input.on_window_event(&state.window, &event);
         if response.repaint {
             state.window.request_redraw();
@@ -587,6 +638,12 @@ impl ApplicationHandler<Option<Instant>> for App {
                 // A geometry change invalidates the previous failure mode.
                 state.surface_state.on_visible();
                 state.resize(size);
+            }
+            WindowEvent::Focused(true) => {
+                if let Some(store) = state.thumbs.as_ref() {
+                    store.invalidate_presence();
+                }
+                state.window.request_redraw();
             }
             WindowEvent::Occluded(false) => {
                 // Visibility returned; a prior failure streak no longer applies
@@ -631,15 +688,16 @@ fn egui_input(
     event_loop: &ActiveEventLoop,
     window: &Window,
     context: &core_pipeline::GpuContext,
-    proxy: EventLoopProxy<Option<Instant>>,
+    proxy: EventLoopProxy<UserEvent>,
 ) -> (egui::Context, egui_winit::State) {
+    let accesskit_proxy = proxy.clone();
     let egui = egui::Context::default();
     egui.set_request_repaint_callback(move |info| {
         if info.viewport_id == egui::ViewportId::ROOT {
-            let _ = proxy.send_event(Instant::now().checked_add(info.delay));
+            let _ = proxy.send_event(UserEvent::Wake(Instant::now().checked_add(info.delay)));
         }
     });
-    let input = egui_winit::State::new(
+    let mut input = egui_winit::State::new(
         egui.clone(),
         egui::ViewportId::ROOT,
         event_loop,
@@ -647,5 +705,6 @@ fn egui_input(
         window.theme(),
         Some(context.max_texture_dim as usize),
     );
+    input.init_accesskit(event_loop, window, accesskit_proxy);
     (egui, input)
 }

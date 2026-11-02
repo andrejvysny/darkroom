@@ -2,7 +2,7 @@
 
 use super::{cull_target, info_tags, selected_row, LibraryUi, INFO_ID};
 use crate::widgets::{chip, color_dots, star_rating};
-use crate::{theme, HistogramData, ThumbSource, ThumbState};
+use crate::{theme, HistogramData, Presence, ThumbSource, ThumbState};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::{ColorLabel, Command, CullChange, CullFlag};
 use core_model::catalog::ImageRow;
@@ -41,7 +41,8 @@ pub(crate) fn show(
                         preview(ui, row, thumbs);
                         rating(ui, snapshot, row, commands);
                         histogram_box(ui, row, histogram);
-                        metadata(ui, row);
+                        let missing = thumbs.presence(row) == Presence::Missing;
+                        metadata(ui, row, missing);
                         info_tags::show(ui, snapshot, ImageId(row.id), lib, commands);
                     });
             });
@@ -104,7 +105,7 @@ fn histogram_box(ui: &mut egui::Ui, row: &ImageRow, histogram: Option<&Histogram
     crate::histogram::draw(ui, 64.0, histogram, row.id);
 }
 
-fn metadata(ui: &mut egui::Ui, row: &ImageRow) {
+fn metadata(ui: &mut egui::Ui, row: &ImageRow, missing: bool) {
     theme::section_heading(ui, "Metadata");
     let dash = || "—".to_owned();
     let camera = row.camera_model.clone().or_else(|| row.camera_make.clone());
@@ -136,6 +137,16 @@ fn metadata(ui: &mut egui::Ui, row: &ImageRow) {
                 );
             });
         });
+    }
+    if missing {
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Missing — {}", row.path))
+                    .size(11.0)
+                    .color(theme::REJECT),
+            )
+            .wrap(),
+        );
     }
 }
 

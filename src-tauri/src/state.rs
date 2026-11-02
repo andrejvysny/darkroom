@@ -1,4 +1,3 @@
-use crate::outbox_worker::OutboxHandle;
 use crate::sidecar_queue::SidecarQueue;
 use crate::thumb_queue::ThumbQueue;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
@@ -9,6 +8,7 @@ use core_pipeline::backend::PreparedImage;
 use core_pipeline::{DevelopPipeline, GpuContext, Histogram};
 use core_raw::LinearImage;
 use core_runtime::save_barrier::SaveBarrier;
+use core_runtime::sidecar::OutboxHandle;
 use std::collections::HashSet;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::path::PathBuf;

@@ -175,6 +175,14 @@ fn view_toggle(ui: &mut egui::Ui, lib: &mut LibraryUi) {
     for (loupe, icon, tip) in [(true, Icon::Square, "Loupe"), (false, Icon::Grid, "Grid")] {
         let active = lib.loupe == loupe;
         let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::click());
+        crate::widgets::describe_selected(
+            &response,
+            egui::accesskit::Role::Button,
+            true,
+            active,
+            tip,
+        );
+        crate::widgets::focus_ring(ui, &response, rect, theme::RADIUS_SM);
         if active {
             ui.painter()
                 .rect_filled(rect, theme::RADIUS_SM, theme::ELEV);

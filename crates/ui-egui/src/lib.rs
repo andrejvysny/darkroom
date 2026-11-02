@@ -78,6 +78,16 @@ pub enum ThumbState {
     Failed,
 }
 
+/// Whether a photo's original file exists on disk, as last checked by the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Presence {
+    /// Not checked yet (or the host cannot tell); rendered as normal.
+    #[default]
+    Unknown,
+    Present,
+    Missing,
+}
+
 /// Host-implemented thumbnail lookup. The UI calls [`ThumbSource::thumb`] for every cell it lays
 /// out this frame, in visual priority order (the first call is the most important); the host
 /// treats the set of rows asked for in one frame as the visible set, queues missing ones and may
@@ -88,6 +98,12 @@ pub trait ThumbSource {
     /// Same contract as [`ThumbSource::thumb`]: cheap, queued, never blocking.
     fn file_preview(&mut self, _path: &str) -> ThumbState {
         ThumbState::Failed
+    }
+    /// Whether the original file of `image` exists. Same contract as [`ThumbSource::thumb`]:
+    /// cheap and cached (the UI must stay filesystem-free); the host checks the rows asked for
+    /// asynchronously and answers [`Presence::Unknown`] until it knows.
+    fn presence(&mut self, _image: &ImageRow) -> Presence {
+        Presence::Unknown
     }
 }
 
@@ -134,8 +150,10 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
     // otherwise be read as a shortcut (Enter → Develop, Cmd+Z → photo undo).
     let typing = root.ctx().text_edit_focused();
     // Modals block pointer input only; their keys must not reach the grid behind them (a culling
-    // key under the delete-rejected confirmation would change what the confirm trashes).
+    // key under the delete-rejected confirmation would change what the confirm trashes) nor the
+    // stage behind them (a bare Z under the import dialog would zoom an unseen photo).
     let modal_open = import.open || state.library.modal_open();
+    state.develop.set_typing(typing || modal_open);
     let mut commands = Vec::new();
     if !typing && !modal_open {
         develop::shortcuts(

@@ -23,9 +23,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use core_model::identity::{DeviceEpoch, FrameKey};
+use core_model::identity::{DeviceEpoch, FrameKey, QualityTier};
 use core_pipeline::backend::PreparedImage;
 use core_pipeline::{ComponentKind, DevelopParams, DevelopPipeline, GpuContext, ViewParams};
 use render_wgpu::{FrameLease, PoolLimits, Renderer};
@@ -88,6 +88,20 @@ pub fn fit_view(width: u32, height: u32) -> ViewParams {
     ViewParams::full(width.max(1), height.max(1))
 }
 
+/// The shader viewport path: render only the crop-local window `[origin, origin + size]` into a
+/// `width × height` target. Overlay defaults come from [`ViewParams::full`] — the presenter never
+/// tints a mask over the presented frame (the histogram worker owns any overlay).
+pub fn window_view(origin: [f32; 2], size: [f32; 2], width: u32, height: u32) -> ViewParams {
+    ViewParams {
+        origin,
+        size,
+        out_w: width.max(1),
+        out_h: height.max(1),
+        active: true,
+        ..ViewParams::full(width, height)
+    }
+}
+
 struct Slot {
     request: Option<PhotoRequest>,
     stop: bool,
@@ -114,6 +128,29 @@ impl SizedPayload for PreparedImage {
     }
 }
 
+/// Wall-clock milliseconds each stage of the last request took. Reset at the start of every
+/// `develop` and published after the request, so a failed/abandoned request still reports the
+/// stages it completed (the rest stay 0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageTimings {
+    /// `core_raw::source_from_path`.
+    pub read_ms: u32,
+    /// `core_raw::develop_linear`.
+    pub develop_ms: u32,
+    /// `pipeline.prepare`.
+    pub prepare_ms: u32,
+    /// The `render_until_free(...)` call.
+    pub render_ms: u32,
+    /// The `histogram_result` call.
+    pub histogram_ms: u32,
+    /// `prepare_image` returned a cached entry.
+    pub prepared_cache_hit: bool,
+}
+
+fn elapsed_ms(started: Instant) -> u32 {
+    u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
 /// Nominal resource numbers (allocation arithmetic, not measured memory) published by the worker
 /// after each request. Pool numbers come from `Renderer::resource_report`; prepared numbers are
 /// summed separately and are NOT folded into the pool.
@@ -128,6 +165,8 @@ pub struct ResourceReport {
     pub peak_decode_cpu_bytes: u64,
     /// The last prepare needed more than the budget even after evicting everything else.
     pub over_budget: bool,
+    /// Stage timings of the last request (zeros before the first).
+    pub last_timings: StageTimings,
 }
 
 /// Prepared-upload cache keyed by `(ImageId, content_hash)`, bounded by BYTES (and a small entry
@@ -141,6 +180,9 @@ pub(crate) struct PreparedCache<V = PreparedImage> {
     over_budget: bool,
     last_decode_cpu_bytes: u64,
     peak_decode_cpu_bytes: u64,
+    /// Stage timings of the request in flight; reset at the start of `develop`, published by
+    /// `report` (same pattern as `note_decode`).
+    timings: StageTimings,
     /// Results the runner wants delivered right after the one it returns (a frame's histogram).
     follow_ups: Vec<PhotoResult>,
 }
@@ -159,6 +201,7 @@ impl<V> PreparedCache<V> {
             over_budget: false,
             last_decode_cpu_bytes: 0,
             peak_decode_cpu_bytes: 0,
+            timings: StageTimings::default(),
             follow_ups: Vec::new(),
         }
     }
@@ -213,6 +256,7 @@ impl<V> PreparedCache<V> {
             last_decode_cpu_bytes: self.last_decode_cpu_bytes,
             peak_decode_cpu_bytes: self.peak_decode_cpu_bytes,
             over_budget: self.over_budget,
+            last_timings: self.timings,
         }
     }
 }
@@ -548,17 +592,25 @@ fn prepare_image(
         request.key.identity.source.image_id.0,
         request.content_hash.clone(),
     );
-    if let Some(prepared) = cache.get(&cache_key) {
-        return Ok(Some(Arc::clone(prepared)));
+    let hit = cache.get(&cache_key).cloned();
+    if let Some(prepared) = hit {
+        cache.timings.prepared_cache_hit = true;
+        return Ok(Some(prepared));
     }
     let path = &request.path;
-    let source = core_raw::source_from_path(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let started = Instant::now();
+    let source = core_raw::source_from_path(path).map_err(|error| {
+        crate::presence::missing_source_message(path, &error)
+            .unwrap_or_else(|| format!("could not read {}: {error}", path.display()))
+    })?;
+    cache.timings.read_ms = elapsed_ms(started);
     if abandon() {
         return Ok(None);
     }
+    let started = Instant::now();
     let linear = core_raw::develop_linear(&source)
         .map_err(|error| format!("could not develop {}: {error}", path.display()))?;
+    cache.timings.develop_ms = elapsed_ms(started);
     if abandon() {
         return Ok(None);
     }
@@ -570,9 +622,11 @@ fn prepare_image(
             + core_pipeline::backend::estimate_mask_bytes(w, h),
         None,
     );
+    let started = Instant::now();
     let prepared = pipeline
         .prepare(ctx, &linear)
         .map_err(|error| format!("GPU prepare failed: {error}"))?;
+    cache.timings.prepare_ms = elapsed_ms(started);
     let prepared = Arc::new(prepared);
     cache.put(cache_key, Arc::clone(&prepared));
     Ok(Some(prepared))
@@ -619,6 +673,22 @@ fn histogram_result(
     }
 }
 
+/// Queue the histogram follow-up and time the whole thing (the GPU work dominates the queueing).
+fn add_histogram(
+    cache: &mut PreparedCache,
+    ctx: &GpuContext,
+    pipeline: &DevelopPipeline,
+    key: FrameKey,
+    prepared: &PreparedImage,
+    params: &DevelopParams,
+) {
+    let started = Instant::now();
+    cache
+        .follow_ups
+        .extend(histogram_result(ctx, pipeline, key, prepared, params));
+    cache.timings.histogram_ms = elapsed_ms(started);
+}
+
 /// Decode (or reuse the cached upload) + develop into a leased target. Worker thread only.
 fn develop(
     ctx: &GpuContext,
@@ -629,6 +699,7 @@ fn develop(
     abandon: Abandon<'_>,
 ) -> Option<PhotoResult> {
     let key = request.key;
+    cache.timings = StageTimings::default();
     let failed = |message: String| Some(PhotoResult::Failed { key, message });
     if let Some(feature) = unsupported_reason(&request.params) {
         return failed(format!(
@@ -649,15 +720,18 @@ fn develop(
         Ok(None) => return Some(PhotoResult::Abandoned(key)),
         Err(message) => return failed(message),
     };
+    let started = Instant::now();
     let rendered = render_until_free(abandon, || {
         renderer.render(key, &prepared, &params, &request.view)
     });
+    cache.timings.render_ms = elapsed_ms(started);
     match rendered {
         Ok(lease) => {
-            if !abandon() {
-                cache
-                    .follow_ups
-                    .extend(histogram_result(ctx, pipeline, key, &prepared, &params));
+            // The histogram is the expensive half of a request (a second 256² render plus a
+            // blocking readback) and nobody reads it mid-drag: only settled frames pay for it.
+            // `timings.histogram_ms` stays 0 for the skipped tier.
+            if !abandon() && key.quality == QualityTier::Settled {
+                add_histogram(cache, ctx, pipeline, key, &prepared, &params);
             }
             Some(PhotoResult::Frame(lease))
         }

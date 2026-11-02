@@ -180,3 +180,13 @@ pub struct RejectDeleteResult {
     /// Hex content hashes of the removed images (thumbnail GC).
     pub hashes: Vec<String>,
 }
+
+/// Result of a remove-from-library pass (catalog rows only; files are never touched).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveResult {
+    /// Rows deleted, companions included.
+    pub removed: usize,
+    /// Of `removed`, the camera companions that rode along with a RAW.
+    pub companions: usize,
+}

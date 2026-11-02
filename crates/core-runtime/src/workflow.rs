@@ -55,6 +55,9 @@ impl EffectExecutor for InlineExecutor {
             Operation::LoadImageTags(image) => catalog
                 .image_tags(image.0)
                 .map(|tags| Outcome::ImageTags(Box::new(tags))),
+            Operation::LoadMirrorStatus { key, .. } => catalog
+                .mirror_status(key.image_id.0)
+                .map(Outcome::MirrorStatus),
             Operation::LoadRejectSummary(params) => {
                 catalog.reject_summary(&params).map(Outcome::RejectSummary)
             }

@@ -33,6 +33,8 @@ pub trait CatalogPort: Send + Sync {
     fn set_cull(&self, image_id: i64, change: crate::workflow::CullChange) -> Result<(), AppError>;
     fn keywords(&self) -> Result<Vec<KeywordRow>, AppError>;
     fn collections(&self) -> Result<Vec<CollectionRow>, AppError>;
+    /// Where the sidecar mirror of `image_id`'s saved edit stands; read-only.
+    fn mirror_status(&self, image_id: i64) -> Result<crate::state::MirrorStatus, AppError>;
     /// Keywords, static collections containing the image, and its pair (from either member).
     fn image_tags(&self, image_id: i64) -> Result<crate::state::ImageTags, AppError>;
     /// Counts for deleting the rejected photos matching `params` (reject flag forced on).

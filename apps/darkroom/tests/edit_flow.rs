@@ -23,6 +23,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 fn fixture() -> Option<PathBuf> {
@@ -220,7 +221,8 @@ fn edit_undo_switch_save_quit_relaunch_restores_exact_exposure() {
     let revision = save
         .saved_catalog_revision
         .expect("catalog save acknowledged");
-    // The native host runs no outbox drain: the sidecar mirror is honestly still owed.
+    // `mirror` is read inside the save, so it still reports what was owed when the commit landed;
+    // the host's own drain catches up afterwards (see `a_saved_edit_is_mirrored_...`).
     assert_eq!(
         save.mirror,
         MirrorStatus::Pending {
@@ -299,4 +301,64 @@ fn failed_save_cancels_quit_keeps_editing_and_discard_unblocks_it() {
     assert!(rig.app.is_shutdown_complete(), "{:?}", rig.snap().error);
     drop(rig);
     assert_eq!(stored(&scratch.catalog(), a), Some(before), "A untouched");
+}
+
+/// The drain runs on the host's mirror thread, on its own schedule.
+fn wait_for_sidecar(raw: &Path) -> core_library::Sidecar {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(sidecar) = core_library::sidecar::read_sidecar(&raw.to_string_lossy()) {
+            return sidecar;
+        }
+        assert!(
+            Instant::now() < until,
+            "no sidecar ever appeared beside {}",
+            raw.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The whole point of the host's mirror: a save the catalog acknowledged reaches the photo folder
+/// without the legacy host, and survives the quit that joined the mirror thread.
+#[test]
+fn a_saved_edit_is_mirrored_to_a_sidecar_beside_the_raw() {
+    let Some((scratch, a, _b)) = catalog_with_two_images("mirror") else {
+        return;
+    };
+    let mut rig = Rig::open(&scratch.catalog());
+    rig.select(a);
+    rig.edit(EditIntent::SetExposure(0.4));
+    rig.settle();
+    assert!(!rig.snap().editor.save.dirty, "the edit is committed");
+
+    let raw = scratch.0.join("library").join("_A.CR3");
+    let sidecar = wait_for_sidecar(&raw);
+    assert_eq!(
+        sidecar.develop.and_then(|d| d["exposure"].as_f64()),
+        Some(0.4),
+        "the file beside the RAW carries the params the catalog committed"
+    );
+
+    // The UI's "Pending" must advance on its own once the mirror publishes: no further edit,
+    // no reselect, only the host's pump.
+    let saved = rig.snap().editor.save.saved_catalog_revision.unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while rig.snap().editor.save.mirror != (MirrorStatus::Mirrored { revision: saved }) {
+        assert!(
+            Instant::now() < until,
+            "mirror status stuck at {:?}",
+            rig.snap().editor.save.mirror
+        );
+        rig.app.pump().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    rig.quit();
+    assert!(rig.app.is_shutdown_complete(), "{:?}", rig.snap().error);
+    drop(rig);
+    assert!(
+        core_library::sidecar::read_sidecar(&raw.to_string_lossy()).is_some(),
+        "joining the mirror left the published file in place"
+    );
 }

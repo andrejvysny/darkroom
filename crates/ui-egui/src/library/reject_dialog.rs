@@ -60,6 +60,7 @@ pub(crate) fn show(
     let mut rects = Vec::new();
     let response = egui::Modal::new(egui::Id::unique("library_reject_dialog")).show(ctx, |ui| {
         ui.set_width(340.0);
+        crate::widgets::label_dialog(ui, "Delete rejected photos");
         ui.label(RichText::new("Delete rejected photos").strong().size(15.0));
         ui.add_space(6.0);
         let Some(summary) = summary else {
