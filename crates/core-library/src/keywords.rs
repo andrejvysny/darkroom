@@ -4,16 +4,8 @@
 
 use crate::error::LibError;
 use core_db::rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeywordRow {
-    pub id: i64,
-    pub name: String,
-    /// Number of present images carrying this keyword (0 when returned per-image).
-    pub count: i64,
-}
+pub use core_model::catalog::KeywordRow;
 
 /// All keywords with present-image counts, ordered by name (for the left nav).
 pub fn list_keywords(conn: &Connection) -> Result<Vec<KeywordRow>, LibError> {

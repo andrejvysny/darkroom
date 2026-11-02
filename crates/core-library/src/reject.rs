@@ -12,35 +12,8 @@
 use crate::error::LibError;
 use crate::query::{rejected_ids, QueryParams};
 use core_db::rusqlite::Connection;
-use serde::Serialize;
 
-/// What "delete all rejected" would touch, for the confirmation dialog.
-#[derive(Debug, Default, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RejectSummary {
-    /// Images the user flagged `reject`.
-    pub images: i64,
-    /// Camera companions (paired JPEG/HEIF) that ride along with a rejected RAW.
-    pub companions: i64,
-    /// Total bytes on disk across both.
-    pub bytes: i64,
-}
-
-/// Result of a delete pass.
-#[derive(Debug, Default, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RejectDeleteResult {
-    /// Files trashed and rows removed (images + companions).
-    pub trashed: usize,
-    /// Files that could not be trashed; their rows were kept.
-    pub failed: usize,
-    /// Of `trashed`, how many were camera companions.
-    pub companions: usize,
-    /// Trashed file whose row was repointed or replaced before finalize; the row was left untouched.
-    pub changed: usize,
-    /// Hex content-hashes of the removed images (for thumbnail GC).
-    pub hashes: Vec<String>,
-}
+pub use core_model::catalog::{RejectDeleteResult, RejectSummary};
 
 /// Planned "delete rejected" run: targets plus which ids are companions (for the count).
 pub struct RejectPlan {

@@ -114,3 +114,69 @@ pub struct DateTreeYear {
     pub count: i64,
     pub dates: Vec<DateNode>,
 }
+
+/// One keyword with its present-image count (0 when listed per image).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeywordRow {
+    pub id: i64,
+    pub name: String,
+    pub count: i64,
+}
+
+/// A static or smart collection. `query` is the smart predicate JSON (a partial camelCase
+/// `QueryParams`), `None` for static collections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionRow {
+    pub id: i64,
+    pub name: String,
+    pub is_smart: bool,
+    pub query: Option<String>,
+    /// Member count (static) or live-match count (smart).
+    pub count: i64,
+}
+
+impl CollectionRow {
+    /// The smart predicate as query params; `None` for a static collection or an unreadable
+    /// predicate (never a silently empty filter that would match everything).
+    pub fn smart_query(&self) -> Option<QueryParams> {
+        if !self.is_smart {
+            return None;
+        }
+        serde_json::from_str(self.query.as_deref()?).ok()
+    }
+}
+
+/// Whole-pair view for an image, from either member (RAW + camera companions).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairInfo {
+    /// `"primary"` (the RAW) or `"secondary"` (a companion JPEG/HEIF).
+    pub role: String,
+    pub primary_id: i64,
+    /// Every companion, ordered by filename (includes the queried image when it is a secondary).
+    pub secondaries: Vec<ImageRow>,
+}
+
+/// What "delete all rejected" would touch, for the confirmation dialog.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectSummary {
+    pub images: i64,
+    /// Camera companions that ride along with a rejected RAW.
+    pub companions: i64,
+    pub bytes: i64,
+}
+
+/// Result of a delete-rejected pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectDeleteResult {
+    pub trashed: usize,
+    pub failed: usize,
+    pub companions: usize,
+    pub changed: usize,
+    /// Hex content hashes of the removed images (thumbnail GC).
+    pub hashes: Vec<String>,
+}
