@@ -1,10 +1,13 @@
 //! Virtualised thumbnail grid. Only the grid rows intersecting the scroll viewport are laid out,
 //! and [`ThumbSource::thumb`] is called only for those cells, in row-major order.
 
-use super::{cull_enabled, LibraryUi, GRID_SCROLL_ID};
+use super::filters::{any_filter, clear_filters};
+use super::{cull_enabled, requery, select, LibraryUi, GRID_SCROLL_ID};
 use crate::icons::{self, Icon};
+use crate::widgets::pill_button;
 use crate::widgets::{label_color, star_rating_at};
-use crate::{theme, Mode, ThumbSource, ThumbState};
+use crate::{theme, PhotoUi, ThumbSource, ThumbState};
+use core_app::import::ImportRequest;
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::{ColorLabel, Command, CullChange};
 use core_model::catalog::ImageRow;
@@ -50,23 +53,21 @@ pub(crate) fn show(
     snapshot: &ApplicationSnapshot,
     thumbs: &mut dyn ThumbSource,
     lib: &mut LibraryUi,
-    mode: &mut Mode,
+    photo: &mut PhotoUi,
+    import_requests: &mut Vec<ImportRequest>,
     commands: &mut Vec<Command>,
 ) {
     lib.cell_rects.clear();
+    if lib.loupe && snapshot.editor.selected.is_some() {
+        loupe(root, snapshot, lib, photo);
+        return;
+    }
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(theme::STAGE))
         .show(root, |ui| {
             let rows = &snapshot.library.rows;
             if rows.is_empty() {
-                let text = if snapshot.catalog_ready {
-                    "No photos match the current filters."
-                } else {
-                    "No catalog open."
-                };
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new(text).color(theme::T2));
-                });
+                empty_state(ui, snapshot, lib, import_requests, commands);
                 return;
             }
             egui::ScrollArea::vertical()
@@ -88,7 +89,7 @@ pub(crate) fn show(
                     let range = (first * m.cols)..(last * m.cols).min(rows.len());
                     for index in range {
                         let rect = m.cell_rect(area.min, index);
-                        cell(ui, snapshot, &rows[index], rect, thumbs, mode, commands);
+                        cell(ui, snapshot, &rows[index], rect, thumbs, lib, commands);
                         lib.cell_rects.push((rows[index].id, rect));
                     }
                 });
@@ -120,13 +121,14 @@ fn cell(
     row: &ImageRow,
     rect: Rect,
     thumbs: &mut dyn ThumbSource,
-    mode: &mut Mode,
+    lib: &mut LibraryUi,
     commands: &mut Vec<Command>,
 ) {
     let id = Id::unique(("library_cell", row.id));
     let mut response = ui.interact(rect, id, Sense::click());
     let fade = if row.flag == "reject" { 0.45 } else { 1.0 };
-    let selected = snapshot.editor.selected == Some(ImageId(row.id));
+    let primary = snapshot.editor.selected == Some(ImageId(row.id));
+    let selected = primary || lib.selected.contains(&row.id);
     let painter = ui.painter().clone();
     if response.hovered() {
         painter.rect_filled(rect.expand(3.0), 6, theme::HOVER.gamma_multiply(fade));
@@ -162,16 +164,77 @@ fn cell(
         painter.rect_stroke(
             rect.expand(3.0),
             6,
-            Stroke::new(1.5, theme::ACCENT),
+            Stroke::new(
+                1.5,
+                if primary {
+                    theme::ACCENT
+                } else {
+                    theme::ACCENT_LINE
+                },
+            ),
             StrokeKind::Inside,
         );
     }
     if response.clicked() || response.double_clicked() {
-        commands.push(Command::SelectImage(Some(ImageId(row.id))));
+        let modifiers = ui.input(|i| i.modifiers);
+        select::click(snapshot, lib, row.id, modifiers, commands);
     }
     if response.double_clicked() {
-        *mode = Mode::Develop;
+        lib.loupe = true;
     }
+}
+
+/// Loupe: the Develop stage in the Library centre; double-click returns to the grid.
+fn loupe(
+    root: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    lib: &mut LibraryUi,
+    photo: &mut PhotoUi,
+) {
+    let area = root.available_rect_before_wrap();
+    crate::develop::stage::central(root, snapshot, photo);
+    let double = root.ctx().input(|i| {
+        i.pointer
+            .button_double_clicked(egui::PointerButton::Primary)
+            && i.pointer.interact_pos().is_some_and(|p| area.contains(p))
+    });
+    if double {
+        lib.loupe = false;
+    }
+}
+
+fn empty_state(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    lib: &mut LibraryUi,
+    import_requests: &mut Vec<ImportRequest>,
+    commands: &mut Vec<Command>,
+) {
+    let query = &snapshot.library.query;
+    ui.vertical_centered(|ui| {
+        ui.add_space((ui.available_height() * 0.4).max(24.0));
+        if !snapshot.catalog_ready {
+            ui.label(RichText::new("No catalog open.").color(theme::T2));
+        } else if !any_filter(query) && snapshot.library.count == 0 {
+            ui.label(
+                RichText::new("Your library is empty")
+                    .size(16.0)
+                    .color(theme::T1),
+            );
+            ui.add_space(8.0);
+            let add = pill_button(ui, Some(Icon::Upload), "Add photos…", true);
+            lib.button_rects.push(("add_photos", add.rect));
+            if add.clicked() {
+                import_requests.push(ImportRequest::Open);
+            }
+        } else {
+            ui.label(RichText::new("No photos match the current filters.").color(theme::T2));
+            ui.add_space(8.0);
+            if any_filter(query) && pill_button(ui, None, "Clear filters", true).clicked() {
+                commands.push(requery(snapshot, clear_filters));
+            }
+        }
+    });
 }
 
 fn badges(painter: &egui::Painter, row: &ImageRow, thumb: Rect, fade: f32) {

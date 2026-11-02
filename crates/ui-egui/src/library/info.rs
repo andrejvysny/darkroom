@@ -1,7 +1,7 @@
 //! Right info panel: preview, rating / flag / colour controls, histogram, metadata.
 
-use super::{cull_target, selected_row, INFO_ID, NOT_YET};
-use crate::widgets::{chip, color_dots, placeholder_row, star_rating};
+use super::{cull_target, info_tags, selected_row, LibraryUi, INFO_ID};
+use crate::widgets::{chip, color_dots, star_rating};
 use crate::{theme, HistogramData, ThumbSource, ThumbState};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::{ColorLabel, Command, CullChange, CullFlag};
@@ -14,8 +14,10 @@ pub(crate) fn show(
     snapshot: &ApplicationSnapshot,
     thumbs: &mut dyn ThumbSource,
     histogram: Option<&HistogramData>,
+    lib: &mut LibraryUi,
     commands: &mut Vec<Command>,
 ) {
+    info_tags::request(snapshot, lib, commands);
     egui::Panel::right(super::INFO_ID)
         .exact_size(240.0)
         .resizable(false)
@@ -40,8 +42,7 @@ pub(crate) fn show(
                         rating(ui, snapshot, row, commands);
                         histogram_box(ui, row, histogram);
                         metadata(ui, row);
-                        theme::section_heading(ui, "Keywords");
-                        placeholder_row(ui, NOT_YET);
+                        info_tags::show(ui, snapshot, ImageId(row.id), lib, commands);
                     });
             });
         });

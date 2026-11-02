@@ -3,12 +3,14 @@
 //! paths) so the headless `tests/edit_flow.rs` can include this file verbatim and drive it with
 //! an injected clock.
 
+use core_app::import::{ImportReport, ImportRequest, ImportView};
 use core_app::ports::{Clock, EventSink, RenderBackend};
 use core_app::state::ApplicationSnapshot;
 use core_app::subscription::{Notice, SnapshotUpdate};
 use core_app::workflow::Command;
 use core_app::AppError;
 use core_runtime::async_workflow::AsyncCatalogWorkflow;
+use core_runtime::import::{ImportPlatform, ImportService};
 use core_runtime::workflow::{InlineExecutor, RuntimePaths};
 use std::{
     path::PathBuf,
@@ -48,6 +50,7 @@ pub struct NativeApplication {
     workflow: AsyncCatalogWorkflow,
     catalog_path: PathBuf,
     clock: Arc<dyn Clock>,
+    import: ImportService,
 }
 impl NativeApplication {
     pub fn new(
@@ -66,6 +69,7 @@ impl NativeApplication {
         wake: Arc<dyn Fn() + Send + Sync>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, AppError> {
+        let import = ImportService::new(Arc::clone(&wake));
         let mut workflow = AsyncCatalogWorkflow::new(
             RuntimePaths {
                 catalog: path.clone(),
@@ -87,6 +91,7 @@ impl NativeApplication {
             workflow,
             catalog_path: path,
             clock,
+            import,
         })
     }
     pub fn reopen_command(&self) -> Command {
@@ -96,7 +101,35 @@ impl NativeApplication {
         self.workflow.snapshot()
     }
     pub fn dispatch(&mut self, command: Command) -> Result<(), AppError> {
+        // A running import holds the open catalog's connection: end it (the current chunk
+        // commits) before the catalog is closed, replaced or the application quits.
+        if matches!(
+            command,
+            Command::CloseCatalog | Command::OpenCatalog(_) | Command::RequestShutdown
+        ) {
+            self.import.stop_and_join();
+        }
         self.workflow.dispatch(command)
+    }
+    pub fn import_view(&self) -> ImportView {
+        self.import.view()
+    }
+    pub fn handle_import(
+        &mut self,
+        request: ImportRequest,
+        platform: &dyn ImportPlatform,
+    ) -> Result<(), AppError> {
+        let catalog = self.workflow.catalog();
+        self.import
+            .handle(request, &catalog, &self.catalog_path, platform)
+    }
+    /// A commit that finished since the last call; the host refreshes the library on it.
+    pub fn take_import_finished(&mut self) -> Option<ImportReport> {
+        self.import.take_finished()
+    }
+    /// A commit ended (finished or failed) since the last call; the host re-reads the library.
+    pub fn take_import_refresh(&mut self) -> bool {
+        self.import.take_refresh()
     }
     pub fn pump(&mut self) -> Result<(), AppError> {
         while self.workflow.pump()? {}

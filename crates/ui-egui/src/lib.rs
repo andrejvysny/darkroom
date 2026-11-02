@@ -6,6 +6,7 @@
 mod develop;
 mod histogram;
 pub mod icons;
+mod import_dialog;
 mod library;
 mod panels;
 mod photo;
@@ -14,11 +15,13 @@ pub mod theme;
 pub mod widgets;
 
 pub use develop::{DevelopUi, DEVELOP_PANEL_ID, EXPOSURE_SLIDER_ID, SAVE_ERROR_ID};
+pub use import_dialog::{ImportUi, IMPORT_DIALOG_ID};
 pub use library::{LibraryUi, GRID_SCROLL_ID, INFO_ID, NAV_ID, NOT_YET, TOOLBAR_ID};
 pub use panels::{settings_notice_strip, SETTINGS_NOTICES_ID};
 pub use photo::{cropped_frame_aspect, fit_output, viewport_revision, PhotoRequestPlan, PhotoUi};
 pub use shell::{COMMAND_ERROR_ID, SEARCH_ID, TOP_BAR_ID};
 
+use core_app::import::{ImportRequest, ImportView};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::Command;
 use core_model::catalog::ImageRow;
@@ -45,6 +48,9 @@ pub struct UiState {
     /// controls drawn over the content (macOS traffic lights with a transparent titlebar).
     pub chrome_inset_left: f32,
     pub library: LibraryUi,
+    pub import: ImportUi,
+    /// Import requests emitted this frame; the host drains and executes them.
+    pub import_requests: Vec<ImportRequest>,
 }
 
 /// Per-channel 256-bin histogram of the developed frame currently on screen. The host passes it
@@ -78,6 +84,11 @@ pub enum ThumbState {
 /// evict textures that were not asked for. Calls must be cheap (no I/O on the UI thread).
 pub trait ThumbSource {
     fn thumb(&mut self, image: &ImageRow) -> ThumbState;
+    /// Preview of a not-yet-imported source file (`path` comes from [`ImportView::files`]).
+    /// Same contract as [`ThumbSource::thumb`]: cheap, queued, never blocking.
+    fn file_preview(&mut self, _path: &str) -> ThumbState {
+        ThumbState::Failed
+    }
 }
 
 /// A [`ThumbSource`] with nothing to show (headless tests, no-catalog window).
@@ -101,6 +112,8 @@ pub struct Frame<'a> {
     pub settings_notices: &'a mut Vec<String>,
     pub thumbs: &'a mut dyn ThumbSource,
     pub histogram: Option<&'a HistogramData>,
+    /// Import service state (dialog, progress, last report).
+    pub import: &'a ImportView,
 }
 
 /// The root UI.
@@ -113,14 +126,24 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
         settings_notices,
         thumbs,
         histogram,
+        import,
     } = frame;
     theme::ensure(root.ctx());
+    // Captured before any widget runs: a single-line TextEdit surrenders focus while handling
+    // Enter/Esc, so by the time the global key handlers run the key that ended the edit would
+    // otherwise be read as a shortcut (Enter → Develop, Cmd+Z → photo undo).
+    let typing = root.ctx().text_edit_focused();
+    // Modals block pointer input only; their keys must not reach the grid behind them (a culling
+    // key under the delete-rejected confirmation would change what the confirm trashes).
+    let modal_open = import.open || state.library.modal_open();
     let mut commands = Vec::new();
-    develop::shortcuts(
-        root.ctx(),
-        develop::enabled_context(snapshot),
-        &mut commands,
-    );
+    if !typing && !modal_open {
+        develop::shortcuts(
+            root.ctx(),
+            develop::enabled_context(snapshot),
+            &mut commands,
+        );
+    }
     shell::top_bar(root, snapshot, reopen, state, &mut commands);
     shell::command_error_strip(root, command_error);
     settings_notice_strip(root, settings_notices);
@@ -134,7 +157,8 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
             thumbs,
             histogram,
             &mut state.library,
-            &mut state.mode,
+            photo,
+            &mut state.import_requests,
             &mut commands,
         ),
         Mode::Develop => {
@@ -150,10 +174,20 @@ pub fn root(root: &mut egui::Ui, frame: Frame<'_>, state: &mut UiState) -> Vec<C
         }
         Mode::Duplicates => shell::duplicates_placeholder(root),
     }
-    library::handle_keys(
+    import_dialog::show(
         root.ctx(),
         snapshot,
-        &state.library,
+        import,
+        thumbs,
+        &mut state.import,
+        &mut state.import_requests,
+        &mut commands,
+    );
+    library::handle_keys(
+        root.ctx(),
+        typing || modal_open,
+        snapshot,
+        &mut state.library,
         &mut state.mode,
         &mut commands,
     );

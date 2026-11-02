@@ -10,7 +10,7 @@ mod left;
 mod modules;
 mod params;
 mod slider;
-mod stage;
+pub(crate) mod stage;
 
 use crate::icons::{icon_button_enabled, Icon};
 use crate::{theme, HistogramData, PhotoUi, ThumbSource};

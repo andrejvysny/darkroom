@@ -35,7 +35,7 @@ fn output_dims(snapshot: &ApplicationSnapshot) -> Option<(u32, u32)> {
     })
 }
 
-pub(super) fn central(root: &mut egui::Ui, snapshot: &ApplicationSnapshot, photo: &mut PhotoUi) {
+pub(crate) fn central(root: &mut egui::Ui, snapshot: &ApplicationSnapshot, photo: &mut PhotoUi) {
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(theme::STAGE_DEV))
         .show(root, |ui| {

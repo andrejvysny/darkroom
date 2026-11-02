@@ -117,6 +117,7 @@ impl Harness {
                     settings_notices: &mut notices,
                     thumbs: &mut self.thumbs,
                     histogram: None,
+                    import: &core_app::import::ImportView::default(),
                 },
                 &mut self.ui,
             );
@@ -178,7 +179,7 @@ fn set_cull(commands: &[Command]) -> Vec<&CullChange> {
 }
 
 #[test]
-fn click_selects_and_double_click_opens_develop() {
+fn click_selects_and_double_click_opens_loupe() {
     let mut h = Harness::new(snapshot(20, None));
     let at = thumb_center(&h, 1);
     let seen = h.click(at);
@@ -189,7 +190,8 @@ fn click_selects_and_double_click_opens_develop() {
     assert_eq!(h.ui.mode, Mode::Library);
     let mut seen = h.click(at);
     seen.extend(h.click(at));
-    assert_eq!(h.ui.mode, Mode::Develop, "{seen:?}");
+    assert_eq!(h.ui.mode, Mode::Library, "{seen:?}");
+    assert!(h.ui.library.loupe, "{seen:?}");
 }
 
 #[test]

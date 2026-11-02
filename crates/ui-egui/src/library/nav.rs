@@ -1,7 +1,7 @@
 //! Left catalog navigation: CATALOG / FOLDERS (capture-date tree) / file type filters. Sections
 //! without native data are explicit placeholders.
 
-use super::{requery, LibraryUi, NAV_ID, NOT_YET};
+use super::{nav_sets, requery, LibraryUi, NAV_ID, NOT_YET};
 use crate::icons::Icon;
 use crate::theme;
 use crate::widgets::{nav_row, placeholder_row};
@@ -40,10 +40,9 @@ pub(crate) fn show(
                 .show(ui, |ui| {
                     catalog(ui, snapshot, commands);
                     folders(ui, snapshot, lib, commands);
-                    for heading in ["Collections", "Smart", "Keywords"] {
-                        theme::section_heading(ui, heading);
-                        placeholder_row(ui, NOT_YET);
-                    }
+                    nav_sets::collections(ui, snapshot, lib, commands);
+                    nav_sets::smart(ui, snapshot, lib, commands);
+                    nav_sets::keywords(ui, snapshot, commands);
                     ui.add_space(8.0);
                     let scan = egui::Button::new("Run AI scan…")
                         .min_size(egui::vec2(ui.available_width(), 28.0));
@@ -74,7 +73,11 @@ fn request_dates(snapshot: &ApplicationSnapshot, lib: &mut LibraryUi, commands: 
 
 fn catalog(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec<Command>) {
     let query = &snapshot.library.query;
-    let scoped = query.capture_year.is_some() || query.capture_date.is_some();
+    // A catalog row is active only when its flag is the sole filter; any other dimension (folder,
+    // keyword, collection, label…) means the grid is not "all photos" / "picks" / "rejected".
+    let mut others = query.clone();
+    others.flag = None;
+    let scoped = super::filters::any_filter(&others);
     let flag = query.flag.as_deref();
     let count = snapshot.library.count;
     theme::section_heading(ui, "Catalog");
@@ -96,14 +99,34 @@ fn catalog(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec
     for (label, icon, filter, selected) in rows {
         let shown = selected.then_some(count);
         if nav_row(ui, Some(icon), label, shown, selected, 0.0).clicked() {
+            // Legacy: a catalog row replaces every filter (sort/search are kept).
             commands.push(requery(snapshot, |q| {
+                super::filters::clear_filters(q);
                 q.flag = filter.map(str::to_owned);
-                q.capture_year = None;
-                q.capture_date = None;
             }));
         }
     }
-    placeholder_row(ui, "Recent import");
+    let recent = query.sort.as_deref() == Some("imported_desc");
+    if nav_row(ui, Some(Icon::Clock), "Recent import", None, recent, 0.0).clicked() {
+        commands.push(requery(snapshot, |q| {
+            q.sort = (!recent).then(|| "imported_desc".to_owned());
+        }));
+    }
+    let paired = query.include_paired == Some(true);
+    if nav_row(
+        ui,
+        Some(Icon::Image),
+        "Show paired JPEGs",
+        None,
+        paired,
+        0.0,
+    )
+    .clicked()
+    {
+        commands.push(requery(snapshot, |q| {
+            q.include_paired = (!paired).then_some(true);
+        }));
+    }
 }
 
 fn folders(

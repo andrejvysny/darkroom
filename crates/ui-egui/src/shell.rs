@@ -4,6 +4,7 @@ use crate::icons::{icon_button, Icon};
 use crate::library::{requery, selected_row, NOT_YET};
 use crate::widgets::{pill_button, segmented};
 use crate::{theme, Mode, UiState};
+use core_app::import::ImportRequest;
 use core_app::registry::{action, ActionId};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::Command;
@@ -55,7 +56,14 @@ pub(crate) fn top_bar(
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    right_side(ui, snapshot, reopen, state.mode, commands);
+                    right_side(
+                        ui,
+                        snapshot,
+                        reopen,
+                        state.mode,
+                        &mut state.import_requests,
+                        commands,
+                    );
                 });
             });
             if state.mode == Mode::Develop {
@@ -69,6 +77,7 @@ fn right_side(
     snapshot: &ApplicationSnapshot,
     reopen: &Command,
     mode: Mode,
+    import_requests: &mut Vec<ImportRequest>,
     commands: &mut Vec<Command>,
 ) {
     // Right-to-left: the ⌘K chip first, so it ends up rightmost.
@@ -97,7 +106,14 @@ fn right_side(
         commands.extend(menu.inner);
     }
     if mode != Mode::Develop {
-        pill_button(ui, Some(Icon::Download), "Import", false).on_hover_text(NOT_YET);
+        let enabled = snapshot.catalog_ready;
+        if pill_button(ui, Some(Icon::Download), "Import", enabled)
+            .on_hover_text("Import photos from a folder or card")
+            .clicked()
+            && enabled
+        {
+            import_requests.push(ImportRequest::Open);
+        }
     }
     pill_button(ui, Some(Icon::Upload), "Export", false).on_hover_text(NOT_YET);
     if mode == Mode::Develop {

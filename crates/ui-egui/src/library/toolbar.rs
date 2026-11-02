@@ -1,9 +1,11 @@
 //! Bottom toolbar: count, filters, sort, zoom, view toggle, pagination.
 
-use super::{requery, LibraryUi, NOT_YET, TOOLBAR_ID};
+use super::filters::{any_filter, clear_filters};
+use super::reject_dialog::RejectDialog;
+use super::{requery, LibraryUi, TOOLBAR_ID};
 use crate::icons::{self, icon_button, Icon};
 use crate::theme;
-use crate::widgets::{chip, color_dots, fmt_count, star_rating};
+use crate::widgets::{chip, color_dots, fmt_count, pill_button, star_rating};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::{ColorLabel, Command};
 use egui::{Align, Layout, Rect, RichText, Sense, Stroke, StrokeKind};
@@ -37,9 +39,9 @@ pub(crate) fn show(
             // Below this width the full right group would overlap the filters (minimum window).
             let compact = ui.available_width() < COMPACT_BELOW;
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                filters(ui, snapshot, commands);
+                filters(ui, snapshot, lib, commands);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    view_toggle(ui);
+                    view_toggle(ui, lib);
                     if !compact {
                         zoom(ui, lib);
                     }
@@ -53,7 +55,12 @@ pub(crate) fn show(
 /// Toolbar width (points) under which the zoom slider and the "Sort" label are dropped.
 const COMPACT_BELOW: f32 = 820.0;
 
-fn filters(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec<Command>) {
+fn filters(
+    ui: &mut egui::Ui,
+    snapshot: &ApplicationSnapshot,
+    lib: &mut LibraryUi,
+    commands: &mut Vec<Command>,
+) {
     let query = &snapshot.library.query;
     ui.label(
         RichText::new(format!(
@@ -89,7 +96,31 @@ fn filters(ui: &mut egui::Ui, snapshot: &ApplicationSnapshot, commands: &mut Vec
             q.color_label = next.map(|l| l.as_str().to_owned());
         }));
     }
+    let unlabeled = query.color_label.as_deref() == Some(NO_LABEL);
+    if chip(ui, "No label", unlabeled).clicked() {
+        commands.push(requery(snapshot, |q| {
+            q.color_label = (!unlabeled).then(|| NO_LABEL.to_owned());
+        }));
+    }
+    if any_filter(query)
+        && chip(ui, "Clear", false)
+            .on_hover_text("Clear all filters")
+            .clicked()
+    {
+        commands.push(requery(snapshot, clear_filters));
+    }
+    if query.flag.as_deref() == Some("reject") && snapshot.library.count > 0 {
+        let ready = snapshot.catalog_ready && super::mutate_enabled(snapshot);
+        let response = pill_button(ui, Some(Icon::Trash), "Delete rejected…", ready);
+        lib.button_rects.push(("delete_rejected", response.rect));
+        if response.clicked() {
+            lib.reject_dialog = Some(RejectDialog::new(query));
+        }
+    }
 }
+
+/// `QueryParams::color_label` sentinel for "no colour label".
+const NO_LABEL: &str = "__none__";
 
 fn sort(
     ui: &mut egui::Ui,
@@ -139,32 +170,34 @@ fn tiny_icon(ui: &mut egui::Ui, icon: Icon) {
     icons::paint(ui.painter(), rect, icon, theme::T3);
 }
 
-fn view_toggle(ui: &mut egui::Ui) {
-    // Right-to-left: loupe (disabled) then grid (active).
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::hover());
-    icons::paint(
-        ui.painter(),
-        Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0)),
-        Icon::Square,
-        theme::T3,
-    );
-    response.on_hover_text(format!("Loupe: {NOT_YET}"));
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, theme::RADIUS_SM, theme::ELEV);
-    ui.painter().rect_stroke(
-        rect,
-        theme::RADIUS_SM,
-        Stroke::new(1.0, theme::LINE2),
-        StrokeKind::Inside,
-    );
-    icons::paint(
-        ui.painter(),
-        Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0)),
-        Icon::Grid,
-        theme::T1,
-    );
-    response.on_hover_text("Grid");
+fn view_toggle(ui: &mut egui::Ui, lib: &mut LibraryUi) {
+    // Right-to-left: loupe then grid.
+    for (loupe, icon, tip) in [(true, Icon::Square, "Loupe"), (false, Icon::Grid, "Grid")] {
+        let active = lib.loupe == loupe;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::click());
+        if active {
+            ui.painter()
+                .rect_filled(rect, theme::RADIUS_SM, theme::ELEV);
+            ui.painter().rect_stroke(
+                rect,
+                theme::RADIUS_SM,
+                Stroke::new(1.0, theme::LINE2),
+                StrokeKind::Inside,
+            );
+        } else if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, theme::RADIUS_SM, theme::HOVER.gamma_multiply(0.6));
+        }
+        icons::paint(
+            ui.painter(),
+            Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0)),
+            icon,
+            if active { theme::T1 } else { theme::T3 },
+        );
+        if response.on_hover_text(tip).clicked() {
+            lib.loupe = loupe;
+        }
+    }
 }
 
 /// `‹ 1–5,000 of 12,345 ›` when the count exceeds the loaded page.

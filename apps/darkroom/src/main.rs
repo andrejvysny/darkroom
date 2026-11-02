@@ -1,6 +1,7 @@
 mod application;
 mod chrome;
 mod gpu;
+mod import_platform;
 mod native_app;
 mod paint;
 mod photo_view;

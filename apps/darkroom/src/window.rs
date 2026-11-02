@@ -7,6 +7,7 @@ use crate::{
     surface_state::{AcquireEvent, Action, Schedule, SurfaceFailure, SurfaceState},
     thumbs::ThumbStore,
 };
+use core_app::workflow::Command;
 use core_model::identity::DeviceEpoch;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -210,6 +211,42 @@ impl State {
         })
     }
 
+    /// Run the import requests the last frame produced. Called between frames (never while a
+    /// surface texture is held) because the folder picker is a blocking modal. A finished commit
+    /// refreshes every library list.
+    fn pump_imports(&mut self) {
+        let Some(application) = self.application.as_mut() else {
+            return;
+        };
+        let requests = std::mem::take(&mut self.ui_state.import_requests);
+        let mut changed = !requests.is_empty();
+        let platform = crate::import_platform::NativePlatform;
+        for request in requests {
+            if let Err(error) = application.handle_import(request, &platform) {
+                self.last_command_error = Some((error.to_string(), Instant::now()));
+            }
+        }
+        // The report itself is shown from the import view; the refresh covers failed runs too.
+        let _ = application.take_import_finished();
+        if application.take_import_refresh() {
+            changed = true;
+            for command in [
+                Command::RefreshLibrary,
+                Command::LoadDates,
+                Command::LoadFolders,
+                Command::LoadKeywords,
+                Command::LoadCollections,
+            ] {
+                if let Err(error) = application.dispatch(command) {
+                    self.last_command_error = Some((error.to_string(), Instant::now()));
+                }
+            }
+        }
+        if changed {
+            self.window.request_redraw();
+        }
+    }
+
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.size = size;
         self.configure_surface();
@@ -360,6 +397,7 @@ impl State {
                 }
                 None => &mut no_thumbs,
             };
+            let import_view = application.import_view();
             let mut commands = Vec::new();
             let mut command_error = self.last_command_error.take();
             // Taken out and put back, like `command_error`: the closure needs `&mut` while
@@ -376,6 +414,7 @@ impl State {
                         settings_notices: &mut settings_notices,
                         thumbs: &mut *thumbs,
                         histogram,
+                        import: &import_view,
                     },
                     &mut self.ui_state,
                 );
@@ -391,7 +430,7 @@ impl State {
                 self.window.request_redraw();
             }
             self.last_command_error = command_error;
-            if !commands.is_empty() {
+            if !commands.is_empty() || !self.ui_state.import_requests.is_empty() {
                 self.window.request_redraw();
             }
             for command in commands {
@@ -470,6 +509,7 @@ impl ApplicationHandler<Option<Instant>> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
+            state.pump_imports();
             if let Some(application) = &mut state.application {
                 let revision = application.snapshot().revision;
                 if let Err(error) = application.pump() {

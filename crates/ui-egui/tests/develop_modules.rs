@@ -114,6 +114,7 @@ impl Harness {
                     settings_notices: &mut notices,
                     thumbs: &mut self.thumbs,
                     histogram: None,
+                    import: &core_app::import::ImportView::default(),
                 },
                 &mut self.ui,
             );

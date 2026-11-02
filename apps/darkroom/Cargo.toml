@@ -21,6 +21,8 @@ winit.workspace = true
 pollster = "0.4"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Synchronous folder picker for the import dialog (same 0.16 node the legacy host links).
+rfd = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 core-db = { path = "../../crates/core-db" }
