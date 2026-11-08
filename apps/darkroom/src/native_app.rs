@@ -195,6 +195,10 @@ impl NativeApplication {
     pub fn catalog(&self) -> std::sync::Arc<core_runtime::catalog::CatalogAdapter> {
         self.workflow.catalog()
     }
+    /// Let committed imports queue their new rows for rendered previews.
+    pub fn attach_previews(&mut self, previews: core_runtime::preview::PreviewHandle) {
+        self.import.set_previews(Some(previews));
+    }
     pub fn mirror_error(&self) -> Option<&str> {
         self.mirror_error.as_deref()
     }

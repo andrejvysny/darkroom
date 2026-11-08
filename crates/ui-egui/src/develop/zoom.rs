@@ -4,16 +4,36 @@
 //! decides *when* the view changes.
 
 use core_app::state::ApplicationSnapshot;
-use core_model::viewport::{one_to_one_zoom, pan_by, zoom_at, ViewState};
+use core_model::viewport::{
+    derive_view, max_zoom, one_to_one_zoom, pan_by, zoom_at, ViewState, MIN_ZOOM,
+};
 use std::time::Duration;
+
+use super::zoom_input::{anchor_px, bare_z, to_px, trackpad_delta, wheel_notches};
 
 /// How long after the last view change the stage still asks for the cheap interactive tier.
 const SETTLE: f64 = 0.2;
 /// Zoom multiplier per mouse-wheel notch.
 const WHEEL_STEP: f64 = 1.25;
+/// Time constant of the wheel-zoom ease (log-space exponential): ~100 ms to settle, short enough
+/// to feel direct, long enough that a notch is not a jump.
+const EASE_TAU: f64 = 0.035;
+/// Below this remaining log-ratio the ease snaps onto its target (and ends).
+const SNAP_LOG: f64 = 1e-3;
+/// Longest frame step the ease will integrate, so a stalled frame does not teleport the zoom.
+const MAX_DT: f64 = 0.1;
 /// Slightly longer than [`SETTLE`]: guarantees one more frame after the gesture settles, which
 /// is the frame that asks for the full-size, histogram-bearing render.
 const REPAINT: Duration = Duration::from_millis(220);
+
+/// Where a wheel zoom is heading: the zoom and the screen point (in points) that must stay put.
+/// The point is kept in screen space, not relative to the image, because the image rect itself
+/// moves while the zoom eases.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WheelTarget {
+    zoom: f64,
+    pointer: egui::Pos2,
+}
 
 /// Transient zoom state of the stage, owned by [`super::DevelopUi`]. A different photo (or a new
 /// editor session) always starts at fit: a stale window into the previous image must never be
@@ -23,6 +43,8 @@ pub(crate) struct ZoomUi {
     view: ViewState,
     subject: Option<(i64 /* image id */, u64 /* editor session */)>,
     interacting_until: f64,
+    /// An eased wheel zoom in flight.
+    target: Option<WheelTarget>,
     /// Where the frame was drawn last time input was handled (test/automation hook: it says
     /// where on screen the image is, i.e. where a gesture has to land).
     image_rect: Option<egui::Rect>,
@@ -47,6 +69,7 @@ impl ZoomUi {
     pub(crate) fn reset(&mut self) {
         self.view = ViewState::default();
         self.interacting_until = 0.0;
+        self.target = None;
     }
 
     /// Drop the view when the stage's subject changed; keep it otherwise (this runs every frame).
@@ -59,13 +82,14 @@ impl ZoomUi {
             self.subject = subject;
             self.view = ViewState::default();
             self.interacting_until = 0.0;
+            self.target = None;
         }
     }
 
     /// While a gesture is in flight the stage asks for half-size interactive frames; the trailing
     /// repaint makes sure the settled frame is asked for once this goes false again.
     pub(crate) fn interacting(&self, now: f64) -> bool {
-        now < self.interacting_until
+        now < self.interacting_until || self.target.is_some()
     }
 
     /// One frame of stage input. `image_rect` is where the presented frame is drawn, in points —
@@ -86,21 +110,27 @@ impl ZoomUi {
         typing: bool,
     ) {
         if self.pinch_zoom(ui, response, image_rect, frame_px, panel_px, ppp) {
+            // Pinch already tracks the fingers; an eased wheel zoom would fight it.
+            self.target = None;
             return;
         }
-        if self.wheel_zoom(ui, response, image_rect, frame_px, panel_px, ppp) {
+        let wheel = self.wheel_zoom(ui, response, frame_px, panel_px);
+        self.ease(ui, image_rect, frame_px, panel_px, ppp);
+        if wheel {
             return;
         }
         self.scroll_pan(ui, response, frame_px, panel_px, ppp);
         self.drag_pan(ui, response, frame_px, panel_px, ppp);
         // Double-click and bare `Z` toggle fit ↔ 1:1 (anchored at the pointer / image centre).
         if response.double_clicked() {
+            self.target = None;
             if let Some(anchor) = anchor_px(ui, response, image_rect, ppp) {
                 self.toggle(ui, anchor, frame_px, panel_px);
             }
             return;
         }
         if !typing && bare_z(ui) {
+            self.target = None;
             let centre = [
                 f64::from(image_rect.width()) * f64::from(ppp) / 2.0,
                 f64::from(image_rect.height()) * f64::from(ppp) / 2.0,
@@ -141,16 +171,16 @@ impl ZoomUi {
         true
     }
 
-    /// A physical mouse wheel zooms at the pointer, `WHEEL_STEP` per notch. True when a wheel
+    /// A physical mouse wheel sets (or moves) the zoom TARGET, `WHEEL_STEP` per notch, anchored
+    /// at the pointer; [`Self::ease`] walks the view there. Notches stack on the target, not on
+    /// the half-way view, so a fast spin lands exactly where the notches say. True when a wheel
     /// event was seen, so the same frame does not also pan.
     fn wheel_zoom(
         &mut self,
         ui: &egui::Ui,
         response: &egui::Response,
-        image_rect: egui::Rect,
         frame_px: (u32, u32),
         panel_px: (u32, u32),
-        ppp: f32,
     ) -> bool {
         if !response.hovered() {
             return false;
@@ -158,18 +188,77 @@ impl ZoomUi {
         let Some(notches) = wheel_notches(ui) else {
             return false;
         };
-        if let Some(anchor) = anchor_px(ui, response, image_rect, ppp) {
-            let factor = WHEEL_STEP.powf(f64::from(notches));
-            let next = zoom_at(
-                self.view,
-                self.view.zoom * factor,
-                anchor,
-                frame_px,
-                panel_px,
-            );
-            self.commit(ui, next);
-        }
+        let Some(pointer) = response
+            .hover_pos()
+            .or_else(|| ui.ctx().pointer_hover_pos())
+        else {
+            return true;
+        };
+        let base = self.target.map_or(self.view.zoom, |target| target.zoom);
+        let zoom = (base * WHEEL_STEP.powf(f64::from(notches)))
+            .clamp(MIN_ZOOM, max_zoom(frame_px, panel_px));
+        // A target equal to where the view already is (wheel-out at fit, wheel-in at the
+        // ceiling) is no gesture at all.
+        self.target = ((zoom / self.view.zoom).ln().abs() >= SNAP_LOG)
+            .then_some(WheelTarget { zoom, pointer });
         true
+    }
+
+    /// One step of the eased wheel zoom: the view moves toward the target in log space (so zooming
+    /// in and out feel alike) with the target's anchor held fixed. Keeps the gesture marked as
+    /// interacting and the frames coming until it lands.
+    fn ease(
+        &mut self,
+        ui: &egui::Ui,
+        image_rect: egui::Rect,
+        frame_px: (u32, u32),
+        panel_px: (u32, u32),
+        ppp: f32,
+    ) {
+        let Some(target) = self.target else {
+            return;
+        };
+        let dt = f64::from(ui.input(|i| i.unstable_dt)).clamp(1e-3, MAX_DT);
+        let remaining = (target.zoom / self.view.zoom).ln();
+        let mut zoom = self.view.zoom * (remaining * (1.0 - (-dt / EASE_TAU).exp())).exp();
+        let landed = (target.zoom / zoom).ln().abs() < SNAP_LOG;
+        if landed {
+            zoom = target.zoom;
+        }
+        let anchor = [
+            f64::from(target.pointer.x - image_rect.min.x) * f64::from(ppp),
+            f64::from(target.pointer.y - image_rect.min.y) * f64::from(ppp),
+        ];
+        let next = zoom_at(self.view, zoom, anchor, frame_px, panel_px);
+        // No progress and not landed: the clamp (a resize, say) moved the goalposts; give up
+        // rather than animate forever.
+        if landed || next == self.view {
+            self.target = None;
+        } else {
+            ui.ctx().request_repaint();
+        }
+        self.commit(ui, next);
+    }
+
+    /// Jump to a footer preset, anchored at the centre of the visible image area. `None` is Fit;
+    /// `Some(zoom)` is a zoom relative to fit.
+    pub(crate) fn jump(
+        &mut self,
+        ui: &egui::Ui,
+        zoom: Option<f64>,
+        frame_px: (u32, u32),
+        panel_px: (u32, u32),
+    ) {
+        self.target = None;
+        let next = match zoom {
+            None => ViewState::default(),
+            Some(zoom) => {
+                let out = derive_view(self.view, frame_px, panel_px).out_px;
+                let centre = [f64::from(out.0) / 2.0, f64::from(out.1) / 2.0];
+                zoom_at(self.view, zoom, centre, frame_px, panel_px)
+            }
+        };
+        self.commit(ui, next);
     }
 
     /// Plain two-finger scroll pans the image the same way a drag of that delta would.
@@ -249,82 +338,6 @@ impl ZoomUi {
     }
 }
 
-/// Net wheel notches this frame (up = positive) from physical-wheel events without Cmd/Ctrl, or
-/// `None` when there were none. Read from raw events: `smooth_scroll_delta` spreads a wheel
-/// notch over later frames and would pan them.
-fn wheel_notches(ui: &egui::Ui) -> Option<f32> {
-    ui.input(|i| {
-        let mut seen = false;
-        let mut sum = 0.0;
-        for event in &i.raw.events {
-            if let egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page,
-                delta,
-                source: egui::MouseWheelSource::Wheel,
-                modifiers,
-                ..
-            } = event
-            {
-                if !modifiers.command {
-                    seen = true;
-                    sum += delta.y;
-                }
-            }
-        }
-        seen.then_some(sum)
-    })
-}
-
-/// Scroll points this frame that did not come from a physical wheel (trackpad two-finger pan).
-fn trackpad_delta(ui: &egui::Ui) -> egui::Vec2 {
-    ui.input(|i| {
-        i.raw
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta,
-                    source,
-                    ..
-                } if *source != egui::MouseWheelSource::Wheel => Some(*delta),
-                _ => None,
-            })
-            .fold(egui::Vec2::ZERO, |acc, d| acc + d)
-    })
-}
-
-/// Bare `Z` pressed: no modifiers, and consumed so nothing else sees it. `consume_key` alone is
-/// not enough — it would also fire with Cmd held, and Cmd+Z is undo (`super::shortcuts`).
-fn bare_z(ui: &egui::Ui) -> bool {
-    ui.ctx()
-        .input_mut(|i| i.modifiers.is_none() && i.consume_key(egui::Modifiers::NONE, egui::Key::Z))
-}
-
-/// The pointer in physical px relative to the top-left of the visible image area.
-fn anchor_px(
-    ui: &egui::Ui,
-    response: &egui::Response,
-    image_rect: egui::Rect,
-    ppp: f32,
-) -> Option<[f64; 2]> {
-    let pos = response
-        .hover_pos()
-        .or_else(|| ui.ctx().pointer_hover_pos())?;
-    Some([
-        f64::from(pos.x - image_rect.min.x) * f64::from(ppp),
-        f64::from(pos.y - image_rect.min.y) * f64::from(ppp),
-    ])
-}
-
-/// A points delta (drag or scroll) in physical px.
-fn to_px(delta: egui::Vec2, ppp: f32) -> [f64; 2] {
-    [
-        f64::from(delta.x) * f64::from(ppp),
-        f64::from(delta.y) * f64::from(ppp),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::ZoomUi;
@@ -380,6 +393,7 @@ mod tests {
             view: ZOOMED,
             subject: Some((image, session)),
             interacting_until: 0.0,
+            target: None,
             image_rect: None,
         }
     }

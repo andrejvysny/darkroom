@@ -81,13 +81,14 @@ impl Harness {
                 ..Default::default()
             },
             photo: PhotoUi {
-                texture: Some((TextureId::Managed(7), [820, 547])),
+                texture: Some(ui_egui::Picture::bare(TextureId::Managed(7), [820, 547])),
                 message: None,
                 failure: None,
                 retry: false,
                 loading: false,
                 device_epoch: Default::default(),
                 plan: None,
+                placeholder: None,
             },
             snapshot: snapshot(params),
             import: ImportView::default(),

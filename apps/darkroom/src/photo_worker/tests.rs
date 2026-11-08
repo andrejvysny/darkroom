@@ -10,7 +10,7 @@ use render_wgpu::RenderError;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-fn key(image: i64) -> FrameKey {
+pub(super) fn key(image: i64) -> FrameKey {
     FrameKey {
         identity: RenderIdentity {
             source: SourceIdentity {
@@ -34,6 +34,24 @@ fn key(image: i64) -> FrameKey {
     }
 }
 
+/// A runner that only handles render jobs (warm-ups and histograms are no-ops).
+fn renders(
+    mut body: impl FnMut(PhotoRequest, &mut PreparedCache, &Ctl<'_>) -> Option<PhotoResult>
+        + Send
+        + 'static,
+) -> Box<Runner> {
+    Box::new(
+        move |job: Job, cache: &mut PreparedCache, ctl: &Ctl<'_>| match job {
+            Job::Render(request) => body(request, cache, ctl),
+            Job::Warm(_) | Job::Upload(_) | Job::Histogram(_) => None,
+        },
+    )
+}
+
+fn source(image: i64) -> SourceKey {
+    (image, format!("hash-{image}"))
+}
+
 fn request(image: i64) -> PhotoRequest {
     PhotoRequest {
         key: key(image),
@@ -52,7 +70,7 @@ fn latest_wins_replaces_an_unstarted_request() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_in_runner = Arc::clone(&seen);
     let mut worker = PhotoWorker::with_runner(
-        Box::new(move |request: PhotoRequest, _cache, _abandon| {
+        renders(move |request: PhotoRequest, _cache, _ctl| {
             seen_in_runner.lock().unwrap().push(request.content_hash);
             if seen_in_runner.lock().unwrap().len() == 1 {
                 // First request blocks until released, so r2/r3 queue behind it unstarted.
@@ -99,7 +117,7 @@ fn shutdown_joins_the_worker_thread() {
     let ticks = Arc::new(AtomicUsize::new(0));
     let ticks_in_runner = Arc::clone(&ticks);
     let mut worker = PhotoWorker::with_runner(
-        Box::new(move |request: PhotoRequest, _cache, _abandon| {
+        renders(move |request: PhotoRequest, _cache, _ctl| {
             ticks_in_runner.fetch_add(1, Ordering::SeqCst);
             Some(PhotoResult::Failed {
                 key: request.key,
@@ -253,6 +271,7 @@ fn report_publishes_last_request_timings() {
         render_ms: 8,
         histogram_ms: 4,
         prepared_cache_hit: true,
+        prefetch_hit: true,
     };
     cache.timings = timings;
     assert_eq!(cache.report(pool).last_timings, timings);
@@ -296,7 +315,7 @@ fn wait_for<T>(worker: &mut PhotoWorker, mut pick: impl FnMut(PhotoResult) -> Op
 #[test]
 fn runner_panic_reports_worker_died_and_status_stopped() {
     let mut worker = PhotoWorker::with_runner(
-        Box::new(|_request, _cache, _abandon| panic!("boom")),
+        renders(|_request, _cache, _ctl| panic!("boom")),
         Arc::new(|| {}),
     )
     .unwrap();
@@ -316,8 +335,7 @@ fn runner_panic_reports_worker_died_and_status_stopped() {
 fn channel_disconnection_is_observed_as_stopped() {
     // A runner that returns None ends the loop without a stop request: the receiver sees a
     // disconnected channel and must report the worker as stopped.
-    let mut worker =
-        PhotoWorker::with_runner(Box::new(|_r, _c, _a| None), Arc::new(|| {})).unwrap();
+    let mut worker = PhotoWorker::with_runner(renders(|_r, _c, _a| None), Arc::new(|| {})).unwrap();
     worker.request(request(1));
     let deadline = Instant::now() + Duration::from_secs(5);
     while worker.status() == WorkerStatus::Running {
@@ -330,8 +348,7 @@ fn channel_disconnection_is_observed_as_stopped() {
 
 #[test]
 fn clean_shutdown_is_not_reported_as_stopped() {
-    let mut worker =
-        PhotoWorker::with_runner(Box::new(|_r, _c, _a| None), Arc::new(|| {})).unwrap();
+    let mut worker = PhotoWorker::with_runner(renders(|_r, _c, _a| None), Arc::new(|| {})).unwrap();
     worker.shutdown().unwrap();
     worker.drain_results();
     assert_eq!(worker.status(), WorkerStatus::Running);
@@ -340,7 +357,7 @@ fn clean_shutdown_is_not_reported_as_stopped() {
 #[test]
 fn spawn_failure_is_an_error_not_a_panic() {
     let result = PhotoWorker::with_spawn(
-        Box::new(|_r, _c, _a| None),
+        renders(|_r, _c, _a| None),
         Arc::new(|| {}),
         Box::new(|_body| Err(std::io::Error::other("no threads"))),
     );
@@ -353,10 +370,10 @@ fn superseding_request_abandons_the_running_one() {
     let started = Arc::new(AtomicBool::new(false));
     let started_in_runner = Arc::clone(&started);
     let mut worker = PhotoWorker::with_runner(
-        Box::new(move |request: PhotoRequest, _cache, abandon| {
+        renders(move |request: PhotoRequest, _cache, ctl| {
             if request.content_hash == "hash-1" {
                 started_in_runner.store(true, Ordering::SeqCst);
-                while !abandon() {
+                while !ctl.output_superseded(&source(1)) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 return Some(PhotoResult::Abandoned(request.key));
@@ -394,8 +411,8 @@ fn shutdown_during_pool_wait_is_prompt() {
     let waiting = Arc::new(AtomicBool::new(false));
     let waiting_in_runner = Arc::clone(&waiting);
     let mut worker = PhotoWorker::with_runner(
-        Box::new(move |request: PhotoRequest, _cache, abandon| {
-            let outcome = render_until_free::<()>(abandon, || {
+        renders(move |request: PhotoRequest, _cache, ctl| {
+            let outcome = render_until_free::<()>(ctl, &source(1), || {
                 waiting_in_runner.store(true, Ordering::SeqCst);
                 Err(RenderError::PoolExhausted { size: (16, 16) })
             });
@@ -422,7 +439,7 @@ fn shutdown_during_pool_wait_is_prompt() {
 #[test]
 fn join_failure_is_reported_by_shutdown() {
     let mut worker = PhotoWorker::with_spawn(
-        Box::new(|_r, _c, _a| None),
+        renders(|_r, _c, _a| None),
         Arc::new(|| {}),
         Box::new(|_body| std::thread::Builder::new().spawn(|| panic!("thread blew up"))),
     )
@@ -431,5 +448,145 @@ fn join_failure_is_reported_by_shutdown() {
     assert!(
         error.contains("photo worker panicked: thread blew up"),
         "{error}"
+    );
+}
+
+fn warm_request(image: i64) -> WarmRequest {
+    WarmRequest {
+        image_id: image,
+        path: PathBuf::from("/nonexistent"),
+        content_hash: format!("hash-{image}"),
+    }
+}
+
+fn inbox(request: Option<PhotoRequest>, warm: Option<WarmRequest>) -> SlotPair {
+    (
+        Mutex::new(Slot {
+            request,
+            warm,
+            stop: false,
+            pool_returns: 0,
+        }),
+        Condvar::new(),
+    )
+}
+
+/// A newer request for the SAME photo replaces the output but keeps the decode; one for another
+/// photo (render or warm-up) abandons both.
+#[test]
+fn supersession_keeps_the_decode_for_the_same_photo() {
+    let same = inbox(Some(request(1)), None);
+    let ctl = Ctl { slot: &same };
+    assert!(!ctl.source_superseded(&source(1)));
+    assert!(ctl.output_superseded(&source(1)));
+
+    let other = inbox(Some(request(2)), None);
+    let ctl = Ctl { slot: &other };
+    assert!(ctl.source_superseded(&source(1)));
+
+    let other_warm = inbox(None, Some(warm_request(2)));
+    let ctl = Ctl { slot: &other_warm };
+    assert!(ctl.source_superseded(&source(1)));
+    assert!(ctl.output_superseded(&source(1)));
+
+    let same_warm = inbox(None, Some(warm_request(1)));
+    let ctl = Ctl { slot: &same_warm };
+    assert!(!ctl.output_superseded(&source(1)));
+}
+
+/// A queued render always runs before a queued warm-up; the warm-up still runs afterwards.
+#[test]
+fn render_runs_before_warm_up() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&order);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let worker = PhotoWorker::with_runner(
+        Box::new(
+            move |job: Job, _cache: &mut PreparedCache, _ctl: &Ctl<'_>| {
+                let first = seen.lock().unwrap().is_empty();
+                let (tag, image) = match &job {
+                    Job::Render(r) => ("render", r.key.identity.source.image_id.0),
+                    Job::Warm(w) => ("warm", w.image_id),
+                    Job::Upload(_) => ("upload", 0),
+                    Job::Histogram(_) => ("histogram", 0),
+                };
+                seen.lock().unwrap().push((tag, image));
+                if first {
+                    let _ = release_rx.recv();
+                }
+                match job {
+                    Job::Render(r) => Some(PhotoResult::Failed {
+                        key: r.key,
+                        message: "stub".into(),
+                    }),
+                    _ => None,
+                }
+            },
+        ),
+        Arc::new(|| {}),
+    )
+    .unwrap();
+    worker.warm(warm_request(9));
+    while order.lock().unwrap().is_empty() {
+        std::thread::yield_now();
+    }
+    worker.warm(warm_request(3));
+    worker.request(request(3));
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while order.lock().unwrap().len() < 3 {
+        assert!(Instant::now() < deadline, "jobs never ran");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![("warm", 9), ("render", 3), ("warm", 3)]
+    );
+}
+
+/// A render waiting on an exhausted pool retries as soon as a target is returned, without
+/// sleeping out the wait slice.
+#[test]
+fn pool_wait_wakes_on_a_returned_target() {
+    let waiting = Arc::new(AtomicBool::new(false));
+    let waiting_in_runner = Arc::clone(&waiting);
+    let mut worker = PhotoWorker::with_runner(
+        renders(move |request: PhotoRequest, _cache, ctl| {
+            let mut tries = 0;
+            let outcome = render_until_free::<()>(ctl, &source(1), || {
+                tries += 1;
+                if tries == 1 {
+                    waiting_in_runner.store(true, Ordering::SeqCst);
+                    Err(RenderError::PoolExhausted { size: (16, 16) })
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(outcome, Ok(()));
+            Some(PhotoResult::Failed {
+                key: request.key,
+                message: "done".into(),
+            })
+        }),
+        Arc::new(|| {}),
+    )
+    .unwrap();
+    worker.request(request(1));
+    while !waiting.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    let started = Instant::now();
+    {
+        let (lock, cvar) = &*worker.slot;
+        lock.lock().unwrap().pool_returns += 1;
+        cvar.notify_all();
+    }
+    wait_for(&mut worker, |r| {
+        matches!(r, PhotoResult::Failed { .. }).then_some(())
+    });
+    assert!(
+        started.elapsed() < Duration::from_millis(90),
+        "retry waited {:?}",
+        started.elapsed()
     );
 }

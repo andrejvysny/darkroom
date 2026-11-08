@@ -19,6 +19,9 @@ pub enum RenderError {
     /// Every pooled target of that size is leased (or live leases fill the byte cap); the caller
     /// retries later — bounded memory over unbounded allocation.
     PoolExhausted { size: (u32, u32) },
+    /// One target of this size alone exceeds the pool's byte cap: waiting can never help, so the
+    /// caller fails instead of retrying.
+    TargetTooLarge { size: (u32, u32) },
     /// The frame key was stamped with a device epoch other than this renderer's: the caller is a
     /// worker still holding a renderer from a retired (or not yet live) device. Refused before a
     /// target is leased, so such a frame can never reach the [`crate::Presenter`].
@@ -37,6 +40,12 @@ impl fmt::Display for RenderError {
             Self::PoolExhausted { size } => {
                 write!(f, "no free render target of size {size:?} (all leased)")
             }
+            Self::TargetTooLarge { size } => {
+                write!(
+                    f,
+                    "a render target of size {size:?} exceeds the frame pool budget"
+                )
+            }
             Self::DeviceEpochMismatch { key, renderer } => write!(
                 f,
                 "frame key is stamped device epoch {key:?} but this renderer holds {renderer:?}"
@@ -49,7 +58,9 @@ impl std::error::Error for RenderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pipeline(error) => Some(error),
-            Self::PoolExhausted { .. } | Self::DeviceEpochMismatch { .. } => None,
+            Self::PoolExhausted { .. }
+            | Self::TargetTooLarge { .. }
+            | Self::DeviceEpochMismatch { .. } => None,
         }
     }
 }
@@ -120,6 +131,17 @@ impl Renderer {
             pool_bytes: pool.total_bytes(),
             pool_limit_bytes: pool.limits().total_bytes,
         }
+    }
+
+    /// Call `signal` every time a leased target returns to the pool, so a caller that saw
+    /// [`RenderError::PoolExhausted`] can wait for a release instead of polling. Replaces any
+    /// earlier signal. Runs on whichever thread drops the lease, under the pool lock: it must be
+    /// cheap and must not touch this renderer.
+    pub fn set_return_signal(&self, signal: Arc<dyn Fn() + Send + Sync>) {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_return_signal(signal);
     }
 
     /// The shared pool, for diagnostics/tests (live counts, byte accounting).

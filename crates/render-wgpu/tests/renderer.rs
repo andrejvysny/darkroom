@@ -456,3 +456,35 @@ fn render_refuses_a_key_from_another_device_epoch() {
     assert_eq!(c.live(&r, SIZE), 1);
     drop(ok);
 }
+
+// A target bigger than the whole byte cap can never be served: it is refused with a distinct
+// error instead of `PoolExhausted`, so callers do not wait for a release that cannot help.
+#[test]
+fn a_target_larger_than_the_cap_fails_fast() {
+    let Some(c) = ctx() else { return };
+    let r = c.renderer_limits(PoolLimits {
+        per_size: 3,
+        total_bytes: bytes_of(SIZE) - 1,
+    });
+    let refused = try_render(&c, &r, SIZE, view(SIZE.0, SIZE.1));
+    assert!(
+        matches!(refused, Err(RenderError::TargetTooLarge { size }) if size == SIZE),
+        "got {refused:?}"
+    );
+}
+
+// Every lease drop fires the return signal, so an exhausted caller can wait instead of polling.
+#[test]
+fn dropping_a_lease_fires_the_return_signal() {
+    let Some(c) = ctx() else { return };
+    let r = c.renderer(1);
+    let returns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&returns);
+    r.set_return_signal(Arc::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let lease = c.render(&r, &params_a(), SIZE);
+    assert_eq!(returns.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(lease);
+    assert_eq!(returns.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

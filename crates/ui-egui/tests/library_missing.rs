@@ -96,6 +96,7 @@ fn render(selected: Option<i64>, report: bool) -> (String, Vec<String>) {
         loading: false,
         device_epoch: Default::default(),
         plan: None,
+        placeholder: None,
     };
     let snapshot = snapshot(selected);
     for step in 0..3 {

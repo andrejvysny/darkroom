@@ -63,7 +63,6 @@ struct FreeTexture {
 }
 
 /// Per-size free lists plus the live/byte accounting that bounds the pool.
-#[derive(Debug)]
 pub struct TexturePool {
     limits: PoolLimits,
     /// `(w, h)` -> free textures, ready to be leased again. Never an empty bucket. The *back* is
@@ -77,6 +76,22 @@ pub struct TexturePool {
     total_bytes: u64,
     /// Monotonic stamp handed to each texture as it lands on a free list.
     next_free_stamp: u64,
+    /// Called after every return, so a waiter on exhaustion can retry (see
+    /// `Renderer::set_return_signal`).
+    return_signal: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for TexturePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TexturePool")
+            .field("limits", &self.limits)
+            .field("free", &self.free)
+            .field("live", &self.live)
+            .field("total_bytes", &self.total_bytes)
+            .field("next_free_stamp", &self.next_free_stamp)
+            .field("return_signal", &self.return_signal.is_some())
+            .finish()
+    }
 }
 
 impl TexturePool {
@@ -90,7 +105,12 @@ impl TexturePool {
             live: HashMap::new(),
             total_bytes: 0,
             next_free_stamp: 0,
+            return_signal: None,
         }
+    }
+
+    pub(crate) fn set_return_signal(&mut self, signal: Arc<dyn Fn() + Send + Sync>) {
+        self.return_signal = Some(signal);
     }
 
     pub fn limits(&self) -> PoolLimits {
@@ -138,11 +158,15 @@ impl TexturePool {
             *self.live.entry(size).or_insert(0) += 1;
             return Ok(texture);
         }
+        let bytes = target_bytes(size.0, size.1);
+        if bytes > self.limits.total_bytes {
+            // No amount of waiting frees enough: fail now instead of retrying forever.
+            return Err(RenderError::TargetTooLarge { size });
+        }
         if self.live_count(size) >= self.limits.per_size {
             // Every target of this size is being rendered into; no eviction can help that.
             return Err(RenderError::PoolExhausted { size });
         }
-        let bytes = target_bytes(size.0, size.1);
         if !self.make_room_for(bytes) {
             return Err(RenderError::PoolExhausted { size });
         }
@@ -213,6 +237,9 @@ impl TexturePool {
             returned_at,
             texture: Arc::clone(texture),
         });
+        if let Some(signal) = &self.return_signal {
+            signal();
+        }
     }
 }
 

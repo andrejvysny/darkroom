@@ -11,6 +11,7 @@ pub mod encode;
 pub mod error;
 pub mod histogram;
 pub mod mask;
+mod mips;
 pub mod params;
 mod validation;
 

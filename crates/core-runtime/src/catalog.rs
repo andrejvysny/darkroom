@@ -97,6 +97,21 @@ impl CatalogAdapter {
         ))
     }
 
+    /// The configured preview long edge, or the default one (`PREVIEW_EDGE_MIN`, which import also
+    /// uses) when unset, `0`, or the catalog is closed/unreadable: cached previews are keyed by
+    /// edge, so the host must look for the same one import wrote.
+    pub fn preview_edge(&self) -> u32 {
+        self.shared()
+            .ok()
+            .and_then(|(_, db)| {
+                db.lock()
+                    .ok()
+                    .and_then(|g| core_library::preview_edge(&g.conn).ok())
+            })
+            .filter(|&edge| edge != 0)
+            .unwrap_or(core_library::PREVIEW_EDGE_MIN)
+    }
+
     /// Whether `generation` (from [`Self::shared`]) still names the open catalog.
     pub fn is_current(&self, generation: u64) -> bool {
         self.slot
@@ -580,5 +595,24 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(task.join().unwrap(), Err(AppError::Stale));
         assert_eq!(adapter.count(&QueryParams::default()).unwrap(), 0);
+    }
+
+    #[test]
+    fn preview_edge_defaults_to_import_minimum_and_follows_the_setting() {
+        let adapter = CatalogAdapter::default();
+        assert_eq!(
+            adapter.preview_edge(),
+            core_library::PREVIEW_EDGE_MIN,
+            "closed"
+        );
+        let db = memory_db();
+        let adapter = CatalogAdapter::from_shared(Arc::clone(&db));
+        assert_eq!(
+            adapter.preview_edge(),
+            core_library::PREVIEW_EDGE_MIN,
+            "unset"
+        );
+        core_library::set_preview_edge(&db.lock().unwrap().conn, 3200).unwrap();
+        assert_eq!(adapter.preview_edge(), 3200);
     }
 }

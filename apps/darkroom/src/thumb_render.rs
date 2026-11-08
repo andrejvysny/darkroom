@@ -7,16 +7,15 @@
 //! `cache.write_edited(hash, pv, version, jpeg)` and reports back so the store re-reads the tier.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
-use crate::photo_worker::{panic_text, unsupported_reason};
+use crate::photo_worker::panic_text;
 use crate::thumbs::ThumbKey;
 use core_library::ThumbCache;
-use core_model::document::{EditDocument, ReadStatus};
 use core_pipeline::{DevelopPipeline, GpuContext};
 use core_runtime::catalog::CatalogAdapter;
 
@@ -254,48 +253,22 @@ fn render_job(
     let Some((json, stored_version, _)) = stored.filter(|row| row.2 == version) else {
         return Ok(Rendered::Dropped);
     };
-    let document = EditDocument::read(json, stored_version);
-    let mut params = match (document.status(), document.preview()) {
-        (ReadStatus::Supported, Some(params)) => params.clone(),
-        _ => return Err("the stored edit cannot be interpreted by this build".into()),
-    };
-    if let Some(reason) = unsupported_reason(&params) {
-        return Err(format!("{reason} edits are not rendered by this host yet"));
-    }
+    let mut params = crate::render_source::interpret_edit(json, stored_version)?;
     if abandon.load(Ordering::SeqCst) {
         return Ok(Rendered::Dropped);
     }
-    let bytes = std::fs::read(&job.path)
-        .map_err(|error| format!("could not read {}: {error}", job.path.display()))?;
-    if core_raw::hex(&core_raw::content_hash(&bytes)) != job.key.hash {
-        return Err(format!(
-            "{} no longer matches the catalogued content",
-            job.path.display()
-        ));
-    }
-    let source = core_raw::source_from_bytes(Arc::new(bytes), &job.path);
-    let linear = core_raw::develop_linear(&source)
-        .map_err(|error| format!("could not decode {}: {error}", job.path.display()))?;
-    params.display_referred = core_raw::is_display(Path::new(&job.path));
+    let linear = crate::render_source::decode_checked(&job.path, &job.key.hash)?;
     if abandon.load(Ordering::SeqCst) {
         return Ok(Rendered::Dropped);
     }
-    let source_edge = params.crop.preview_source_edge(
-        linear.width,
-        linear.height,
+    let (rgba, width, height) = crate::render_source::render_rgba(
+        &deps.ctx,
+        &deps.pipeline,
+        linear,
+        &mut params,
+        &job.path,
         EDIT_EDGE,
-        deps.ctx.max_texture_dim,
-    );
-    let linear = linear.downscale_into_hq(source_edge);
-    let (rgba, width, height) = deps
-        .pipeline
-        .render_cropped_with_ai_coverages(&deps.ctx, &linear, &params, &[])
-        .map_err(|error| error.to_string())?;
-    let (rgba, width, height) = if width.max(height) > EDIT_EDGE {
-        core_pipeline::resize_rgba8(&rgba, width, height, EDIT_EDGE)
-    } else {
-        (rgba, width, height)
-    };
+    )?;
     let jpeg = core_pipeline::rgba8_to_jpeg(&rgba, width, height, EDIT_QUALITY)
         .map_err(|error| error.to_string())?;
     cache

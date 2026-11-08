@@ -640,7 +640,7 @@ fn process_bytes_matches_process_file() {
     let bytes = std::sync::Arc::new(std::fs::read(&src).unwrap());
     let digest = core_raw::content_hash(&bytes);
     let via_bytes =
-        core_library::process_bytes(&src, bytes, digest, &thumbs, core_library::THUMB_SIZE)
+        core_library::process_bytes(&src, bytes, digest, &thumbs, core_library::THUMB_SIZE, None)
             .unwrap();
 
     assert_eq!(via_file.content_hash_hex, via_bytes.content_hash_hex);
@@ -734,6 +734,7 @@ fn stop_before_first_chunk_commits_nothing() {
         ImportMode::Copy,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &StopAlways,
     )
@@ -777,6 +778,7 @@ fn stop_between_chunks_keeps_committed_rows() {
         ImportMode::Copy,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &control,
     )
@@ -829,6 +831,7 @@ fn run_to_end_unchanged() {
         ImportMode::Copy,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &RunToEnd,
     )
@@ -932,6 +935,7 @@ fn stale_catalog_before_commit_writes_nothing_and_keeps_originals() {
         ImportMode::Move,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &StaleAlways,
     )
@@ -982,6 +986,7 @@ fn stale_catalog_mid_run_keeps_earlier_commits() {
         ImportMode::Copy,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &control,
     )
@@ -1024,6 +1029,7 @@ fn relink_reports_source_event() {
         ImportMode::Copy,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &RunToEnd,
     )
@@ -1069,6 +1075,7 @@ fn relink_reports_source_event() {
         ImportMode::Copy,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &control,
     )
@@ -1112,6 +1119,7 @@ fn fresh_import_reports_one_source_event_per_added_row() {
         ImportMode::Copy,
         libdir.path(),
         Pairing::Standalone,
+        None,
         |_, _, _| {},
         &control,
     )

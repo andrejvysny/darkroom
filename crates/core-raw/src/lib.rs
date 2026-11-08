@@ -40,7 +40,10 @@ pub use panic::{decode_in_flight, ISOLATION_ACTIVE};
 pub use pano::{
     develop_camera_native, native_to_srgb_jpeg, write_pano_dng, CameraNativeImage, PanoColorMeta,
 };
-pub use thumb::{oriented_preview, preview_image, preview_with_orientation, thumbnail_jpeg, Thumb};
+pub use thumb::{
+    oriented_preview, preview_image, preview_with_orientation, thumbnail_jpeg, thumbnail_jpegs,
+    Thumb,
+};
 
 pub use rawler::rawsource::RawSource;
 

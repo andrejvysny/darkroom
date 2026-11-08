@@ -88,3 +88,46 @@ fn index_and_query_real_cr3() {
     let _ = &mut db;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn process_bytes_writes_embedded_preview_and_survives_its_failure() {
+    let Some(dir) = library_dir() else {
+        eprintln!("library/2026 not present — skipping");
+        return;
+    };
+    let Some(path) = first_n_cr3(&dir, 1).pop() else {
+        return;
+    };
+    let bytes = std::sync::Arc::new(std::fs::read(&path).unwrap());
+    let digest = core_raw::content_hash(&bytes);
+    let hex = core_raw::hex(&digest);
+    let root = std::env::temp_dir().join(format!("darkroom-emb-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let thumbs = ThumbCache::new(&root).unwrap();
+
+    let p = core_library::process_bytes(&path, bytes.clone(), digest, &thumbs, 512, Some(2560))
+        .expect("process with preview");
+    assert!(thumbs.has(&hex, 512));
+    let emb = thumbs
+        .read_embedded_preview(&hex, 2560)
+        .expect("emb written");
+    assert_eq!(&emb[..2], &[0xFF, 0xD8]);
+    // The grid thumb is the same bytes as without a preview request.
+    let plain_root = root.join("plain");
+    let plain = ThumbCache::new(&plain_root).unwrap();
+    core_library::process_bytes(&path, bytes.clone(), digest, &plain, 512, None).unwrap();
+    assert_eq!(
+        thumbs.read(&hex, 512).unwrap(),
+        plain.read(&hex, 512).unwrap()
+    );
+    assert!(!plain.has_embedded_preview(&hex, 2560));
+
+    // A directory squatting on the preview path makes that write fail; the import must not.
+    let broken = ThumbCache::new(root.join("broken")).unwrap();
+    std::fs::create_dir(broken.embedded_preview_path_for(&hex, 2560)).unwrap();
+    let q = core_library::process_bytes(&path, bytes, digest, &broken, 512, Some(2560))
+        .expect("preview failure is non-fatal");
+    assert_eq!(q.content_hash_hex, p.content_hash_hex);
+    assert!(broken.has(&hex, 512));
+    let _ = std::fs::remove_dir_all(&root);
+}

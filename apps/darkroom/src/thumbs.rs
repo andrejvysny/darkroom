@@ -15,6 +15,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
+use crate::file_stamp::{remove_if_unchanged, stamp};
 use crate::presence::PresenceStore;
 use crate::thumb_render::{EditedThumbRenderer, RenderDeps, RenderEvent};
 use core_library::{ThumbCache, THUMB_SIZE};
@@ -393,6 +394,19 @@ impl ThumbStore {
     }
 }
 
+impl ThumbStore {
+    /// The resident texture of exactly `key` unless it is provisional (a stand-in for a render
+    /// still owed, so not a picture of this edit). A cloned handle keeps it alive for the caller
+    /// even if the budget evicts it; `None` when not resident.
+    pub fn exact_resident(&mut self, key: &ThumbKey) -> Option<(egui::TextureHandle, [u32; 2])> {
+        if self.residents.is_provisional(key) {
+            return None;
+        }
+        let (handle, size) = self.residents.touch(key, self.frame)?;
+        Some((handle.clone(), size))
+    }
+}
+
 impl ThumbSource for ThumbStore {
     fn presence(&mut self, image: &core_model::catalog::ImageRow) -> Presence {
         self.presence.ask(image.id, &image.path)
@@ -442,20 +456,33 @@ impl ThumbSource for ThumbStore {
     }
 }
 
-/// Cache tiers in legacy `protocol.rs` order; an unreadable or undecodable tier is a miss.
+/// Cache tiers in legacy `protocol.rs` order. A tier that exists but does not decode is deleted
+/// (only if still the file that was read) and the next tier is tried; a read error is skipped.
 fn read_cached(cache: &ThumbCache, pv: i64, key: &ThumbKey) -> Option<Decoded> {
     let tiers = [
         key.edited_at
-            .and_then(|version| cache.read_edited(&key.hash, pv, version).ok()),
-        cache.read_canonical(&key.hash, pv).ok(),
-        cache.read(&key.hash, THUMB_SIZE).ok(),
+            .map(|version| cache.edited_path_for(&key.hash, pv, version)),
+        Some(cache.canonical_path_for(&key.hash, pv)),
+        Some(cache.path_for(&key.hash, THUMB_SIZE)),
     ];
-    let (tier, mut decoded) = tiers
-        .into_iter()
-        .enumerate()
-        .find_map(|(tier, jpeg)| decode(&jpeg?).ok().map(|decoded| (tier, decoded)))?;
-    decoded.provisional = key.edited_at.is_some() && tier != 0;
-    Some(decoded)
+    for (tier, path) in tiers.into_iter().enumerate() {
+        let Some(path) = path else { continue };
+        let before = stamp(&path);
+        let Ok(jpeg) = std::fs::read(&path) else {
+            continue;
+        };
+        match decode(&jpeg) {
+            Ok(mut decoded) => {
+                decoded.provisional = key.edited_at.is_some() && tier != 0;
+                return Some(decoded);
+            }
+            Err(error) => {
+                eprintln!("thumbnail {} corrupt: {error}", path.display());
+                remove_if_unchanged(&path, before);
+            }
+        }
+    }
+    None
 }
 
 fn decode(jpeg: &[u8]) -> Result<Decoded, String> {

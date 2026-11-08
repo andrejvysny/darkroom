@@ -9,21 +9,36 @@
 //! Frame order in the host: `reconcile` → `accept_results` → `ui_state` → egui `run_ui` →
 //! `submit` → paint + queue submit → `after_submit`.
 
-use crate::photo_worker::{self, PhotoRequest, PhotoResult};
+use crate::open_journey::{Journeys, Milestone};
+use crate::photo_worker::{self, PhotoRequest, PhotoResult, WarmRequest};
 use core_app::state::{ApplicationSnapshot, DocumentStatus};
+use core_model::identity::QualityTier;
 use core_model::identity::{
     CatalogEpoch, DeviceEpoch, EditorSession, FrameHandle, FrameKey, ImageId, SelectionGeneration,
 };
 use core_pipeline::ViewParams;
 use render_wgpu::{FrameLease, Offer, Presenter};
-use ui_egui::{HistogramData, PhotoRequestPlan, PhotoUi};
+use std::collections::VecDeque;
+use std::time::Instant;
+use ui_egui::{HistogramData, PhotoRequestPlan, PhotoUi, Picture, PresentId};
 
+/// A crop-local UV window `(origin, size)`, as the plan carries it.
+type Window = ([f32; 2], [f32; 2]);
+/// What a submitted request will be, remembered until its frame is presented: key, identity,
+/// window, and whether the texture is sampled nearest-neighbour.
+type Submission = (FrameKey, PresentId, Option<Window>, bool);
+/// Requests whose window/identity are remembered until their frame is presented.
+const SUBMITTED_CAP: usize = 16;
+
+mod neighbours;
+mod placeholder;
 #[cfg(test)]
 mod tests;
 
 /// egui registration of leased textures, abstracted so tests need no `egui_wgpu::Renderer`.
 pub trait TextureRegistry {
-    fn register(&mut self, lease: &FrameLease) -> (egui::TextureId, [u32; 2]);
+    /// `nearest`: sample with nearest-neighbour (a native-resolution window magnified past 100 %).
+    fn register(&mut self, lease: &FrameLease, nearest: bool) -> (egui::TextureId, [u32; 2]);
     fn free(&mut self, id: egui::TextureId);
 }
 
@@ -34,8 +49,8 @@ pub struct EguiRegistry<'a> {
 }
 
 impl TextureRegistry for EguiRegistry<'_> {
-    fn register(&mut self, lease: &FrameLease) -> (egui::TextureId, [u32; 2]) {
-        crate::present::register_presented_frame(self.device, self.renderer, lease)
+    fn register(&mut self, lease: &FrameLease, nearest: bool) -> (egui::TextureId, [u32; 2]) {
+        crate::present::register_presented_frame(self.device, self.renderer, lease, nearest)
     }
 
     fn free(&mut self, id: egui::TextureId) {
@@ -100,6 +115,9 @@ struct Registration {
     handle: FrameHandle,
     size: [u32; 2],
     subject: PhotoSubject,
+    /// What the frame is of and the window it shows, from the request that produced it.
+    present: Option<PresentId>,
+    window: Option<Window>,
 }
 
 #[derive(Default)]
@@ -115,6 +133,16 @@ pub struct PhotoView {
     device_epoch: DeviceEpoch,
     /// Newest histogram of the wanted subject; dropped whenever the subject is retired.
     histogram: Option<HistogramData>,
+    /// Open-latency milestones of the photo being opened (diagnostics only).
+    journeys: Journeys,
+    /// The source last handed to the worker as a warm-up, so each selection warms once.
+    warmed: Option<(i64, String)>,
+    /// The selected source whose neighbours were last handed to the prefetch.
+    pub(super) prefetched_for: Option<(i64, String)>,
+    /// Identity + window of recent submissions, matched to their frame when it is presented.
+    submitted: VecDeque<Submission>,
+    /// The cached picture under the live frame.
+    placeholders: placeholder::Placeholders,
 }
 
 impl PhotoView {
@@ -122,6 +150,61 @@ impl PhotoView {
         Self {
             device_epoch,
             ..Self::default()
+        }
+    }
+
+    /// A new photo was selected: start timing how long it takes to appear.
+    pub fn begin_journey(&mut self, image: ImageId) {
+        self.journeys.begin(image, Instant::now());
+    }
+
+    /// A warm-up for the selected photo as soon as its catalog row is known — before its edit
+    /// document is ready — so the decode overlaps the document load. At most once per source.
+    pub fn warm_request(&mut self, snapshot: &ApplicationSnapshot) -> Option<WarmRequest> {
+        if !snapshot.catalog_ready || self.unavailable.is_some() {
+            return None;
+        }
+        let editor = &snapshot.editor;
+        let image = editor.image.as_ref()?;
+        if editor.selected != Some(ImageId(image.id)) {
+            return None;
+        }
+        // A document already known to be unrenderable never needs its pixels.
+        if !matches!(
+            editor.document.status,
+            DocumentStatus::Loading | DocumentStatus::Ready
+        ) {
+            return None;
+        }
+        let source = (image.id, image.content_hash.clone());
+        if self.warmed.as_ref() == Some(&source) {
+            return None;
+        }
+        self.warmed = Some(source);
+        Some(WarmRequest {
+            image_id: image.id,
+            path: std::path::PathBuf::from(&image.path),
+            content_hash: image.content_hash.clone(),
+        })
+    }
+
+    /// Enable disk previews as placeholders (without it only resident thumbnails are used).
+    pub fn attach_stage_preview(&mut self, loader: crate::stage_preview::StagePreview) {
+        self.placeholders.attach(loader);
+    }
+
+    /// Refresh the placeholder for the selection (before `ui_state`). `edge` is the configured
+    /// preview long edge, read lazily: only when a disk preview is actually requested.
+    pub fn update_placeholder(
+        &mut self,
+        snapshot: &ApplicationSnapshot,
+        ctx: &egui::Context,
+        thumbs: Option<&mut crate::thumbs::ThumbStore>,
+        edge: &dyn Fn() -> u32,
+    ) {
+        if let Some(image) = self.placeholders.update(snapshot, ctx, thumbs, edge) {
+            self.journeys
+                .mark(image, Milestone::Placeholder, Instant::now());
         }
     }
 
@@ -184,16 +267,31 @@ impl PhotoView {
     fn accept_frame(&mut self, lease: FrameLease, reg: &mut dyn TextureRegistry) {
         let handle = lease.handle();
         let subject = PhotoSubject::of_key(lease.key());
-        let (texture, size) = reg.register(&lease);
+        let quality = lease.key().quality;
+        let key = *lease.key();
+        // Newest submission of this key wins (a key re-submitted later carries the same
+        // window, but the newest is the one still recorded after eviction).
+        let sent = self.submitted.iter().rev().find(|(k, ..)| *k == key);
+        let (present, window) = (sent.map(|s| s.1), sent.and_then(|s| s.2));
+        let nearest = sent.is_some_and(|s| s.3);
+        let (texture, size) = reg.register(&lease, nearest);
         if self.presenter.offer(lease, self.device_epoch) == Offer::Presented {
             if let Some(previous) = self.registration.replace(Registration {
                 texture,
                 handle,
                 size,
                 subject,
+                present,
+                window,
             }) {
                 self.pending_free.push(previous.texture);
             }
+            let milestone = match quality {
+                QualityTier::Settled => Milestone::Settled,
+                QualityTier::Interactive => Milestone::Live,
+            };
+            self.journeys
+                .mark(subject.image_id, milestone, Instant::now());
             self.collect();
         } else {
             // A rejected lease was never in a draw list.
@@ -225,19 +323,34 @@ impl PhotoView {
             .registration
             .as_ref()
             .filter(|reg| Some(reg.subject) == subject)
-            .map(|reg| (reg.texture, reg.size));
+            .map(|reg| match reg.present {
+                Some(id) => Picture {
+                    texture: reg.texture,
+                    px: reg.size,
+                    id,
+                    window: reg.window,
+                },
+                None => Picture::bare(reg.texture, reg.size),
+            });
         let presented = self.presenter.current().map(|lease| lease.key());
         let satisfied = self.wanted.as_ref().is_some_and(|w| Some(w) == presented);
+        // A selection whose catalog row is still loading is loading too (never "Select a photo").
+        let row_pending = snapshot.editor.selected.is_some() && snapshot.editor.image.is_none();
         let loading = message.is_none()
             && failure.is_none()
-            && snapshot.editor.image.is_some()
-            && match snapshot.editor.document.status {
-                DocumentStatus::Loading => true,
-                DocumentStatus::Ready => !satisfied,
-                _ => false,
-            };
+            && (row_pending
+                || snapshot.editor.image.is_some()
+                    && match snapshot.editor.document.status {
+                        DocumentStatus::Loading => true,
+                        DocumentStatus::Ready => !satisfied,
+                        _ => false,
+                    });
+        let placeholder = self
+            .placeholders
+            .picture(subject.map(|subject| subject.image_id));
         PhotoUi {
             texture,
+            placeholder,
             message,
             failure,
             retry: false,
@@ -268,6 +381,12 @@ impl PhotoView {
         }
         self.wanted = Some(plan.key);
         self.failure = None;
+        self.placeholders.variant = plan.present.variant;
+        if self.submitted.len() == SUBMITTED_CAP {
+            self.submitted.pop_front();
+        }
+        self.submitted
+            .push_back((plan.key, plan.present, plan.window, plan.nearest));
         self.presenter.want(plan.key);
         self.sync_registration();
         self.collect();
@@ -306,6 +425,7 @@ impl PhotoView {
     /// Device/surface death: nothing is painted afterwards, so release immediately.
     pub fn retire_for_device_loss(&mut self, reg: &mut dyn TextureRegistry) {
         self.retire_all();
+        self.placeholders.retire();
         self.after_submit(reg);
     }
 

@@ -1308,6 +1308,7 @@ dependencies = [
  "core-raw",
  "image",
  "pollster",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

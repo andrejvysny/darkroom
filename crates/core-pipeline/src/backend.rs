@@ -457,7 +457,7 @@ fn align4(n: u64) -> u64 {
     n.div_ceil(4) * 4
 }
 
-fn mip_count_for(w: u32, h: u32) -> u32 {
+pub(crate) fn mip_count_for(w: u32, h: u32) -> u32 {
     (32 - w.max(h).leading_zeros()).clamp(1, 14)
 }
 
@@ -601,7 +601,7 @@ const WRITE_SLOTS: usize = 12;
 
 /// Area-average one RGBA f32 mip level into the next. GPU mip dimensions are floor-halved, so an
 /// odd source edge must be distributed over the smaller level rather than dropping its last texel.
-fn downsample_rgba_f32(src: &[f32], w: u32, h: u32) -> Vec<f32> {
+pub(crate) fn downsample_rgba_f32(src: &[f32], w: u32, h: u32) -> Vec<f32> {
     let (nw, nh) = ((w / 2).max(1) as usize, (h / 2).max(1) as usize);
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![0f32; nw * nh * 4];
@@ -850,6 +850,8 @@ pub struct DevelopPipeline {
     brush_bake: crate::mask::BrushBake,
     // Edge-aware mask refinement (cross-bilateral).
     refine: crate::mask::MaskRefine,
+    // GPU mip-chain builder; `None` when the compute pipeline is rejected (CPU mips then).
+    mips: Option<crate::mips::MipGenerator>,
 }
 
 impl DevelopPipeline {
@@ -1098,7 +1100,41 @@ impl DevelopPipeline {
             prepass,
             brush_bake,
             refine,
+            mips: crate::mips::MipGenerator::new(device),
         }
+    }
+
+    /// GPU mip generator unless disabled by `DARKROOM_CPU_MIPS`.
+    fn mip_gen(&self) -> Option<&crate::mips::MipGenerator> {
+        self.mips
+            .as_ref()
+            .filter(|_| std::env::var_os("DARKROOM_CPU_MIPS").is_none())
+    }
+
+    /// Test hook: build the input mip chain on the GPU (`gpu`) or CPU and read back every level.
+    #[doc(hidden)]
+    pub fn debug_mip_levels(
+        &self,
+        ctx: &GpuContext,
+        img: &LinearImage,
+        gpu: bool,
+    ) -> Result<Vec<Vec<f32>>, PipelineError> {
+        let limits = ctx.device.limits();
+        let rgba_len = crate::validation::linear_image(
+            img,
+            limits.max_texture_dimension_2d,
+            limits.max_buffer_size,
+        )?;
+        let gen = if gpu {
+            Some(
+                self.mips
+                    .as_ref()
+                    .ok_or_else(|| PipelineError::Device("GPU mip generator unavailable".into()))?,
+            )
+        } else {
+            None
+        };
+        crate::mips::read_levels(ctx, gen, img, rgba_len)
     }
 
     /// The develop pass bind group (bindings 0-15) with `mask_view` at @binding(5).
@@ -1332,18 +1368,8 @@ impl DevelopPipeline {
             limits.max_buffer_size,
         )?;
 
-        // RGB f32 -> RGBA f32 (alpha = 1).
-        let mut rgba = Vec::new();
-        rgba.try_reserve_exact(rgba_len)
-            .map_err(|e| PipelineError::Allocation(format!("CPU upload: {e}")))?;
-        rgba.resize(rgba_len, 0.0f32);
-        for (i, px) in img.data.chunks_exact(3).enumerate() {
-            let o = i * 4;
-            rgba[o] = px[0];
-            rgba[o + 1] = px[1];
-            rgba[o + 2] = px[2];
-            rgba[o + 3] = 1.0;
-        }
+        // RGB f32 -> RGBA f32 (alpha = 1), parallel.
+        let rgba = crate::mips::rgb_to_rgba(img, rgba_len)?;
 
         let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
@@ -1352,65 +1378,18 @@ impl DevelopPipeline {
             height: h,
             depth_or_array_layers: 1,
         };
-        // Mip chain (CPU box filter, built once per prepare): zoomed-OUT viewport renders sample a
+        // Full mip chain (down to 1x1), built once per prepare: zoomed-OUT viewport renders sample a
         // matching lower level instead of undersampling full res (aliasing/shimmer), and the Presence
         // (clarity/texture/dehaze) local-contrast stage reads coarser levels relative to the display
         // mip. Level 0 is the exact source; the shader picks level 0 for identity/legacy renders, so
-        // goldens are untouched. Build the FULL chain (down to 1×1) so the coarse local-contrast band
-        // has headroom even in a minified fit-view preview (the extra levels are ~⅓ more memory, cheap).
-        let mip_count = mip_count_for(w, h);
-        let input = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("develop-input"),
-            size,
-            mip_level_count: mip_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &input,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&rgba),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 16),
-                rows_per_image: Some(h),
-            },
-            size,
+        // goldens are untouched. Levels 1.. come from a compute shader (CPU box filter fallback).
+        let input = crate::mips::upload_chain(
+            ctx,
+            self.mip_gen(),
+            rgba,
+            (w, h),
+            wgpu::TextureUsages::empty(),
         );
-        let mut level_data = rgba;
-        let (mut lw, mut lh) = (w, h);
-        for level in 1..mip_count {
-            level_data = downsample_rgba_f32(&level_data, lw, lh);
-            lw = (lw / 2).max(1);
-            lh = (lh / 2).max(1);
-            ctx.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &input,
-                    mip_level: level,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bytemuck::cast_slice(&level_data),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(lw * 16),
-                    rows_per_image: Some(lh),
-                },
-                wgpu::Extent3d {
-                    width: lw,
-                    height: lh,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-        drop(level_data);
 
         let output = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("develop-output"),

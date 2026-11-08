@@ -8,8 +8,9 @@
 
 /// Zoom floor: fit. Native does not zoom out below fit.
 pub const MIN_ZOOM: f64 = 1.0;
-/// Guaranteed zoom ceiling; the real ceiling is `max_zoom` (at least this).
-pub const MAX_ZOOM_FLOOR: f64 = 8.0;
+/// The ceiling in actual pixels: 400 % is enough to peep at pixels, and a bigger render target
+/// would only cost memory.
+pub const MAX_ACTUAL_ZOOM: f64 = 4.0;
 
 /// Zoom and pan state: zoom relative to fit, and the view centre in crop-local UV `[0,1]²`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -65,9 +66,10 @@ pub fn derive_view(state: ViewState, frame_px: (u32, u32), panel_px: (u32, u32))
     }
 }
 
-/// Largest zoom allowed: `max(MAX_ZOOM_FLOOR, 2 * one_to_one_zoom(..))`.
+/// Largest zoom allowed: 400 % of actual pixels, never below fit — a tiny image (or tight crop)
+/// that already fits above 400 % simply cannot zoom further, and the clamp bounds never invert.
 pub fn max_zoom(frame_px: (u32, u32), panel_px: (u32, u32)) -> f64 {
-    MAX_ZOOM_FLOOR.max(2.0 * one_to_one_zoom(frame_px, panel_px))
+    MIN_ZOOM.max(MAX_ACTUAL_ZOOM * one_to_one_zoom(frame_px, panel_px))
 }
 
 /// Zoom at which one frame pixel == one physical panel pixel.
@@ -315,11 +317,33 @@ mod tests {
     }
 
     #[test]
-    fn max_zoom_at_least_double_one_to_one_for_100mp() {
-        let frame = (10000u32, 10000u32);
-        let panel = (1200u32, 800u32);
-        assert!(max_zoom(frame, panel) >= 2.0 * one_to_one_zoom(frame, panel));
-        assert!(max_zoom(frame, panel) > MAX_ZOOM_FLOOR);
+    fn max_zoom_is_four_times_one_to_one_for_a_big_image() {
+        for (frame, panel) in [
+            ((10000u32, 10000u32), (1200u32, 800u32)),
+            ((6960, 4640), (1392, 928)),
+            ((4640, 6960), (800, 1000)), // portrait photo, portrait-ish panel
+            ((6960, 4640), (500, 1400)), // portrait panel, landscape photo
+        ] {
+            let o = one_to_one_zoom(frame, panel);
+            assert!(o > 1.0);
+            assert!((max_zoom(frame, panel) - 4.0 * o).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn max_zoom_never_drops_below_fit() {
+        // A tiny image (already shown above 100 % at fit) and a tight crop of one: the ceiling is
+        // fit itself, not a value below it.
+        assert_eq!(max_zoom((200, 100), (1200, 800)), MIN_ZOOM);
+        assert_eq!(max_zoom((1, 1), (1200, 800)), MIN_ZOOM);
+        let z = zoom_at(
+            ViewState::default(),
+            3.0,
+            [10.0, 10.0],
+            (200, 100),
+            (1200, 800),
+        );
+        assert_eq!(z.zoom, MIN_ZOOM);
     }
 
     #[test]

@@ -20,7 +20,10 @@ pub use export_dialog::{ExportUi, EXPORT_DIALOG_ID, EXPORT_DIALOG_LABEL};
 pub use import_dialog::{ImportUi, IMPORT_DIALOG_ID};
 pub use library::{LibraryUi, GRID_SCROLL_ID, INFO_ID, NAV_ID, NOT_YET, TOOLBAR_ID};
 pub use panels::{settings_notice_strip, SETTINGS_NOTICES_ID};
-pub use photo::{cropped_frame_aspect, fit_output, viewport_revision, PhotoRequestPlan, PhotoUi};
+pub use photo::{
+    cropped_frame_aspect, fit_output, geometry_sig, target_id, viewport_revision, PhotoRequestPlan,
+    PhotoUi, Picture, PresentId, StageVariant, SAVED_GEOMETRY,
+};
 pub use shell::{COMMAND_ERROR_ID, SEARCH_ID, TOP_BAR_ID};
 
 use core_app::export::{ExportRequest, ExportView};
@@ -57,6 +60,18 @@ pub struct UiState {
     pub export: ExportUi,
     /// Export requests emitted this frame; the host drains and executes them.
     pub export_requests: Vec<ExportRequest>,
+}
+
+impl UiState {
+    /// Whether the photo stage (Develop, or the Library loupe) is on screen — the host warms the
+    /// selected photo's decode only then, never while the user just browses the grid.
+    pub fn photo_stage_shown(&self) -> bool {
+        match self.mode {
+            Mode::Develop => true,
+            Mode::Library => self.library.loupe,
+            Mode::Duplicates => false,
+        }
+    }
 }
 
 /// Per-channel 256-bin histogram of the developed frame currently on screen. The host passes it

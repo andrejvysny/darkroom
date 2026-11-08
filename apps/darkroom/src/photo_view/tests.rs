@@ -84,12 +84,15 @@ enum Ev {
 struct FakeRegistry {
     next: u64,
     events: Vec<Ev>,
+    /// The `nearest` flag of every registration, in order.
+    nearest: Vec<bool>,
     /// Texture referenced by the draw list currently being built; freeing it is a bug.
     in_draw_list: Option<egui::TextureId>,
 }
 
 impl TextureRegistry for FakeRegistry {
-    fn register(&mut self, lease: &FrameLease) -> (egui::TextureId, [u32; 2]) {
+    fn register(&mut self, lease: &FrameLease, nearest: bool) -> (egui::TextureId, [u32; 2]) {
+        self.nearest.push(nearest);
         self.next += 1;
         let id = egui::TextureId::User(self.next);
         self.events.push(Ev::Register(id));
@@ -212,7 +215,14 @@ fn plan(sel: Sel, snap: &ApplicationSnapshot) -> Option<PhotoRequestPlan> {
         viewport_px: VIEWPORT,
         display_px: VIEWPORT,
         window: None,
+        nearest: false,
         crop_preview: false,
+        present: ui_egui::PresentId {
+            image: ImageId(sel.image),
+            edit_version: None,
+            variant: ui_egui::StageVariant::Edited,
+            geometry: 1,
+        },
     })
 }
 
@@ -228,7 +238,7 @@ fn frame(
     view.reconcile(snap);
     view.accept_results(results, reg);
     let ui = view.ui_state(snap);
-    reg.in_draw_list = ui.texture.map(|(id, _)| id);
+    reg.in_draw_list = ui.texture.map(|pic| pic.texture);
     let request = view.submit(plan(sel_, snap), retry);
     reg.in_draw_list = None;
     view.after_submit(reg);
@@ -236,7 +246,7 @@ fn frame(
 }
 
 fn texture_id(ui: &PhotoUi) -> Option<egui::TextureId> {
-    ui.texture.map(|(id, _)| id)
+    ui.texture.map(|pic| pic.texture)
 }
 
 #[test]
@@ -351,8 +361,40 @@ fn loading_document_or_missing_image_row_retires_old_frame() {
     let mut no_row = ready(b);
     no_row.editor.image = None;
     let (ui, request) = frame(&mut view, &mut reg, b, &no_row, vec![], false);
-    assert!(ui.texture.is_none() && !ui.loading && ui.message.is_none());
+    // A selection whose row is still loading reads as loading, never as "Select a photo".
+    assert!(ui.texture.is_none() && ui.loading && ui.message.is_none());
     assert!(request.is_none());
+}
+
+#[test]
+fn warm_up_is_issued_once_per_selected_source_while_the_document_loads() {
+    let (a, b) = (sel(1, 1), sel(2, 2));
+    let mut view = PhotoView::new(DeviceEpoch(1));
+    let loading = snapshot(a, DocumentStatus::Loading);
+    let warm = view
+        .warm_request(&loading)
+        .expect("row known: warm while loading");
+    assert_eq!(warm.image_id, 1);
+    assert!(
+        view.warm_request(&loading).is_none(),
+        "same source warms once"
+    );
+    assert!(view.warm_request(&ready(a)).is_none());
+
+    let mut no_row = snapshot(b, DocumentStatus::Loading);
+    no_row.editor.image = None;
+    assert!(
+        view.warm_request(&no_row).is_none(),
+        "no row, no path to decode"
+    );
+
+    let corrupt = snapshot(b, DocumentStatus::Corrupt);
+    assert!(
+        view.warm_request(&corrupt).is_none(),
+        "unrenderable never decodes"
+    );
+    assert!(view.warm_request(&ready(b)).is_some());
+    assert!(view.warm_request(&closed()).is_none());
 }
 
 #[test]
@@ -580,4 +622,67 @@ fn the_crop_preview_flag_reaches_the_render_view() {
         let request = view.submit(Some(wanted), false).expect("a new key submits");
         assert_eq!(request.view.crop_preview, flag);
     }
+}
+
+#[test]
+fn the_plans_nearest_flag_reaches_the_texture_registration() {
+    let Some(h) = harness() else { return };
+    let a = sel(1, 1);
+    let mut view = PhotoView::new(DeviceEpoch(1));
+    let mut reg = FakeRegistry::default();
+    for nearest in [true, false] {
+        let mut plan = plan(a, &ready(a)).unwrap();
+        plan.nearest = nearest;
+        let revision = if nearest { 1 } else { 2 };
+        plan.key = key(a, revision);
+        view.submit(Some(plan), false)
+            .expect("a new key is submitted");
+        view.accept_results(vec![h.frame(key(a, revision))], &mut reg);
+    }
+    assert_eq!(reg.nearest, [true, false]);
+}
+
+fn library_of(ids: &[i64]) -> Arc<Vec<ImageRow>> {
+    Arc::new(
+        ids.iter()
+            .map(|&id| ImageRow {
+                id,
+                path: format!("/lib/img{id}.cr3"),
+                content_hash: format!("hash{id}"),
+                ..Default::default()
+            })
+            .collect(),
+    )
+}
+
+fn neighbours(view: &mut PhotoView, snap: &ApplicationSnapshot, gone: &[i64]) -> Option<Vec<i64>> {
+    view.prefetch_request(snap, &mut |row| gone.contains(&row.id))
+        .map(|list| list.iter().map(|w| w.image_id).collect())
+}
+
+#[test]
+fn prefetch_neighbours_follow_library_order_once_per_selection() {
+    let mut view = PhotoView::new(DeviceEpoch(1));
+    let mut snap = ready(sel(3, 1));
+    snap.library.rows = library_of(&[1, 2, 3, 4, 5]);
+    assert_eq!(neighbours(&mut view, &snap, &[]), Some(vec![4, 2]));
+    assert_eq!(neighbours(&mut view, &snap, &[]), None, "once per source");
+
+    // Missing neighbours give way to the next present row in that direction.
+    let mut snap = ready(sel(2, 2));
+    snap.library.rows = library_of(&[1, 2, 3, 4, 5]);
+    assert_eq!(neighbours(&mut view, &snap, &[1, 3]), Some(vec![4]));
+
+    // Edges: first row has only a next, last row only a previous.
+    let mut first = ready(sel(1, 3));
+    first.library.rows = library_of(&[1, 2]);
+    assert_eq!(neighbours(&mut view, &first, &[]), Some(vec![2]));
+    let mut last = ready(sel(2, 4));
+    last.library.rows = library_of(&[1, 2]);
+    assert_eq!(neighbours(&mut view, &last, &[]), Some(vec![1]));
+
+    // Selected row outside the result set: nothing to derive, and nothing is consumed.
+    let mut outside = ready(sel(9, 5));
+    outside.library.rows = library_of(&[1, 2]);
+    assert_eq!(neighbours(&mut view, &outside, &[]), None);
 }

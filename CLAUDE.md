@@ -90,8 +90,10 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 
 ### Data flow (three paths)
 
-- **Thumbnails:** embedded JPEG → downscale 512px → disk cache keyed by content hash → `thumb://localhost/<hash_hex>?size=N` protocol → `<img>`.
-- **Develop preview:** `core-raw::develop_linear` (rawler demosaic + our camera→**linear wide-gamut ProPhoto** map via `clip_negative`, >1.0 headroom kept; ProPhoto→sRGB happens in-shader at the display transition) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG bytes → `tauri::ipc::Response` → JS `invoke<ArrayBuffer>` → `URL.createObjectURL`. **Never base64 over IPC.**
+Bullets below describe the legacy Tauri host; the native host (`apps/darkroom`) reads the same cache tiers and renders in-process — see `docs/native-application.md` ("Photo open & preview tiers").
+
+- **Thumbnails:** (Tauri) embedded JPEG → downscale 512px → disk cache keyed by content hash → `thumb://localhost/<hash_hex>?size=N` protocol → `<img>`.
+- **Develop preview:** (Tauri; native: worker renders straight to a shared wgpu texture, no JPEG/IPC) `core-raw::develop_linear` (rawler demosaic + our camera→**linear wide-gamut ProPhoto** map via `clip_negative`, >1.0 headroom kept; ProPhoto→sRGB happens in-shader at the display transition) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG bytes → `tauri::ipc::Response` → JS `invoke<ArrayBuffer>` → `URL.createObjectURL`. **Never base64 over IPC.**
 - **Export:** re-decode full-res → full-res GPU render → PNG/JPEG → save dialog dest (not cached).
 
 ## Hard constraints (do not violate — see Plane page "Architecture & Hard Constraints")

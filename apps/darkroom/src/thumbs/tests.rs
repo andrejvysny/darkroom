@@ -71,6 +71,55 @@ fn cache_tiers_win_in_legacy_order() {
 }
 
 #[test]
+fn corrupt_tier_is_deleted_and_the_next_tier_serves() {
+    let dir = TempDir::new();
+    let cache = ThumbCache::new(dir.0.join("thumbs")).unwrap();
+    let job = ThumbJob {
+        key: key(1, Some(7)),
+        path: dir.0.join("missing.cr3"),
+    };
+    let hash = &job.key.hash;
+    cache.write(hash, THUMB_SIZE, &jpeg(4, 4)).unwrap();
+    cache.write_edited(hash, 6, 7, b"not a jpeg").unwrap();
+    let edited = cache.edited_path_for(hash, 6, 7);
+    let loaded = load(&cache, 6, &job).unwrap();
+    assert_eq!(loaded.size, [4, 4]);
+    assert!(loaded.provisional);
+    assert!(!edited.exists(), "corrupt tier must be removed");
+    assert!(cache.has(hash, THUMB_SIZE), "good tier must survive");
+}
+
+#[test]
+fn unreadable_tier_is_skipped_never_deleted() {
+    let dir = TempDir::new();
+    let cache = ThumbCache::new(dir.0.join("thumbs")).unwrap();
+    let job = ThumbJob {
+        key: key(1, Some(7)),
+        path: dir.0.join("missing.cr3"),
+    };
+    let hash = &job.key.hash;
+    cache.write(hash, THUMB_SIZE, &jpeg(4, 4)).unwrap();
+    // A directory where the file belongs: read fails with an I/O error that is not NotFound.
+    let edited = cache.edited_path_for(hash, 6, 7);
+    std::fs::create_dir(&edited).unwrap();
+    assert_eq!(load(&cache, 6, &job).unwrap().size, [4, 4]);
+    assert!(edited.is_dir(), "unreadable entry must be left alone");
+}
+
+#[test]
+fn changed_file_is_not_deleted_as_corrupt() {
+    let dir = TempDir::new();
+    let path = dir.0.join("t.jpg");
+    std::fs::write(&path, b"bad").unwrap();
+    let before = crate::file_stamp::stamp(&path);
+    std::fs::write(&path, jpeg(4, 4)).unwrap();
+    crate::file_stamp::remove_if_unchanged(&path, before);
+    assert!(path.exists());
+    crate::file_stamp::remove_if_unchanged(&path, None);
+    assert!(path.exists(), "no stamp, no delete");
+}
+
+#[test]
 fn hash_mismatch_fails_without_writing() {
     let dir = TempDir::new();
     let cache = ThumbCache::new(dir.0.join("thumbs")).unwrap();
@@ -283,6 +332,32 @@ mod provisional {
         }
         assert_eq!(tier.calls.load(Ordering::SeqCst), 1);
         assert!(store.shutdown().is_ok());
+    }
+
+    #[test]
+    fn a_provisional_resident_is_not_an_exact_picture_of_its_edit() {
+        let tier = Arc::new(Tier::default());
+        let mut store = rig(&tier);
+        let row = row(Some(5));
+        let key = ThumbKey {
+            image_id: row.id,
+            hash: row.content_hash.clone(),
+            edited_at: Some(5),
+        };
+        settle(&mut store, &row, 2); // provisional stand-in is resident
+        assert!(
+            store.exact_resident(&key).is_none(),
+            "provisional is rejected"
+        );
+        settle(&mut store, &row, 20);
+        let (_, size) = store.exact_resident(&key).expect("settled edit is exact");
+        assert_eq!(size, [20, 20]);
+        assert!(store
+            .exact_resident(&ThumbKey {
+                edited_at: Some(6),
+                ..key
+            })
+            .is_none());
     }
 
     #[test]

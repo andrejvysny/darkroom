@@ -57,6 +57,24 @@ The runtime/catalog tests use copied temporary catalogs and deterministic channe
 
 The photo worker supervises itself: start failure, panic (caught and reported as `WorkerDied`), channel disconnection and join failure are surfaced to the panel instead of an endless spinner. It checks stop/supersession between decode, develop, prepare and render stages and during render-target waits; an in-progress native decode or GPU submission is not interrupted.
 
+## Photo open & preview tiers
+
+Opening a photo shows the best picture the host already has, then replaces it with a live render. The tier ladder, fastest first: (1) the resident grid thumbnail texture (`ThumbStore::exact_resident`, instant); (2) a large disk preview, read off the UI thread by `stage_preview.rs` in the order edited preview (`<hash>_editpv_pv<pv>_<version>_<edge>.jpg`), canonical preview (`<hash>_pv<pv>_<edge>.jpg`), then the embedded-derived preview (`<hash>_emb_<edge>.jpg`); (3) the live frame from the photo worker. `<hash>_emb_<edge>.jpg` is written at import from the camera's embedded JPEG (`core_raw::thumbnail_jpegs`, `process_bytes(.., preview_edge)`); a rendered canonical preview supersedes it (publish-then-sweep: the new file is renamed into place first, stale variants are removed after, so a failed write never leaves the photo without a preview). A cache file that exists but does not decode is deleted only if its size and mtime are unchanged since it was read (`file_stamp.rs`) and the next tier is tried; an I/O read error is skipped and never deletes.
+
+**Identity and placeholders.** Every picture carries a `PresentId` (image, edit version, stage variant, geometry signature). A placeholder is used only when it is geometry-exact for the selection and variant: an edited photo is answered only by its edited tiers, the Before view only by unedited ones, and the crop tool by nothing (its framing exists only live). Until the document loads, a placeholder carries the `SAVED_GEOMETRY` sentinel, which is pinned to the real signature from the saved document, never from a live frame that may already show an unsaved crop. A held picture whose geometry differs from the live target is reprojected into the new framing rather than snapped, and the switch from placeholder to live frame is a short crossfade (`develop/stage_paint.rs`).
+
+**Worker intake.** The photo worker has a latest-wins inbox with priority render > warm > upload: a render request always runs before an early decode (warm), which runs before a speculative upload of a prefetched neighbour. A running job checks the inbox between stages and during render-target waits and stops when it is superseded by a request for another source; a request for the same source only replaces the pending one. The histogram is rendered after the frame is delivered and rides behind it, so it never delays a picture. When the render-target pool is exhausted the worker waits on the pool's return signal instead of polling.
+
+**Neighbour prefetch and admission.** A prefetch thread decodes the +-1 neighbours of the selection (library order) with the full `develop_linear`, one at a time, into a single bounded slot; the GPU worker uploads it only when otherwise idle. The prepared cache pins the current photo and tracks speculative entries separately: a speculative upload is admitted only if it fits the 3 GiB nominal budget and the entry cap by evicting other speculative entries, never the pinned or a used one, and by resident size rather than count. When a photo opens, its mask array reservation is accounted up front. A new selection replaces the neighbour list and cancels the decode in flight at its next stage.
+
+**PreviewService** (`core-runtime/src/preview`) keeps a rendered large preview on disk for every photo. It is GPU-free: the host supplies pixels through `PreviewRenderPort` (`apps/darkroom/src/preview_render.rs`). Visible or just-opened ids go in a priority queue that always runs before the bulk backfill, which walks the library in `id > cursor` pages (256 per page, 4096 pending at most). The host pauses it while a frame is owed or an edit gesture is active (`steer_previews`). Results are published under the catalog's publication fence, so a render for a closed or replaced catalog is dropped. Previews are rendered from the full decode only; a half-resolution proxy decode was deferred pending an Astra parity check of its colour against the full path.
+
+**Device loss.** `PhotoView::retire_for_device_loss` releases the presented frame, the placeholder texture handle and any queued stage-preview result of the old epoch; no texture of a retired device survives.
+
+**Diagnostics.** `DARKROOM_TRACE_OPEN=1` prints one stderr line per open journey (selection command to placeholder, first live frame and settled frame) and per worker request stage timings. `DARKROOM_CPU_MIPS=1` forces the CPU box filter for mip generation instead of the compute shader (`mips.wgsl`), for parity checks.
+
+**Measured** (Canon R7, 32 MP, release): `develop_linear` about 310 ms; GPU prepare 120-145 ms with GPU mips. `make dev` prepare was 2320 ms before the dev-profile optimisation fix and is about 130 ms after.
+
 ## Host scheduling and recovery
 
 Surface acquisition is gated by a retry-not-before instant set by every retry-class surface action; unrelated input/egui redraw requests cannot acquire early (`SurfaceState::schedule`, fake-clock tested). Surface reconfiguration no longer requests a repaint by itself. Occluded/zero-size windows suspend acquisition until visibility or a resize. The host also folds `NativeApplication::next_deadline()` (autosave debounce/backoff, barrier timeout) into its wake schedule.
@@ -82,8 +100,8 @@ The host's `thumbs.rs` serves `ThumbSource`: the UI asks only for cells it lays 
 - A crash between staging and publishing a sidecar can leave a hidden `.<name>.<pid>-<n>.tmp` file beside the photo; nothing sweeps them yet.
 - Rating/flag/keyword sidecar marks for a temporarily missing source are not re-applied on remount (pre-existing).
 - Native display is SDR only; display colour management, HDR output and GPU-device recovery are separate acceptance gates.
-- All global Develop sliders are editable natively; drags render at Settled quality (no interactive tier). Border is editable but not previewed. Cull marks are catalog-only (no metadata sidecar).
-- An edited image without a cached edited thumbnail shows its unedited thumbnail (legacy fallback); the native host does not render edited thumbnails yet.
+- All global Develop sliders are editable natively; drags and zoom gestures render a half-size Interactive tier, then one Settled frame. Border is previewed on the stage at fit. Cull marks are catalog-only (no metadata sidecar).
+- Previews are rendered from the full decode; the half-resolution proxy decode is deferred until its colour parity is checked.
 
 ## Editing and durable saves
 

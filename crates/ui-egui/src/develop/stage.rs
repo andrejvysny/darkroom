@@ -5,14 +5,16 @@
 
 use super::border;
 use super::crop_tool::{self, CropState};
+use super::stage_paint::{self, Win};
 use super::zoom::ZoomUi;
-use crate::photo::{fit_output, photo_plan, StageVariant};
+use super::zoom_footer::{self, Zoomer};
+use crate::photo::{fit_output, photo_plan, target_id, StageVariant};
 use crate::{theme, PhotoUi};
 use core_app::state::ApplicationSnapshot;
 use core_app::workflow::Command;
 use core_model::viewport::{derive_view, DerivedView, ViewState};
 use core_model::Crop;
-use egui::{Align2, Color32, CursorIcon, FontId, Rect};
+use egui::{Color32, CursorIcon, FontId, Rect};
 
 /// What only the Develop stage has: the Before view, the crop tool and the commands the tool
 /// emits. The Library loupe passes `None` and gets the plain edited picture.
@@ -20,20 +22,6 @@ pub(crate) struct DevelopStage<'a> {
     pub before: bool,
     pub crop: &'a mut CropState,
     pub commands: &'a mut Vec<Command>,
-}
-
-/// `"10%  •  6960 × 4640  •  sRGB"`; the zoom is the frame's DISPLAYED pixel width over the
-/// output image's pixel width (not the texture's width: an interactive frame is rendered at
-/// half size yet displayed at the full fitted size), and is left out while nothing is presented.
-fn footer_text(displayed_w: Option<u32>, dims: (u32, u32)) -> String {
-    let size = format!("{} × {}  •  sRGB", dims.0, dims.1);
-    match displayed_w {
-        Some(w) => {
-            let pct = (f64::from(w) / f64::from(dims.0.max(1)) * 100.0).round();
-            format!("{pct:.0}%  •  {size}")
-        }
-        None => size,
-    }
 }
 
 /// Native output size of the picture the stage shows (catalog dims through that variant's
@@ -83,23 +71,6 @@ fn fitted_draw(rect: Rect, ppp: f32, tex_px: [u32; 2]) -> (Rect, u32) {
     (Rect::from_center_size(rect.center(), size_points), width)
 }
 
-/// The presented frame at `draw_rect`, with the stage's soft shadow. `ui.put` stretches the
-/// texture to the rect, which is the point: the interactive frame is a half-size approximation
-/// of the same picture.
-fn paint_frame(ui: &mut egui::Ui, texture: egui::TextureId, draw_rect: Rect) {
-    let shadow = egui::Shadow {
-        offset: [0, 6],
-        blur: 28,
-        spread: 0,
-        color: Color32::from_black_alpha(150),
-    };
-    ui.painter().add(shadow.as_shape(draw_rect, 0));
-    let size_points = draw_rect.size();
-    let image = egui::Image::from_texture(egui::load::SizedTexture::new(texture, size_points))
-        .fit_to_exact_size(size_points);
-    ui.put(draw_rect, image);
-}
-
 /// The stage's render geometry this frame, shared by the plan and the drawing so the box the
 /// frame is rendered for and the box it is drawn into are the same box.
 struct Geometry {
@@ -133,9 +104,6 @@ struct Drawn {
     /// Where the presented frame was painted, in points: the fitted rect at fit, the visible
     /// image area when zoomed — also the rect the zoom gestures anchor on.
     rect: Rect,
-    /// The width the footer's zoom percentage is measured against, in physical px: the fitted
-    /// frame's width at fit, the WHOLE image's on-screen width when zoomed (so 1:1 reads 100%).
-    footer_w: u32,
 }
 
 /// Where the whole image lands when zoomed, clipped to the stage: the box the window frame is a
@@ -152,16 +120,27 @@ fn visible_rect(panel: Rect, derived: &DerivedView, ppp: f32) -> Rect {
     panel.intersect(image)
 }
 
+/// The current view's window in crop-local UV, or `None` at fit (the whole frame).
+fn view_window(derived: &DerivedView) -> Win {
+    (
+        [derived.origin[0] as f32, derived.origin[1] as f32],
+        [derived.size[0] as f32, derived.size[1] as f32],
+    )
+}
+
 /// What the stage holds this frame: the retry banner, then either a state message (which
 /// replaces the image — a protected/unsupported/failed document must never be silently shown
-/// as a render) or the presented frame. `None` when nothing of the photo was drawn (and so there
-/// is nothing to zoom into).
+/// as a render) or the composed picture: a compatible cached placeholder under the live frame,
+/// each re-projected into the current view. `None` when nothing of the photo was drawn (and so
+/// there is nothing to zoom into).
 fn stage_content(
     ui: &mut egui::Ui,
     snapshot: &ApplicationSnapshot,
     photo: &mut PhotoUi,
     rect: Rect,
     geometry: Option<&Geometry>,
+    variant: StageVariant,
+    interacting: bool,
 ) -> Option<Drawn> {
     if let Some(failure) = &photo.failure {
         ui.horizontal(|ui| {
@@ -176,7 +155,14 @@ fn stage_content(
         ui.label(message);
         return None;
     }
-    let Some((texture, tex_px)) = photo.texture else {
+    // A placeholder is painted only when it is a picture of what is wanted now; a live frame is
+    // always of the selected photo (the host retires it on any subject change).
+    let target = target_id(snapshot, variant);
+    let backdrop = photo
+        .placeholder
+        .filter(|pic| target.is_some_and(|target| pic.id.compatible(&target)));
+    let live = photo.texture;
+    let Some(base) = live.or(backdrop) else {
         if photo.loading {
             ui.spinner();
             ui.label("Loading photo…");
@@ -186,21 +172,39 @@ fn stage_content(
         return None;
     };
     let ppp = ui.ctx().pixels_per_point();
-    let (draw_rect, footer_w) = match geometry.and_then(|geometry| geometry.derived) {
-        Some(derived) => (
-            visible_rect(rect, &derived, ppp),
-            derived.image_px[0].round().max(1.0) as u32,
-        ),
-        None => fitted_draw(rect, ppp, tex_px),
+    let derived = geometry.and_then(|geometry| geometry.derived);
+    let draw_rect = match derived {
+        Some(derived) => visible_rect(rect, &derived, ppp),
+        None => {
+            // A window picture's own aspect is not the frame's: fit by the cropped frame's dims
+            // when the document defines them.
+            let fit_px = match geometry {
+                Some(geo) if base.window.is_some() && snapshot.editor.document.params.is_some() => {
+                    [geo.frame_px.0, geo.frame_px.1]
+                }
+                _ => base.px,
+            };
+            fitted_draw(rect, ppp, fit_px).0
+        }
     };
-    paint_frame(ui, texture, draw_rect);
-    if photo.loading {
-        ui.spinner();
-    }
-    Some(Drawn {
-        rect: draw_rect,
-        footer_w,
-    })
+    let window = derived.as_ref().map(view_window);
+    let alpha = stage_paint::live_alpha(
+        ui.ctx(),
+        target.map(|target| target.image),
+        live.map(|pic| pic.texture),
+        live.is_none() && backdrop.is_some(),
+        interacting,
+    );
+    stage_paint::paint(
+        ui,
+        draw_rect,
+        backdrop.as_ref(),
+        live.as_ref(),
+        window,
+        alpha,
+    );
+    stage_paint::activity_dot(ui, rect, photo.loading);
+    Some(Drawn { rect: draw_rect })
 }
 
 /// "BEFORE" tag over the stage while the unedited picture is shown.
@@ -307,15 +311,28 @@ pub(crate) fn central(
                 ui.painter()
                     .rect_filled(preview.outer, 0, border::paint_color(&p.border));
             }
-            let drawn = stage_content(ui, snapshot, photo, frame_rect, geo.as_ref());
+            let drawn = stage_content(
+                ui,
+                snapshot,
+                photo,
+                frame_rect,
+                geo.as_ref(),
+                variant,
+                interacting,
+            );
             if let Some(dims) = output_dims(snapshot, variant) {
-                ui.painter().text(
-                    rect.left_bottom() + egui::vec2(14.0, -12.0),
-                    Align2::LEFT_BOTTOM,
-                    footer_text(drawn.as_ref().map(|drawn| drawn.footer_w), dims),
-                    FontId::monospace(11.0),
-                    theme::T3,
-                );
+                // The crop tool never zooms, so it gets no zoom readout.
+                let zoomer = match (zoom.as_deref_mut(), geo.as_ref(), drawn.as_ref()) {
+                    (Some(zoom), Some(geo), Some(_)) if variant != StageVariant::CropTool => {
+                        Some(Zoomer {
+                            zoom,
+                            frame_px: geo.frame_px,
+                            panel_px: geo.panel_px,
+                        })
+                    }
+                    _ => None,
+                };
+                zoom_footer::show(ui, rect, dims, zoomer);
             }
             if variant == StageVariant::Before {
                 paint_before_badge(ui, rect);
@@ -357,38 +374,13 @@ pub(crate) fn central(
 
 #[cfg(test)]
 mod tests {
-    use super::{fitted_draw, footer_text, visible_rect};
-    use core_model::viewport::{derive_view, one_to_one_zoom, ViewState};
+    use super::{fitted_draw, visible_rect};
+    use core_model::viewport::{derive_view, ViewState};
     use egui::{pos2, Pos2, Rect};
 
     /// The fixture's settled frame for a 3:2 photo in the 820×625-px panel.
     const SETTLED_PX: [u32; 2] = [820, 547];
     const FRAME_PX: (u32, u32) = (6960, 4640);
-
-    #[test]
-    fn footer_shows_zoom_size_and_space() {
-        assert_eq!(
-            footer_text(Some(696), (6960, 4640)),
-            "10%  •  6960 × 4640  •  sRGB"
-        );
-        assert_eq!(footer_text(None, (6960, 4640)), "6960 × 4640  •  sRGB");
-    }
-
-    #[test]
-    fn the_footer_reads_one_hundred_percent_at_one_to_one() {
-        // While zoomed the footer measures the WHOLE image's on-screen width, which at the 1:1
-        // zoom equals the frame's own pixel width.
-        let panel_px = (1200u32, 900u32);
-        let view = ViewState {
-            zoom: one_to_one_zoom(FRAME_PX, panel_px),
-            center: [0.5, 0.5],
-        };
-        let derived = derive_view(view, FRAME_PX, panel_px);
-        assert_eq!(
-            footer_text(Some(derived.image_px[0].round() as u32), FRAME_PX),
-            "100%  •  6960 × 4640  •  sRGB"
-        );
-    }
 
     #[test]
     fn the_visible_box_is_what_the_window_frame_is_a_picture_of() {
@@ -431,11 +423,6 @@ mod tests {
         let (drag, drag_w) = fitted_draw(rect, 1.0, [410, 273]);
         assert_eq!(settled_w, drag_w);
         assert_eq!(settled.center(), drag.center());
-        assert_eq!(
-            footer_text(Some(drag_w), (6960, 4640)),
-            footer_text(Some(settled_w), (6960, 4640)),
-            "the zoom reading must not jump mid-drag"
-        );
         assert_eq!(settled_w, 820);
         assert!((settled.width() - 820.0).abs() <= 0.5);
         // The half-size frame's rounded aspect (410/273) differs from 820/547 by <0.1%: at most

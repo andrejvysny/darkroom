@@ -1,6 +1,7 @@
 //! Integration test over a real Canon EOS R7 CR3 from `library/2026`.
 //! Skips gracefully if the validation library is not present.
 
+use image::GenericImageView;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -60,4 +61,34 @@ fn metadata_thumbnail_hash_fingerprint() {
 
     let fp = core_raw::capture_fingerprint(&meta, thumb.src_width, thumb.src_height);
     assert!(fp.is_some(), "fingerprint should be high-confidence");
+}
+
+#[test]
+fn thumbnail_jpegs_one_decode_many_sizes() {
+    let Some(path) = sample_cr3() else {
+        eprintln!("library/2026 not present — skipping");
+        return;
+    };
+    let bytes = Arc::new(std::fs::read(&path).expect("read file"));
+    let src = core_raw::source_from_bytes(bytes, &path);
+
+    let single = core_raw::thumbnail_jpeg(&src, 512, 82).expect("single");
+    let many =
+        core_raw::thumbnail_jpegs(&src, &[(512, 82), (2560, 85), (100_000, 85)]).expect("multi");
+    assert_eq!(many.len(), 3);
+    // The grid thumb must not change just because a larger preview rides along.
+    assert_eq!(
+        many[0].jpeg, single.jpeg,
+        "512 entry must be byte-identical"
+    );
+    assert_eq!(many[0].src_width, single.src_width);
+    assert_eq!(many[0].disp_height, single.disp_height);
+
+    let dims = |t: &core_raw::Thumb| image::load_from_memory(&t.jpeg).unwrap().dimensions();
+    let (w1, h1) = dims(&many[1]);
+    assert_eq!(w1.max(h1), 2560, "embedded preview is larger than 2560");
+    // An edge above the embedded preview's own size is never upscaled.
+    let (w2, h2) = dims(&many[2]);
+    assert!(w2.max(h2) >= 2560 && w2.max(h2) <= 100_000);
+    assert!(many[2].jpeg.len() >= many[1].jpeg.len());
 }

@@ -64,13 +64,14 @@ impl ThumbSource for Nothing {
 
 fn photo(texture: Option<(TextureId, [u32; 2])>) -> PhotoUi {
     PhotoUi {
-        texture,
+        texture: texture.map(|(id, px)| ui_egui::Picture::bare(id, px)),
         message: None,
         failure: None,
         retry: false,
         loading: false,
         device_epoch: Default::default(),
         plan: None,
+        placeholder: None,
     }
 }
 

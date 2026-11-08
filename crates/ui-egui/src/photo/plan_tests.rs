@@ -445,3 +445,70 @@ fn the_crop_tool_plan_resets_the_crop_but_keeps_rotation_and_ignores_zoom() {
         planned_variant(&snap, ViewState::default(), StageVariant::Before).key
     );
 }
+
+fn zoomed_to_actual(actual: f64, interacting: bool) -> PhotoRequestPlan {
+    let one = core_model::viewport::one_to_one_zoom(FRAME_PX, (820, 625));
+    planned(
+        HASH,
+        false,
+        ViewState {
+            zoom: actual * one,
+            center: [0.5, 0.5],
+        },
+        interacting,
+    )
+}
+
+#[test]
+fn above_one_hundred_percent_the_window_renders_at_native_resolution() {
+    // 400 %: each frame pixel is 4 screen pixels, so the render target is a quarter of the
+    // displayed window per side — and never bigger than the panel.
+    let plan = zoomed_to_actual(4.0, false);
+    assert!(plan.nearest, "magnified native pixels are sampled crisp");
+    assert_eq!(plan.key.quality, QualityTier::Settled);
+    let (_, size) = plan.window.expect("zoomed");
+    assert_eq!(
+        plan.viewport_px,
+        (
+            (f64::from(size[0]) * 6960.0).round() as u32,
+            (f64::from(size[1]) * 4640.0).round() as u32
+        ),
+        "one render pixel per source pixel"
+    );
+    assert!(plan.viewport_px.0 <= 820 && plan.viewport_px.1 <= 625);
+    assert!(
+        (f64::from(plan.display_px.0) / f64::from(plan.viewport_px.0) - 4.0).abs() < 0.05,
+        "{:?} shown at {:?}",
+        plan.viewport_px,
+        plan.display_px
+    );
+    let plan = zoomed_to_actual(2.0, false);
+    assert!(plan.nearest);
+    assert!(
+        (f64::from(plan.display_px.0) / f64::from(plan.viewport_px.0) - 2.0).abs() < 0.05,
+        "{:?} shown at {:?}",
+        plan.viewport_px,
+        plan.display_px
+    );
+}
+
+#[test]
+fn up_to_one_hundred_percent_nothing_is_magnified_or_nearest() {
+    for actual in [1.0, 0.5, 0.2] {
+        let plan = zoomed_to_actual(actual, false);
+        if plan.window.is_none() {
+            continue; // <= fit: the historical whole-crop plan
+        }
+        assert!(!plan.nearest, "{actual}");
+        assert_eq!(plan.viewport_px, plan.display_px, "{actual}");
+    }
+    assert!(!plan_at(HASH, false).nearest);
+}
+
+#[test]
+fn the_interactive_tier_stays_smooth_above_one_hundred_percent() {
+    let plan = zoomed_to_actual(4.0, true);
+    assert_eq!(plan.key.quality, QualityTier::Interactive);
+    assert!(!plan.nearest, "a half-size frame is not real pixels");
+    assert_eq!(plan.viewport_px, interactive_render_px(plan.display_px));
+}

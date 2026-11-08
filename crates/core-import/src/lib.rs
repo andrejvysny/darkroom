@@ -305,6 +305,7 @@ where
         mode,
         library_root,
         pairing,
+        None,
         progress,
         control,
     )
@@ -392,6 +393,7 @@ pub fn import_files<F>(
     mode: ImportMode,
     library_root: &Path,
     pairing: Pairing,
+    preview_edge: Option<u32>,
     progress: F,
     control: &dyn ImportControl,
 ) -> Result<ImportStats, ImportError>
@@ -462,7 +464,17 @@ where
         let outcomes: Vec<Result<Outcome, ImportError>> = pool.install(|| {
             chunk
                 .par_iter()
-                .map(|p| process_one_unlocked(thumbs, p, mode, library_root, &st.seen, &claimed))
+                .map(|p| {
+                    process_one_unlocked(
+                        thumbs,
+                        p,
+                        mode,
+                        library_root,
+                        &st.seen,
+                        &claimed,
+                        preview_edge,
+                    )
+                })
                 .collect()
         });
         // `Option` so a stale stop can leave the chunk's untouched outcomes in place: they are
@@ -1003,6 +1015,7 @@ fn process_one_unlocked(
     library_root: &Path,
     seen: &HashSet<[u8; 32]>,
     claimed: &Mutex<HashSet<PathBuf>>,
+    preview_edge: Option<u32>,
 ) -> Result<Outcome, ImportError> {
     let bytes = Arc::new(std::fs::read(src_path)?);
     let src_hash = content_hash(&bytes);
@@ -1079,7 +1092,14 @@ fn process_one_unlocked(
 
     // The destination is byte-identical to the source (verified above), so the buffer we already
     // hold IS the destination's content — no second read, and `src_hash` stays its content hash.
-    let processed = match process_bytes(&dest_path, bytes, src_hash, thumbs, THUMB_SIZE) {
+    let processed = match process_bytes(
+        &dest_path,
+        bytes,
+        src_hash,
+        thumbs,
+        THUMB_SIZE,
+        preview_edge,
+    ) {
         Ok(p) => p,
         Err(e) => {
             // The copy exists but will never be catalogued. Reference mode owns nothing: never
@@ -1125,6 +1145,7 @@ mod tests {
             library.path(),
             &HashSet::new(),
             &Mutex::new(HashSet::new()),
+            None,
         )
         .expect("an undecodable file is an outcome, not an error");
 

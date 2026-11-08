@@ -15,7 +15,10 @@ mod params;
 mod presets_panel;
 mod slider;
 pub(crate) mod stage;
+mod stage_paint;
 pub(crate) mod zoom;
+mod zoom_footer;
+mod zoom_input;
 
 use crate::icons::{icon_button_enabled, Icon};
 use crate::{theme, HistogramData, PhotoUi, ThumbSource};

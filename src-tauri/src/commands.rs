@@ -2753,6 +2753,7 @@ pub async fn import_commit(
                 import_mode,
                 Path::new(&dest),
                 pairing,
+                None,
                 |done, total, added| {
                     if let Some(row) = added {
                         added_ids.borrow_mut().push(row.id);

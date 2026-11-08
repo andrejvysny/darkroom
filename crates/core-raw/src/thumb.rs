@@ -167,27 +167,73 @@ pub fn oriented_preview(src: &RawSource) -> Result<DynamicImage, RawError> {
 /// `src_*` dims are the *sensor-native* (pre-orientation) full-image dims — see [`sensor_dims`] —
 /// which is the pair the capture fingerprint is built from.
 pub fn thumbnail_jpeg(src: &RawSource, max_edge: u32, quality: u8) -> Result<Thumb, RawError> {
-    crate::panic::catch_decode_panic("thumbnail_jpeg", || {
-        thumbnail_jpeg_inner(src, max_edge, quality)
-    })
+    let mut v = thumbnail_jpegs(src, &[(max_edge, quality)])?;
+    Ok(v.remove(0))
 }
 
-fn thumbnail_jpeg_inner(src: &RawSource, max_edge: u32, quality: u8) -> Result<Thumb, RawError> {
+/// Like [`thumbnail_jpeg`] for several `(max_edge, quality)` sizes from ONE decode of the source
+/// (the embedded JPEG of a CR3 is ~7000 px wide, so decoding it once per size would double import
+/// cost). Output order = input order; each size is cut from the original decoded image, never from
+/// another size's output, and nothing is upscaled.
+pub fn thumbnail_jpegs(src: &RawSource, sizes: &[(u32, u8)]) -> Result<Vec<Thumb>, RawError> {
+    crate::panic::catch_decode_panic("thumbnail_jpeg", || thumbnail_jpegs_inner(src, sizes))
+}
+
+/// Oriented full-quality image plus the NATIVE and ORIENTED full-image dims it stands for.
+struct Decoded {
+    img: DynamicImage,
+    native: (u32, u32),
+    oriented: (u32, u32),
+    /// True for the HDR-PQ fallback, whose pixels are already downscaled to one edge.
+    developed: bool,
+}
+
+fn thumbnail_jpegs_inner(src: &RawSource, sizes: &[(u32, u8)]) -> Result<Vec<Thumb>, RawError> {
     use crate::display::ImageKind;
-    match crate::display::classify(src.path()) {
-        ImageKind::Jpeg | ImageKind::Png => {
-            let bytes = src.as_vec()?;
-            let orientation = crate::display::exif_orientation(&bytes);
-            return crate::display::decode_display_thumb(&bytes, orientation, max_edge, quality);
-        }
-        ImageKind::Heif => {
-            return crate::heif::decode_heif_thumb(&src.as_vec()?, max_edge, quality)
-        }
-        ImageKind::Hdr => {
-            return crate::hdr_file::decode_hdr_thumb(&src.as_vec()?, max_edge, quality)
-        }
-        ImageKind::Raw => {}
+    // Display/HEIF/EXR sources decode cheaply (or have no large embedded JPEG), so each size runs
+    // its own dedicated path.
+    let kind = crate::display::classify(src.path());
+    if !matches!(kind, ImageKind::Raw) {
+        return sizes
+            .iter()
+            .map(|&(edge, q)| non_raw_thumb(src, kind, edge, q))
+            .collect();
     }
+    let max_edge = sizes.iter().map(|s| s.0).max().unwrap_or(1);
+    let d = decode_raw_oriented(src, max_edge)?;
+    if d.developed {
+        // The developed fallback (rare HDR-PQ CR3) downscales in linear light to one edge, so each
+        // size is developed on its own to stay identical to a single-size call.
+        return sizes
+            .iter()
+            .map(|&(edge, q)| encode_at(&decode_raw_oriented(src, edge)?, edge, q))
+            .collect();
+    }
+    sizes
+        .iter()
+        .map(|&(edge, q)| encode_at(&d, edge, q))
+        .collect()
+}
+
+fn non_raw_thumb(
+    src: &RawSource,
+    kind: crate::display::ImageKind,
+    max_edge: u32,
+    quality: u8,
+) -> Result<Thumb, RawError> {
+    use crate::display::ImageKind;
+    let bytes = src.as_vec()?;
+    match kind {
+        ImageKind::Heif => crate::heif::decode_heif_thumb(&bytes, max_edge, quality),
+        ImageKind::Hdr => crate::hdr_file::decode_hdr_thumb(&bytes, max_edge, quality),
+        _ => {
+            let orientation = crate::display::exif_orientation(&bytes);
+            crate::display::decode_display_thumb(&bytes, orientation, max_edge, quality)
+        }
+    }
+}
+
+fn decode_raw_oriented(src: &RawSource, max_edge: u32) -> Result<Decoded, RawError> {
     let decoder = rawler::get_decoder(src)?;
     let params = RawDecodeParams::default();
     let exif_orientation = decoder
@@ -212,19 +258,23 @@ fn thumbnail_jpeg_inner(src: &RawSource, max_edge: u32, quality: u8) -> Result<T
     })
     .ok();
 
-    // `(w, h)` = NATIVE (pre-orientation) dims, which feed the capture fingerprint; `(ow, oh)` =
-    // ORIENTED (display) dims for the catalog. Both describe the FULL image, never the thumbnail.
-    let (img, w, h, ow, oh) = match embedded_preview(decoder.as_ref(), src, &params) {
-        Some(img) => {
+    // `native` feeds the capture fingerprint; `oriented` is the display dims for the catalog. Both
+    // describe the FULL image, never a thumbnail.
+    match embedded_preview(decoder.as_ref(), src, &params) {
+        Some(mut img) => {
             // Only if the geometry read failed do the PREVIEW's own dims stand in for the sensor's.
-            let (w, h) = native_dims.unwrap_or_else(|| img.dimensions());
+            let native = native_dims.unwrap_or_else(|| img.dimensions());
             // Upright the preview from its EXIF orientation (1–8). Absent/unknown → already upright.
-            let mut img = img;
             if let Some(o) = exif_orientation.and_then(|v| Orientation::from_exif(v as u8)) {
                 img.apply_orientation(o);
             }
-            let (ow, oh) = oriented_dims((w, h), exif_orientation);
-            (img, w, h, ow, oh)
+            let oriented = oriented_dims(native, exif_orientation);
+            Ok(Decoded {
+                img,
+                native,
+                oriented,
+                developed: false,
+            })
         }
         None => {
             // HDR-PQ CR3: no readable embedded preview, so develop the mosaic. `develop_linear`
@@ -232,25 +282,32 @@ fn thumbnail_jpeg_inner(src: &RawSource, max_edge: u32, quality: u8) -> Result<T
             // sensor ones. Its output is already uprighted, so those dims ARE the display dims and
             // the native pair is recovered by undoing a quarter-turn orientation.
             let lin = crate::develop::develop_linear(src)?;
-            let (w, h) = native_dims
+            let native = native_dims
                 .unwrap_or_else(|| oriented_dims((lin.width, lin.height), exif_orientation));
-            let (ow, oh) = oriented_dims((w, h), exif_orientation);
-            // Downscale in linear light before the sRGB encode (the shared tail below then has
-            // nothing left to do), so a 32 MP mosaic never materializes as a full-size RGB8 buffer.
+            let oriented = oriented_dims(native, exif_orientation);
             let small = lin.downscale_into(max_edge.max(1));
             let img = DynamicImage::ImageRgb8(crate::display::linear_to_srgb_rgb8(&small));
-            (img, w, h, ow, oh)
+            Ok(Decoded {
+                img,
+                native,
+                oriented,
+                developed: true,
+            })
         }
-    };
+    }
+}
 
-    let (iw, ih) = img.dimensions();
-    let scaled = if iw.max(ih) > max_edge {
+fn encode_at(d: &Decoded, max_edge: u32, quality: u8) -> Result<Thumb, RawError> {
+    let (iw, ih) = d.img.dimensions();
+    let scaled;
+    let shown = if iw.max(ih) > max_edge {
         // `thumbnail` preserves aspect ratio, fitting within the box; fast triangle filter.
-        img.thumbnail(max_edge, max_edge)
+        scaled = d.img.thumbnail(max_edge, max_edge);
+        &scaled
     } else {
-        img
+        &d.img
     };
-    let rgb = scaled.to_rgb8();
+    let rgb = shown.to_rgb8();
     let mut buf = Vec::new();
     let mut enc = JpegEncoder::new_with_quality(&mut buf, quality);
     enc.encode(
@@ -261,9 +318,9 @@ fn thumbnail_jpeg_inner(src: &RawSource, max_edge: u32, quality: u8) -> Result<T
     )?;
     Ok(Thumb {
         jpeg: buf,
-        src_width: w,
-        src_height: h,
-        disp_width: ow,
-        disp_height: oh,
+        src_width: d.native.0,
+        src_height: d.native.1,
+        disp_width: d.oriented.0,
+        disp_height: d.oriented.1,
     })
 }

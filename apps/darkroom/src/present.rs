@@ -11,17 +11,24 @@ use crate::{gpu::Gpu, paint};
 use render_wgpu::FrameLease;
 
 /// Register a finished lease's texture with the host's egui renderer as a native texture
-/// (linear filtering). Returns the egui texture id plus the frame's pixel size, ready for
-/// `ui.image((id, size_in_points))`.
+/// (linear filtering, or nearest-neighbour when `nearest`: a native-resolution window magnified
+/// past 100 % must show real pixels, and egui picks the sampler at registration). Returns the
+/// egui texture id plus the frame's pixel size, ready for `ui.image((id, size_in_points))`.
 pub fn register_presented_frame(
     device: &wgpu::Device,
     renderer: &mut egui_wgpu::Renderer,
     lease: &FrameLease,
+    nearest: bool,
 ) -> (egui::TextureId, [u32; 2]) {
     let view = lease
         .texture()
         .create_view(&wgpu::TextureViewDescriptor::default());
-    let texture_id = renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear);
+    let filter = if nearest {
+        wgpu::FilterMode::Nearest
+    } else {
+        wgpu::FilterMode::Linear
+    };
+    let texture_id = renderer.register_native_texture(device, &view, filter);
     let (width, height) = lease.key().viewport_px;
     (texture_id, [width, height])
 }
@@ -43,7 +50,8 @@ pub fn paint_probe_frame(gpu: &Gpu, lease: &FrameLease) -> Result<f64, String> {
         .push_error_scope(wgpu::ErrorFilter::Validation);
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut renderer = egui_wgpu::Renderer::new(&gpu.context.device, format, Default::default());
-    let (texture_id, _) = register_presented_frame(&gpu.context.device, &mut renderer, lease);
+    let (texture_id, _) =
+        register_presented_frame(&gpu.context.device, &mut renderer, lease, false);
     let target = paint::probe_target(&gpu.context.device, format, [width, height]);
     let egui = egui::Context::default();
     egui.set_missing_glyph_policy(egui::epaint::text::MissingGlyphPolicy::Panic);

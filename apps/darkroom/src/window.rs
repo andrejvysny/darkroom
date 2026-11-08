@@ -90,6 +90,9 @@ struct State {
     photo: Option<PhotoWorker>,
     /// Presented frame, its egui registration and the failure state (see `photo_view.rs`).
     photo_view: PhotoView,
+    /// The catalog's preview edge, read once per catalog epoch: reading it takes the catalog
+    /// lock, which must not happen on every selection change on the UI thread.
+    preview_edge: Option<(u64, u32)>,
     /// Transient develop input state (drag in flight, dismissed banner).
     ui_state: ui_egui::UiState,
     /// Asynchronous thumbnail service; `None` without a catalog or when it could not start (the
@@ -97,6 +100,11 @@ struct State {
     thumbs: Option<ThumbStore>,
     /// Export dialog state and the render worker behind it.
     export: crate::export_host::ExportHost,
+    /// Keeps a rendered large preview on disk for every photo; `None` without a catalog or when it
+    /// could not start (embedded previews then stay).
+    previews: Option<core_runtime::preview::PreviewService>,
+    /// The selected photo and its edit version last handed to `previews`.
+    preview_focus: Option<(i64, Option<i64>)>,
 }
 
 fn sdr_config(
@@ -158,7 +166,7 @@ impl State {
         let mut settings = crate::settings::SettingsState::load(catalog_path.as_deref());
         let wake_workflow = proxy.clone();
         let thumbs_root = catalog_path.clone();
-        let application = catalog_path
+        let mut application = catalog_path
             .map(|path| {
                 crate::application::NativeApplication::new(
                     path,
@@ -234,9 +242,30 @@ impl State {
                 }
             }
         });
+        let preview_proxy = proxy.clone();
+        let proxy_for_previews = proxy.clone();
         let photo_proxy = proxy;
         let device_epoch = DeviceEpoch(1);
         let mut photo_view = PhotoView::new(device_epoch);
+        // Large cached previews as placeholders; without the thumbnail cache only resident
+        // thumbnails are used.
+        if let Some(root) = thumbs_root.as_deref().and_then(|path| path.parent()) {
+            let started = core_library::ThumbCache::new(root.join("thumbs"))
+                .map_err(|error| error.to_string())
+                .and_then(|cache| {
+                    crate::stage_preview::StagePreview::start(
+                        cache,
+                        core_model::identity::CURRENT_PROCESS_VERSION.0,
+                        Arc::new(move || {
+                            let _ = preview_proxy.send_event(UserEvent::Wake(Some(Instant::now())));
+                        }),
+                    )
+                });
+            match started {
+                Ok(loader) => photo_view.attach_stage_preview(loader),
+                Err(error) => eprintln!("stage previews unavailable: {error}"),
+            }
+        }
         let photo = match PhotoWorker::start(
             &gpu.context,
             Arc::clone(&gpu.pipeline),
@@ -251,6 +280,39 @@ impl State {
                 None
             }
         };
+        let previews = application.as_ref().and_then(|app| {
+            let root = thumbs_root.as_deref()?.parent()?.join("thumbs");
+            let wake = proxy_for_previews;
+            let busy: crate::preview_render::BusyProbe = match photo.as_ref() {
+                Some(worker) => worker.busy_probe(),
+                None => Arc::new(|| false),
+            };
+            let port = Arc::new(crate::preview_render::PreviewRenderer {
+                catalog: app.catalog(),
+                ctx: core_pipeline::GpuContext {
+                    device: gpu.context.device.clone(),
+                    queue: gpu.context.queue.clone(),
+                    info: gpu.context.info.clone(),
+                    max_texture_dim: gpu.context.max_texture_dim,
+                },
+                pipeline: Arc::clone(&gpu.pipeline),
+                busy,
+            });
+            let started = core_runtime::preview::PreviewService::start(
+                app.catalog(),
+                root,
+                port,
+                Arc::new(move || {
+                    let _ = wake.send_event(UserEvent::Wake(Some(Instant::now())));
+                }),
+            );
+            started
+                .map_err(|error| eprintln!("rendered previews unavailable: {error}"))
+                .ok()
+        });
+        if let (Some(app), Some(service)) = (application.as_mut(), previews.as_ref()) {
+            app.attach_previews(service.handle());
+        }
         Ok(Self {
             application,
             settings,
@@ -268,12 +330,15 @@ impl State {
             shutdown_requested: false,
             photo,
             photo_view,
+            preview_edge: None,
             ui_state: ui_egui::UiState {
                 chrome_inset_left: chrome::chrome_inset_left(),
                 ..ui_egui::UiState::default()
             },
             thumbs,
             export: crate::export_host::ExportHost::new(export_worker),
+            previews,
+            preview_focus: None,
         })
     }
 
@@ -354,11 +419,41 @@ impl State {
             .configure(&self.gpu.context.device, &self.config);
     }
 
+    /// Background previews yield while the user is waiting on a frame or dragging an edit, and the
+    /// photo in front (or just saved) is rendered ahead of the backfill.
+    fn steer_previews(
+        previews: Option<&core_runtime::preview::PreviewService>,
+        preview_focus: &mut Option<(i64, Option<i64>)>,
+        snapshot: &core_app::state::ApplicationSnapshot,
+        loading: bool,
+    ) {
+        let Some(service) = previews else {
+            return;
+        };
+        service.set_paused(loading || snapshot.editor.document.gesture_active);
+        let focus = snapshot
+            .editor
+            .image
+            .as_ref()
+            .map(|image| (image.id, image.edited_at));
+        if focus != *preview_focus {
+            *preview_focus = focus;
+            if let Some((id, _)) = focus {
+                service.prioritize(&[id]);
+            }
+        }
+    }
+
     fn shutdown_photo(&mut self) -> Result<(), String> {
+        // First: its renders use the GPU the other services share.
+        let previews = self
+            .previews
+            .as_mut()
+            .map_or(Ok(()), core_runtime::preview::PreviewService::shutdown);
         let thumbs = self.thumbs.as_mut().map_or(Ok(()), ThumbStore::shutdown);
         let photo = self.photo.as_mut().map_or(Ok(()), PhotoWorker::shutdown);
         let export = self.export.shutdown();
-        photo.and(thumbs).and(export)
+        previews.and(photo).and(thumbs).and(export)
     }
 
     fn recover_surface(&mut self) -> Result<(), String> {
@@ -478,6 +573,26 @@ impl State {
                     renderer: &mut self.renderer,
                 },
             );
+            let catalog = application.catalog();
+            let epoch = snapshot.catalog_epoch.0;
+            let cached_edge = self.preview_edge;
+            let edge = std::cell::Cell::new(None::<u32>);
+            self.photo_view.update_placeholder(
+                &snapshot,
+                &self.egui,
+                self.thumbs.as_mut(),
+                &|| {
+                    let value = match cached_edge {
+                        Some((cached_epoch, value)) if cached_epoch == epoch => value,
+                        _ => catalog.preview_edge(),
+                    };
+                    edge.set(Some(value));
+                    value
+                },
+            );
+            if let Some(value) = edge.get() {
+                self.preview_edge = Some((epoch, value));
+            }
             let mut photo_ui = self.photo_view.ui_state(&snapshot);
             let histogram = self.photo_view.histogram(&snapshot);
             let mut no_thumbs = ui_egui::NoThumbs;
@@ -515,6 +630,31 @@ impl State {
             if let Some(store) = self.thumbs.as_mut() {
                 store.end_frame();
             }
+            Self::steer_previews(
+                self.previews.as_ref(),
+                &mut self.preview_focus,
+                &snapshot,
+                photo_ui.loading,
+            );
+            if self.ui_state.photo_stage_shown() {
+                if let (Some(warm), Some(worker)) =
+                    (self.photo_view.warm_request(&snapshot), self.photo.as_ref())
+                {
+                    worker.warm(warm);
+                }
+                let thumbs = &mut self.thumbs;
+                let mut missing = |row: &core_model::catalog::ImageRow| {
+                    thumbs.as_mut().is_some_and(|store| {
+                        ui_egui::ThumbSource::presence(store, row) == ui_egui::Presence::Missing
+                    })
+                };
+                if let (Some(neighbours), Some(worker)) = (
+                    self.photo_view.prefetch_request(&snapshot, &mut missing),
+                    self.photo.as_ref(),
+                ) {
+                    worker.prefetch(neighbours);
+                }
+            }
             let submitted = self.photo_view.submit(photo_ui.plan.take(), photo_ui.retry);
             if let (Some(request), Some(worker)) = (submitted, self.photo.as_ref()) {
                 worker.request(request);
@@ -529,6 +669,11 @@ impl State {
                 self.window.request_redraw();
             }
             for command in commands {
+                if let core_app::workflow::Command::SelectImage(Some(image)) = &command {
+                    if snapshot.editor.selected != Some(*image) {
+                        self.photo_view.begin_journey(*image);
+                    }
+                }
                 match application.dispatch(command) {
                     Ok(()) => self.last_command_error = None,
                     Err(error) => {

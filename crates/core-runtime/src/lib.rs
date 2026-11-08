@@ -5,6 +5,7 @@ pub mod export_io;
 pub mod import;
 pub mod jobs;
 pub mod presets;
+pub mod preview;
 pub mod publication;
 pub mod save_barrier;
 pub mod settings_store;

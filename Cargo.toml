@@ -52,3 +52,9 @@ opt-level = 2
 # `cargo test` develops a 32 MP RAW at opt-level 0 (10-20x slower corpus tests).
 [profile.dev.package.core-raw]
 opt-level = 3
+# `prepare` converts and mip-reduces every opened photo on the CPU (32 MP RGBA f32 plus its mip
+# chain); at opt-level 0 that alone takes seconds per open in `make dev`.
+[profile.dev.package.core-pipeline]
+opt-level = 3
+[profile.dev.package.render-wgpu]
+opt-level = 3

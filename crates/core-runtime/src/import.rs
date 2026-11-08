@@ -8,6 +8,7 @@
 //! on, so a closed or replaced catalog stops the run instead of receiving its rows.
 
 use crate::catalog::{CatalogAdapter, SharedDb};
+use crate::preview::PreviewHandle;
 use core_app::import::{
     FileStatus, ImportFile, ImportMode, ImportOptions, ImportPhase, ImportPlan, ImportReport,
     ImportRequest, ImportView, Pairing,
@@ -68,6 +69,8 @@ pub struct ImportService {
     wake: Wake,
     listings: Vec<Task>,
     import: Option<Task>,
+    /// Where freshly imported ids go for a rendered preview; `None` keeps the embedded one.
+    previews: Option<PreviewHandle>,
     #[cfg(test)]
     start_gate: Option<Arc<AtomicBool>>,
 }
@@ -88,9 +91,15 @@ impl ImportService {
             wake,
             listings: Vec::new(),
             import: None,
+            previews: None,
             #[cfg(test)]
             start_gate: None,
         }
+    }
+
+    /// Queue every row a later commit adds for a rendered preview (bulk priority).
+    pub fn set_previews(&mut self, previews: Option<PreviewHandle>) {
+        self.previews = previews;
     }
 
     /// Cheap snapshot: the file list is shared, not copied.
@@ -367,6 +376,14 @@ impl ImportService {
                     AppError::Catalog(format!("could not open the thumbnail cache: {e}").into())
                 })
             })?;
+        // Unset/unreadable setting falls back to the minimum so import still produces a large
+        // preview; the render pipeline re-keys it if the user later picks another edge.
+        let preview_edge = db
+            .lock()
+            .ok()
+            .and_then(|g| core_library::preview_edge(&g.conn).ok())
+            .filter(|&e| e != 0)
+            .unwrap_or(core_library::PREVIEW_EDGE_MIN);
         let total = plan.selected.len();
         lock(&self.inner).view.phase = ImportPhase::Importing { done: 0, total };
         let stop = Arc::new(AtomicBool::new(false));
@@ -379,6 +396,8 @@ impl ImportService {
             thumbs,
             destination,
             plan,
+            preview_edge,
+            previews: self.previews.clone(),
             #[cfg(test)]
             gate: self.start_gate.clone(),
         };
@@ -571,6 +590,8 @@ struct ImportJob {
     thumbs: ThumbCache,
     destination: PathBuf,
     plan: ImportPlan,
+    preview_edge: u32,
+    previews: Option<PreviewHandle>,
     #[cfg(test)]
     gate: Option<Arc<AtomicBool>>,
 }
@@ -619,6 +640,7 @@ impl ImportJob {
             engine_mode(plan.mode),
             &self.destination,
             engine_pairing(plan.pairing),
+            Some(self.preview_edge),
             |done, total, row| {
                 if let Some(row) = row {
                     added.borrow_mut().push(row.id);
@@ -636,6 +658,12 @@ impl ImportJob {
         )
         .map_err(|e| e.to_string())?;
         let added = added.into_inner();
+        // Import wrote the embedded preview; the rendered one replaces it in the background.
+        if let Some(previews) = &self.previews {
+            if !added.is_empty() && self.catalog.is_current(self.generation) {
+                previews.enqueue_back(&added);
+            }
+        }
         // A stopped run keeps what it committed, and those rows get the marks the user asked for:
         // skipping them would silently import unmarked photos.
         let options_error = if added.is_empty() || !self.catalog.is_current(self.generation) {
@@ -835,6 +863,37 @@ mod tests {
         let report = env.finish();
         assert_eq!((report.added, report.skipped), (0, 1));
         assert_eq!(env.image_count(), 1);
+    }
+
+    #[test]
+    fn imported_ids_are_queued_for_rendered_previews() {
+        use crate::preview::{
+            PreviewJob, PreviewRenderError, PreviewRenderPort, PreviewService, RenderedPreview,
+        };
+        struct Never;
+        impl PreviewRenderPort for Never {
+            fn render(&self, _: &PreviewJob) -> Result<RenderedPreview, PreviewRenderError> {
+                Err(PreviewRenderError::Skip("test".into()))
+            }
+        }
+        let Some(mut env) = env() else { return };
+        let none = Picker::new(&[]);
+        let service = PreviewService::start(
+            Arc::clone(&env.catalog),
+            env._dir.path().join("data/thumbs"),
+            Arc::new(Never),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        // Paused: nothing is rendered or scanned, so the queue shows only what import enqueued.
+        service.set_paused(true);
+        env.service.set_previews(Some(service.handle()));
+        let view = env.listed();
+        let plan = env.plan(&view, ImportMode::Reference, None);
+        env.request(ImportRequest::Commit(Box::new(plan)), &none)
+            .unwrap();
+        assert_eq!(env.finish().added, 1);
+        assert_eq!(service.handle().pending_ids().len(), 1);
     }
 
     #[test]

@@ -106,6 +106,8 @@ struct Harness {
     /// The import dialog's view: `open` puts a modal in front of the stage.
     import: ImportView,
     time: f64,
+    /// Seconds per frame (the real-time wheel-ease tests run at 60 Hz).
+    dt: f64,
 }
 
 impl Harness {
@@ -118,25 +120,27 @@ impl Harness {
                 ..Default::default()
             },
             photo: PhotoUi {
-                texture: Some((TextureId::Managed(7), TEXTURE)),
+                texture: Some(ui_egui::Picture::bare(TextureId::Managed(7), TEXTURE)),
                 message: None,
                 failure: None,
                 retry: false,
                 loading: false,
                 device_epoch: Default::default(),
                 plan: None,
+                placeholder: None,
             },
             snapshot: snapshot(),
             thumbs: Nothing,
             import: core_app::import::ImportView::default(),
             time: 0.0,
+            dt: 0.05,
         };
         harness.settle(4);
         harness
     }
 
     fn frame(&mut self, events: Vec<Event>) -> Vec<Command> {
-        self.time += 0.05;
+        self.time += self.dt;
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
@@ -554,8 +558,9 @@ fn wheel_down_zooms_out_and_at_fit_does_nothing() {
     harness.notch(at, 1.0, MouseWheelSource::Wheel, Modifiers::NONE);
     assert!(harness.settle(6).window.is_some());
     harness.notch(at, -1.0, MouseWheelSource::Wheel, Modifiers::NONE);
+    // The wheel eases: the zoom lands a few frames in, and the settled tier follows.
     assert_eq!(
-        harness.settle(6),
+        harness.settle(12),
         fit,
         "one notch out of one notch in is fit"
     );
@@ -589,4 +594,109 @@ fn cmd_trackpad_scroll_zooms() {
     let at = harness.hover_photo();
     harness.notch(at, 40.0, MouseWheelSource::Trackpad, Modifiers::COMMAND);
     assert!(harness.settle(6).window.is_some());
+}
+
+/// The crop-local point under `at` for the stage's last drawn rect and `window`.
+fn uv_under(rect: Rect, at: Pos2, window: ([f32; 2], [f32; 2])) -> [f64; 2] {
+    let (origin, size) = window;
+    [
+        f64::from(origin[0]) + f64::from((at.x - rect.min.x) / rect.width()) * f64::from(size[0]),
+        f64::from(origin[1]) + f64::from((at.y - rect.min.y) / rect.height()) * f64::from(size[1]),
+    ]
+}
+
+/// A zoomed stage with a wheel pointer off-centre, at 60 Hz, ready for notches.
+fn eased_stage() -> (Harness, Pos2, f64) {
+    let mut harness = Harness::new();
+    harness.zoom_in(2.0);
+    let centre = harness.hover_photo();
+    let rect = harness.ui.develop.stage_image_rect().expect("drawn");
+    let at = centre + Vec2::new(rect.width() * 0.25, -rect.height() * 0.2);
+    harness.frame(vec![Event::PointerMoved(at)]);
+    harness.frame(vec![Event::PointerMoved(at)]);
+    harness.dt = 0.016;
+    let size = f64::from(harness.wanted().window.expect("zoomed").1[0]);
+    (harness, at, size)
+}
+
+#[test]
+fn a_wheel_notch_eases_to_its_target_keeping_the_pointer_point_fixed() {
+    let (mut harness, at, size0) = eased_stage();
+    let rect = harness.ui.develop.stage_image_rect().expect("drawn");
+    let window = harness.wanted().window.expect("zoomed");
+    let anchor = uv_under(rect, at, window);
+    harness.notch(at, 1.0, MouseWheelSource::Wheel, Modifiers::NONE);
+    let mut sizes = Vec::new();
+    for _ in 0..10 {
+        let wanted = harness.wanted();
+        let rect = harness.ui.develop.stage_image_rect().expect("drawn");
+        let now = uv_under(rect, at, wanted.window.expect("zoomed"));
+        for axis in 0..2 {
+            // Half a physical pixel, in crop-local UV of the drawn window.
+            let tolerance =
+                0.5 / f64::from(rect.width()) * f64::from(wanted.window.unwrap().1[axis]);
+            assert!(
+                (now[axis] - anchor[axis]).abs() <= tolerance.max(1e-4),
+                "frame drifted: {anchor:?} -> {now:?}"
+            );
+        }
+        sizes.push(f64::from(wanted.window.expect("zoomed").1[0]));
+        harness.frame(vec![Event::PointerMoved(at)]);
+    }
+    assert!(
+        sizes.windows(2).all(|w| w[1] <= w[0] + 1e-6) && sizes[9] < sizes[0],
+        "a smooth monotone zoom-in, not a jump: {sizes:?}"
+    );
+    assert!(
+        sizes[0] > 0.9 * size0,
+        "the first frame is only a step: {sizes:?}"
+    );
+    harness.settle(20);
+    let landed = f64::from(harness.wanted().window.expect("zoomed").1[0]);
+    assert!(
+        (landed / (size0 * 0.8) - 1.0).abs() < 1e-3,
+        "converged to 1.25x: {landed} vs {}",
+        size0 * 0.8
+    );
+}
+
+#[test]
+fn a_new_notch_mid_animation_retargets_from_the_target() {
+    let (mut harness, at, size0) = eased_stage();
+    harness.notch(at, 1.0, MouseWheelSource::Wheel, Modifiers::NONE);
+    harness.frame(vec![Event::PointerMoved(at)]);
+    harness.frame(vec![Event::PointerMoved(at)]);
+    let mid = f64::from(harness.wanted().window.expect("zoomed").1[0]);
+    assert!(mid > size0 * 0.8, "still on the way to the first target");
+    harness.notch(at, 1.0, MouseWheelSource::Wheel, Modifiers::NONE);
+    harness.settle(30);
+    let landed = f64::from(harness.wanted().window.expect("zoomed").1[0]);
+    assert!(
+        (landed / (size0 * 0.64) - 1.0).abs() < 1e-3,
+        "two notches compound on the target (1.25^2), not on the half-way view: {landed}"
+    );
+    assert_eq!(harness.wanted().quality, QualityTier::Settled);
+}
+
+#[test]
+fn the_wheel_never_zooms_past_four_hundred_percent() {
+    let mut harness = Harness::new();
+    let at = harness.hover_photo();
+    for _ in 0..40 {
+        harness.notch(at, 1.0, MouseWheelSource::Wheel, Modifiers::NONE);
+    }
+    let wanted = harness.settle(40);
+    // Whatever the panel, 400 % is four screen pixels per source pixel.
+    let (_, size) = wanted.window.expect("zoomed");
+    let shown_px = f64::from(size[0]) * 6960.0;
+    let displayed = f64::from(wanted.display_px.0);
+    assert!(
+        (displayed / shown_px - 4.0).abs() < 0.05,
+        "400 % is four screen pixels per source pixel: {displayed} / {shown_px}"
+    );
+    assert!(wanted.viewport_px.0 <= wanted.display_px.0);
+    assert!(
+        wanted.viewport_px.0 < wanted.display_px.0,
+        "above 100 % the render is native, i.e. smaller than what is shown"
+    );
 }

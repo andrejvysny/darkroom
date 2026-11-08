@@ -8,7 +8,10 @@ use core_model::identity::{
     QualityTier, RenderIdentity, RendererVersion, SourceIdentity, SourceRevision, ViewportRevision,
 };
 use core_model::viewport::{derive_view, ViewState};
+
+mod present;
 use core_model::{Crop, DevelopParams};
+pub use present::{geometry_sig, Picture, PresentId, SAVED_GEOMETRY};
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -36,15 +39,21 @@ pub struct PhotoRequestPlan {
     /// The crop-local window to render — `((origin u, origin v), (size u, size v))` — or `None`
     /// for the fit view, which renders the whole crop (`ViewParams::full`) exactly as before.
     pub window: Option<([f32; 2], [f32; 2])>,
+    /// The frame is a native-resolution window magnified past 100 %: the host registers its
+    /// texture with nearest-neighbour sampling so pixels stay crisp. Never set for the cheap
+    /// interactive tier (a half-size frame is not "real pixels"; it stays smooth).
+    pub nearest: bool,
     /// Render the crop tool's preview: the whole straightened/rotated frame, auto-zoom off,
     /// out-of-image corners dimmed (`ViewParams::crop_preview`).
     pub crop_preview: bool,
+    /// What the rendered frame will be OF, so the host can stamp the live picture it presents.
+    pub present: PresentId,
 }
 
 /// Which picture the stage asks the worker for. Anything but `Edited` is a different image at the
 /// same edit revision, so it folds into the viewport revision (and thereby the frame key).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum StageVariant {
+pub enum StageVariant {
     /// The document as edited (the historical plan).
     #[default]
     Edited,
@@ -67,9 +76,13 @@ impl StageVariant {
 
 /// Photo presentation state for the central panel, owned by the host (`window.rs`): the egui
 /// texture of the presented frame, the status label, and the out-param for this frame's plan.
+#[derive(Default)]
 pub struct PhotoUi {
-    /// Registered egui texture of the frame the presenter currently holds, with its pixel size.
-    pub texture: Option<(egui::TextureId, [u32; 2])>,
+    /// The live frame the presenter currently holds.
+    pub texture: Option<Picture>,
+    /// A cached thumbnail/preview of the selected photo, painted under the live frame (alone
+    /// until one exists) only when [`PresentId::compatible`] with the stage's target.
+    pub placeholder: Option<Picture>,
     /// Explicit state label (protected/unsupported/failed). When set it replaces the image —
     /// an unreadable or unsupported document must never be silently shown as a render.
     pub message: Option<String>,
@@ -191,6 +204,10 @@ fn variant_revision(
 struct PlanGeometry {
     display_px: (u32, u32),
     window: Option<([f32; 2], [f32; 2])>,
+    /// Set when the zoom is above 100 %: the visible window at the SOURCE's resolution — one
+    /// render pixel per frame pixel, so magnifying it shows the real pixels. Capped by the
+    /// panel's physical size, which it cannot exceed anyway (it is smaller than the display).
+    native_px: Option<(u32, u32)>,
 }
 
 /// At fit (or without catalog dims to zoom against) the whole crop at the fitted size — exactly
@@ -206,20 +223,74 @@ fn plan_geometry(
 ) -> PlanGeometry {
     let zoomed = cropped_frame_px(crop, width, height)
         .filter(|_| !view.is_fit())
-        .map(|frame_px| derive_view(view, frame_px, panel_px));
+        .map(|frame_px| (derive_view(view, frame_px, panel_px), frame_px));
     match zoomed {
-        Some(derived) => PlanGeometry {
-            display_px: derived.out_px,
-            window: Some((
-                [derived.origin[0] as f32, derived.origin[1] as f32],
-                [derived.size[0] as f32, derived.size[1] as f32],
-            )),
-        },
+        Some((derived, frame_px)) => {
+            let scale = derived.image_px[0] / f64::from(frame_px.0.max(1));
+            let native = |size: f64, frame: u32, panel: u32| {
+                ((size * f64::from(frame)).round().max(1.0) as u32).min(panel.max(1))
+            };
+            PlanGeometry {
+                display_px: derived.out_px,
+                window: Some((
+                    [derived.origin[0] as f32, derived.origin[1] as f32],
+                    [derived.size[0] as f32, derived.size[1] as f32],
+                )),
+                native_px: (scale > 1.0 + 1e-6).then(|| {
+                    (
+                        native(derived.size[0], frame_px.0, panel_px.0),
+                        native(derived.size[1], frame_px.1, panel_px.1),
+                    )
+                }),
+            }
+        }
         None => PlanGeometry {
             display_px: fit_output(panel_px, aspect),
             window: None,
+            native_px: None,
         },
     }
+}
+
+/// The params `variant` renders: the edit as is, the unedited picture (keeping the source's
+/// intrinsic `display_referred`), or the full frame with only straighten/rotation kept.
+pub(crate) fn variant_params(
+    variant: StageVariant,
+    edited: Arc<DevelopParams>,
+) -> Arc<DevelopParams> {
+    match variant {
+        StageVariant::Edited => edited,
+        StageVariant::Before => Arc::new(DevelopParams {
+            display_referred: edited.display_referred,
+            ..Default::default()
+        }),
+        StageVariant::CropTool => Arc::new(DevelopParams {
+            crop: Crop {
+                angle: edited.crop.angle,
+                rot90: edited.crop.rot90,
+                ..Crop::default()
+            },
+            ..(*edited).clone()
+        }),
+    }
+}
+
+/// What the stage wants to show right now, for the compatibility check: the selected row's edit
+/// version and variant, with the framing of the Ready document (else [`SAVED_GEOMETRY`]: until
+/// the document loads, the saved edit's framing is the best-known one).
+pub fn target_id(snapshot: &ApplicationSnapshot, variant: StageVariant) -> Option<PresentId> {
+    let image = snapshot.editor.image.as_ref()?;
+    let document = &snapshot.editor.document;
+    let geometry = match (&document.status, document.params.clone()) {
+        (DocumentStatus::Ready, Some(params)) => geometry_sig(&variant_params(variant, params)),
+        _ => SAVED_GEOMETRY,
+    };
+    Some(PresentId {
+        image: ImageId(image.id),
+        edit_version: image.edited_at,
+        variant,
+        geometry,
+    })
 }
 
 /// The wanted frame for a `Ready` document at this panel rect under `view`, or `None` when
@@ -237,7 +308,8 @@ fn plan_geometry(
 ///
 /// At fit (`view.is_fit()`) or without catalog dims the plan is exactly the historical one: the
 /// whole crop rendered at the fitted size, `window: None`. Zoomed, only the visible window of the
-/// crop is rendered, at the physical size of the visible image area.
+/// crop is rendered: at the physical size of the visible image area up to 100 %, and above it at
+/// the window's native source resolution (`nearest`), which the stage magnifies crisply.
 ///
 /// `variant` swaps the picture: `Before` renders the unedited params (keeping the source's
 /// intrinsic `display_referred` flag, as Reset does), `CropTool` the full frame with the
@@ -256,21 +328,7 @@ pub(crate) fn photo_plan(
     if snapshot.editor.document.status != DocumentStatus::Ready {
         return None;
     }
-    let params = match (variant, snapshot.editor.document.params.clone()?) {
-        (StageVariant::Edited, edited) => edited,
-        (StageVariant::Before, edited) => Arc::new(DevelopParams {
-            display_referred: edited.display_referred,
-            ..Default::default()
-        }),
-        (StageVariant::CropTool, edited) => Arc::new(DevelopParams {
-            crop: Crop {
-                angle: edited.crop.angle,
-                rot90: edited.crop.rot90,
-                ..Crop::default()
-            },
-            ..(*edited).clone()
-        }),
-    };
+    let params = variant_params(variant, snapshot.editor.document.params.clone()?);
     let view = if variant == StageVariant::CropTool {
         ViewState::default()
     } else {
@@ -288,7 +346,11 @@ pub(crate) fn photo_plan(
         image.height,
         f64::from(panel_w) / f64::from(panel_h),
     );
-    let PlanGeometry { display_px, window } = plan_geometry(
+    let PlanGeometry {
+        display_px,
+        window,
+        native_px,
+    } = plan_geometry(
         &params.crop,
         image.width,
         image.height,
@@ -296,10 +358,17 @@ pub(crate) fn photo_plan(
         aspect,
         view,
     );
-    let (viewport_px, quality) = if snapshot.editor.document.gesture_active || interacting {
-        (interactive_render_px(display_px), QualityTier::Interactive)
+    let (viewport_px, quality, nearest) = if snapshot.editor.document.gesture_active || interacting
+    {
+        (
+            interactive_render_px(display_px),
+            QualityTier::Interactive,
+            false,
+        )
+    } else if let Some(native) = native_px {
+        (native, QualityTier::Settled, true)
     } else {
-        (display_px, QualityTier::Settled)
+        (display_px, QualityTier::Settled, false)
     };
     let key = wanted_key(
         snapshot,
@@ -313,6 +382,12 @@ pub(crate) fn photo_plan(
         window,
         variant,
     );
+    let present = PresentId {
+        image: ImageId(image.id),
+        edit_version: image.edited_at,
+        variant,
+        geometry: geometry_sig(&params),
+    };
     Some(PhotoRequestPlan {
         key,
         image_id: ImageId(image.id),
@@ -322,7 +397,9 @@ pub(crate) fn photo_plan(
         viewport_px,
         display_px,
         window,
+        nearest,
         crop_preview: variant == StageVariant::CropTool,
+        present,
     })
 }
 

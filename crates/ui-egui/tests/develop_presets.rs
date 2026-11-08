@@ -113,6 +113,7 @@ impl Harness {
                 loading: false,
                 device_epoch: Default::default(),
                 plan: None,
+                placeholder: None,
             },
             snapshot,
             tree: HashMap::new(),
