@@ -9,6 +9,7 @@ pub use error::DedupError;
 
 use core_db::rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 pub const SIMILARITY_FEATURE_VERSION: i64 = 1;
 
@@ -17,7 +18,10 @@ pub const SIMILARITY_FEATURE_VERSION: i64 = 1;
 /// sound, spawning a subprocess, and pulling Finder forward (a white WKWebView repaint). Resolving
 /// a duplicate group of N files would otherwise fire that N times. `NsFileManager` trashes silently
 /// and directly; files remain recoverable from the Trash (sans one-click "Put Back").
-fn make_trash_ctx() -> trash::TrashContext {
+///
+/// Public so a host that runs [`trash_victims`] outside the catalog lock can build exactly the
+/// remover [`resolve`] uses internally.
+pub fn make_trash_ctx() -> trash::TrashContext {
     #[allow(unused_mut)]
     let mut ctx = trash::TrashContext::default();
     #[cfg(target_os = "macos")]
@@ -715,36 +719,77 @@ pub fn find_same_capture(conn: &Connection) -> Result<Vec<DupGroup>, DedupError>
 pub struct ResolveResult {
     pub trashed: usize,
     pub trashed_hashes: Vec<String>,
+    /// Files that failed to trash; their catalog rows were kept.
+    pub failed: usize,
+    /// Gone victims whose rows were NOT removed because the row no longer matches the plan
+    /// (re-pointed or deleted by someone else between planning and finalize).
+    pub changed: usize,
+    /// Number of plans aborted because the keeper was lost: its file vanished mid-trash
+    /// ([`trash_victims`]) or its row vanished before finalize ([`finalize_resolve`]).
+    pub keeper_lost: usize,
 }
 
-/// Trash the given images (never the keeper) and remove their catalog rows.
+/// One victim snapshotted while the catalog was locked: everything needed to trash its file and
+/// remove its row later, without re-reading the catalog in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Victim {
+    pub id: i64,
+    pub path: String,
+    pub hash_hex: String,
+}
+
+/// A validated resolve whose catalog reads are already done, so the file IO may run with **no
+/// lock held**. [`finalize_resolve`] re-checks each snapshot before dropping rows.
+#[derive(Debug, Clone)]
+pub struct ResolvePlan {
+    pub keep_id: i64,
+    pub keep_path: String,
+    pub victims: Vec<Victim>,
+}
+
+/// Outcome of [`trash_victims`] — pure file IO, no catalog access. Carries the keeper identity
+/// from the plan so [`finalize_resolve`] can prove in its own transaction that a copy survived
+/// before it removes any victim row.
+#[derive(Debug, Default, Clone)]
+pub struct TrashedVictims {
+    /// The plan's keeper id — finalize deletes victim rows only while this row is still present.
+    pub keep_id: i64,
+    /// The plan's keeper path, matched against the row at finalize (a re-pointed keeper row is
+    /// not the keeper we trashed against).
+    pub keep_path: String,
+    /// Victims whose files are verifiably gone; their rows may be removed.
+    pub gone: Vec<Victim>,
+    /// Files that failed to trash; their rows must stay.
+    pub failed: usize,
+    /// The keeper's file was not on disk, so the plan was aborted before any further trashing.
+    pub keeper_lost: bool,
+}
+
+/// Brief lock: validate the keeper and snapshot the victims (never the keeper; ids without a row
+/// are skipped).
 ///
-/// Consistency: each file is sent to the Trash *first*; a row is removed only once its file is gone
-/// (or was already missing). A file that fails to trash keeps its row, so the catalog never points
-/// at a still-present file it thinks it deleted. The row removals then run in a single transaction.
-pub fn resolve(
+/// The keeper must be a present catalog row. A stale/already-resolved or foreign keeper would
+/// otherwise let us trash every id in `trash_ids` with nothing guaranteed to survive — the worst
+/// case being the last copy of a byte-identical group. Validate first; trash nothing on miss.
+pub fn plan_resolve(
     conn: &Connection,
     keep_id: i64,
     trash_ids: &[i64],
-) -> Result<ResolveResult, DedupError> {
-    // Guard: the keeper must be a present catalog row. A stale/already-resolved or foreign keeper
-    // would otherwise let us trash every id in `trash_ids` with nothing guaranteed to survive — the
-    // worst case being the last copy of a byte-identical group. Validate first; trash nothing on miss.
-    let keeper_present: Option<i64> = conn
+) -> Result<ResolvePlan, DedupError> {
+    let keep_path: Option<String> = conn
         .query_row(
-            "SELECT id FROM images WHERE id=?1 AND status='present'",
+            "SELECT path FROM images WHERE id=?1 AND status='present'",
             params![keep_id],
             |r| r.get(0),
         )
         .optional()?;
-    if keeper_present.is_none() {
+    let Some(keep_path) = keep_path else {
         return Err(DedupError::InvalidKeeper(format!(
             "id {keep_id} is not a present image"
         )));
-    }
+    };
 
-    // Snapshot (id, path, hash) for each victim; tolerate rows already gone.
-    let mut victims: Vec<(i64, String, Vec<u8>)> = Vec::new();
+    let mut victims: Vec<Victim> = Vec::new();
     for &id in trash_ids {
         if id == keep_id {
             continue;
@@ -757,39 +802,144 @@ pub fn resolve(
             )
             .optional()?;
         if let Some((path, hash)) = row {
-            victims.push((id, path, hash));
+            victims.push(Victim {
+                id,
+                path,
+                hash_hex: hexs(&hash),
+            });
         }
     }
+    Ok(ResolvePlan {
+        keep_id,
+        keep_path,
+        victims,
+    })
+}
 
-    // Trash files; collect only those whose file is gone (so the row can be safely removed).
-    // Per-file (not batched) so a single failure only skips that one row — a batch `delete_all`
-    // stops at the first error and would hide which files actually made it to the Trash.
-    let trash_ctx = make_trash_ctx();
-    let mut to_delete: Vec<i64> = Vec::new();
-    let mut hashes: Vec<String> = Vec::new();
-    for (id, path, hash) in &victims {
-        let p = std::path::Path::new(path);
-        if p.exists() && trash_ctx.delete(p).is_err() {
-            continue; // leave the row intact; skip this one
+/// Send each victim's file (and its `.json` sidecar) to the Trash. **No catalog access**, so the
+/// caller may hold no lock while this runs.
+///
+/// Before EACH victim the keeper's file is re-checked on disk: dedup's whole promise is that a
+/// copy survives, so whenever the keeper is not on disk we stop trashing and report what is
+/// already gone with `keeper_lost`. This includes a keeper whose file was already absent when the
+/// pass started (e.g. externally deleted, or a volume unmounted before reconciliation): trashing
+/// then would send the last copy of the photo to the Trash, so nothing is trashed at all.
+///
+/// `remove` returns `true` when the file is gone; an already-missing victim counts as gone.
+pub fn trash_victims(plan: &ResolvePlan, remove: &dyn Fn(&Path) -> bool) -> TrashedVictims {
+    let mut out = TrashedVictims {
+        keep_id: plan.keep_id,
+        keep_path: plan.keep_path.clone(),
+        ..Default::default()
+    };
+    let keep = Path::new(&plan.keep_path);
+    for victim in &plan.victims {
+        if !keep.exists() {
+            out.keeper_lost = true;
+            break;
         }
-        to_delete.push(*id);
-        hashes.push(hexs(hash));
+        let p = Path::new(&victim.path);
+        if p.exists() && !remove(p) {
+            out.failed += 1;
+            continue; // leave the row intact — the file is still there
+        }
+        // Best-effort: the sidecar carries only derived state, so a failure here is not fatal.
+        let sidecar = sidecar_path(&victim.path);
+        if sidecar.exists() {
+            remove(&sidecar);
+        }
+        out.gone.push(victim.clone());
     }
+    out
+}
 
-    // Atomic row removal.
+/// Mirrors `core_library::sidecar::sidecar_path` (`<image path>.json`); core-dedup does not depend
+/// on core-library, so the naming is replicated here.
+fn sidecar_path(image_path: &str) -> PathBuf {
+    PathBuf::from(format!("{image_path}.json"))
+}
+
+/// Brief lock: in one transaction, delete each gone victim's row ONLY if its path and content hash
+/// still match the plan. A row re-pointed or deleted since planning is counted in `changed` and
+/// left alone — we never remove a row we can no longer prove was the file we trashed.
+///
+/// Before ANY victim row is removed, the keeper's row is re-proved present (`id` + `path` +
+/// `status='present'`, the same lock that validates the deletes). A keeper row that vanished since
+/// planning means no copy is provably left, so removing victim rows would claim a successful
+/// resolve while orphaning the group: instead nothing is deleted and `keeper_lost` is set — the
+/// victim files already in the Trash remain recoverable and every row stays.
+pub fn finalize_resolve(
+    conn: &Connection,
+    trashed: &TrashedVictims,
+) -> Result<ResolveResult, DedupError> {
+    let mut out = ResolveResult {
+        failed: trashed.failed,
+        keeper_lost: usize::from(trashed.keeper_lost),
+        ..Default::default()
+    };
     let tx = conn.unchecked_transaction()?;
+    let keeper_alive: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM images WHERE id=?1 AND path=?2 AND status='present'",
+            params![trashed.keep_id, trashed.keep_path],
+            |_| Ok(1),
+        )
+        .optional()?;
+    if keeper_alive.is_none() {
+        // Cannot prove a copy survived: keep every victim row, report the loss.
+        out.keeper_lost = 1;
+        tx.commit()?;
+        return Ok(out);
+    }
     {
-        let mut stmt = tx.prepare("DELETE FROM images WHERE id=?1")?;
-        for id in &to_delete {
-            stmt.execute(params![id])?;
+        let mut check = tx.prepare("SELECT path, content_hash FROM images WHERE id=?1")?;
+        let mut del = tx.prepare("DELETE FROM images WHERE id=?1")?;
+        for victim in &trashed.gone {
+            let row = check
+                .query_row(params![victim.id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .optional()?;
+            if row.is_some_and(|(path, hash)| path == victim.path && hexs(&hash) == victim.hash_hex)
+            {
+                del.execute(params![victim.id])?;
+                out.trashed += 1;
+                out.trashed_hashes.push(victim.hash_hex.clone());
+            } else {
+                out.changed += 1;
+            }
         }
     }
     tx.commit()?;
+    Ok(out)
+}
 
-    Ok(ResolveResult {
-        trashed: to_delete.len(),
-        trashed_hashes: hashes,
-    })
+/// Trash the given images (never the keeper) and remove their catalog rows.
+///
+/// Consistency: each file is sent to the Trash *first*; a row is removed only once its file is gone
+/// (or was already missing). A file that fails to trash keeps its row, so the catalog never points
+/// at a still-present file it thinks it deleted.
+pub fn resolve(
+    conn: &Connection,
+    keep_id: i64,
+    trash_ids: &[i64],
+) -> Result<ResolveResult, DedupError> {
+    let ctx = make_trash_ctx();
+    resolve_with(conn, keep_id, trash_ids, &|p| ctx.delete(p).is_ok())
+}
+
+/// `resolve` with an injectable remover — `remove` returns `true` when the file is gone. Exists so
+/// tests can exercise the real file/row path without touching the user's Trash (mirrors
+/// `core_library::trash::trash_images_with`).
+pub fn resolve_with(
+    conn: &Connection,
+    keep_id: i64,
+    trash_ids: &[i64],
+    remove: &dyn Fn(&Path) -> bool,
+) -> Result<ResolveResult, DedupError> {
+    let plan = plan_resolve(conn, keep_id, trash_ids)?;
+    let trashed = trash_victims(&plan, remove);
+    finalize_resolve(conn, &trashed)
 }
 
 /// Keeper for a group: prefer the largest file (most complete), tiebreak by lowest id (stable /
@@ -810,16 +960,34 @@ fn pick_keeper(group: &DupGroup) -> (i64, Vec<i64>) {
     (keep, trash)
 }
 
+/// Brief lock: plan every byte-identical group (same keeper choice as `pick_keeper`), so the
+/// caller can release the catalog lock and run the file IO unlocked via [`trash_victims`].
+pub fn plan_auto_resolve_byte_identical(conn: &Connection) -> Result<Vec<ResolvePlan>, DedupError> {
+    find_byte_identical(conn)?
+        .iter()
+        .map(|g| {
+            let (keep, trash) = pick_keeper(g);
+            plan_resolve(conn, keep, &trash)
+        })
+        .collect()
+}
+
 /// Auto-resolve every byte-identical group: keep one copy, trash the bit-for-bit duplicates. Only
 /// applied to byte-identical groups — same-capture / perceptual matches are intentional variants and
-/// are never auto-trashed. Returns the aggregate outcome.
+/// are never auto-trashed. Returns the aggregate outcome. A plan whose keeper vanishes mid-trash is
+/// aborted (`keeper_lost` counts it) and the remaining groups still proceed.
 pub fn auto_resolve_byte_identical(conn: &Connection) -> Result<ResolveResult, DedupError> {
-    let groups = find_byte_identical(conn)?;
+    let plans = plan_auto_resolve_byte_identical(conn)?;
+    let ctx = make_trash_ctx();
+    let remove = |p: &Path| ctx.delete(p).is_ok();
     let mut out = ResolveResult::default();
-    for g in &groups {
-        let (keep, trash) = pick_keeper(g);
-        let r = resolve(conn, keep, &trash)?;
+    for plan in &plans {
+        let trashed = trash_victims(plan, &remove);
+        let r = finalize_resolve(conn, &trashed)?;
         out.trashed += r.trashed;
+        out.failed += r.failed;
+        out.changed += r.changed;
+        out.keeper_lost += r.keeper_lost;
         out.trashed_hashes.extend(r.trashed_hashes);
     }
     Ok(out)

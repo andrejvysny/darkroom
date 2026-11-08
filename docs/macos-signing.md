@@ -116,12 +116,17 @@ matches `APPLE_SIGNING_IDENTITY`, and authenticates against the notary service w
 
 ## Verifying a release locally
 
+Build and stage the pinned codec closure using [native platform builds](native-platform-builds.md).
+The staging gate checks each native library's architecture and macOS 12 deployment target
+before copying or signing; the executable's deployment target alone is insufficient.
+
 ```bash
 # on a machine WITHOUT Homebrew libheif, ideally
 xcrun stapler validate Darkroom_0.4.0_aarch64.dmg
 spctl --assess --type open --context context:primary-signature -vv Darkroom_0.4.0_aarch64.dmg
 codesign --display --verbose=4 /Applications/Darkroom.app       # Authority + TeamIdentifier + runtime flag
 otool -L /Applications/Darkroom.app/Contents/MacOS/darkroom | grep heif   # → @executable_path/../Frameworks/
+cargo xtask macos-deployment /Applications/Darkroom.app/Contents/MacOS/darkroom "$(uname -m)"
 xattr -d com.apple.quarantine <dmg>   # only to re-test the "fresh download" path after clearing it
 ```
 

@@ -20,7 +20,7 @@
 //! distinguishes.
 
 use core_db::Db;
-use core_import::{import, ImportMode, Pairing};
+use core_import::{import, ImportMode, Pairing, RunToEnd};
 use core_library::{enumerate_raws, ThumbCache};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -154,6 +154,7 @@ fn run_once(
         true,                // recursive: a real card nests by manufacturer subfolder
         Pairing::Standalone, // pairing's extra DB pass is orthogonal to worker-count scaling
         |_, _, _| {},
+        &RunToEnd,
     )?;
     let wall = t.elapsed();
     let peak_rss = peak_rss_bytes();

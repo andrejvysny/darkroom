@@ -7,10 +7,9 @@
 //! legacy tripod accumulator (`new` + `add_frame`). A true tripod fixture should align to an
 //! identity-like transform, so both paths land in the same place there.
 //!
-//! Prints per-frame EV/scale/timings, writes `/tmp/darkroom-hdr.exr` (the shipping fp16
-//! linear-ProPhoto format) and `/tmp/darkroom-hdr-preview.jpg` (clamped-SDR eyeball). For a real
-//! tone-mapped look, render the EXR through the GPU pipeline:
-//!   cargo run -p core-pipeline --example render_one /tmp/darkroom-hdr.exr
+//! Prints per-frame EV/scale/timings and unique temporary output paths for the shipping fp16
+//! linear-ProPhoto EXR and a clamped-SDR JPEG preview. For a real tone-mapped look, render the
+//! printed EXR path through `cargo run -p core-pipeline --example render_one PATH`.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -183,14 +182,18 @@ fn main() -> anyhow::Result<()> {
             }
         })
         .collect();
-    let out = std::env::temp_dir().join("darkroom-hdr.exr");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let stem = format!("darkroom-hdr-{}-{stamp}", std::process::id());
+    let out = std::env::temp_dir().join(format!("{stem}.exr"));
     core_raw::write_hdr_exr(&out, &merged, &meta, &sources, ref_idx)?;
     println!("wrote {}", out.display());
 
     // Clamped-SDR eyeball via the shipping thumbnail path over the EXR we just wrote.
     let src = core_raw::source_from_path(&out)?;
     let thumb = core_raw::thumbnail_jpeg(&src, 2560, 90)?;
-    let jpg = std::env::temp_dir().join("darkroom-hdr-preview.jpg");
+    let jpg = out.with_extension("jpg");
     std::fs::write(&jpg, &thumb.jpeg)?;
     println!(
         "wrote {} (clamped SDR; use core-pipeline render_one for the tone-mapped look)",

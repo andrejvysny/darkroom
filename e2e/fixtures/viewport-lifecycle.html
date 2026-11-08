@@ -1,0 +1,40 @@
+<!doctype html>
+<html><body><div id="root"></div><script type="module">
+import React, { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { useViewport } from "/src/lib/useViewport.ts";
+
+const originalFrame = window.requestAnimationFrame.bind(window);
+const originalCancel = window.cancelAnimationFrame.bind(window);
+const pending = new Set();
+window.requestAnimationFrame = callback => {
+  const id = originalFrame(time => { pending.delete(id); callback(time); });
+  pending.add(id);
+  return id;
+};
+window.cancelAnimationFrame = id => { pending.delete(id); originalCancel(id); };
+const releases = [];
+const state = { renders: 0, published: 0 };
+let schedule;
+function Viewport({ owner }) {
+  const viewport = useViewport({ natural: { w: 100, h: 100 }, resetKey: owner,
+    render: async (_view, _canvas, isCurrent) => {
+      state.renders++;
+      await new Promise(resolve => releases.push(resolve));
+      if (isCurrent()) state.published++;
+    },
+  });
+  schedule = viewport.scheduleRender;
+  return React.createElement("div", { ref: viewport.containerRef, style: { width: 100, height: 100 } },
+    React.createElement("canvas", { ref: viewport.canvasRef }));
+}
+const root = createRoot(document.getElementById("root"));
+window.viewportHarness = {
+  mount(owner) { root.render(React.createElement(StrictMode, null, React.createElement(Viewport, { owner }))); },
+  dirty() { schedule(); },
+  release() { releases.splice(0).forEach(resolve => resolve()); },
+  unmount() { root.unmount(); },
+  state() { return { ...state, pending: pending.size }; },
+  settle() { return new Promise(resolve => originalFrame(() => originalFrame(resolve))); },
+};
+</script></body></html>

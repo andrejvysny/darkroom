@@ -71,11 +71,12 @@ fn denoise_output(
 struct RunGuard<'a> {
     running: &'a AtomicBool,
     cancel: &'a AtomicBool,
+    workers: &'a core_runtime::workers::ManagedWorkers,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.cancel.store(false, Ordering::SeqCst);
+        let _ = self.workers.reset_cancel(self.cancel);
     }
 }
 
@@ -119,12 +120,14 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, image_id: i64, amount: f32) -> Resu
     if st.denoise_running.swap(true, Ordering::SeqCst) {
         return Err("denoise already running".into());
     }
-    st.denoise_cancel.store(false, Ordering::SeqCst);
     let _guard = RunGuard {
         running: &st.denoise_running,
         cancel: &st.denoise_cancel,
+        workers: &st.workers,
     };
+    st.workers.reset_cancel(&st.denoise_cancel)?;
     let a = (amount / 100.0).clamp(0.0, 1.0);
+    let sequence = st.publications.sequence();
 
     // Reuse cached buffers if this image was already denoised (amount change → no re-inference).
     let cached = {
@@ -145,7 +148,7 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, image_id: i64, amount: f32) -> Resu
                     .path
             };
             let src = core_raw::source_from_path(Path::new(&path)).map_err(|e| e.to_string())?;
-            if st.denoise_cancel.load(Ordering::SeqCst) {
+            if st.workers.is_stopping() || st.denoise_cancel.load(Ordering::SeqCst) {
                 return Err("cancelled".into());
             }
             emit_phase(app, "denoise");
@@ -162,12 +165,17 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, image_id: i64, amount: f32) -> Resu
             // Downscale both to the render cap so the prepared texture matches the clean path's size.
             let clean = Arc::new(out.clean.downscale_into_hq(FULL_MAX_EDGE));
             let denoised = Arc::new(denoised.downscale_into_hq(FULL_MAX_EDGE));
-            *st.denoise_cache.lock().map_err(|e| e.to_string())? =
-                Some((image_id, clean.clone(), denoised.clone()));
+            st.publications
+                .with_sequence(sequence, || -> Result<(), String> {
+                    *st.denoise_cache.lock().map_err(|e| e.to_string())? =
+                        Some((image_id, clean.clone(), denoised.clone()));
+                    Ok(())
+                })
+                .map_err(|_| "denoise stale: catalog source changed".to_string())??;
             (clean, denoised)
         }
     };
-    if st.denoise_cancel.load(Ordering::SeqCst) {
+    if st.workers.is_stopping() || st.denoise_cancel.load(Ordering::SeqCst) {
         return Err("cancelled".into());
     }
 
@@ -175,20 +183,32 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, image_id: i64, amount: f32) -> Resu
     // (the user may have navigated away during the compute; the buffers stay cached for their return).
     emit_phase(app, "upload");
     let blended = blend(clean.as_ref(), denoised.as_ref(), a);
+    let mut published = false;
     if st.current_image.load(Ordering::SeqCst) == image_id {
         let prepared = gpu
             .pipeline
             .prepare(&gpu.ctx, &blended)
             .map_err(|e| e.to_string())?;
-        *st.full_render_cache.lock().map_err(|e| e.to_string())? =
-            Some((image_id, Arc::new(prepared)));
-        // Drop any clean preview for this id so the full (denoised) path is what gets served.
-        let mut slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
-        if slot.as_ref().is_some_and(|(id, _)| *id == image_id) {
-            *slot = None;
-        }
+        st.publications
+            .with_sequence(sequence, || -> Result<(), String> {
+                if st.current_image.load(Ordering::SeqCst) == image_id {
+                    *st.full_render_cache.lock().map_err(|e| e.to_string())? =
+                        Some((image_id, Arc::new(prepared)));
+                    let mut slot = st.preview_render_cache.lock().map_err(|e| e.to_string())?;
+                    if slot.as_ref().is_some_and(|(id, _)| *id == image_id) {
+                        *slot = None;
+                    }
+                    published = true;
+                }
+                Ok(())
+            })
+            .map_err(|_| "denoise stale: catalog source changed".to_string())??;
     }
-    let _ = app.emit("denoise:done", serde_json::json!({ "imageId": image_id }));
+    // Only announce completion when the render swap actually landed — a cancel/navigation skip
+    // must not tell the UI to re-render a denoised image that was never published.
+    if published {
+        let _ = app.emit("denoise:done", serde_json::json!({ "imageId": image_id }));
+    }
     Ok(())
 }
 

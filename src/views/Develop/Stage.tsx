@@ -53,6 +53,8 @@ interface StageProps {
   renderGate?: boolean;
   /** Embedded preview <img> for instant first paint; painted to canvas synchronously. */
   previewImg?: HTMLImageElement | null;
+  /** The image id `previewImg` was loaded for; the paint is skipped unless it matches. */
+  previewImageId?: number | null;
   /** Set when the last render threw (auto-retry exhausted); shows the retry overlay. */
   renderError?: string | null;
   /** Manual retry for the error overlay. */
@@ -73,6 +75,7 @@ export default function Stage({
   renderTick,
   renderGate = true,
   previewImg,
+  previewImageId,
   renderError,
   onRetryRender,
 }: StageProps) {
@@ -137,9 +140,9 @@ export default function Stage({
     interactive: !cropMode,
     transformViewState: (live) =>
       useDevelopStore.getState().cropMode ? fitViewState() : live,
-    render: async (d, canvas) => {
+    render: async (d, canvas, isCurrent) => {
       const frame = await renderFn(d);
-      if (frame) {
+      if (frame && isCurrent()) {
         lastFrameRef.current = frame;
         // Size + paint the backing store, THEN publish the matching CSS box + view — one atomic
         // "painted state". Nothing else ever resizes or clears the canvas.
@@ -224,7 +227,13 @@ export default function Stage({
       Math.abs(v.sx - 1) < 1e-6 &&
       Math.abs(v.sy - 1) < 1e-6;
     const uncropped = crop.hw === 0.5 && crop.hh === 0.5;
-    if (lastFrameRef.current === null && fitView && uncropped) {
+    // Ownership gate: a preview loaded for a different image must never paint here.
+    if (
+      previewImageId === selectedId &&
+      lastFrameRef.current === null &&
+      fitView &&
+      uncropped
+    ) {
       const c = canvasRef.current;
       if (c) {
         // The preview is the first content: size the backing store itself (atomically with the

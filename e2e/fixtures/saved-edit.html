@@ -1,0 +1,66 @@
+<!doctype html>
+<html><body><div id="root"></div><script type="module">
+import React, { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { useSavedEdit } from "/src/lib/useSavedEdit.ts";
+
+// Controllable developGetEdit stand-in: load(id) parks a promise the harness settles.
+// StrictMode's double effect run must share ONE promise per image (reused until settled),
+// otherwise the cancelled first effect would consume the only resolution.
+const entries = new Map();
+function load(id) {
+  const e = entries.get(id);
+  if (e && !e.settled) return e.promise;
+  const { promise, resolve, reject } = Promise.withResolvers();
+  const entry = {
+    promise,
+    settled: false,
+    resolve: (p) => { entry.settled = true; resolve(p); },
+    reject: (err) => { entry.settled = true; reject(err); },
+  };
+  entries.set(id, entry);
+  return promise;
+}
+
+const readyCounts = {};
+function onReady(id) { readyCounts[id] = (readyCounts[id] ?? 0) + 1; }
+
+let current = { kind: "loading" };
+let retryFn = null;
+function Comp({ id }) {
+  const edit = useSavedEdit(id, load, onReady);
+  current = edit.state;
+  retryFn = edit.retry;
+  return React.createElement("div", { "data-testid": "kind" }, edit.state.kind);
+}
+const root = createRoot(document.getElementById("root"));
+window.savedEditHarness = {
+  mount(id) {
+    root.render(React.createElement(StrictMode, null, React.createElement(Comp, { id })));
+  },
+  // True once the effect has actually started a load for `id` (React commits are async).
+  pending(id) {
+    const e = entries.get(id);
+    return !!e && !e.settled;
+  },
+  resolve(id, marker) {
+    const e = entries.get(id);
+    if (!e || e.settled) throw new Error("no pending load for " + id);
+    e.resolve({ marker });
+  },
+  reject(id, message) {
+    const e = entries.get(id);
+    if (!e || e.settled) throw new Error("no pending load for " + id);
+    e.reject(new Error(message));
+  },
+  retry() { retryFn(); },
+  state() {
+    return {
+      kind: current.kind,
+      marker: current.kind === "ready" ? current.params.marker : null,
+      message: current.kind === "error" ? current.message : null,
+      readyCounts: { ...readyCounts },
+    };
+  },
+};
+</script></body></html>

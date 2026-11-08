@@ -12,32 +12,50 @@
 use crate::error::LibError;
 use crate::query::{rejected_ids, QueryParams};
 use core_db::rusqlite::Connection;
-use serde::Serialize;
 
-/// What "delete all rejected" would touch, for the confirmation dialog.
-#[derive(Debug, Default, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RejectSummary {
-    /// Images the user flagged `reject`.
-    pub images: i64,
-    /// Camera companions (paired JPEG/HEIF) that ride along with a rejected RAW.
-    pub companions: i64,
-    /// Total bytes on disk across both.
-    pub bytes: i64,
+pub use core_model::catalog::{RejectDeleteResult, RejectSummary};
+
+/// Planned "delete rejected" run: targets plus which ids are companions (for the count).
+pub struct RejectPlan {
+    pub targets: Vec<crate::trash::TrashTarget>,
+    pub companions: std::collections::HashSet<i64>,
 }
 
-/// Result of a delete pass.
-#[derive(Debug, Default, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RejectDeleteResult {
-    /// Files trashed and rows removed (images + companions).
-    pub trashed: usize,
-    /// Files that could not be trashed; their rows were kept.
-    pub failed: usize,
-    /// Of `trashed`, how many were camera companions.
-    pub companions: usize,
-    /// Hex content-hashes of the removed images (for thumbnail GC).
-    pub hashes: Vec<String>,
+/// Brief lock: derive the delete set for `p` and snapshot its files, so the file work can run with
+/// the catalog lock released.
+pub fn plan_delete_rejected(conn: &Connection, p: &QueryParams) -> Result<RejectPlan, LibError> {
+    let (rejected, companions) = target_ids(conn, p)?;
+    let all: Vec<i64> = rejected.iter().chain(companions.iter()).copied().collect();
+    Ok(RejectPlan {
+        targets: crate::trash::plan_trash(conn, &all)?,
+        companions: companions.into_iter().collect(),
+    })
+}
+
+/// Brief lock: remove the rows of `gone` targets whose file work succeeded, then report. Companion
+/// count covers only rows actually removed.
+pub fn finalize_delete_rejected(
+    conn: &Connection,
+    plan: &RejectPlan,
+    gone: &[crate::trash::TrashTarget],
+    failed: usize,
+) -> Result<RejectDeleteResult, LibError> {
+    let out = crate::trash::finalize_trash(conn, gone, failed)?;
+    // Rows that survived (failed to trash, or repointed under us) are still present; count
+    // companions among those actually gone.
+    let companions_gone = plan
+        .companions
+        .iter()
+        .filter(|&&id| !row_exists(conn, id).unwrap_or(true))
+        .count();
+
+    Ok(RejectDeleteResult {
+        trashed: out.trashed,
+        failed: out.failed,
+        companions: companions_gone,
+        changed: out.changed,
+        hashes: out.hashes,
+    })
 }
 
 /// The full delete set for `p`: rejected images plus the companions of any rejected primary.
@@ -87,26 +105,9 @@ pub fn delete_rejected_with(
     p: &QueryParams,
     remove: &dyn Fn(&std::path::Path) -> bool,
 ) -> Result<RejectDeleteResult, LibError> {
-    let (rejected, companions) = target_ids(conn, p)?;
-    if rejected.is_empty() {
-        return Ok(RejectDeleteResult::default());
-    }
-    let companion_set: std::collections::HashSet<i64> = companions.iter().copied().collect();
-    let all: Vec<i64> = rejected.iter().copied().chain(companions).collect();
-
-    let out = crate::trash::trash_images_with(conn, &all, remove)?;
-    // Rows that survived (failed to trash) are still present; count companions among those gone.
-    let companions_gone = companion_set
-        .iter()
-        .filter(|&&id| !row_exists(conn, id).unwrap_or(true))
-        .count();
-
-    Ok(RejectDeleteResult {
-        trashed: out.trashed,
-        failed: out.failed,
-        companions: companions_gone,
-        hashes: out.hashes,
-    })
+    let plan = plan_delete_rejected(conn, p)?;
+    let (gone, failed) = crate::trash::trash_files(&plan.targets, remove);
+    finalize_delete_rejected(conn, &plan, &gone, failed)
 }
 
 fn row_exists(conn: &Connection, id: i64) -> Result<bool, LibError> {

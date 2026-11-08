@@ -1,0 +1,364 @@
+{
+  "surface": [
+    {
+      "kind": "event",
+      "name": "analysis:done",
+      "source": "src-tauri/src/analysis.rs",
+      "evidence": "analysis:done",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes analysis:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "analysis:models",
+      "source": "src-tauri/src/analysis.rs",
+      "evidence": "analysis:models",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes analysis:models event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "analysis:progress",
+      "source": "src-tauri/src/analysis.rs",
+      "evidence": "analysis:progress",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes analysis:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "app:flush-edits",
+      "source": "src-tauri/src/quit.rs",
+      "evidence": "app:flush-edits",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes app:flush-edits with { barrierId }; the editor flushes and answers develop_flush_ack with that id."
+    },
+    {
+      "kind": "event",
+      "name": "app:save-barrier",
+      "source": "src-tauri/src/quit.rs",
+      "evidence": "app:save-barrier",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "src-tauri/src/quit.rs",
+      "behavior": "Publishes app:save-barrier {reason, message} when the quit/updater save barrier ends without reaching disk, cancelling the exit; the UI offers retry, cancel, or ask again to discard."
+    },
+    {
+      "kind": "event",
+      "name": "dedup:progress",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "dedup:progress",
+      "target": "core-app",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes dedup:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "denoise:done",
+      "source": "src-tauri/src/denoise.rs",
+      "evidence": "denoise:done",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes denoise:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "denoise:progress",
+      "source": "src-tauri/src/denoise.rs",
+      "evidence": "denoise:progress",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes denoise:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "develop:edit-changed",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "develop:edit-changed",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes develop:edit-changed event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "develop:full-ready",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "develop:full-ready",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes develop:full-ready event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "develop:histogram",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "develop:histogram",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes develop:histogram event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "faces:models",
+      "source": "src-tauri/src/faces.rs",
+      "evidence": "faces:models",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes faces:models event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "features:done",
+      "source": "src-tauri/src/features.rs",
+      "evidence": "features:done",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes features:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "features:progress",
+      "source": "src-tauri/src/features.rs",
+      "evidence": "features:progress",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes features:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "hdr:done",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "hdr:done",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes hdr:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "hdr:progress",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "hdr:progress",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes hdr:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "import:dedup:progress",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "import:dedup:progress",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes import:dedup:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "import:done",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "import:done",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes import:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "import:progress",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "import:progress",
+      "target": "core-app",
+      "task": "DARKROOM-147",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes import:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "library:changed",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "library:changed",
+      "target": "core-app",
+      "task": "DARKROOM-135",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes library:changed event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "mask_ai:models",
+      "source": "src-tauri/src/segment.rs",
+      "evidence": "mask_ai:models",
+      "target": "core-app",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes mask_ai:models event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "pano_detect:done",
+      "source": "src-tauri/src/pano_detect.rs",
+      "evidence": "pano_detect:done",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes pano_detect:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "pano_detect:error",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "pano_detect:error",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes pano_detect:error event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "pano_detect:progress",
+      "source": "src-tauri/src/pano_detect.rs",
+      "evidence": "pano_detect:progress",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes pano_detect:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "panorama:done",
+      "source": "src-tauri/src/panorama.rs",
+      "evidence": "panorama:done",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes panorama:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "panorama:error",
+      "source": "src-tauri/src/commands.rs",
+      "evidence": "panorama:error",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes panorama:error event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "panorama:progress",
+      "source": "src-tauri/src/panorama.rs",
+      "evidence": "panorama:progress",
+      "target": "core-app",
+      "task": "DARKROOM-150",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes panorama:progress event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "scan:done",
+      "source": "src-tauri/src/scan.rs",
+      "evidence": "scan:done",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes scan:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "suggest:done",
+      "source": "src-tauri/src/suggest.rs",
+      "evidence": "suggest:done",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes suggest:done event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "suggest:error",
+      "source": "src-tauri/src/suggest.rs",
+      "evidence": "suggest:error",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes suggest:error event; see producer for payload."
+    },
+    {
+      "kind": "event",
+      "name": "thumb:rendered",
+      "source": "src-tauri/src/thumb_queue.rs",
+      "evidence": "thumb:rendered",
+      "target": "render-wgpu",
+      "task": "DARKROOM-141",
+      "test": "coverage gap: event parity test not yet identified",
+      "behavior": "Publishes thumb:rendered event; see producer for payload."
+    },
+    {
+      "kind": "screen",
+      "name": "CommandPalette",
+      "source": "src/App.tsx",
+      "evidence": "<CommandPalette",
+      "target": "ui-egui",
+      "task": "DARKROOM-140",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents CommandPalette in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "DedupView",
+      "source": "src/App.tsx",
+      "evidence": "<DedupView",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents DedupView in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "DevelopView",
+      "source": "src/App.tsx",
+      "evidence": "<DevelopView",
+      "target": "ui-egui",
+      "task": "DARKROOM-143",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents DevelopView in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "ExportModal",
+      "source": "src/App.tsx",
+      "evidence": "<ExportModal",
+      "target": "ui-egui",
+      "task": "DARKROOM-149",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents ExportModal in the application."
+    },
+    {
+      "kind": "screen",
+      "name": "LibraryView",
+      "source": "src/App.tsx",
+      "evidence": "<LibraryView",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: screen parity test not yet identified",
+      "behavior": "Presents LibraryView in the application."
+    }
+  ]
+}

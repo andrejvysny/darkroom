@@ -8,19 +8,8 @@
 use crate::error::LibError;
 use crate::query::{count_images, QueryParams};
 use core_db::rusqlite::{params, Connection};
-use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CollectionRow {
-    pub id: i64,
-    pub name: String,
-    pub is_smart: bool,
-    /// Predicate JSON for smart collections (a serialized `QueryParams`); None for static.
-    pub query: Option<String>,
-    /// Member count (static) or live-match count (smart).
-    pub count: i64,
-}
+pub use core_model::catalog::CollectionRow;
 
 /// All collections with counts, ordered by name. Smart counts are evaluated against the catalog.
 pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRow>, LibError> {

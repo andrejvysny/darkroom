@@ -2,7 +2,6 @@
 //! `backup` module. IPC surface for this lives in `commands.rs` (`catalog_backup_now` /
 //! `catalog_backup_status`); this module owns the policy (where, how many, when).
 
-use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,12 +49,11 @@ pub fn status<R: Runtime>(app: &AppHandle<R>) -> Result<BackupStatus, String> {
     Ok(status_for(&backups_dir(app)?))
 }
 
-/// Run a backup now (briefly holds the `db` lock for the `VACUUM INTO`), returning fresh status.
+/// Run a backup through a separate read connection, returning fresh status.
 pub fn run_now<R: Runtime>(app: &AppHandle<R>) -> Result<BackupStatus, String> {
     let dir = backups_dir(app)?;
-    let st = app.state::<AppState>();
-    let db = st.db.lock().map_err(|e| e.to_string())?;
-    core_db::backup::backup_now(&db.conn, &dir, KEEP).map_err(|e| e.to_string())?;
+    let conn = backup_connection(app)?;
+    core_db::backup::backup_now(&conn, &dir, KEEP).map_err(|e| e.to_string())?;
     Ok(status_for(&dir))
 }
 
@@ -63,12 +61,13 @@ pub fn run_now<R: Runtime>(app: &AppHandle<R>) -> Result<BackupStatus, String> {
 /// background so a long-running session is never more than a day from a recovery point. Runs off
 /// the setup thread and logs its own result — nothing here can fail app startup.
 pub fn maybe_backup_on_startup<R: Runtime + 'static>(app: AppHandle<R>) {
-    std::thread::spawn(move || {
+    let host = app.clone();
+    if let Err(error) = crate::jobs::worker(&host, "daily-backup", move || {
         let dir = match backups_dir(&app) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(error = %e, "catalog backup: app data dir unavailable");
-                return;
+                return Ok(());
             }
         };
         let stale = match core_db::backup::backups(&dir).first() {
@@ -76,11 +75,10 @@ pub fn maybe_backup_on_startup<R: Runtime + 'static>(app: AppHandle<R>) {
             None => true,
         };
         if !stale {
-            return;
+            return Ok(());
         }
-        let st = app.state::<AppState>();
-        let result = st.db.lock().map_err(|e| e.to_string()).and_then(|db| {
-            core_db::backup::backup_now(&db.conn, &dir, KEEP).map_err(|e| e.to_string())
+        let result = backup_connection(&app).and_then(|conn| {
+            core_db::backup::backup_now(&conn, &dir, KEEP).map_err(|e| e.to_string())
         });
         match result {
             // Log the filename only, not the full path — app-data paths embed the OS username.
@@ -90,5 +88,26 @@ pub fn maybe_backup_on_startup<R: Runtime + 'static>(app: AppHandle<R>) {
             ),
             Err(error) => tracing::warn!(error = %error, "catalog backup failed"),
         }
-    });
+        Ok(())
+    }) {
+        tracing::warn!(%error, "backup worker failed to start");
+    }
+}
+
+fn backup_connection<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<core_db::rusqlite::Connection, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("catalog.db");
+    let conn = core_db::rusqlite::Connection::open_with_flags(
+        path,
+        core_db::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    Ok(conn)
 }

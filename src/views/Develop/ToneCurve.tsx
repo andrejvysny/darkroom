@@ -27,9 +27,9 @@ const IDENTITY: CurvePoint[] = [
 // --- Monotone cubic Hermite (Fritsch–Carlson) — a faithful port of `core-pipeline::curve::eval`, so
 // the drawn line matches the LUT actually applied to the image (WYSIWYG). ----------------------------
 function cleanPts(points: CurvePoint[]): [number, number][] {
-  const p = points.map(
-    (c) => [clamp01(c.x), clamp01(c.y)] as [number, number],
-  );
+  const p = points
+    .filter((c) => Number.isFinite(c.x) && Number.isFinite(c.y))
+    .map((c) => [clamp01(c.x), clamp01(c.y)] as [number, number]);
   p.sort((a, b) => a[0] - b[0]);
   const out: [number, number][] = [];
   for (const q of p) {
@@ -41,8 +41,7 @@ function cleanPts(points: CurvePoint[]): [number, number][] {
 
 function evalClean(pts: [number, number][], x: number): number {
   const n = pts.length;
-  if (n === 0) return clamp01(x);
-  if (n === 1) return pts[0][1];
+  if (n < 2) return clamp01(x);
   if (x <= pts[0][0]) return pts[0][1];
   if (x >= pts[n - 1][0]) return pts[n - 1][1];
 
@@ -53,7 +52,11 @@ function evalClean(pts: [number, number][], x: number): number {
   const m = new Array<number>(n).fill(0);
   m[0] = d[0];
   m[n - 1] = d[n - 2];
-  for (let i = 1; i < n - 1; i++) m[i] = (d[i - 1] + d[i]) * 0.5;
+  for (let i = 1; i < n - 1; i++) {
+    // Match the renderer: extrema have a horizontal tangent, otherwise the plotted spline can
+    // overshoot its controls even though the applied LUT stays within the adjacent endpoints.
+    m[i] = d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) * 0.5;
+  }
 
   for (let i = 0; i < n - 1; i++) {
     if (Math.abs(d[i]) < 1e-9) {

@@ -54,16 +54,17 @@ cargo run -p core-raw      --example calibrate_pq A.CR3 A.HIF  # PQ anchor ΔEV 
 cargo run -p core-hdr      --example merge_one DIR  # tripod CR3 bracket → merged-HDR EXR in /tmp
 ```
 
-System deps for HEIF decode (dynamic-linked): macOS `brew install libheif`; Linux
-`apt-get install libheif-dev libde265-dev`. `.dmg` bundling of the dylibs is a release-checklist
-item (`bundle.macOS.frameworks`) — dev machines use Homebrew's copies.
+System deps for HEIF decode (dynamic-linked): macOS uses the pinned macOS 12 codec build
+described in `docs/native-platform-builds.md`; select its pkg-config prefix and stage the
+validated closure before building Tauri. Linux uses `apt-get install libheif-dev libde265-dev`.
+The macOS staging gate rejects newer-OS Homebrew bottles before bundle mutation.
 
 App data (catalog + thumb cache): `~/Library/Application Support/com.andrejvysny.darkroom/`
 (`catalog.db` is WAL — recent rows live in `catalog.db-wal` until checkpoint).
 
 ## Architecture
 
-Workspace = `src-tauri` + `crates/*`; frontend at repo root `src/` (deviates from spec's `/ui`
+Workspace = `apps/darkroom` + `src-tauri` + `crates/*` + `xtask`; legacy frontend at repo root `src/` (deviates from spec's `/ui`
 intentionally, reusing the Tauri scaffold). **The frontend never touches the DB or filesystem
 directly — all access is typed Rust IPC commands.** The IPC command surface is the contract; it is
 defined in `src-tauri/src/lib.rs` + `src/lib/ipc.ts` (summary: Plane page "Architecture & Hard Constraints").
@@ -73,6 +74,9 @@ defined in `src-tauri/src/lib.rs` + `src/lib/ipc.ts` (summary: Plane page "Archi
 | `core-db`       | SQLite catalog: DDL (STRICT), migrations, pragmas. **Re-exports `rusqlite`** so every crate links one copy.                             |
 | `core-raw`      | rawler decode, embedded thumb/preview, EXIF meta, BLAKE3 hash, capture fingerprint, linear develop. **All rawler calls isolated here** — and all libheif calls (`heif.rs`, HDR PQ `.hif`) + merged-HDR EXR I/O (`hdr_file.rs`). |
 | `core-library`  | indexing (rayon), thumb cache, queries, keywords, collections, culling, edit persistence                                                |
+| `core-model`    | GPU-free edit values/defaults/curves, lossless read-only document interpretation, typed revisions/epochs, control specs and UI geometry. Only serde/serde_json dependencies. |
+| `core-app`      | UI-independent application state, immutable snapshots, typed commands/completions, action registry and narrow effect ports. See `docs/native-application.md`. |
+| `core-runtime`  | Generation-fenced catalog adapter, bounded supervised jobs, publication barriers and asynchronous ordered catalog workflow; shared by native and temporary legacy hosts. |
 | `core-pipeline` | wgpu/Metal develop pipeline (`develop.wgsl`, prepare/render), PNG/JPEG encode                                                           |
 | `core-import`   | copy/move/reference import, date routing (`YYYY/YYYY-MM-DD`), hash-verify, Trash                                                        |
 | `core-dedup`    | byte-identical + same-capture grouping, safe resolve → Trash                                                                            |
@@ -86,13 +90,15 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 
 ### Data flow (three paths)
 
-- **Thumbnails:** embedded JPEG → downscale 512px → disk cache keyed by content hash → `thumb://localhost/<hash_hex>?size=N` protocol → `<img>`.
-- **Develop preview:** `core-raw::develop_linear` (rawler demosaic + our camera→**linear wide-gamut ProPhoto** map via `clip_negative`, >1.0 headroom kept; ProPhoto→sRGB happens in-shader at the display transition) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG bytes → `tauri::ipc::Response` → JS `invoke<ArrayBuffer>` → `URL.createObjectURL`. **Never base64 over IPC.**
+Bullets below describe the legacy Tauri host; the native host (`apps/darkroom`) reads the same cache tiers and renders in-process — see `docs/native-application.md` ("Photo open & preview tiers").
+
+- **Thumbnails:** (Tauri) embedded JPEG → downscale 512px → disk cache keyed by content hash → `thumb://localhost/<hash_hex>?size=N` protocol → `<img>`.
+- **Develop preview:** (Tauri; native: worker renders straight to a shared wgpu texture, no JPEG/IPC) `core-raw::develop_linear` (rawler demosaic + our camera→**linear wide-gamut ProPhoto** map via `clip_negative`, >1.0 headroom kept; ProPhoto→sRGB happens in-shader at the display transition) cached once per image (`prepare()` uploads to an `Rgba32Float` texture); slider change → `render()` (uniform rewrite + draw + readback) → JPEG bytes → `tauri::ipc::Response` → JS `invoke<ArrayBuffer>` → `URL.createObjectURL`. **Never base64 over IPC.**
 - **Export:** re-decode full-res → full-res GPU render → PNG/JPEG → save dialog dest (not cached).
 
 ## Hard constraints (do not violate — see Plane page "Architecture & Hard Constraints")
 
-- **Do NOT add padding to the `vec3 wb_gain` uniform** (`params.rs` ↔ `develop.wgsl`). A scalar packs into the vec3 tail per std140/WGSL; it is correct. A past review false-flagged it. Guarded by golden test `param_effects.rs`.
+- **Do NOT add padding to the `vec3 wb_gain` uniform** (`params/uniforms.rs` ↔ `develop.wgsl`). A scalar packs into the vec3 tail per std140/WGSL; it is correct. A past review false-flagged it. Guarded by `param_effects.rs` and the frozen `model_compatibility.rs` ABI test. Domain types live in `core-model`; GPU packing requires `GpuParamsExt` / `GpuViewParamsExt`, re-exported by `core-pipeline`. See `tests/migration/model/README.md` for compatibility and document policies.
 - **All new GPU data must use new bindings**, never alter `ParamsUniform`. Bindings 0–15 are all in use; **next free = `@binding(16)`**. Map: 0 `input_tex`, 1 `input_smp`, 2 `ParamsUniform` (guarded), 3 tone-curve LUT, 4 HSL `FxUniform`, 5–7 masks (array + sampler + storage), 8 white-balance CAT mat3, 9 Detail+vignette+Presence `ExtraUniform`, **10 `ToneOpUniform` (scene-referred base tone operator), 11 `base_lut` (base-curve texture), 12 `GeomUniform` (crop/straighten + lens), 13 `ViewUniform` (viewport + mask overlay), 14 `CbRgbUniform` (Color-balance-RGB grading), 15 `ChanMix` (channel mixer)**. (Global WB rides the `@binding(8)` matrix; `ParamsUniform.wb_gain` is held at identity, masks keep their per-channel gain delta.)
 - **rawler `=0.8.0`** pinned (non-SemVer; bumped from 0.7.2 on 2026-09-08 — `Demosaic` trait moved to
   `imgop::sensor`, `CFAConfig.sensor: SensorType`, per-format embedded previews are now `preview_image`). No
@@ -108,8 +114,8 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
   `RawError::Unsupported`, are recorded in `decode_failure` and skipped on rescans until the decoder version changes.
   Multi-maker corpus: `tests/corpus/manifest.toml` + `scripts/fetch_raw_corpus.sh` (see AGENTS.md).
 - **libheif-rs `=2.7.0`** pinned, `default-features=false, features=["v1_17"]` (oldest supported system libheif — Ubuntu noble; Homebrew's newer releases are API-compatible). Keep every libheif call inside `core-raw/src/heif.rs`; not built on Windows (stub returns a clean error). `exr = "1.74"` (same version image 0.25 already pulls) for merged-HDR files.
-- **wgpu `=29`** — API differs substantially from older majors (Instance/device/pipeline-descriptor changes catalogued on the Plane Architecture page).
-- **rusqlite `0.39` + rusqlite_migration `=2.5.0`** pinned for rustc 1.91 (newer needs ≥1.95). Don't bump without checking MSRV.
+- **Native stack:** exact Rust 1.95.0, egui/egui-winit/egui-wgpu 0.37.0, winit 0.30.13 and wgpu 30.0.1. The application owns winit, surface negotiation and one GPU context shared with image processing. `apps/darkroom` builds independently of the retained Tauri host; catalog/UI parity lands in later migration tasks. `cargo xtask layers` checks dependency boundaries.
+- **rusqlite `0.39` + rusqlite_migration `=2.5.0`** remain independently pinned during the toolchain/UI migration; do not combine SQLite upgrades with this transition.
 - All SQL filters use bound named params (injection-safe) — keep new queries that way.
 - CSP is `null` (permissive) in `tauri.conf.json` — required for `thumb://` + inline styles today; harden before any public distribution.
 
@@ -119,9 +125,10 @@ hooks: `lib/useLibrary.ts`, `views/Develop/useDevelop.ts`, `hooks/useCulling.ts`
 evidence packet to GPT-6-Astra via the Codex CLI for the parts of Darkroom where a wrong algorithm
 ships a wrong photograph. Routing rule: **if a mistake produces the wrong pixel, involve Astra; if it
 produces broken software, involve Fable.** In scope: RAW colour science
-(`core-raw/{color,develop,heif,display}.rs`), develop shader math (`develop.wgsl`, `curve.rs`,
-`base_curve_ref.rs`, the mask shaders, and `params.rs:603–1139` — WB/CAT/tone/geometry math, *not*
-the std140 packing below it), HDR merge and deghosting (`core-hdr`), panorama geometry (`core-pano`,
+(`core-raw/{color,develop,heif,display}.rs`), develop shader math (`develop.wgsl`,
+`core-model/src/{curve,crop}.rs`, `base_curve_ref.rs`, the mask shaders, and
+`core-pipeline/src/params/{color,tone,geometry}.rs` — WB/CAT/tone/geometry math, *not*
+the std140 packing in `params/{adapter,uniforms}.rs`), HDR merge and deghosting (`core-hdr`), panorama geometry (`core-pano`,
 all files), denoise and analysis DSP (`core-analyze/{denoise,metrics,presence,face_aligner}.rs`),
 colour management, `core-suggest` statistics, `core-dedup` similarity math, and the numerics in
 `core-library/{face_cluster,features}.rs`. Refuses and redirects for UI, IPC, SQLite, import, CI, ORT

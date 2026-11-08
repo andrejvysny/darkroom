@@ -1,5 +1,19 @@
 use core_db::rusqlite::params;
 use core_db::Db;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn scratch_dir(name: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "darkroom-dedup-grouping-{name}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
 fn insert(db: &Db, hash: &[u8], fp: Option<&[u8]>, path: &str) {
     db.conn
@@ -17,9 +31,11 @@ fn groups_byte_and_capture_then_resolve() {
     let (h1, h2, h3, h4) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
     let (fp_a, fp_b, fp_u) = ([9u8; 32], [8u8; 32], [7u8; 32]);
 
-    // Byte-identical pair (same hash + same fingerprint).
-    insert(&db, &h1, Some(&fp_a), "a1.cr3");
-    insert(&db, &h1, Some(&fp_a), "a2.cr3");
+    // Byte-identical pair (same hash + same fingerprint). Real temp paths: the keeper file must
+    // exist on disk for resolve to trash anything.
+    let dir = scratch_dir("byte-resolve");
+    insert(&db, &h1, Some(&fp_a), dir.join("a1.cr3").to_str().unwrap());
+    insert(&db, &h1, Some(&fp_a), dir.join("a2.cr3").to_str().unwrap());
     // Same-capture pair (different bytes, shared fingerprint).
     insert(&db, &h2, Some(&fp_b), "b1.cr3");
     insert(&db, &h3, Some(&fp_b), "b2.cr3");
@@ -35,10 +51,18 @@ fn groups_byte_and_capture_then_resolve() {
     assert_eq!(cap.len(), 2, "fp_a group + fp_b group");
     assert!(cap.iter().all(|g| g.images.len() == 2));
 
-    // Resolve the byte-identical group: keep first, trash second. Paths don't exist on disk,
+    // Resolve the byte-identical group: keep first, trash second. The keeper file is created on
+    // disk (resolve never trashes while the keeper is absent); the victim's path doesn't exist,
     // so the Trash step is skipped and only the catalog row is removed.
     let keep = byte[0].images[0].id;
     let drop = byte[0].images[1].id;
+    let keep_path: String = db
+        .conn
+        .query_row("SELECT path FROM images WHERE id=?1", params![keep], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    std::fs::write(&keep_path, b"copy").unwrap();
     let res = core_dedup::resolve(&db.conn, keep, &[drop]).unwrap();
     assert_eq!(res.trashed, 1);
     assert_eq!(res.trashed_hashes.len(), 1, "one trashed hash reported");
@@ -294,12 +318,21 @@ fn perceptual_ignores_missing_capture_date() {
 fn auto_resolve_keeps_one_per_byte_group() {
     let db = Db::open_in_memory().unwrap();
     let (h1, h2) = ([1u8; 32], [2u8; 32]);
-    // Group 1: three identical; Group 2: two identical.
-    insert(&db, &h1, None, "g1a.cr3");
-    insert(&db, &h1, None, "g1b.cr3");
-    insert(&db, &h1, None, "g1c.cr3");
-    insert(&db, &h2, None, "g2a.cr3");
-    insert(&db, &h2, None, "g2b.cr3");
+    let dir = scratch_dir("auto-resolve");
+    // Group 1: three identical; Group 2: two identical. All sizes tie, so pick_keeper keeps the
+    // lowest id per group (g1a, g2a) — those keeper files must exist on disk or nothing trashes;
+    // the victim files stay absent so the real Trash is never touched.
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    for n in ["g1a.cr3", "g1b.cr3", "g1c.cr3", "g2a.cr3", "g2b.cr3"] {
+        insert(
+            &db,
+            if n.starts_with("g1") { &h1 } else { &h2 },
+            None,
+            &p(n),
+        );
+    }
+    std::fs::write(dir.join("g1a.cr3"), b"copy").unwrap();
+    std::fs::write(dir.join("g2a.cr3"), b"copy").unwrap();
 
     let res = core_dedup::auto_resolve_byte_identical(&db.conn).unwrap();
     assert_eq!(res.trashed, 3, "2 + 1 duplicates trashed");

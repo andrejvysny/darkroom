@@ -4,16 +4,8 @@
 
 use crate::error::LibError;
 use core_db::rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
 
-/// A snapshot row without its params blob — for the History panel list.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SnapshotSummary {
-    pub id: i64,
-    pub name: String,
-    pub created_at: i64,
-}
+pub use core_model::catalog::SnapshotSummary;
 
 /// Snapshots for an image, newest first.
 pub fn list_snapshots(conn: &Connection, image_id: i64) -> Result<Vec<SnapshotSummary>, LibError> {

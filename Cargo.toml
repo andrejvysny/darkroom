@@ -1,11 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
+    "xtask",
+    "apps/darkroom",
     "src-tauri",
     "crates/core-raw",
     "crates/core-db",
     "crates/core-library",
     "crates/core-pipeline",
+    "crates/render-wgpu",
+    "crates/core-model",
+    "crates/core-app",
+    "crates/core-runtime",
+    "crates/ui-egui",
     "crates/core-dedup",
     "crates/core-import",
     "crates/core-analyze",
@@ -21,12 +28,20 @@ version = "0.1.2"
 license = "MIT"
 authors = ["Andrej Vysny"]
 
+[workspace.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "dx12", "vulkan", "gles", "wgsl"] }
+egui = { version = "=0.37.0", features = ["default_fonts"] }
+egui-winit = { version = "=0.37.0", default-features = false, features = ["accesskit", "clipboard", "links", "wayland", "x11"] }
+egui-wgpu = { version = "=0.37.0", default-features = false }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland"] }
+
 [profile.release]
+panic = "unwind"
 lto = true
 codegen-units = 1
 strip = true
 opt-level = 3
-# Unwind (the default) is load-bearing: `core-raw` contains decoder panics from the rawler crate
+# Unwind is load-bearing: `core-raw` contains decoder panics from the rawler crate
 # with `catch_unwind` so one corrupt/odd RAW skips that file instead of aborting the whole app.
 # Do NOT set `panic = "abort"` here — `core-raw` fails to compile if you do.
 
@@ -36,4 +51,10 @@ opt-level = 2
 # `package."*"` covers dependencies only; the decode hot loops live in our own crate. Without this,
 # `cargo test` develops a 32 MP RAW at opt-level 0 (10-20x slower corpus tests).
 [profile.dev.package.core-raw]
+opt-level = 3
+# `prepare` converts and mip-reduces every opened photo on the CPU (32 MP RGBA f32 plus its mip
+# chain); at opt-level 0 that alone takes seconds per open in `make dev`.
+[profile.dev.package.core-pipeline]
+opt-level = 3
+[profile.dev.package.render-wgpu]
 opt-level = 3

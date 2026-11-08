@@ -13,7 +13,6 @@
 //! [`develop_camera_native`] into [`write_pano_dng`] untouched.
 
 use std::collections::HashMap;
-use std::io::BufWriter;
 use std::path::Path;
 
 use rawler::decoders::{Camera, RawDecodeParams, RawMetadata};
@@ -144,6 +143,8 @@ fn develop_camera_native_inner(src: &RawSource) -> Result<CameraNativeImage, Raw
 /// reference frame's ColorMatrix + AsShotNeutral (so absolute WB latitude survives), an embedded
 /// sRGB preview + thumbnail (fast library thumbnails without a full develop), the source's EXIF
 /// via rawler's metadata pass-through, and `Orientation=1` (pixels are already upright).
+/// Writes through a unique sibling `.part`, flushes and syncs, then publishes without replacing
+/// an existing destination. Errors preserve existing files and remove this writer's temporary.
 pub fn write_pano_dng(
     dest: &Path,
     width: u32,
@@ -164,13 +165,14 @@ fn write_pano_dng_inner(
     meta: &PanoColorMeta,
 ) -> Result<(), RawError> {
     let (w, h) = (width as usize, height as usize);
-    if rgb_native.len() != w * h * 3 {
+    let len = crate::output::rgb_len(width, height)?;
+    if rgb_native.len() != len {
         return Err(RawError::Decode(format!(
             "panorama buffer is {} samples but {}x{}x3 = {} expected",
             rgb_native.len(),
             width,
             height,
-            w * h * 3
+            len
         )));
     }
     // A DNG without a color matrix would silently re-decode through the calibrated fallback,
@@ -209,12 +211,8 @@ fn write_pano_dng_inner(
         false,
     );
 
-    // Encode into a sibling `.part` and rename only on success: a truncated `.dng` left at the
-    // final path would be handed to `process_file` and indexed as a real photo.
-    let part = dest.with_extension("dng.part");
-    let encode = || -> Result<(), RawError> {
-        let file = std::fs::File::create(&part).map_err(RawError::Io)?;
-        let mut dng = DngWriter::new(BufWriter::new(file), DNG_VERSION_V1_4).map_err(de)?;
+    crate::output::write_atomically(dest, false, |writer| {
+        let mut dng = DngWriter::new(writer, DNG_VERSION_V1_4).map_err(de)?;
 
         // Raw subframe (type 0); thumbnail goes to the root IFD below, mirroring rawler's converter.
         let mut raw_frame = dng.subframe(0);
@@ -245,18 +243,8 @@ fn write_pano_dng_inner(
         dng.root_ifd_mut()
             .add_tag(rawler::tags::TiffCommonTag::Software, "Darkroom");
 
-        dng.close().map_err(de)?;
-        Ok(())
-    };
-    if let Err(e) = encode() {
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
-    }
-    std::fs::rename(&part, dest).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        de(e.to_string())
-    })?;
-    Ok(())
+        dng.close().map_err(de)
+    })
 }
 
 /// Display-referred JPEG of a camera-native buffer (as-shot WB + camera→sRGB + OETF), long side
@@ -270,7 +258,12 @@ pub fn native_to_srgb_jpeg(
     max_edge: u32,
     quality: u8,
 ) -> Result<Vec<u8>, RawError> {
-    if rgb_native.len() != width as usize * height as usize * 3 {
+    if max_edge == 0 {
+        return Err(RawError::Decode(
+            "preview maximum edge must be nonzero".into(),
+        ));
+    }
+    if rgb_native.len() != crate::output::rgb_len(width, height)? {
         return Err(RawError::Decode("preview buffer length mismatch".into()));
     }
     let img = preview_srgb_edge(width, height, rgb_native, meta, max_edge);
@@ -493,6 +486,35 @@ mod tests {
         let meta = test_meta();
         let path = temp_dng("badlen");
         assert!(write_pano_dng(&path, 8, 8, &[0.0; 10], &meta).is_err());
+    }
+
+    #[test]
+    fn write_pano_dng_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.dng");
+        std::fs::write(&path, b"original photograph").unwrap();
+        assert!(write_pano_dng(&path, 4, 4, &test_native(4, 4), &test_meta()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original photograph");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pano_output_rejects_invalid_dimensions_and_preview_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.dng");
+        let meta = test_meta();
+        for (width, height) in [(0, 8), (8, 0), (u32::MAX, u32::MAX)] {
+            assert!(matches!(
+                write_pano_dng(&path, width, height, &[], &meta),
+                Err(RawError::Decode(_))
+            ));
+            assert!(matches!(
+                native_to_srgb_jpeg(width, height, &[], &meta, 512, 80),
+                Err(RawError::Decode(_))
+            ));
+        }
+        assert!(native_to_srgb_jpeg(4, 4, &test_native(4, 4), &meta, 0, 80).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     /// Fixture-gated: camera-native decode of the committed R7 CR3 (skips without library/2026).

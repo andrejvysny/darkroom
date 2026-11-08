@@ -173,7 +173,7 @@ export function useDevelop() {
           overlayIdx,
           st.cropMode,
         );
-        if (seq !== renderSeq.current) return null; // superseded
+        if (seq !== renderSeq.current || useAppStore.getState().selectedId !== id) return null; // superseded
         if (frame) {
           retryUsed.current = false;
           setRenderError(null);
@@ -347,6 +347,9 @@ export function useDevelop() {
 
   // Load + render on image change.
   useEffect(() => {
+    renderSeq.current++;
+    debouncedRerender.cancel();
+    debouncedHistogram.cancel();
     // This effect body runs AFTER selectedId has already changed, so the outgoing image can only be
     // reached through the pending map — flush every dirty image before the new one loads.
     void developPersistence.flushAll();
@@ -460,6 +463,9 @@ export function useDevelop() {
 
     return () => {
       cancelled = true;
+      renderSeq.current++;
+      debouncedRerender.cancel();
+      debouncedHistogram.cancel();
       setPreview(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -513,6 +519,9 @@ export function useDevelop() {
   // Cleanup on unmount.
   useEffect(() => {
     return () => {
+      renderSeq.current++;
+      debouncedRerender.cancel();
+      debouncedHistogram.cancel();
       if (previewObjUrl.current) {
         URL.revokeObjectURL(previewObjUrl.current);
         previewObjUrl.current = null;
@@ -522,7 +531,7 @@ export function useDevelop() {
         retryTimer.current = null;
       }
     };
-  }, []);
+  }, [debouncedRerender, debouncedHistogram]);
 
   // Manual retry from the Stage error overlay: reset the retry budget and re-render.
   const retryRender = useCallback(() => {

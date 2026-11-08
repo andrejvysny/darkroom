@@ -32,6 +32,8 @@ pub fn image_kind(path: &Path) -> &'static str {
 }
 
 /// Default grid thumbnail longest-edge (px). 2× headroom for HiDPI cells.
+/// JPEG quality of the embedded-derived preview tier.
+const PREVIEW_QUALITY: u8 = 85;
 pub const THUMB_SIZE: u32 = 512;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -121,6 +123,14 @@ pub fn existing_paths(conn: &Connection) -> Result<std::collections::HashSet<Str
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+/// Every catalogued source path, failing on any unreadable row: export's overwrite guard must not
+/// run against a partial list.
+pub fn all_image_paths(conn: &Connection) -> Result<Vec<String>, LibError> {
+    let mut stmt = conn.prepare("SELECT path FROM images")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// File modification time as epoch seconds, or `None` if unavailable. Used as the capture-date
 /// fallback when EXIF carries no `DateTimeOriginal` (mirrors core-import's path-routing fallback).
 fn file_mtime_epoch(path: &Path) -> Option<i64> {
@@ -140,7 +150,7 @@ pub fn process_file(
 ) -> Result<ProcessedImage, LibError> {
     let bytes = Arc::new(std::fs::read(path)?);
     let digest = content_hash(&bytes);
-    process_bytes(path, bytes, digest, thumbs, thumb_size)
+    process_bytes(path, bytes, digest, thumbs, thumb_size, None)
 }
 
 /// Everything [`process_file`] does *after* the read + hash, over a buffer the caller already holds.
@@ -151,12 +161,16 @@ pub fn process_file(
 /// (the library copy for copy/move, the source itself for reference), which need not be where
 /// `bytes` were read from; `digest` must be `content_hash(&bytes)` and `file_size` is derived from
 /// the buffer, so both stay consistent with the bytes actually processed.
+///
+/// `preview_edge = Some(e)` also writes the embedded-derived `_emb_e` preview from the SAME decode
+/// as the grid thumb. That extra is best-effort: a failure is logged and never fails the import.
 pub fn process_bytes(
     path: &Path,
     bytes: Arc<Vec<u8>>,
     digest: [u8; 32],
     thumbs: &ThumbCache,
     thumb_size: u32,
+    preview_edge: Option<u32>,
 ) -> Result<ProcessedImage, LibError> {
     let hex_digest = hex(&digest);
     let file_size = bytes.len() as i64;
@@ -171,8 +185,36 @@ pub fn process_bytes(
     if meta.capture_date.is_none() {
         meta.capture_date = file_mtime_epoch(path);
     }
-    let thumb = core_raw::thumbnail_jpeg(&src, thumb_size, 82)?;
-    thumbs.write(&hex_digest, thumb_size, &thumb.jpeg)?;
+    let sizes = [
+        (thumb_size, 82),
+        (preview_edge.unwrap_or(0), PREVIEW_QUALITY),
+    ];
+    let want_preview = preview_edge.is_some();
+    let both = if want_preview {
+        core_raw::thumbnail_jpegs(&src, &sizes)
+            .map_err(|e| eprintln!("embedded preview decode failed for {}: {e}", path.display()))
+            .ok()
+    } else {
+        None
+    };
+    let thumb = match both {
+        Some(mut both) => {
+            let big = both.pop().expect("two sizes requested");
+            let t = both.pop().expect("two sizes requested");
+            let edge = preview_edge.expect("preview requested");
+            thumbs.write(&hex_digest, thumb_size, &t.jpeg)?;
+            if let Err(e) = thumbs.write_embedded_preview(&hex_digest, edge, &big.jpeg) {
+                eprintln!("embedded preview write failed for {}: {e}", path.display());
+            }
+            t
+        }
+        // No preview wanted, or producing it failed: the grid thumb alone must still succeed.
+        None => {
+            let t = core_raw::thumbnail_jpeg(&src, thumb_size, 82)?;
+            thumbs.write(&hex_digest, thumb_size, &t.jpeg)?;
+            t
+        }
+    };
 
     // Fingerprint keys off NATIVE (pre-orientation) dims for stability; the catalog stores the
     // ORIENTED display dims so portrait shots aren't recorded as landscape (correct aspect/UI).
@@ -276,6 +318,9 @@ pub fn relink_missing_image(
          WHERE id = ?4",
         params![p.path, folder_id, imported_at, id],
     )?;
+    // The source is back: any sidecar intent parked while it was missing is due now, without
+    // needing a new edit.
+    crate::outbox::reset_outbox_schedule(conn, Some(id))?;
     Ok(Some(id))
 }
 

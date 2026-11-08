@@ -47,35 +47,36 @@ fi
 # Version-stripped stable name: libheif.1.dylib → libheif.dylib.
 stable() { basename "$1" | sed -E 's/\.[0-9]+(\.[0-9]+)*\.dylib$/.dylib/'; }
 
-# Resolve the real (versioned) libheif dylib from Homebrew.
+# A qualified source prefix keeps deployment compatibility independent of Homebrew bottles.
 heif_root=""
-if command -v brew >/dev/null 2>&1; then
+prefix="${DARKROOM_CODEC_PREFIX:-}"
+if [ -n "$prefix" ]; then
+  heif_root=$(find "$prefix/lib" -maxdepth 1 -name 'libheif.*.dylib' -type f | head -1)
+elif command -v brew >/dev/null 2>&1; then
   prefix="$(brew --prefix libheif 2>/dev/null || true)"
   if [ -n "$prefix" ]; then
     heif_root="$(find "$prefix/lib" -name 'libheif.*.dylib' -type f 2>/dev/null | head -1)"
   fi
 fi
 if [ -z "$heif_root" ]; then
-  echo "macos-bundle-dylibs: Homebrew libheif not found (brew install libheif)" >&2
+  echo "macos-bundle-dylibs: libheif not found; set DARKROOM_CODEC_PREFIX to a qualified build" >&2
   exit 1
 fi
 
-# BFS the non-system closure (skip /usr/lib + /System). Dedup by STABLE name — the same lib can
-# appear both as its on-disk path (libheif.1.21.1.dylib) and as its install id (libheif.1.dylib).
-queue=("$heif_root")
+# Check the source closure before any copy or signing mutation. This also rejects stale bottles.
+build_arch="${TAURI_ENV_TARGET_TRIPLE:-$(uname -m)}"
+case "$build_arch" in
+  aarch64-*|arm64) build_arch=arm64 ;;
+  x86_64-*|x86_64) build_arch=x86_64 ;;
+  *) echo "macos-bundle-dylibs: unsupported target $build_arch" >&2; exit 1 ;;
+esac
+validated_closure=$(DYLD_LIBRARY_PATH="$prefix/lib" \
+  cargo run --quiet --locked -p xtask -- macos-deployment-files "$heif_root" "$build_arch")
 closure=()
-seen=""
-while [ ${#queue[@]} -gt 0 ]; do
-  lib="${queue[0]}"; queue=("${queue[@]:1}")
-  s="$(stable "$lib")"
-  case " $seen " in *" $s "*) continue ;; esac
-  seen="$seen $s"
+while IFS= read -r lib; do
+  [ -n "$lib" ] || { echo "macos-bundle-dylibs: empty validated path" >&2; exit 1; }
   closure+=("$lib")
-  while IFS= read -r dep; do
-    case "$dep" in /usr/lib/*|/System/*|"$lib") continue ;; esac
-    queue+=("$dep")
-  done < <(otool -L "$lib" | tail -n +2 | awk '{print $1}')
-done
+done <<< "$validated_closure"
 
 EXPECTED="libaom.dylib libde265.dylib libheif.dylib libsharpyuv.dylib libvmaf.dylib libx265.dylib"
 actual=$(for l in "${closure[@]}"; do stable "$l"; done | sort | tr '\n' ' ' | sed 's/ $//')
@@ -87,7 +88,7 @@ if [ "$actual" != "$EXPECTED" ]; then
   exit 1
 fi
 
-STAGE="src-tauri/frameworks"
+STAGE="${DARKROOM_DYLIB_STAGE:-src-tauri/frameworks}"
 mkdir -p "$STAGE"
 
 # Repoint every non-system reference EMBEDDED in the given Mach-O to the staged stable names.
@@ -96,7 +97,7 @@ mkdir -p "$STAGE"
 # `install_name_tool -change` only rewrites an exact string match.
 repoint() { # $1 = mach-o file
   while IFS= read -r dep; do
-    case "$dep" in /usr/lib/*|/System/*|@*) continue ;; esac
+    case "$dep" in /usr/lib/*|/System/*|@executable_path/../Frameworks/*) continue ;; esac
     install_name_tool -change "$dep" "@executable_path/../Frameworks/$(stable "$dep")" "$1" 2>/dev/null
   done < <(otool -L "$1" | tail -n +2 | awk '{print $1}')
 }

@@ -1,0 +1,194 @@
+{
+  "surface": [
+    {
+      "kind": "contract",
+      "name": "DedupOverview",
+      "source": "src/views/Dedup/DedupView.tsx",
+      "evidence": "<Overview",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Duplicate groups and review entry."
+    },
+    {
+      "kind": "contract",
+      "name": "DedupReview",
+      "source": "src/views/Dedup/DedupView.tsx",
+      "evidence": "<Review",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Read-only candidate comparison, keeper decisions and review navigation."
+    },
+    {
+      "kind": "contract",
+      "name": "DedupBin",
+      "source": "src/views/Dedup/DedupView.tsx",
+      "evidence": "<BinDrawer",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Stage removals and confirm Trash resolution."
+    },
+    {
+      "kind": "contract",
+      "name": "DedupPreview",
+      "source": "src/views/Dedup/DedupView.tsx",
+      "evidence": "<PreviewOverlay",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Open selected duplicate candidate at larger size."
+    },
+    {
+      "kind": "contract",
+      "name": "DedupPhotoStage",
+      "source": "src/views/Dedup/Review.tsx",
+      "evidence": "<HeroStage",
+      "target": "ui-egui",
+      "task": "DARKROOM-148",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Shared zoom and comparison presentation for duplicate candidates."
+    },
+    {
+      "kind": "contract",
+      "name": "DevelopPresets",
+      "source": "src/views/Develop/DevelopView.tsx",
+      "evidence": "<PresetsPanel",
+      "target": "ui-egui",
+      "task": "DARKROOM-145",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Preset groups, filtering and application."
+    },
+    {
+      "kind": "contract",
+      "name": "DevelopControls",
+      "source": "src/views/Develop/DevelopView.tsx",
+      "evidence": "<InstrumentPanel",
+      "target": "ui-egui",
+      "task": "DARKROOM-143",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Global controls, reset, numeric input, module search and collapse."
+    },
+    {
+      "kind": "contract",
+      "name": "LocalMaskControls",
+      "source": "src/views/Develop/InstrumentPanel.tsx",
+      "evidence": "<MaskPanel",
+      "target": "ui-egui",
+      "task": "DARKROOM-144",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Local adjustment components and prompt/brush interaction."
+    },
+    {
+      "kind": "contract",
+      "name": "LibraryNavigation",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<LeftNav",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Folders, dates, collections, people, keywords and filters."
+    },
+    {
+      "kind": "contract",
+      "name": "LibraryPhotoMetadata",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<RightInfo",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Selected-photo metadata and user annotations."
+    },
+    {
+      "kind": "contract",
+      "name": "LibraryGrid",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<ThumbGrid",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Virtualized cells, stable selection and rating controls."
+    },
+    {
+      "kind": "contract",
+      "name": "LibrarySelectionActions",
+      "source": "src/views/Library/LibraryView.tsx",
+      "evidence": "<SelectionBar",
+      "target": "ui-egui",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Multi-image culling, annotation, export and merge entry points."
+    },
+    {
+      "kind": "contract",
+      "name": "DecoderPanicIsolation",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "ISOLATION_ACTIVE",
+      "target": "core-runtime",
+      "task": "DARKROOM-133",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Keep decoder panics contained and release panic=unwind."
+    },
+    {
+      "kind": "contract",
+      "name": "ThumbWorker",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "thumb_queue::spawn_worker",
+      "target": "core-runtime",
+      "task": "DARKROOM-136",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Own and supervise canonical thumbnail generation."
+    },
+    {
+      "kind": "contract",
+      "name": "SidecarWorker",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "sidecar_queue::spawn_worker",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Preserve mirrored edits and own worker shutdown."
+    },
+    {
+      "kind": "contract",
+      "name": "PrefetchWorker",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "prefetch::spawn_worker",
+      "target": "core-runtime",
+      "task": "DARKROOM-136",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Bound speculative photo decoding and stop worker on close."
+    },
+    {
+      "kind": "contract",
+      "name": "CatalogBackup",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "backup::",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Preserve catalog backups and recoverable startup."
+    },
+    {
+      "kind": "contract",
+      "name": "IntelAICapability",
+      "source": "src-tauri/src/lib.rs",
+      "evidence": "analysis_stub.rs",
+      "target": "core-runtime",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Retain explicit unavailable AI capabilities on macOS Intel."
+    },
+    {
+      "kind": "contract",
+      "name": "WindowsHEIFCapability",
+      "source": "crates/core-raw/src/heif.rs",
+      "evidence": "cfg(windows)",
+      "target": "core-runtime",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: native parity test not yet identified",
+      "behavior": "Retain typed unavailable HEIF capability on Windows."
+    }
+  ]
+}

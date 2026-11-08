@@ -186,6 +186,33 @@ pub fn images_missing_features(conn: &Connection) -> Result<Vec<(i64, String)>, 
     Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
 }
 
+/// One stable ID-ordered page of present images without features.
+pub fn images_missing_features_after(
+    conn: &Connection,
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<(i64, String)>, LibError> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.path FROM images i
+         LEFT JOIN image_features f ON f.image_id = i.id
+         WHERE i.status='present' AND f.image_id IS NULL AND i.id > ?1
+         ORDER BY i.id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map([after_id, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<core_db::rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Count present images without features for backfill progress.
+pub fn count_images_missing_features(conn: &Connection) -> Result<i64, LibError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM images i
+         LEFT JOIN image_features f ON f.image_id = i.id
+         WHERE i.status='present' AND f.image_id IS NULL",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 /// True if an image already has a features row.
 pub fn has_features(conn: &Connection, image_id: i64) -> Result<bool, LibError> {
     Ok(conn
@@ -196,4 +223,31 @@ pub fn has_features(conn: &Connection, image_id: i64) -> Result<bool, LibError> 
         )
         .optional()?
         .is_some())
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn missing_features_pages_are_ordered_and_complete() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE images (id INTEGER PRIMARY KEY, path TEXT, status TEXT);
+             CREATE TABLE image_features (image_id INTEGER PRIMARY KEY);
+             INSERT INTO images VALUES (7, 'seven', 'present'), (2, 'two', 'present'),
+                 (4, 'four', 'present'), (6, 'six', 'missing'), (9, 'nine', 'present');
+             INSERT INTO image_features VALUES (4);",
+        )
+        .unwrap();
+        assert_eq!(count_images_missing_features(&conn).unwrap(), 3);
+        let first = images_missing_features_after(&conn, i64::MIN, 2).unwrap();
+        assert_eq!(first, vec![(2, "two".into()), (7, "seven".into())]);
+        let second = images_missing_features_after(&conn, first.last().unwrap().0, 2).unwrap();
+        assert_eq!(second, vec![(9, "nine".into())]);
+        assert!(images_missing_features_after(&conn, 9, 2)
+            .unwrap()
+            .is_empty());
+        assert_eq!(images_missing_features(&conn).unwrap().len(), 3);
+    }
 }

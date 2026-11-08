@@ -3,9 +3,11 @@
 //! (`vec3 wb_gain` + scalars) — a misalignment would make exposure/saturation/etc. no-ops.
 //! Skips gracefully when no GPU adapter is available.
 
+mod common;
+
 use core_pipeline::{
     AiCoverage, AiPoint, CbRgb, ChannelMix, ComponentKind, DevelopParams, DevelopPipeline,
-    GpuContext, LocalAdjust, Mask, MaskComponent, MaskOp,
+    LocalAdjust, Mask, MaskComponent, MaskOp,
 };
 use core_raw::LinearImage;
 
@@ -32,13 +34,7 @@ fn mean_channel(rgba: &[u8], ch: usize) -> f64 {
 
 #[test]
 fn develop_params_have_correct_effects() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     let gray = solid(16, 16, [0.2, 0.2, 0.2]);
@@ -136,13 +132,7 @@ fn mean_band(rgba: &[u8], w: u32, x0: u32, x1: u32, ch: usize) -> f64 {
 /// per-mask local adjust. Deliberately `feather=false` so the boundary stays a hard half/half split.
 #[test]
 fn ai_mask_coverage_applies_locally() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let gray = solid(64, 64, [0.2, 0.2, 0.2]);
     let prep = pipe.prepare(&ctx, &gray).unwrap();
@@ -207,13 +197,7 @@ fn ai_mask_coverage_applies_locally() {
 /// mid-grey 0.18 → ~167 (65% sRGB, the ACR mid-grey), smooth highlight shoulder asymptoting to white.
 #[test]
 fn base_curve_tone_response() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     let render_val = |v: f32| {
@@ -257,13 +241,7 @@ fn base_curve_tone_response() {
 /// distinctly red (R ≫ B) in the output.
 #[test]
 fn base_curve_preserves_saturated_hue() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     // Bright, saturated red with headroom (>1.0) — the regime where per-channel curves twist hue.
@@ -281,13 +259,7 @@ fn base_curve_preserves_saturated_hue() {
 /// to the right half makes the output center sample the bright side, the left half the dark side.
 #[test]
 fn crop_selects_region() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = edge(64, 16);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -333,13 +305,7 @@ fn crop_selects_region() {
 /// letterbox edge into the center).
 #[test]
 fn straighten_solid_has_no_center_artifacts() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = solid(48, 32, [0.35, 0.35, 0.35]);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -401,13 +367,7 @@ fn edge(w: u32, h: u32) -> LinearImage {
 
 #[test]
 fn vignette_darkens_corners() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = solid(32, 32, [0.4, 0.4, 0.4]);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -432,13 +392,7 @@ fn vignette_darkens_corners() {
 
 #[test]
 fn sharpen_overshoots_edges_keeps_flats() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     // Flat region: sharpen is a no-op (base − blur ≈ 0).
@@ -485,13 +439,7 @@ fn sharpen_overshoots_edges_keeps_flats() {
 /// saturation collapses a colored pixel toward neutral. Locks the grading round-trip + masks wiring.
 #[test]
 fn color_balance_global_offset_brightens() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = solid(8, 8, [0.18, 0.18, 0.18]);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -516,13 +464,7 @@ fn color_balance_global_offset_brightens() {
 
 #[test]
 fn color_balance_saturation_neutralizes() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     // A clearly reddish pixel (R ≫ B).
     let img = solid(8, 8, [0.5, 0.12, 0.12]);
@@ -555,13 +497,7 @@ fn color_balance_saturation_neutralizes() {
 /// blue-dominant, and the identity default renders byte-identical to a pre-binding-15 build.
 #[test]
 fn channel_mix_swaps_green_blue() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     // A clearly green pixel (G ≫ B).
     let img = solid(8, 8, [0.12, 0.5, 0.12]);
@@ -602,13 +538,7 @@ fn channel_mix_swaps_green_blue() {
 
 #[test]
 fn lens_distortion_remaps_nonflat_image() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     // A uniform image has nothing to warp: a geometry remap must leave it byte-identical. This is
@@ -650,13 +580,7 @@ fn lens_distortion_remaps_nonflat_image() {
 
 #[test]
 fn ca_separates_channels_on_grayscale_edge() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
 
     // A grayscale gradient has r==g==b per pixel. Lateral CA rescales the red/blue radial sampling,
@@ -700,13 +624,7 @@ fn ca_separates_channels_on_grayscale_edge() {
 
 #[test]
 fn presence_clarity_texture_noop_on_flat() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     // A uniform image has zero local contrast at every scale → clarity/texture are a no-op. This is
     // the byte-identity guard for the Presence stage vs. a flat input.
@@ -732,13 +650,7 @@ fn presence_clarity_texture_noop_on_flat() {
 
 #[test]
 fn presence_boosts_local_contrast_on_edge() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     let img = edge(64, 16);
     let prep = pipe.prepare(&ctx, &img).unwrap();
@@ -772,13 +684,7 @@ fn presence_boosts_local_contrast_on_edge() {
 
 #[test]
 fn dehaze_darkens_and_contrasts_flat_midtone() {
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("no GPU adapter — skipping");
-            return;
-        }
-    };
+    let Some(ctx) = common::gpu() else { return };
     let pipe = DevelopPipeline::new(&ctx);
     // Dehaze pulls the local black point down (veiling removal) — visible even on a flat midtone.
     let flat = solid(32, 32, [0.4, 0.4, 0.4]);

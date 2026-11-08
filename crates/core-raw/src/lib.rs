@@ -17,6 +17,7 @@ pub mod hdr_dng;
 pub mod hdr_file;
 pub mod heif;
 pub mod meta;
+mod output;
 pub mod panic;
 pub mod pano;
 pub mod thumb;
@@ -39,7 +40,10 @@ pub use panic::{decode_in_flight, ISOLATION_ACTIVE};
 pub use pano::{
     develop_camera_native, native_to_srgb_jpeg, write_pano_dng, CameraNativeImage, PanoColorMeta,
 };
-pub use thumb::{oriented_preview, preview_image, preview_with_orientation, thumbnail_jpeg, Thumb};
+pub use thumb::{
+    oriented_preview, preview_image, preview_with_orientation, thumbnail_jpeg, thumbnail_jpegs,
+    Thumb,
+};
 
 pub use rawler::rawsource::RawSource;
 

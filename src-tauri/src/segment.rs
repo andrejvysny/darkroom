@@ -42,10 +42,10 @@ pub fn models_ready(st: &AppState) -> bool {
 pub fn ensure_models<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let st = app.state::<AppState>();
     let _dl_guard = st.sam_download_lock.lock().map_err(|e| e.to_string())?;
-    st.mask_ai_dl_cancel.store(false, Ordering::SeqCst);
+    st.workers.reset_cancel(&st.mask_ai_dl_cancel)?;
     let store = ModelStore::new(st.models_dir.clone());
     let files = active_tier(&st).files();
-    let cancel = || st.mask_ai_dl_cancel.load(Ordering::SeqCst);
+    let cancel = || st.workers.is_stopping() || st.mask_ai_dl_cancel.load(Ordering::SeqCst);
     store
         .ensure_with(
             files,
@@ -193,11 +193,17 @@ fn embedding(st: &AppState, image_id: i64) -> Result<Arc<SamEmbedding>, String> 
     if let Some(emb) = cached_embedding(st, image_id)? {
         return Ok(emb);
     }
+    let sequence = st.publications.sequence();
     let seg = segmenter(st)?;
     let img = decode_oriented(st, image_id)?;
     let emb = Arc::new(seg.encode(&img).map_err(|e| e.to_string())?);
-    *st.sam_embedding.lock().map_err(|e| e.to_string())? = Some((image_id, emb.clone()));
-    st.sam_masks.lock().map_err(|e| e.to_string())?.clear();
+    st.publications
+        .with_sequence(sequence, || -> Result<(), String> {
+            *st.sam_embedding.lock().map_err(|e| e.to_string())? = Some((image_id, emb.clone()));
+            st.sam_masks.lock().map_err(|e| e.to_string())?.clear();
+            Ok(())
+        })
+        .map_err(|_| "AI mask stale: catalog source changed".to_string())??;
     Ok(emb)
 }
 
@@ -261,6 +267,7 @@ pub fn prompt(st: &AppState, image_id: i64, points: Vec<AiPoint>) -> Result<Prom
     if points.is_empty() {
         return Err("no prompt points".into());
     }
+    let sequence = st.publications.sequence();
     let seg = segmenter(st)?;
     let emb = embedding(st, image_id)?;
     let mask = seg
@@ -273,10 +280,15 @@ pub fn prompt(st: &AppState, image_id: i64, points: Vec<AiPoint>) -> Result<Prom
         height: mask.height,
         alpha: mask.alpha,
     };
-    st.sam_masks
-        .lock()
-        .map_err(|e| e.to_string())?
-        .insert(hash.clone(), cov);
+    st.publications
+        .with_sequence(sequence, || -> Result<(), String> {
+            st.sam_masks
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(hash.clone(), cov);
+            Ok(())
+        })
+        .map_err(|_| "AI mask stale: catalog source changed".to_string())??;
     Ok(PromptResult {
         hash,
         width: mask.width,
@@ -304,6 +316,7 @@ pub fn coverages_for(st: &AppState, image_id: i64, params: &DevelopParams) -> Ve
         return Vec::new();
     }
 
+    let sequence = st.publications.sequence();
     let mut out = Vec::new();
     let missing: Vec<(String, Vec<AiPoint>)> = {
         let cache = match st.sam_masks.lock() {
@@ -330,10 +343,17 @@ pub fn coverages_for(st: &AppState, image_id: i64, params: &DevelopParams) -> Ve
                         height: mask.height,
                         alpha: mask.alpha,
                     };
-                    if let Ok(mut cache) = st.sam_masks.lock() {
-                        cache.insert(hash, cov.clone());
+                    let published = st.publications.with_sequence(sequence, || {
+                        if let Ok(mut cache) = st.sam_masks.lock() {
+                            cache.insert(hash, cov.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if matches!(published, Ok(true)) {
+                        out.push(cov);
                     }
-                    out.push(cov);
                 }
             }
         }

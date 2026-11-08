@@ -33,8 +33,8 @@ struct Fx {
 @group(0) @binding(5) var mask_tex: texture_2d_array<f32>;
 @group(0) @binding(6) var mask_smp: sampler;
 
-// One mask's scalar deltas (matches Rust `MaskParamsUniform`, std430). `wb_gain` is the
-// multiplicative delta gain; the rest are additive deltas on top of the global develop.
+// One mask's local controls (matches Rust `MaskParamsUniform`, std430). `wb_gain` is the
+// multiplicative gain; each mask applies its controls to the running result in its own domain.
 struct MaskParams {
   wb_gain: vec3<f32>,
   exposure: f32,
@@ -666,15 +666,19 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     base_wb, vec3<f32>(1.0), P.exposure, P.highlights, P.shadows, P.saturation);
   for (var i = 0u; i < M.count; i = i + 1u) {
     let mp = M.masks[i];
+    // Masks are ordered adjustments to the running pixel, with opacity blending the before/after
+    // values. A neutral mask (including a display-only mask) is an exact scene-linear no-op.
+    if (all(mp.wb_gain == vec3<f32>(1.0)) && mp.exposure == 0.0 &&
+        mp.highlights == 0.0 && mp.shadows == 0.0 && mp.saturation == 0.0) { continue; }
     let a = textureSampleLevel(mask_tex, mask_smp, suv, i32(i), 0.0).r * mp.opacity;
     if (a < 1e-4) { continue; }
     let li = apply_local_linear(
-      base_wb,
+      lin,
       mp.wb_gain,
-      P.exposure + mp.exposure,
-      P.highlights + mp.highlights,
-      P.shadows + mp.shadows,
-      P.saturation + mp.saturation,
+      mp.exposure,
+      mp.highlights,
+      mp.shadows,
+      mp.saturation,
     );
     lin = mix(lin, li, a);
   }
@@ -699,10 +703,11 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   var out = apply_local_display(d, P.contrast, P.blacks, P.whites);
   for (var i = 0u; i < M.count; i = i + 1u) {
     let mp = M.masks[i];
+    if (mp.contrast == 0.0 && mp.blacks == 0.0 && mp.whites == 0.0) { continue; }
     let a = textureSampleLevel(mask_tex, mask_smp, suv, i32(i), 0.0).r * mp.opacity;
     if (a < 1e-4) { continue; }
     let di = apply_local_display(
-      d, P.contrast + mp.contrast, P.blacks + mp.blacks, P.whites + mp.whites);
+      out, mp.contrast, mp.blacks, mp.whites);
     out = mix(out, di, a);
   }
 

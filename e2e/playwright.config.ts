@@ -28,7 +28,10 @@ export default defineConfig({
     {
       name: "mock",
       testMatch: "mock/**/*.spec.ts",
-      use: { baseURL: "http://localhost:1420" },
+      use: {
+        baseURL: "http://localhost:1420",
+        channel: process.env.DARKROOM_E2E_CHANNEL,
+      },
     },
   ],
   // `tauri dev` already serves Vite on :1420; reuse it instead of starting a second server.

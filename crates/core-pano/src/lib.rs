@@ -116,6 +116,7 @@ impl FrameSource for &[Frame] {
         let f = self
             .get(i)
             .ok_or_else(|| PanoError::Load(format!("frame index {i} out of range")))?;
+        validate_rgb(&f.rgb, f.width, f.height)?;
         let (dw, dh) = match max_long_side {
             Some(m) => features::capped_dims(f.width, f.height, m),
             None => (f.width, f.height),
@@ -223,6 +224,61 @@ pub enum PanoError {
     /// A [`FrameSource`] could not materialize a frame (decode failure, missing file, …).
     #[error("{0}")]
     Load(String),
+    #[error("invalid panorama input: {0}")]
+    InvalidInput(String),
+}
+
+/// Check the public buffer contract before indexing, resizing, or passing data to imageproc.
+fn validate_rgb(rgb: &[f32], width: usize, height: usize) -> Result<(), PanoError> {
+    let expected = width.checked_mul(height).and_then(|n| n.checked_mul(3));
+    if width == 0
+        || height == 0
+        || width > u32::MAX as usize
+        || height > u32::MAX as usize
+        || expected != Some(rgb.len())
+    {
+        return Err(PanoError::InvalidInput(
+            "RGB buffer must have nonzero dimensions and exactly width * height * 3 samples".into(),
+        ));
+    }
+    if rgb.iter().any(|v| !v.is_finite()) {
+        return Err(PanoError::InvalidInput("RGB samples must be finite".into()));
+    }
+    Ok(())
+}
+
+fn validate_loaded(frame: &LoadedFrame) -> Result<(), PanoError> {
+    validate_rgb(&frame.rgb, frame.width, frame.height)?;
+    if frame.full_width < frame.width
+        || frame.full_height < frame.height
+        || frame.full_width > u32::MAX as usize
+        || frame.full_height > u32::MAX as usize
+    {
+        return Err(PanoError::InvalidInput(
+            "loaded frame must report full dimensions at least as large as its buffer".into(),
+        ));
+    }
+    let scale =
+        frame.width.max(frame.height) as f64 / frame.full_width.max(frame.full_height) as f64;
+    // Allow a pixel for integer rounding, but not a source that changes aspect ratio:
+    // registration and low-resolution warping lift coordinates with one uniform scale.
+    if (frame.width as f64 - frame.full_width as f64 * scale).abs() > 1.0
+        || (frame.height as f64 - frame.full_height as f64 * scale).abs() > 1.0
+    {
+        return Err(PanoError::InvalidInput(
+            "loaded frame must preserve the full-resolution aspect ratio".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_options(opt: &StitchOptions) -> Result<(), PanoError> {
+    if opt.max_long_side == 0 || !opt.boundary_warp.is_finite() {
+        return Err(PanoError::InvalidInput(
+            "output size must be positive and boundary warp must be finite".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The cancel probe the non-cancellable public entry points pass through (`&never_cancel`).
@@ -307,6 +363,9 @@ fn register_inner(
     let n = frames.len();
     if n < 2 {
         return Err(PanoError::TooFewMatched(n));
+    }
+    for frame in frames {
+        validate_rgb(frame.rgb, frame.width, frame.height)?;
     }
 
     // --- Features (parallel over frames) ---
@@ -395,10 +454,12 @@ fn register_inner(
         .map(|f| (f.full_width as f64 * 0.5, f.full_height as f64 * 0.5))
         .collect();
 
-    // Focal from every verified homography; fall back to the reference frame's seed / a wide guess.
-    let homs: Vec<Matrix3<f64>> = pairwise.iter().map(|pm| pm.h).collect();
+    // Focal from the selected component; discarded groups must not bias its calibration.
+    // Fall back to the reference frame's seed / a wide guess.
     let focal = camera::estimate_focal(
-        &homs,
+        &pairwise,
+        &principal_points,
+        &tree.used,
         frames[tree.reference].full_width as f64,
         frames[tree.reference].focal_seed_px,
     );
@@ -462,6 +523,7 @@ pub fn stitch(
     opt: &StitchOptions,
     progress: &(dyn Fn(Phase) + Sync),
 ) -> Result<StitchResult, PanoError> {
+    validate_options(opt)?;
     let reg = register(frames, progress)?;
     compose_inner(Source::Resident(frames), &reg, opt, progress, &never_cancel)
 }
@@ -479,6 +541,7 @@ pub fn stitch_streaming(
     progress: &(dyn Fn(Phase) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<StitchResult, PanoError> {
+    validate_options(opt)?;
     progress(Phase::Register);
     let lows = load_low_pass(src, cancel)?;
     let reg = {
@@ -500,7 +563,9 @@ fn load_low_pass(
         if cancel() {
             return Err(PanoError::Cancelled);
         }
-        lows.push(src.load(i, Some(project::SEAM_LONG_SIDE as u32))?);
+        let loaded = src.load(i, Some(project::SEAM_LONG_SIDE as u32))?;
+        validate_loaded(&loaded)?;
+        lows.push(loaded);
     }
     Ok(lows)
 }
@@ -591,10 +656,21 @@ impl Source<'_> {
     }
 
     /// Frame `i` at FULL resolution for the blend step.
-    fn full(&self, i: usize) -> Result<Held<'_>, PanoError> {
+    fn full(&self, i: usize, expected: (usize, usize)) -> Result<Held<'_>, PanoError> {
         match self {
             Source::Resident(frames) => Ok(Held::Borrowed(&frames[i])),
-            Source::Streaming { src, .. } => Ok(Held::Owned(src.load(i, None)?)),
+            Source::Streaming { src, .. } => {
+                let loaded = src.load(i, None)?;
+                validate_loaded(&loaded)?;
+                if (loaded.width, loaded.height) != expected
+                    || (loaded.full_width, loaded.full_height) != expected
+                {
+                    return Err(PanoError::InvalidInput(format!(
+                        "frame {i} dimensions changed between registration and blending"
+                    )));
+                }
+                Ok(Held::Owned(loaded))
+            }
         }
     }
 }
@@ -627,9 +703,16 @@ fn compose_inner(
     progress: &(dyn Fn(Phase) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<StitchResult, PanoError> {
+    validate_options(opt)?;
     progress(Phase::Warp);
 
     let dims = source.dims();
+    validate_registration(reg, &dims)?;
+    if let Source::Resident(frames) = &source {
+        for &i in &reg.used_indices {
+            validate_rgb(&frames[i].rgb, frames[i].width, frames[i].height)?;
+        }
+    }
     let cams = project::build_used_cams(&dims, reg);
     let ref_slot = reg
         .used_indices
@@ -682,7 +765,7 @@ fn compose_inner(
         }
         // `held` owns the full-res buffer on the streaming path and is dropped at the end of this
         // iteration — at most one full-res source is ever resident.
-        let held = source.full(fidx)?;
+        let held = source.full(fidx, dims[fidx])?;
         if let Some(w) = project::warp(cam, held.view(), &map) {
             blender.add(&w, slot, &seams, gains[slot]);
         }
@@ -691,6 +774,11 @@ fn compose_inner(
         return Err(PanoError::Cancelled);
     }
     let (mut rgb, mut valid) = blender.finish();
+    if !valid.contains(&1) {
+        return Err(PanoError::InvalidInput(
+            "registered frames have no usable coverage in the output projection".into(),
+        ));
+    }
     let mut width = map.width;
     let mut height = map.height;
 
@@ -742,6 +830,49 @@ fn compose_inner(
         projection_used: projection,
         capped,
     })
+}
+
+/// `compose` accepts caller-owned registrations, so never assume their indices or poses are valid.
+fn validate_registration(reg: &Registration, dims: &[(usize, usize)]) -> Result<(), PanoError> {
+    if reg.used_indices.len() < 2 {
+        return Err(PanoError::TooFewMatched(reg.used_indices.len()));
+    }
+    // Seam ownership stores slots in a byte and reserves 255 for uncovered pixels.
+    if reg.used_indices.len() > 255 || !reg.used_indices.contains(&reg.reference_index) {
+        return Err(PanoError::InvalidInput(
+            "registration must contain its reference and at most 255 used frames".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for &i in &reg.used_indices {
+        let Some(cam) = reg.cameras.get(i).and_then(Option::as_ref) else {
+            return Err(PanoError::InvalidInput(format!(
+                "frame {i} has no camera pose"
+            )));
+        };
+        if i >= dims.len() || !seen.insert(i) {
+            return Err(PanoError::InvalidInput(format!(
+                "invalid or repeated frame index {i}"
+            )));
+        }
+        let rotation_error = (cam.rotation.transpose() * cam.rotation - Matrix3::identity()).norm();
+        let determinant = cam.rotation.determinant();
+        if !cam.focal_px.is_finite()
+            || cam.focal_px <= 0.0
+            || !cam.ppx.is_finite()
+            || !cam.ppy.is_finite()
+            || cam.rotation.iter().any(|v| !v.is_finite())
+            || !rotation_error.is_finite()
+            || rotation_error > 1e-6
+            || !determinant.is_finite()
+            || (determinant - 1.0).abs() > 1e-6
+        {
+            return Err(PanoError::InvalidInput(format!(
+                "frame {i} has an invalid camera pose"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Flatten verified inliers into bundle-adjustment observations, subsampling each pair to at most

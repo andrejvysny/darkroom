@@ -126,3 +126,77 @@ fn foreign_exr_reads_with_empty_meta() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn exr_metadata_preserves_unicode() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("darkroom_unicode_{}.exr", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut meta = test_meta();
+    meta.lens = Some("Voigtländer — 50mm 📷".into());
+    let img = LinearImage {
+        width: 1,
+        height: 1,
+        data: vec![0.5; 3],
+    };
+    core_raw::write_hdr_exr(&path, &img, &meta, &[], 0).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(core_raw::hdr_file::read_hdr_meta(&bytes).lens, meta.lens);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn exr_decode_does_not_propagate_nonfinite_samples() {
+    let path = std::env::temp_dir().join(format!("darkroom_nonfinite_{}.exr", std::process::id()));
+    exr::prelude::write_rgb_file(&path, 1, 1, |_x, _y| (f32::INFINITY, f32::NAN, -1.0f32)).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let image = core_raw::hdr_file::read_hdr_linear(&bytes).unwrap();
+    assert_eq!(image.data, [0.0; 3]);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn exr_merge_output_never_overwrites_an_existing_file() {
+    let path = std::env::temp_dir().join(format!("darkroom_existing_{}.exr", std::process::id()));
+    std::fs::write(&path, b"existing photograph").unwrap();
+    let img = LinearImage {
+        width: 1,
+        height: 1,
+        data: vec![0.5; 3],
+    };
+    assert!(core_raw::write_hdr_exr(&path, &img, &test_meta(), &[], 0).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"existing photograph");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn exr_writer_rejects_overflowing_dimensions_without_panicking() {
+    let img = LinearImage {
+        width: u32::MAX,
+        height: u32::MAX,
+        data: vec![],
+    };
+    let path = std::env::temp_dir().join("darkroom_invalid_dimensions.exr");
+    assert!(core_raw::write_hdr_exr(&path, &img, &test_meta(), &[], 0).is_err());
+}
+
+#[test]
+fn exr_reader_rejects_overflowing_dimensions_without_allocating() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge.exr");
+    exr::prelude::write_rgb_file(&path, 1, 1, |_x, _y| (0.5f32, 0.5f32, 0.5f32)).unwrap();
+    let mut bytes = std::fs::read(path).unwrap();
+    let marker = b"dataWindow\0box2i\0";
+    let start = bytes
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .unwrap()
+        + marker.len()
+        + 4;
+    // A tiny corrupt file advertises a roughly 2^31 by 2^31 image. This layout cannot fit a
+    // Rust Vec<f32>; reject the dimensions before the decoder invokes its pixel allocator.
+    for offset in [8, 12] {
+        bytes[start + offset..start + offset + 4].copy_from_slice(&(i32::MAX - 1).to_le_bytes());
+    }
+    assert!(core_raw::hdr_file::read_hdr_linear(&bytes).is_err());
+}

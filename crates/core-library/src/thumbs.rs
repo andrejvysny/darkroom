@@ -47,25 +47,31 @@ impl ThumbCache {
         std::fs::rename(&tmp, &final_path)
     }
 
-    /// Path for an *edited* thumbnail variant: `‹hash›_edit_‹version›.jpg`, where `version` is the
-    /// edit's `updated_at`. Kept separate from the base (unedited) thumbnail so toggling/resetting an
-    /// edit never destroys the original, and so the URL changes when the edit does (cache-busting).
-    pub fn edited_path_for(&self, hash_hex: &str, version: i64) -> PathBuf {
-        self.root.join(format!("{hash_hex}_edit_{version}.jpg"))
+    /// Path for an edited thumbnail, keyed by both the renderer's process version and the edit's
+    /// `updated_at` revision. The stored edit's process version is provenance; the current renderer
+    /// version identifies the pixels and invalidates old renders without rewriting saved edits.
+    pub fn edited_path_for(&self, hash_hex: &str, pv: i64, version: i64) -> PathBuf {
+        self.root
+            .join(format!("{hash_hex}_edit_pv{pv}_{version}.jpg"))
     }
 
-    pub fn read_edited(&self, hash_hex: &str, version: i64) -> std::io::Result<Vec<u8>> {
-        std::fs::read(self.edited_path_for(hash_hex, version))
+    pub fn read_edited(&self, hash_hex: &str, pv: i64, version: i64) -> std::io::Result<Vec<u8>> {
+        std::fs::read(self.edited_path_for(hash_hex, pv, version))
     }
 
-    /// Write the edited thumbnail for `version`, first removing any older edited variants of this
-    /// hash (only the current version is ever requested, so stale ones are dead weight).
-    pub fn write_edited(&self, hash_hex: &str, version: i64, jpeg: &[u8]) -> std::io::Result<()> {
-        let _ = self.clear_edited(hash_hex);
-        let final_path = self.edited_path_for(hash_hex, version);
+    /// Write an edited thumbnail atomically. Keep other revisions until ordinary cache eviction:
+    /// an older render can finish late and must not remove a newer render or another process version.
+    pub fn write_edited(
+        &self,
+        hash_hex: &str,
+        pv: i64,
+        version: i64,
+        jpeg: &[u8],
+    ) -> std::io::Result<()> {
+        let final_path = self.edited_path_for(hash_hex, pv, version);
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = self.root.join(format!(
-            "{hash_hex}_edit_{version}.{}.{seq}.tmp",
+            "{hash_hex}_edit_pv{pv}_{version}.{}.{seq}.tmp",
             std::process::id()
         ));
         std::fs::write(&tmp, jpeg)?;
@@ -106,18 +112,15 @@ impl ThumbCache {
         std::fs::read(self.canonical_path_for(hash_hex, pv))
     }
 
-    /// Write the canonical render for `pv`, first sweeping any stale `‹hash›_dev*` variants (a prior
-    /// process version) so only the current one survives. Atomic (unique temp + rename).
+    /// Write the canonical render for `pv`, then sweep any stale `‹hash›_dev*` variants (a prior
+    /// process version) so only the current one survives. Publish-then-sweep: a failed write keeps
+    /// the old file.
     pub fn write_canonical(&self, hash_hex: &str, pv: i64, jpeg: &[u8]) -> std::io::Result<()> {
-        let _ = self.clear_canonical(hash_hex);
-        let final_path = self.canonical_path_for(hash_hex, pv);
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.root.join(format!(
-            "{hash_hex}_dev{pv}.{}.{seq}.tmp",
-            std::process::id()
-        ));
-        std::fs::write(&tmp, jpeg)?;
-        std::fs::rename(&tmp, &final_path)
+        self.publish(
+            &format!("{hash_hex}_dev{pv}.jpg"),
+            jpeg,
+            &[format!("{hash_hex}_dev")],
+        )
     }
 
     /// Remove every canonical variant (`‹hash›_dev*.jpg`) for a hash. Returns count removed.
@@ -156,8 +159,9 @@ impl ThumbCache {
         std::fs::read(self.preview_path_for(hash_hex, pv, edge))
     }
 
-    /// Write the canonical preview, first sweeping stale `‹hash›_pv*` variants (prior pv/edge) so only
-    /// the current one survives. Atomic (unique temp + rename).
+    /// Write the canonical preview, then sweep stale `‹hash›_pv*` variants (prior pv/edge) and every
+    /// `‹hash›_emb_*` (a rendered preview supersedes the embedded one). Publish-then-sweep: a failed
+    /// write keeps the old files.
     pub fn write_preview(
         &self,
         hash_hex: &str,
@@ -165,64 +169,122 @@ impl ThumbCache {
         edge: u32,
         jpeg: &[u8],
     ) -> std::io::Result<()> {
-        let _ = self.clear_prefix(&format!("{hash_hex}_pv"));
-        let final_path = self.preview_path_for(hash_hex, pv, edge);
+        self.publish(
+            &format!("{hash_hex}_pv{pv}_{edge}.jpg"),
+            jpeg,
+            &[format!("{hash_hex}_pv"), format!("{hash_hex}_emb_")],
+        )
+    }
+
+    // ── Embedded-derived preview tier (written at import from the camera's embedded JPEG) ──────
+
+    /// Path for the embedded-derived preview: `‹hash›_emb_‹edge›.jpg`.
+    pub fn embedded_preview_path_for(&self, hash_hex: &str, edge: u32) -> PathBuf {
+        self.root.join(format!("{hash_hex}_emb_{edge}.jpg"))
+    }
+
+    pub fn has_embedded_preview(&self, hash_hex: &str, edge: u32) -> bool {
+        self.embedded_preview_path_for(hash_hex, edge).exists()
+    }
+
+    pub fn read_embedded_preview(&self, hash_hex: &str, edge: u32) -> std::io::Result<Vec<u8>> {
+        std::fs::read(self.embedded_preview_path_for(hash_hex, edge))
+    }
+
+    /// Write the embedded-derived preview, then sweep other `‹hash›_emb_*` edges.
+    pub fn write_embedded_preview(
+        &self,
+        hash_hex: &str,
+        edge: u32,
+        jpeg: &[u8],
+    ) -> std::io::Result<()> {
+        self.publish(
+            &format!("{hash_hex}_emb_{edge}.jpg"),
+            jpeg,
+            &[format!("{hash_hex}_emb_")],
+        )
+    }
+
+    /// Atomically publish `final_name` (unique temp + rename), and only AFTER that succeeds remove
+    /// every other `.jpg` starting with one of `sweep_prefixes`. Sweeping first would lose the old
+    /// file when the write fails.
+    fn publish(
+        &self,
+        final_name: &str,
+        jpeg: &[u8],
+        sweep_prefixes: &[String],
+    ) -> std::io::Result<()> {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.root.join(format!(
-            "{hash_hex}_pv{pv}_{edge}.{}.{seq}.tmp",
-            std::process::id()
-        ));
+        let tmp = self
+            .root
+            .join(format!("{final_name}.{}.{seq}.tmp", std::process::id()));
         std::fs::write(&tmp, jpeg)?;
-        std::fs::rename(&tmp, &final_path)
+        if let Err(e) = std::fs::rename(&tmp, self.root.join(final_name)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        for prefix in sweep_prefixes {
+            let _ = self.clear_prefix_except(prefix, final_name);
+        }
+        Ok(())
     }
 
-    /// Path for an *edited* preview variant: `‹hash›_editpv_‹version›_‹edge›.jpg`.
-    pub fn edited_preview_path_for(&self, hash_hex: &str, version: i64, edge: u32) -> PathBuf {
+    /// Path for an edited preview, keyed by renderer process version, edit revision and size.
+    pub fn edited_preview_path_for(
+        &self,
+        hash_hex: &str,
+        pv: i64,
+        version: i64,
+        edge: u32,
+    ) -> PathBuf {
         self.root
-            .join(format!("{hash_hex}_editpv_{version}_{edge}.jpg"))
+            .join(format!("{hash_hex}_editpv_pv{pv}_{version}_{edge}.jpg"))
     }
 
-    pub fn has_edited_preview(&self, hash_hex: &str, version: i64, edge: u32) -> bool {
-        self.edited_preview_path_for(hash_hex, version, edge)
+    pub fn has_edited_preview(&self, hash_hex: &str, pv: i64, version: i64, edge: u32) -> bool {
+        self.edited_preview_path_for(hash_hex, pv, version, edge)
             .exists()
     }
 
     pub fn read_edited_preview(
         &self,
         hash_hex: &str,
+        pv: i64,
         version: i64,
         edge: u32,
     ) -> std::io::Result<Vec<u8>> {
-        std::fs::read(self.edited_preview_path_for(hash_hex, version, edge))
+        std::fs::read(self.edited_preview_path_for(hash_hex, pv, version, edge))
     }
 
-    /// Write an edited preview, first sweeping stale `‹hash›_editpv_*` variants (older edit/edge).
+    /// Write an edited preview without deleting other revisions that may have completed earlier.
+    /// All edited variants remain subject to the ordinary bounded cache eviction policy.
     pub fn write_edited_preview(
         &self,
         hash_hex: &str,
+        pv: i64,
         version: i64,
         edge: u32,
         jpeg: &[u8],
     ) -> std::io::Result<()> {
-        let _ = self.clear_prefix(&format!("{hash_hex}_editpv_"));
-        let final_path = self.edited_preview_path_for(hash_hex, version, edge);
+        let final_path = self.edited_preview_path_for(hash_hex, pv, version, edge);
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = self.root.join(format!(
-            "{hash_hex}_editpv_{version}_{edge}.{}.{seq}.tmp",
+            "{hash_hex}_editpv_pv{pv}_{version}_{edge}.{}.{seq}.tmp",
             std::process::id()
         ));
         std::fs::write(&tmp, jpeg)?;
         std::fs::rename(&tmp, &final_path)
     }
 
-    /// Remove every cached `.jpg` whose name starts with `prefix`. Returns count removed.
-    fn clear_prefix(&self, prefix: &str) -> std::io::Result<usize> {
+    /// Remove every cached `.jpg` whose name starts with `prefix`, except `keep`.
+    fn clear_prefix_except(&self, prefix: &str, keep: &str) -> std::io::Result<usize> {
         let mut removed = 0;
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with(prefix)
+            if name != keep
+                && name.starts_with(prefix)
                 && name.ends_with(".jpg")
                 && std::fs::remove_file(entry.path()).is_ok()
             {
@@ -276,7 +338,7 @@ impl ThumbCache {
     /// placeholders and edited variants evict normally.
     pub fn evict_to(&self, cap_bytes: u64) -> std::io::Result<u64> {
         // (path, last_used, size) for every evictable cached thumbnail.
-        let mut files: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+        let mut files: Vec<(PathBuf, bool, std::time::SystemTime, u64)> = Vec::new();
         let mut total: u64 = 0;
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -293,15 +355,16 @@ impl ThumbCache {
                 .or_else(|_| meta.modified())
                 .unwrap_or(std::time::UNIX_EPOCH);
             total += meta.len();
-            files.push((entry.path(), used, meta.len()));
+            files.push((entry.path(), name.contains("_emb_"), used, meta.len()));
         }
         if total <= cap_bytes {
             return Ok(0);
         }
-        // Oldest first; delete until under cap.
-        files.sort_by_key(|(_, used, _)| *used);
+        // Embedded-derived previews first (cheap to regenerate from the source file's embedded
+        // JPEG), then oldest first; delete until under cap.
+        files.sort_by_key(|(_, emb, used, _)| (!*emb, *used));
         let mut freed = 0;
-        for (path, _, size) in files {
+        for (path, _, _, size) in files {
             if total <= cap_bytes {
                 break;
             }
@@ -311,5 +374,171 @@ impl ThumbCache {
             }
         }
         Ok(freed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestCache(ThumbCache);
+
+    impl TestCache {
+        fn new() -> Self {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("darkroom-thumb-cache-{}-{seq}", std::process::id()));
+            Self(ThumbCache::new(root).unwrap())
+        }
+    }
+
+    impl Drop for TestCache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.root());
+        }
+    }
+
+    #[test]
+    fn renderer_change_invalidates_edited_thumbnails_and_previews() {
+        let cache = TestCache::new();
+        let cache = &cache.0;
+        let hash = "ab".repeat(32);
+        let revision = 1_700_000_000;
+        cache
+            .write_edited(&hash, 5, revision, b"old thumb")
+            .unwrap();
+        cache
+            .write_edited_preview(&hash, 5, revision, 1536, b"old preview")
+            .unwrap();
+        // Legacy unversioned entries must not be accepted either.
+        std::fs::write(
+            cache.root().join(format!("{hash}_edit_{revision}.jpg")),
+            b"legacy",
+        )
+        .unwrap();
+        std::fs::write(
+            cache
+                .root()
+                .join(format!("{hash}_editpv_{revision}_1536.jpg")),
+            b"legacy",
+        )
+        .unwrap();
+
+        assert!(cache.read_edited(&hash, 6, revision).is_err());
+        assert!(!cache.has_edited_preview(&hash, 6, revision, 1536));
+        assert!(cache.read_edited_preview(&hash, 6, revision, 1536).is_err());
+
+        cache
+            .write_edited(&hash, 6, revision, b"new thumb")
+            .unwrap();
+        cache
+            .write_edited_preview(&hash, 6, revision, 1536, b"new preview")
+            .unwrap();
+        assert_eq!(cache.read_edited(&hash, 6, revision).unwrap(), b"new thumb");
+        assert_eq!(
+            cache.read_edited_preview(&hash, 6, revision, 1536).unwrap(),
+            b"new preview"
+        );
+        assert!(cache.read_edited(&hash, 6, revision + 1).is_err());
+        assert!(!cache.has_edited_preview(&hash, 6, revision, 1024));
+    }
+
+    #[test]
+    fn late_old_render_cannot_remove_newer_revision_or_renderer() {
+        let cache = TestCache::new();
+        let cache = &cache.0;
+        let hash = "cd".repeat(32);
+        cache.write_edited(&hash, 6, 102, b"new thumb").unwrap();
+        cache
+            .write_edited_preview(&hash, 6, 102, 1536, b"new preview")
+            .unwrap();
+
+        for (pv, revision) in [(6, 101), (5, 102)] {
+            cache
+                .write_edited(&hash, pv, revision, b"late thumb")
+                .unwrap();
+            cache
+                .write_edited_preview(&hash, pv, revision, 1536, b"late preview")
+                .unwrap();
+        }
+        assert_eq!(cache.read_edited(&hash, 6, 102).unwrap(), b"new thumb");
+        assert_eq!(
+            cache.read_edited_preview(&hash, 6, 102, 1536).unwrap(),
+            b"new preview"
+        );
+
+        // Retained revisions still obey the cache cap and never become durable canonical entries.
+        assert!(cache.evict_to(0).unwrap() > 0);
+        assert_eq!(cache.total_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn preview_publishes_before_sweeping_and_replaces_embedded() {
+        let cache = TestCache::new();
+        let cache = &cache.0;
+        let h = "ef".repeat(32);
+        cache.write_embedded_preview(&h, 2560, b"emb").unwrap();
+        cache.write_embedded_preview(&h, 3000, b"emb3").unwrap();
+        assert!(!cache.has_embedded_preview(&h, 2560), "other edges swept");
+        cache.write_preview(&h, 5, 2560, b"old").unwrap();
+        assert!(
+            !cache.has_embedded_preview(&h, 3000),
+            "rendered supersedes emb"
+        );
+        cache.write_preview(&h, 6, 2560, b"new").unwrap();
+        assert!(!cache.has_preview(&h, 5, 2560));
+        assert_eq!(cache.read_preview(&h, 6, 2560).unwrap(), b"new");
+    }
+
+    #[test]
+    fn failed_publish_keeps_old_files() {
+        let cache = TestCache::new();
+        let cache = &cache.0;
+        let h = "12".repeat(32);
+        cache.write_preview(&h, 5, 2560, b"old").unwrap();
+        cache.write_embedded_preview(&h, 2560, b"emb").unwrap();
+        cache.write_canonical(&h, 1, b"dev1").unwrap();
+        // A directory occupying the final path makes rename fail.
+        std::fs::create_dir(cache.preview_path_for(&h, 6, 2560)).unwrap();
+        assert!(cache.write_preview(&h, 6, 2560, b"new").is_err());
+        assert_eq!(cache.read_preview(&h, 5, 2560).unwrap(), b"old");
+        assert!(cache.has_embedded_preview(&h, 2560), "emb kept on failure");
+        std::fs::create_dir(cache.canonical_path_for(&h, 2)).unwrap();
+        assert!(cache.write_canonical(&h, 2, b"dev2").is_err());
+        assert_eq!(cache.read_canonical(&h, 1).unwrap(), b"dev1");
+        std::fs::create_dir(cache.embedded_preview_path_for(&h, 3000)).unwrap();
+        assert!(cache.write_embedded_preview(&h, 3000, b"x").is_err());
+        assert!(cache.has_embedded_preview(&h, 2560));
+        // No stray temp files left behind.
+        let tmps = std::fs::read_dir(cache.root())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(tmps, 0);
+    }
+
+    #[test]
+    fn eviction_takes_embedded_first_and_never_dev() {
+        let cache = TestCache::new();
+        let cache = &cache.0;
+        let h = "34".repeat(32);
+        // Written in this order so the embedded file is the NEWEST by mtime/atime.
+        cache.write(&h, 512, &[0u8; 100]).unwrap();
+        cache.write_canonical(&h, 1, &[0u8; 100]).unwrap();
+        cache.write_embedded_preview(&h, 2560, &[0u8; 100]).unwrap();
+        // Cap leaves room for exactly one evictable file: only the emb file goes.
+        assert_eq!(cache.evict_to(100).unwrap(), 100);
+        assert!(!cache.has_embedded_preview(&h, 2560));
+        assert!(cache.has(&h, 512));
+        assert!(cache.has_canonical(&h, 1));
+        cache.evict_to(0).unwrap();
+        assert!(!cache.has(&h, 512));
+        assert!(cache.has_canonical(&h, 1), "_dev is exempt");
     }
 }

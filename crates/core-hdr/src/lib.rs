@@ -40,6 +40,12 @@ pub enum HdrError {
     },
     #[error("frame buffer length does not match its dimensions")]
     MalformedFrame,
+    #[error("frame scale must be finite and positive")]
+    InvalidScale,
+    #[error("frame contains non-finite radiance or overflows at its exposure scale")]
+    InvalidRadiance,
+    #[error("deghost sigma must be finite and positive, and k must be finite and nonnegative")]
+    InvalidDeghostParams,
     #[error("merge needs at least 2 frames")]
     TooFewFrames,
 }
@@ -54,20 +60,28 @@ pub struct ExposureInfo {
 
 /// EV at ISO 100: `log2(N²/t · 100/ISO)`. Higher EV₁₀₀ = LESS light captured (darker frame).
 pub fn ev100(e: &ExposureInfo) -> Result<f64, HdrError> {
-    if e.exposure_time_s <= 0.0 || e.f_number <= 0.0 || e.iso <= 0.0 {
+    if [e.exposure_time_s, e.f_number, e.iso]
+        .iter()
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
         return Err(HdrError::InvalidExposure(format!(
             "t={} N={} ISO={}",
             e.exposure_time_s, e.f_number, e.iso
         )));
     }
-    Ok(((e.f_number * e.f_number / e.exposure_time_s) * (100.0 / e.iso)).log2())
+    // Work in log space: valid finite metadata can still overflow N²/t or underflow 100/ISO.
+    Ok(2.0 * e.f_number.log2() - e.exposure_time_s.log2() + 100.0f64.log2() - e.iso.log2())
 }
 
 /// Radiance scale that normalizes `frame` onto `reference`'s exposure: `2^(EV_frame − EV_ref)`.
 /// A frame exposed 1 EV brighter than the reference (lower EV₁₀₀) gets scale 0.5, so the merged
 /// output's brightness ≈ the reference frame's.
 pub fn relative_scale(frame: &ExposureInfo, reference: &ExposureInfo) -> Result<f64, HdrError> {
-    Ok((ev100(frame)? - ev100(reference)?).exp2())
+    let scale = (ev100(frame)? - ev100(reference)?).exp2();
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(HdrError::InvalidScale);
+    }
+    Ok(scale)
 }
 
 /// Pick the reference (metered) frame: median EV₁₀₀ (lower-middle for even counts) — the middle
@@ -138,8 +152,9 @@ pub struct MergeAccumulator {
     sum: Vec<f32>,
     /// Σ w (single channel).
     wsum: Vec<f32>,
-    /// The scaled shortest exposure (highest EV₁₀₀) — sole source for pixels clipped in EVERY
-    /// frame, where the weighted sum is empty.
+    /// The scaled shortest exposure (highest EV₁₀₀), used where the weighted sum is empty.
+    /// On the hand-held path this starts with the reference, which remains the fallback outside
+    /// the shortest frame's valid warp coverage.
     fallback: Vec<f32>,
     frames: usize,
     /// Reference radiance (reference-exposure scale, 3 f32/px), held on the hand-held path so each
@@ -177,9 +192,25 @@ impl MergeAccumulator {
         ref_is_shortest: bool,
         params: DeghostParams,
     ) -> Result<Self, HdrError> {
+        if !params.sigma.is_finite()
+            || params.sigma <= 0.0
+            || !params.k.is_finite()
+            || params.k < 0.0
+        {
+            return Err(HdrError::InvalidDeghostParams);
+        }
+        // Validate before allocating a second full-resolution image from caller-supplied dimensions.
+        let expected = (reference.width as usize)
+            .checked_mul(reference.height as usize)
+            .and_then(|pixels| pixels.checked_mul(3));
+        if reference.width == 0 || reference.height == 0 || expected != Some(reference.data.len()) {
+            return Err(HdrError::MalformedFrame);
+        }
+        Self::check_radiance(&reference.data, 1.0, None)?;
         let mut acc = MergeAccumulator::new(reference.width, reference.height);
         acc.check_dims(reference)?;
         acc.reference = Some(reference.data.clone());
+        acc.fallback.copy_from_slice(&reference.data);
         acc.deghost = params;
         // Accumulate the reference itself. With a stored reference the deghost factor is computed,
         // but obs == pred here (d == 0 → consist == 1), so it is an exact no-op for this frame.
@@ -198,8 +229,28 @@ impl MergeAccumulator {
                 got_h: frame.height,
             });
         }
-        if frame.data.len() != self.wsum.len() * 3 {
+        if frame.width == 0 || frame.height == 0 || frame.data.len() != self.wsum.len() * 3 {
             return Err(HdrError::MalformedFrame);
+        }
+        Ok(())
+    }
+
+    /// Validate the complete contributing frame before changing any accumulated pixels. Invalid
+    /// warp borders are intentionally ignored, just as they are during accumulation.
+    fn check_radiance(data: &[f32], scale: f32, valid: Option<&[u8]>) -> Result<(), HdrError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(HdrError::InvalidScale);
+        }
+        for (i, px) in data.chunks_exact(3).enumerate() {
+            if valid.is_some_and(|mask| mask[i] == 0) {
+                continue;
+            }
+            if px
+                .iter()
+                .any(|&value| !value.is_finite() || !(value * scale).is_finite())
+            {
+                return Err(HdrError::InvalidRadiance);
+            }
         }
         Ok(())
     }
@@ -214,6 +265,7 @@ impl MergeAccumulator {
         is_shortest: bool,
     ) -> Result<(), HdrError> {
         self.check_dims(frame)?;
+        Self::check_radiance(&frame.data, scale, None)?;
         self.accumulate(&frame.data, scale, is_shortest, None);
         self.frames += 1;
         Ok(())
@@ -237,6 +289,7 @@ impl MergeAccumulator {
         if valid.len() != self.wsum.len() {
             return Err(HdrError::MalformedFrame);
         }
+        Self::check_radiance(&frame.data, scale, Some(valid))?;
         self.accumulate(&frame.data, scale, is_shortest, Some(valid));
         self.frames += 1;
         Ok(())
@@ -292,13 +345,18 @@ impl MergeAccumulator {
     }
 
     /// Finish the merge: weighted average where any frame contributed, the scaled shortest
-    /// exposure where every frame clipped. Negatives floored (mirrors `clip_negative`).
+    /// exposure where every frame clipped. Outside that frame's warp coverage the hand-held path
+    /// retains the reference, so unrecoverable highlights stay clipped instead of becoming black.
+    /// Negatives floored (mirrors `clip_negative`).
     pub fn finish(self) -> Result<LinearImage, HdrError> {
         if self.frames < 2 {
             return Err(HdrError::TooFewFrames);
         }
         let mut data = self.sum;
         for (i, &w) in self.wsum.iter().enumerate() {
+            if !w.is_finite() || data[i * 3..i * 3 + 3].iter().any(|v| !v.is_finite()) {
+                return Err(HdrError::InvalidRadiance);
+            }
             if w > 1e-4 {
                 let inv = 1.0 / w;
                 for c in 0..3 {
@@ -541,7 +599,9 @@ mod tests {
     fn deghost_downweights_moved_pixel() {
         let reference = img(2, 2, |_| [0.30, 0.30, 0.30]);
         let consistent = img(2, 2, |_| [0.30, 0.30, 0.30]); // agrees with the reference
-        let moved = img(2, 2, |_| [0.90, 0.90, 0.90]); // a bright object that moved into frame
+
+        // Stay below the clipping roll-off: 0.90 has zero exposure weight even WITHOUT deghosting.
+        let moved = img(2, 2, |_| [0.60, 0.60, 0.60]); // a bright object that moved into frame
         let valid = vec![1u8; 4];
 
         let mut acc =
@@ -551,7 +611,14 @@ mod tests {
         acc.add_frame_masked(&moved, 1.0, true, &valid).unwrap();
         let out = acc.finish().unwrap();
 
-        // Naive average would be (0.3+0.3+0.9)/3 = 0.5; deghosting drops the moved frame → ≈ 0.30.
+        let mut naive = MergeAccumulator::new(2, 2);
+        naive.add_frame(&reference, 1.0, false).unwrap();
+        naive.add_frame(&consistent, 1.0, false).unwrap();
+        naive.add_frame(&moved, 1.0, true).unwrap();
+        let naive = naive.finish().unwrap();
+        assert!((naive.data[0] - 0.40).abs() < 1e-6);
+
+        // Naive average is (0.3+0.3+0.6)/3 = 0.4; deghosting drops the moved frame → ≈ 0.30.
         for px in out.data.chunks_exact(3) {
             assert!(
                 (px[0] - 0.30).abs() < 0.03,

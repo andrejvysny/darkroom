@@ -1,0 +1,5 @@
+[alias]
+xtask = "run --package xtask --"
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "12.0", force = false }

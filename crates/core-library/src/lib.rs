@@ -13,12 +13,15 @@ pub mod features;
 pub mod index;
 pub mod keywords;
 pub mod maintenance;
+pub mod merge;
+pub mod outbox;
 pub mod pairs;
 pub mod pano_detect;
 pub mod presets;
 pub mod query;
 pub mod reconcile;
 pub mod reject;
+pub mod remove;
 pub mod settings;
 pub mod sidecar;
 pub mod snapshots;
@@ -46,7 +49,10 @@ pub use decode_failure::{
     record_decode_failure, record_failure_facts, skippable_failures, DecodeFailureCounts,
     DecodeFailureRow, FailureFacts,
 };
-pub use edits::{get_edit, get_edit_with_version, set_edit, thumb_precheck};
+pub use edits::{
+    get_edit, get_edit_with_process_version, get_edit_with_version, save_edit_expecting_source,
+    save_edit_with_intent, set_edit, thumb_precheck,
+};
 pub use error::LibError;
 pub use events::{append_event, context_with_suggested, event_count, ids_json, Event};
 pub use face::{
@@ -60,7 +66,8 @@ pub use face_cluster::{
     ungrouped_face_count, ClusterParams, ClusterPlan, ClusterSnapshot, ClusterStats,
 };
 pub use features::{
-    compute_features, has_features, images_missing_features, set_image_features, ImageFeatures,
+    compute_features, count_images_missing_features, has_features, images_missing_features,
+    images_missing_features_after, set_image_features, ImageFeatures,
 };
 pub use index::{
     add_root, enumerate_raws, existing_paths, image_kind, insert_image, now_epoch, process_bytes,
@@ -72,6 +79,12 @@ pub use keywords::{
     keywords_for_image, list_keywords, remove_keyword_from_image, KeywordRow,
 };
 pub use maintenance::reap_dangling_import_sessions;
+pub use merge::insert_hdr_image;
+pub use outbox::{
+    complete_outbox, defer_outbox, fail_outbox, mirror_state, mirrored_revision, next_outbox_due,
+    pending_outbox, pending_outbox_keyed, reset_outbox_schedule, MirrorState, OutboxCompletion,
+    OutboxCursor, OutboxItem,
+};
 pub use pairs::{link_pair, pair_info, primary_of, secondaries_of, unlink_pair, PairInfo};
 pub use presets::{
     delete_preset, get_preset, insert_preset, is_builtin, list_presets, seed_builtin_preset,
@@ -84,8 +97,10 @@ pub use query::{
 };
 pub use reconcile::{reconcile, ReconcileStats};
 pub use reject::{
-    delete_rejected, delete_rejected_with, summarize_rejected, RejectDeleteResult, RejectSummary,
+    delete_rejected, delete_rejected_with, finalize_delete_rejected, plan_delete_rejected,
+    summarize_rejected, RejectDeleteResult, RejectPlan, RejectSummary,
 };
+pub use remove::{remove_from_catalog, RemoveResult};
 pub use settings::{
     animal_detector_size, default_scan_stages, face_stage_enabled, get_meta, library_root,
     mask_ai_tier, preview_edge, scan_stages, set_animal_detector_size, set_face_stage_enabled,
@@ -94,8 +109,8 @@ pub use settings::{
     PREVIEW_EDGE_MAX, PREVIEW_EDGE_MIN,
 };
 pub use sidecar::{
-    hydrate_if_blank, rebuild_from_sidecars, sidecar_snapshot, write_all_sidecars, write_sidecar,
-    write_snapshot, Sidecar, SidecarWrite,
+    hydrate_if_blank, rebuild_from_sidecars, sidecar_snapshot, staging_path, write_all_sidecars,
+    write_sidecar, write_snapshot, write_staged, Sidecar, SidecarWrite,
 };
 pub use snapshots::{
     create_snapshot, delete_snapshot, get_snapshot_params, list_snapshots, rename_snapshot,

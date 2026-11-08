@@ -24,23 +24,23 @@ jobs:
     env:
       # Turn a missing committed fixture into a hard failure instead of a silently-skipped test.
       DARKROOM_REQUIRE_FIXTURES: "1"
+      # GPU assertions must execute on the Metal runner; missing adapters cannot turn them green.
+      DARKROOM_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@v4
 
-      # HEIF decode (core-raw/src/heif.rs) dynamic-links system libheif — the runner image
-      # usually ships it, but pin the install so the build never depends on image luck.
-      - name: Install libheif (HEIF decode system dep)
-        run: brew install libheif
+      - name: Build macOS 12 codec closure
+        uses: ./.github/actions/macos-codecs
+
+      - name: Install Rust 1.95 (+ clippy)
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
 
       # tauri-build validates the bundle.macOS.frameworks paths (tauri.macos.conf.json) at
       # compile time, so the dylib closure must be staged before any cargo build of src-tauri.
       - name: Stage macOS dylib closure
         run: bash scripts/macos-bundle-dylibs.sh stage
-
-      - name: Install Rust 1.91 (+ clippy)
-        uses: dtolnay/rust-toolchain@1.91.0
-        with:
-          components: clippy
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -57,14 +57,13 @@ jobs:
       - name: Frontend type-check + build
         run: npm run build
 
-      - name: Formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy (warnings = errors)
-        run: cargo clippy --workspace --examples -- -D warnings
-
-      - name: Tests
-        run: cargo test --workspace
+      # The single shared checklist (scripts/repo-checks.sh): fmt, native baseline type-check,
+      # xtask parity + layers, `cargo test -p xtask`, both clippy sweeps (workspace+examples and
+      # darkroom-native/render-wgpu --all-targets), then workspace tests. `gpu` is the designated
+      # pixel-validation lane: the script exports DARKROOM_REQUIRE_FIXTURES/GPU before the test
+      # run and prints a summary naming the mode, so headless and GPU results are never confused.
+      - name: Repository checks (gpu lane)
+        run: bash scripts/repo-checks.sh gpu
 
       # Tier-1 UI: the frontend in Chromium against `src/dev/tauriMock.ts`. No GPU, no catalog, so it
       # is deterministic on a hosted runner — unlike the real-backend `tauri` project, which needs a
@@ -75,6 +74,33 @@ jobs:
       - name: Mock-IPC UI tests
         run: npm run e2e:mock
 
+  native-host-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build macOS 12 codec closure
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/macos-codecs
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint native host
+        run: cargo clippy --locked -p darkroom-native --all-targets -- -D warnings
+      - name: Build native host independently of Tauri
+        run: cargo build --locked -p darkroom-native
+      - name: Verify macOS native deployment closure
+        if: runner.os == 'macOS'
+        shell: bash
+        run: cargo xtask macos-deployment target/debug/darkroom-native "$(uname -m)"
+
   # Compile-only gate so PRs catch Windows breakage (cross-platform cfg, ort/DirectML linking,
   # MSVC-built C deps). GPU/CR3 behaviour is validated by the macOS job + manual run-through; the
   # headless windows-latest runner can't exercise the real DX12 path, so no tests run here.
@@ -83,8 +109,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.91 (+ clippy)
-        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install Rust 1.95 (+ clippy)
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
 
@@ -131,8 +157,8 @@ jobs:
       - name: Install libheif (HEIF decode system dep)
         run: sudo apt-get update && sudo apt-get install -y libheif-dev libde265-dev
 
-      - name: Install Rust 1.91
-        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2

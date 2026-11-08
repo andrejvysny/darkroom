@@ -8,6 +8,14 @@ pub enum PipelineError {
     Device(String),
     #[error("image {w}x{h} exceeds GPU max texture dimension {max}")]
     ImageTooLarge { w: u32, h: u32, max: u32 },
+    #[error("invalid image input: {0}")]
+    InvalidInput(&'static str),
+    #[error("image readback needs {required} bytes, exceeding GPU buffer limit {max}")]
+    BufferTooLarge { required: u64, max: u64 },
+    #[error("image allocation: {0}")]
+    Allocation(String),
+    #[error("invalid develop render target: {0}")]
+    InvalidTarget(String),
     #[error("buffer map: {0}")]
     Map(String),
     #[error("raw: {0}")]

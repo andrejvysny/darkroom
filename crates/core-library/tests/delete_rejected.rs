@@ -5,7 +5,8 @@
 use core_db::rusqlite::{params, Connection};
 use core_db::Db;
 use core_library::{
-    delete_rejected_with, link_pair, rejected_ids, summarize_rejected, trash::trash_images_with,
+    delete_rejected_with, link_pair, rejected_ids, summarize_rejected,
+    trash::{finalize_trash, plan_trash, trash_files, trash_images_with, TrashTarget},
     QueryParams,
 };
 use std::path::{Path, PathBuf};
@@ -319,6 +320,126 @@ fn empty_reject_set_is_a_no_op() {
     assert_eq!(res.trashed, 0);
     assert_eq!(present_ids(&db.conn), vec![a]);
     assert!(dir.join("a.cr3").exists());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ── plan / unlocked file work / verified finalize ─────────────────────────────
+
+/// Between plan and finalize the file is gone, but a concurrent relink repointed the row. The
+/// finalize must not delete a row that no longer describes the trashed file.
+#[test]
+fn finalize_skips_row_repointed_after_plan() {
+    let dir = tempdir("repoint");
+    let db = Db::open_in_memory().unwrap();
+    let a = insert_file(&db.conn, &dir, 1, "a.cr3");
+    let b = insert_file(&db.conn, &dir, 2, "b.cr3");
+
+    let targets = plan_trash(&db.conn, &[a, b]).unwrap();
+    let (gone, failed) = trash_files(&targets, &fs_remover());
+    assert_eq!(failed, 0);
+
+    // Simulate a concurrent relink of A's row after its file went to the Trash.
+    db.conn
+        .execute(
+            "UPDATE images SET path = '/elsewhere' WHERE id = ?1",
+            params![a],
+        )
+        .unwrap();
+
+    let out = finalize_trash(&db.conn, &gone, failed).unwrap();
+    assert_eq!(out.trashed, 1);
+    assert_eq!(out.changed, 1);
+    assert_eq!(present_ids(&db.conn), vec![a], "repointed row survives");
+    assert!(!dir.join("a.cr3").exists(), "its file was still trashed");
+    assert_eq!(
+        out.hashes,
+        vec!["02".repeat(32)],
+        "only B's hash is reported"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Same window, but the row's bytes were replaced (re-hash to different content) rather than the
+/// path. Same rule: the row no longer describes the trashed file, so it is kept.
+#[test]
+fn finalize_skips_replaced_bytes() {
+    let dir = tempdir("rehash");
+    let db = Db::open_in_memory().unwrap();
+    let a = insert_file(&db.conn, &dir, 1, "a.cr3");
+    let b = insert_file(&db.conn, &dir, 2, "b.cr3");
+
+    let targets = plan_trash(&db.conn, &[a, b]).unwrap();
+    let (gone, failed) = trash_files(&targets, &fs_remover());
+    assert_eq!(failed, 0);
+
+    db.conn
+        .execute(
+            "UPDATE images SET content_hash = ?1 WHERE id = ?2",
+            params![vec![9u8; 32], a],
+        )
+        .unwrap();
+
+    let out = finalize_trash(&db.conn, &gone, failed).unwrap();
+    assert_eq!(out.trashed, 1);
+    assert_eq!(out.changed, 1);
+    assert_eq!(present_ids(&db.conn), vec![a]);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A file the remover cannot trash is counted in `failed` and its row — and the file — survive.
+#[test]
+fn failed_trash_keeps_row() {
+    let dir = tempdir("split-failed");
+    let db = Db::open_in_memory().unwrap();
+    let a = insert_file(&db.conn, &dir, 1, "a.cr3");
+    let b = insert_file(&db.conn, &dir, 2, "b.cr3");
+
+    let targets = plan_trash(&db.conn, &[a, b]).unwrap();
+    let (gone, failed) = trash_files(&targets, &|p: &Path| {
+        !p.ends_with("a.cr3") && std::fs::remove_file(p).is_ok()
+    });
+    let out = finalize_trash(&db.conn, &gone, failed).unwrap();
+
+    assert_eq!(out.failed, 1);
+    assert_eq!(out.trashed, 1);
+    assert_eq!(out.changed, 0);
+    assert_eq!(present_ids(&db.conn), vec![a]);
+    assert!(dir.join("a.cr3").exists());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The unlocked phase takes targets only — no connection anywhere in scope. This documents that
+/// `trash_files` performs pure file IO and can run with the catalog lock released.
+#[test]
+fn plan_and_trash_files_need_no_lock() {
+    let dir = tempdir("unlocked");
+    std::fs::write(dir.join("here.cr3"), vec![7u8; 16]).unwrap();
+    let targets = vec![
+        TrashTarget {
+            id: 1,
+            path: dir.join("here.cr3").display().to_string(),
+            hash_hex: "aa".repeat(32),
+        },
+        TrashTarget {
+            id: 2,
+            path: dir.join("already-gone.cr3").display().to_string(),
+            hash_hex: "bb".repeat(32),
+        },
+    ];
+
+    // No `Db`/`Connection` value exists here; the call compiles and runs regardless.
+    let (gone, failed) = trash_files(&targets, &fs_remover());
+
+    assert_eq!(
+        failed, 0,
+        "a missing file counts as already gone, not as a failure"
+    );
+    assert_eq!(gone, targets, "both targets report as gone, unchanged");
+    assert!(!dir.join("here.cr3").exists());
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -1,0 +1,140 @@
+{
+  "commands": [
+    {
+      "name": "face_reject",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Reject a face from its person (\"not this person\") \u2014 unlink + remember the rejection.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "face_assign",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Reassign a face to a person (confirmed), or `null` to send it back to the suggestion pool.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "faces_delete_all",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Delete ALL face + person data (privacy \"Delete all face data\"). Atomic; not reversible.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "features_backfill",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Backfill per-image feature vectors (lighting/best-shot/dedup model inputs) for images missing them. Explicit action; emits `features:progress`/`features:done`. Returns the count computed.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "suggest_train",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Fit the pick/reject suggestion model on the current labels, in the background. Returns as soon as the job is queued; the outcome arrives as `suggest:done` (a `TrainOutcome`) or `suggest:error`. A promoted fit re-scores the library before `suggest:done` fires.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "suggest_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "The suggester's state: live-model metrics, the label census by provenance, and scored counts.",
+      "target": "core-app",
+      "task": "DARKROOM-151",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "sidecars_write_all",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Write a sidecar (`<raw>.json`: edits + rating + keywords) next to every present RAW \u2014 migrates an existing catalog onto the durable on-disk format. Returns the count written.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "sidecars_rebuild",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Force-apply every present image's sidecar back into the catalog (recover edits/ratings/keywords after a catalog loss or when moving between machines). Returns the count hydrated.",
+      "target": "core-runtime",
+      "task": "DARKROOM-138",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "image_histogram",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Real per-image histogram for the Library metadata panel, computed from the cached thumbnail (no GPU render needed). Reads the SAME canonical/edited render the grid shows (so it matches the Develop histogram), falling back to the camera placeholder. `None` if nothing is cached yet.",
+      "target": "core-app",
+      "task": "DARKROOM-146",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "frontend_log",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Frontend log; inputs: level: String, target: String, message: String, fields: Option<serde_json::Value>,; returns: ().",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "logs_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Logs status; inputs: ; returns: Result<crate::logging::LogsStatus, String>.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "e2e/tests/native/migration-baseline.spec.ts"
+    },
+    {
+      "name": "set_logs_directory",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set logs directory; inputs: path: String; returns: Result<crate::logging::LogsStatus, String>. AppHandle is host-injected for bounded executor admission; IPC payload unchanged.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "set_log_level",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Set log level; inputs: level: String; returns: Result<crate::logging::LogsStatus, String>.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "logs_export_zip",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Logs export zip; inputs: dest: String; returns: Result<u64, String>. AppHandle is host-injected for bounded executor admission; IPC payload unchanged.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "logs_delete_all",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Logs delete all; inputs: ; returns: Result<crate::logging::LogsStatus, String>.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "catalog_backup_now",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Catalog backup now; inputs: app: AppHandle; returns: Result<crate::backup::BackupStatus, String>.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    },
+    {
+      "name": "catalog_backup_status",
+      "source": "src-tauri/src/commands.rs",
+      "behavior": "Catalog backup status; inputs: app: AppHandle; returns: Result<crate::backup::BackupStatus, String>.",
+      "target": "core-runtime",
+      "task": "DARKROOM-152",
+      "test": "coverage gap: command-specific parity test not yet identified"
+    }
+  ]
+}
